@@ -3,6 +3,7 @@ use lattice_domain::{DeviceId, EvidenceFact, EvidenceFamily, PresenceChanged, Pr
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use std::collections::HashSet;
 use thiserror::Error;
 
 pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
@@ -169,6 +170,7 @@ impl M2StateRepository {
             .await?;
             if let Some(old) = old {
                 if old == digest {
+                    verify_idempotent_checkpoint(&mut tx, &self.config, &input).await?;
                     tx.commit().await?;
                     return Ok(());
                 }
@@ -181,26 +183,44 @@ impl M2StateRepository {
             sqlx::query_scalar("SELECT commit_sequence FROM state_checkpoints WHERE singleton=1")
                 .fetch_optional(&mut *tx)
                 .await?;
-        let expected = previous.map_or(1, |value| value.checked_add(1).unwrap_or(i64::MIN));
+        let expected = previous.map_or(Ok(1), |value| {
+            value
+                .checked_add(1)
+                .ok_or_else(|| CheckpointError::Conflict("commit sequence is exhausted".into()))
+        })?;
         if input.checkpoint.commit_sequence != expected {
             return Err(CheckpointError::Conflict(format!(
                 "stale or out-of-order sequence: expected {expected}, got {}",
                 input.checkpoint.commit_sequence
             )));
         }
-        let checkpoint_insert = sqlx::query("INSERT INTO state_checkpoints(singleton,format_version,checkpoint_bytes,source_fingerprint,commit_sequence,written_at,sha256) VALUES(1,?,?,?,?,?,?)")
-            .bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checkpoint_checksum(&input.checkpoint)).execute(&mut *tx).await;
-        if let Err(error) = checkpoint_insert {
-            if error.as_database_error().is_some_and(|db| {
-                db.is_unique_violation()
-                    || db.code().as_deref() == Some("5")
-                    || db.message().contains("database is locked")
-            }) {
-                return Err(CheckpointError::Conflict(
-                    "another writer committed this sequence first".into(),
-                ));
+        let checksum = checkpoint_checksum(&input.checkpoint);
+        let checkpoint_insert = if let Some(previous) = previous {
+            sqlx::query("UPDATE state_checkpoints SET format_version=?,checkpoint_bytes=?,source_fingerprint=?,commit_sequence=?,written_at=?,sha256=? WHERE singleton=1 AND commit_sequence=?")
+                .bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checksum).bind(previous).execute(&mut *tx).await
+        } else {
+            sqlx::query("INSERT INTO state_checkpoints(singleton,format_version,checkpoint_bytes,source_fingerprint,commit_sequence,written_at,sha256) VALUES(1,?,?,?,?,?,?) ON CONFLICT(singleton) DO NOTHING")
+                .bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checksum).execute(&mut *tx).await
+        };
+        let changed = match checkpoint_insert {
+            Ok(result) => result.rows_affected(),
+            Err(error) => {
+                if error.as_database_error().is_some_and(|db| {
+                    db.is_unique_violation()
+                        || db.code().as_deref() == Some("5")
+                        || db.message().contains("database is locked")
+                }) {
+                    return Err(CheckpointError::Conflict(
+                        "another writer committed this sequence first".into(),
+                    ));
+                }
+                return Err(CheckpointError::Storage(error));
             }
-            return Err(CheckpointError::Storage(error));
+        };
+        if changed != 1 {
+            return Err(CheckpointError::Conflict(
+                "another writer advanced the checkpoint first".into(),
+            ));
         }
         for device in &input.devices {
             upsert_device(&mut tx, device).await?;
@@ -242,10 +262,21 @@ fn validate_input(config: &M2StateConfig, input: &CommitInput) -> Result<(), Che
         &checkpoint_checksum(&input.checkpoint),
         CheckpointError::Invalid,
     )?;
+    let mut devices = HashSet::new();
     for d in &input.devices {
+        if !devices.insert(d.device_id.to_string()) {
+            return Err(CheckpointError::Invalid(
+                "duplicate device projection".into(),
+            ));
+        }
         if d.first_seen_at > d.last_seen_at {
             return Err(CheckpointError::Invalid(
                 "device first_seen_at is after last_seen_at".into(),
+            ));
+        }
+        if !whole_seconds(d.first_seen_at) || !whole_seconds(d.last_seen_at) {
+            return Err(CheckpointError::Invalid(
+                "device timestamps must be whole UTC seconds".into(),
             ));
         }
         check_optional_string(&d.owner_name, config, "owner name")?;
@@ -267,7 +298,36 @@ fn validate_input(config: &M2StateConfig, input: &CommitInput) -> Result<(), Che
         check_string(&f.key, config, "evidence key")?;
         check_string(&f.value, config, "evidence value")?;
     }
+    let mut transition_ids = HashSet::new();
+    let mut evidence_keys = HashSet::new();
+    for e in &input.evidence {
+        let f = &e.fact;
+        let key = format!(
+            "{}|{}|{}|{}|{}|{:08x}|{}|{}|{}",
+            e.device_id,
+            evidence_family(f.family),
+            f.source,
+            f.key,
+            f.value,
+            f.confidence.to_bits(),
+            f.observed_at.to_rfc3339(),
+            f.expires_at
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_default(),
+            f.owner_confirmed
+        );
+        if !evidence_keys.insert(key) {
+            return Err(CheckpointError::Invalid(
+                "duplicate semantic evidence projection".into(),
+            ));
+        }
+    }
     for t in &input.transitions {
+        if !transition_ids.insert(t.transition_id) {
+            return Err(CheckpointError::Invalid(
+                "duplicate transition identifier".into(),
+            ));
+        }
         if t.transition_id == 0
             || t.transition_id > i64::MAX as u64
             || t.correction_of
@@ -275,6 +335,31 @@ fn validate_input(config: &M2StateConfig, input: &CommitInput) -> Result<(), Che
         {
             return Err(CheckpointError::Invalid(
                 "transition identifier is out of SQLite range".into(),
+            ));
+        }
+        if t.from == t.to {
+            return Err(CheckpointError::Invalid(
+                "presence transition cannot keep the same state".into(),
+            ));
+        }
+        if t.correction_of.is_some_and(|id| id >= t.transition_id) {
+            return Err(CheckpointError::Invalid(
+                "transition correction must reference an earlier identifier".into(),
+            ));
+        }
+        if t.evidence_observed_at > t.trigger_arrival_at || t.occurred_at > t.trigger_arrival_at {
+            return Err(CheckpointError::Invalid(
+                "transition timestamps are not causally ordered".into(),
+            ));
+        }
+        if !whole_seconds(t.occurred_at)
+            || !whole_seconds(t.evidence_observed_at)
+            || !whole_seconds(t.trigger_arrival_at)
+            || t.evidence_valid_until
+                .is_some_and(|value| !whole_seconds(value))
+        {
+            return Err(CheckpointError::Invalid(
+                "transition timestamps must be whole UTC seconds".into(),
             ));
         }
         if t.evidence_valid_until
@@ -350,6 +435,45 @@ fn checkpoint_checksum(checkpoint: &CheckpointInput) -> Vec<u8> {
         checkpoint.written_at,
     )
 }
+async fn verify_idempotent_checkpoint(
+    tx: &mut Transaction<'_, Sqlite>,
+    config: &M2StateConfig,
+    input: &CommitInput,
+) -> Result<(), CheckpointError> {
+    let row: Option<StoredCheckpointRow> = sqlx::query_as("SELECT format_version,checkpoint_bytes,source_fingerprint,commit_sequence,written_at,sha256 FROM state_checkpoints WHERE singleton=1")
+        .fetch_optional(&mut **tx).await?;
+    let Some((version, bytes, fingerprint, sequence, timestamp, checksum)) = row else {
+        return Err(CheckpointError::Corrupt(
+            "idempotency record exists without a checkpoint".into(),
+        ));
+    };
+    let written_at = parse_timestamp(
+        &timestamp,
+        "checkpoint written_at",
+        CheckpointError::Corrupt,
+    )?;
+    validate_checkpoint(
+        config,
+        &bytes,
+        version,
+        sequence,
+        &fingerprint,
+        &input.checkpoint.source_fingerprint,
+        written_at,
+        &checksum,
+        CheckpointError::Corrupt,
+    )?;
+    if version != input.checkpoint.format_version
+        || bytes != input.checkpoint.bytes
+        || sequence != input.checkpoint.commit_sequence
+        || written_at != input.checkpoint.written_at
+    {
+        return Err(CheckpointError::Conflict(
+            "idempotency record does not match current checkpoint envelope".into(),
+        ));
+    }
+    Ok(())
+}
 fn checkpoint_checksum_fields(
     version: i64,
     bytes: &[u8],
@@ -360,9 +484,12 @@ fn checkpoint_checksum_fields(
     Sha256::digest(serde_json::to_vec(&json!({"checkpoint_bytes":bytes,"commit_sequence":sequence,"format_version":version,"source_fingerprint":fingerprint,"written_at":written_at.to_rfc3339()})).expect("JSON value serializes")).to_vec()
 }
 fn logical_commit_digest(input: &CommitInput) -> Result<Vec<u8>, CheckpointError> {
-    let devices: Vec<_> = input.devices.iter().map(|d| json!({"device_id":d.device_id.to_string(),"first_seen_at":d.first_seen_at.to_rfc3339(),"last_seen_at":d.last_seen_at.to_rfc3339(),"owner_name":d.owner_name,"owner_type":d.owner_type,"owner_confirmed":d.owner_confirmed})).collect();
-    let evidence: Vec<_> = input.evidence.iter().map(|e| { let f=&e.fact; json!({"device_id":e.device_id.to_string(),"family":evidence_family(f.family),"source":f.source,"key":f.key,"value":f.value,"confidence":f.confidence,"observed_at":f.observed_at.to_rfc3339(),"expires_at":f.expires_at.map(|x|x.to_rfc3339()),"owner_confirmed":f.owner_confirmed}) }).collect();
-    let transitions: Vec<_> = input.transitions.iter().map(|t| json!({"transition_id":t.transition_id,"device_id":t.device_id.to_string(),"from":presence_state(t.from),"to":presence_state(t.to),"occurred_at":t.occurred_at.to_rfc3339(),"reason":t.reason,"trigger_source":t.trigger_source,"trigger_kind":t.trigger_kind,"evidence_observed_at":t.evidence_observed_at.to_rfc3339(),"evidence_valid_until":t.evidence_valid_until.map(|x|x.to_rfc3339()),"trigger_arrival_at":t.trigger_arrival_at.to_rfc3339(),"correction_of":t.correction_of})).collect();
+    let mut devices: Vec<_> = input.devices.iter().map(|d| json!({"device_id":d.device_id.to_string(),"first_seen_at":d.first_seen_at.to_rfc3339(),"last_seen_at":d.last_seen_at.to_rfc3339(),"owner_name":d.owner_name,"owner_type":d.owner_type,"owner_confirmed":d.owner_confirmed})).collect();
+    let mut evidence: Vec<_> = input.evidence.iter().map(|e| { let f=&e.fact; json!({"device_id":e.device_id.to_string(),"family":evidence_family(f.family),"source":f.source,"key":f.key,"value":f.value,"confidence":f.confidence,"observed_at":f.observed_at.to_rfc3339(),"expires_at":f.expires_at.map(|x|x.to_rfc3339()),"owner_confirmed":f.owner_confirmed}) }).collect();
+    let mut transitions: Vec<_> = input.transitions.iter().map(|t| json!({"transition_id":t.transition_id,"device_id":t.device_id.to_string(),"from":presence_state(t.from),"to":presence_state(t.to),"occurred_at":t.occurred_at.to_rfc3339(),"reason":t.reason,"trigger_source":t.trigger_source,"trigger_kind":t.trigger_kind,"evidence_observed_at":t.evidence_observed_at.to_rfc3339(),"evidence_valid_until":t.evidence_valid_until.map(|x|x.to_rfc3339()),"trigger_arrival_at":t.trigger_arrival_at.to_rfc3339(),"correction_of":t.correction_of})).collect();
+    sort_json_values(&mut devices);
+    sort_json_values(&mut evidence);
+    sort_json_values(&mut transitions);
     let c = &input.checkpoint;
     let canonical = json!({"checkpoint":{"format_version":c.format_version,"bytes":c.bytes,"source_fingerprint":c.source_fingerprint,"commit_sequence":c.commit_sequence,"written_at":c.written_at.to_rfc3339()},"devices":devices,"evidence":evidence,"transitions":transitions,"discovery":input.discovery.as_ref().map(|d|json!({"input_hash":d.input_hash,"source":d.source,"result_summary":d.result_summary,"committed_at":d.committed_at.to_rfc3339()}))});
     Ok(Sha256::digest(serde_json::to_vec(&canonical).map_err(|e| {
@@ -370,11 +497,14 @@ fn logical_commit_digest(input: &CommitInput) -> Result<Vec<u8>, CheckpointError
     })?)
     .to_vec())
 }
+fn sort_json_values(values: &mut [serde_json::Value]) {
+    values.sort_by_key(|value| serde_json::to_string(value).expect("JSON value serializes"));
+}
 async fn upsert_device(
     tx: &mut Transaction<'_, Sqlite>,
     d: &DeviceProjection,
 ) -> Result<(), CheckpointError> {
-    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed) VALUES(?,?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET first_seen_at=MIN(devices.first_seen_at,excluded.first_seen_at),last_seen_at=MAX(devices.last_seen_at,excluded.last_seen_at),owner_name=COALESCE(excluded.owner_name,devices.owner_name),owner_type=COALESCE(excluded.owner_type,devices.owner_type),owner_confirmed=MAX(devices.owner_confirmed,excluded.owner_confirmed)").bind(d.device_id.to_string()).bind(d.first_seen_at.to_rfc3339()).bind(d.last_seen_at.to_rfc3339()).bind(&d.owner_name).bind(&d.owner_type).bind(d.owner_confirmed).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed) VALUES(?,?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET first_seen_at=MIN(devices.first_seen_at,excluded.first_seen_at),last_seen_at=MAX(devices.last_seen_at,excluded.last_seen_at),owner_name=CASE WHEN excluded.owner_confirmed=1 THEN COALESCE(excluded.owner_name,devices.owner_name) ELSE devices.owner_name END,owner_type=CASE WHEN excluded.owner_confirmed=1 THEN COALESCE(excluded.owner_type,devices.owner_type) ELSE devices.owner_type END,owner_confirmed=MAX(devices.owner_confirmed,excluded.owner_confirmed)").bind(d.device_id.to_string()).bind(d.first_seen_at.to_rfc3339()).bind(d.last_seen_at.to_rfc3339()).bind(&d.owner_name).bind(&d.owner_type).bind(d.owner_confirmed).execute(&mut **tx).await?;
     Ok(())
 }
 async fn insert_evidence(
@@ -389,6 +519,20 @@ async fn insert_transition(
     tx: &mut Transaction<'_, Sqlite>,
     t: &PresenceChanged,
 ) -> Result<(), CheckpointError> {
+    if let Some(correction_of) = t.correction_of {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT transition_id FROM presence_transitions WHERE transition_id=?",
+        )
+        .bind(correction_of as i64)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if exists.is_none() {
+            return Err(CheckpointError::Invalid(format!(
+                "transition {} references a missing correction target",
+                t.transition_id
+            )));
+        }
+    }
     let existing: Option<StoredTransitionRow> = sqlx::query_as("SELECT device_id,from_state,to_state,occurred_at,reason,trigger_source,trigger_kind,evidence_observed_at,evidence_valid_until,trigger_arrival_at,correction_of FROM presence_transitions WHERE transition_id=?").bind(t.transition_id as i64).fetch_optional(&mut **tx).await?;
     let row = (
         t.device_id.to_string(),
@@ -472,4 +616,7 @@ fn check_optional_string(
         check_string(value, config, field)?;
     }
     Ok(())
+}
+fn whole_seconds(value: DateTime<Utc>) -> bool {
+    value.timestamp_subsec_nanos() == 0
 }

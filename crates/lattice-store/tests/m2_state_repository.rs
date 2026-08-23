@@ -103,17 +103,111 @@ async fn identical_retry_is_idempotent_but_changed_payload_conflicts() -> anyhow
 }
 
 #[tokio::test]
-async fn corrupt_checksum_fingerprint_version_json_and_timestamp_fail_closed() -> anyhow::Result<()>
-{
+async fn sequential_checkpoint_cas_advances_and_preserves_projections() -> anyhow::Result<()> {
     let pool = lattice_store::connect_memory().await?;
     let repo = M2StateRepository::new(pool.clone());
-    repo.commit(input(1, [9; 32])).await?;
+    repo.commit(input(1, [21; 32])).await?;
+    repo.commit(input(2, [22; 32])).await?;
+    assert_eq!(
+        repo.load("sensor-config-v1")
+            .await?
+            .unwrap()
+            .commit_sequence,
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM presence_transitions")
+            .fetch_one(&pool)
+            .await?,
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_detects_a_corrupt_or_diverged_checkpoint() -> anyhow::Result<()> {
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool.clone());
+    let commit = input(1, [23; 32]);
+    repo.commit(commit.clone()).await?;
+    sqlx::query("UPDATE state_checkpoints SET checkpoint_bytes=x'7b7d'")
+        .execute(&pool)
+        .await?;
+    assert!(matches!(
+        repo.commit(commit).await,
+        Err(CheckpointError::Corrupt(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn projections_have_owner_precedence_and_canonical_retry_order() -> anyhow::Result<()> {
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool.clone());
+    let mut original = input(1, [24; 32]);
+    let second = DeviceId::parse("018f47a0-9b5c-7a22-8a33-112233445598").unwrap();
+    let mut second_device = original.devices[0].clone();
+    second_device.device_id = second;
+    let mut second_evidence = original.evidence[0].clone();
+    second_evidence.device_id = second;
+    let mut second_transition = original.transitions[0].clone();
+    second_transition.device_id = second;
+    second_transition.transition_id = 99;
+    original.devices.push(second_device);
+    original.evidence.push(second_evidence);
+    original.transitions.push(second_transition);
+    repo.commit(original.clone()).await?;
+    let mut retry = original.clone();
+    retry.devices.reverse();
+    retry.evidence.reverse();
+    retry.transitions.reverse();
+    repo.commit(retry).await?;
+    let mut next = input(2, [25; 32]);
+    next.devices[0].owner_name = Some("Mallory".into());
+    next.devices[0].owner_confirmed = false;
+    repo.commit(next).await?;
+    let owner: String = sqlx::query_scalar("SELECT owner_name FROM devices WHERE device_id=?")
+        .bind(device().to_string())
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(owner, "Paul");
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_duplicate_and_impossible_projection_values_before_mutation() -> anyhow::Result<()>
+{
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool);
+    let mut duplicate = input(1, [26; 32]);
+    duplicate.devices.push(duplicate.devices[0].clone());
+    assert!(matches!(
+        repo.commit(duplicate).await,
+        Err(CheckpointError::Invalid(_))
+    ));
+    let mut impossible = input(1, [27; 32]);
+    impossible.transitions[0].from = PresenceState::Online;
+    impossible.transitions[0].to = PresenceState::Online;
+    impossible.transitions[0].correction_of = Some(1);
+    assert!(matches!(
+        repo.commit(impossible).await,
+        Err(CheckpointError::Invalid(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn corrupt_checksum_fingerprint_version_json_and_timestamp_fail_closed() -> anyhow::Result<()>
+{
     for (column, value) in [
         ("sha256", "zeroblob(32)"),
         ("format_version", "99"),
         ("checkpoint_bytes", "x'6e6f7065'"),
         ("written_at", "'not-a-time'"),
     ] {
+        let pool = lattice_store::connect_memory().await?;
+        let repo = M2StateRepository::new(pool.clone());
+        repo.commit(input(1, [9; 32])).await?;
         sqlx::query(&format!("UPDATE state_checkpoints SET {column}={value}"))
             .execute(&pool)
             .await?;
@@ -121,8 +215,10 @@ async fn corrupt_checksum_fingerprint_version_json_and_timestamp_fail_closed() -
             repo.load("sensor-config-v1").await,
             Err(CheckpointError::Corrupt(_))
         ));
-        repo.commit(input(1, [9; 32])).await?;
     }
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool.clone());
+    repo.commit(input(1, [9; 32])).await?;
     sqlx::query("UPDATE state_checkpoints SET source_fingerprint='wrong'")
         .execute(&pool)
         .await?;
@@ -179,11 +275,10 @@ async fn concurrent_first_sequences_return_a_typed_conflict() -> anyhow::Result<
 async fn migration_sets_current_version_and_enforces_m2_foreign_keys_and_indexes()
 -> anyhow::Result<()> {
     let pool = lattice_store::connect_memory().await?;
-    sqlx::query("INSERT INTO install_state(singleton,install_id,first_run_at,schema_version) VALUES(1,'018f47a0-9b5c-7a22-8a33-112233445511','2026-08-23T00:00:00Z',1)")
-        .execute(&pool).await?;
-    sqlx::query("UPDATE install_state SET schema_version=3 WHERE singleton=1")
-        .execute(&pool)
+    let install = lattice_store::InstallRepository::new(pool.clone())
+        .initialize(time(0))
         .await?;
+    assert_eq!(install.schema_version, 3);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT schema_version FROM install_state WHERE singleton=1")
             .fetch_one(&pool)
