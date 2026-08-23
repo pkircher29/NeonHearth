@@ -8,9 +8,11 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+fs2.workspace = true
 lattice-domain = { path = "../lattice-domain" }
 sqlx.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tempfile = "3"
