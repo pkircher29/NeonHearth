@@ -1,6 +1,6 @@
 use axum::{body::Body, http::Request};
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use lattice_domain::{EventPayload, ServiceStatus};
 use lattice_event_bus::EventBus;
@@ -78,6 +78,16 @@ async fn websocket_streams_events_and_consumes_ticket_once() {
         .await
         .unwrap();
 
+    let ping_payload = b"neonhearth-ping".to_vec();
+    socket
+        .send(Message::Ping(ping_payload.clone().into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        socket.next().await.unwrap().unwrap(),
+        Message::Pong(ping_payload.into())
+    );
+
     state.events().publish(Utc::now(), payload()).await;
     let message = socket.next().await.unwrap().unwrap();
     let Message::Text(message) = message else {
@@ -115,4 +125,5 @@ async fn websocket_stale_cursor_receives_resync_required() {
         serde_json::from_str::<serde_json::Value>(&message).unwrap(),
         serde_json::json!({"type": "resync_required"})
     );
+    assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
 }

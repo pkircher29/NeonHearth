@@ -26,6 +26,11 @@ async fn send_message(
     sink.send(Message::Text(encoded.into())).await
 }
 
+async fn send_resync_and_close(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>) {
+    let _ = send_message(sink, ServerMessage::ResyncRequired).await;
+    let _ = sink.send(Message::Close(None)).await;
+}
+
 pub(crate) async fn serve_socket(socket: WebSocket, bus: EventBus, after_sequence: u64) {
     // Subscribe before reading replay so publish cannot be lost between the two operations.
     let mut receiver = bus.subscribe();
@@ -36,7 +41,7 @@ pub(crate) async fn serve_socket(socket: WebSocket, bus: EventBus, after_sequenc
     for message in messages {
         match message {
             ServerMessage::ResyncRequired => {
-                let _ = send_message(&mut sink, ServerMessage::ResyncRequired).await;
+                send_resync_and_close(&mut sink).await;
                 return;
             }
             ServerMessage::Event(event) => {
@@ -54,13 +59,26 @@ pub(crate) async fn serve_socket(socket: WebSocket, bus: EventBus, after_sequenc
     loop {
         tokio::select! {
             incoming = stream.next() => match incoming {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                Some(Ok(_)) => return,
+                Some(Ok(Message::Ping(payload))) => {
+                    if sink.send(Message::Pong(payload)).await.is_err() {
+                        return;
+                    }
+                }
+                Some(Ok(Message::Pong(_))) => {},
+                Some(Ok(Message::Close(_))) => {
+                    let _ = sink.send(Message::Close(None)).await;
+                    return;
+                }
+                Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
+                    let _ = sink.send(Message::Close(None)).await;
+                    return;
+                }
+                None | Some(Err(_)) => return,
             },
             event = receiver.recv() => match event {
                 Ok(event) if event.sequence <= last_sent_sequence => {},
                 Ok(event) if event.sequence != last_sent_sequence.saturating_add(1) => {
-                    let _ = send_message(&mut sink, ServerMessage::ResyncRequired).await;
+                    send_resync_and_close(&mut sink).await;
                     return;
                 }
                 Ok(event) => {
@@ -70,7 +88,7 @@ pub(crate) async fn serve_socket(socket: WebSocket, bus: EventBus, after_sequenc
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    let _ = send_message(&mut sink, ServerMessage::ResyncRequired).await;
+                    send_resync_and_close(&mut sink).await;
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
