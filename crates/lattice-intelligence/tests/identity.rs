@@ -25,6 +25,7 @@ fn engine() -> IdentityEngine {
         IdentityConfig::default(),
         vec![id(1), id(2), id(3)].into_iter(),
     )
+    .unwrap()
 }
 
 #[test]
@@ -35,6 +36,7 @@ fn stable_mac_keeps_identity_across_dhcp_ip_change() {
             None,
             vec![
                 fact(EvidenceFamily::LinkLayer, "mac", "00:11:22:33:44:55", 0.98),
+                fact(EvidenceFamily::Addressing, "dhcp_client_id", "client", 0.98),
                 fact(EvidenceFamily::Addressing, "ip", "192.168.1.2", 0.7),
             ],
         )
@@ -45,6 +47,7 @@ fn stable_mac_keeps_identity_across_dhcp_ip_change() {
             None,
             vec![
                 fact(EvidenceFamily::LinkLayer, "mac", "00:11:22:33:44:55", 0.98),
+                fact(EvidenceFamily::Addressing, "dhcp_client_id", "client", 0.98),
                 fact(EvidenceFamily::Addressing, "ip", "192.168.1.99", 0.7)
             ]
         )
@@ -131,7 +134,7 @@ fn contradiction_blocks_matching() {
         .observe(
             None,
             vec![
-                fact(EvidenceFamily::Cryptographic, "serial", "A", 0.99),
+                fact(EvidenceFamily::Service, "serial", "A", 0.99),
                 fact(EvidenceFamily::Service, "uuid", "u", 0.95),
             ],
         )
@@ -140,7 +143,7 @@ fn contradiction_blocks_matching() {
         .observe(
             None,
             vec![
-                fact(EvidenceFamily::Cryptographic, "serial", "B", 0.99),
+                fact(EvidenceFamily::Service, "serial", "B", 0.99),
                 fact(EvidenceFamily::Service, "uuid", "u", 0.95),
             ],
         )
@@ -237,14 +240,13 @@ fn identification_threshold_router_cap_and_independent_families_are_exact() {
 fn owner_values_override_until_explicit_clear() {
     let mut e = engine();
     let d = e.observe(None, vec![]).unwrap();
-    let mut o = fact(EvidenceFamily::Owner, "vendor", "Mine", 0.2);
-    o.owner_confirmed = true;
+    e.set_owner_fact(d, "vendor", "Mine", Utc::now()).unwrap();
     e.add_facts(
         d,
         vec![
-            o,
             fact(EvidenceFamily::Naming, "vendor", "Auto", 1.0),
             fact(EvidenceFamily::Service, "class", "camera", 1.0),
+            fact(EvidenceFamily::Naming, "class", "camera", 1.0),
         ],
     )
     .unwrap();
@@ -341,15 +343,16 @@ fn expiry_validation_capacity_and_ordering_are_bounded() {
             ..Default::default()
         },
         vec![id(1), id(2), id(3)].into_iter(),
-    );
+    )
+    .unwrap();
     let now = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
-    let mut expired = fact(EvidenceFamily::Cryptographic, "serial", "x", 1.0);
+    let mut expired = fact(EvidenceFamily::Service, "serial", "x", 1.0);
     expired.expires_at = Some(now - Duration::seconds(1));
     let a = e.observe_at(None, vec![expired], now).unwrap();
     let b = e
         .observe_at(
             None,
-            vec![fact(EvidenceFamily::Cryptographic, "serial", "x", 1.0)],
+            vec![fact(EvidenceFamily::Service, "serial", "x", 1.0)],
             now,
         )
         .unwrap();
@@ -358,8 +361,8 @@ fn expiry_validation_capacity_and_ordering_are_bounded() {
         e.add_facts(
             a,
             vec![
-                fact(EvidenceFamily::Naming, "a", "1", 0.5),
-                fact(EvidenceFamily::Service, "b", "2", 0.5)
+                fact(EvidenceFamily::Naming, "hostname", "one", 0.5),
+                fact(EvidenceFamily::Service, "uuid", "two", 0.5)
             ]
         ),
         Err(IdentityError::Capacity(_))

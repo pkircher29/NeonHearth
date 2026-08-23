@@ -6,7 +6,7 @@ NeonHearth owns device identity. Router labels, including Acer Predator W6 label
 
 Every fact retains its family, source, observation time, optional expiry, confidence, value, and owner-confirmed flag. Inputs, device count, per-device facts, proposals, audit decisions, and returned fact lists are bounded before state changes. Expired facts do not participate in matching or identification.
 
-Identity anchors are deliberately narrower than classification facts. A stable, globally administered MAC can maintain an identity across IP/DHCP changes. Locally administered/private MAC changes require matching strong anchors from at least two independent families, such as a TLS SPKI plus ONVIF UUID. Stable serials, protocol UUIDs, TLS keys, SSH host keys, UPnP UDNs, and DHCP client identifiers are eligible anchors. IP, OUI/vendor, router label, hostname, device class, and open ports are not automatic merge anchors.
+Identity anchors are deliberately narrower than classification facts. Every automatic merge requires strong matches from at least two independent, taxonomy-validated families. A globally administered MAC plus DHCP client ID can maintain identity across IP changes. Private-MAC changes require two other independent anchors, such as a TLS SPKI plus ONVIF UUID. Stable serials, protocol UUIDs, TLS keys, SSH host keys, UPnP UDNs, and DHCP client identifiers are eligible only in their assigned families. IP, OUI/vendor, router label, hostname, device class, and open ports are not automatic merge anchors.
 
 Each contributing family must independently meet the configured match threshold. Repeated facts from one family count once. A conflicting high-confidence stable identifier blocks automatic correlation. If evidence points toward multiple candidates, NeonHearth creates deterministic owner-review proposals instead of choosing one.
 
@@ -16,8 +16,8 @@ Automatic vendor plus device-class identification requires both fields to meet `
 
 ## Review and reversibility
 
-Merge proposals include candidate IDs, score, independent families, and sorted reasons. Accept/reject/undo decisions append audit records. Acceptance changes canonical resolution without moving or deleting facts; undo restores the prior identity and all original evidence.
+Merge proposals include candidate IDs, score, independent families, and sorted reasons. Accept/reject/undo decisions append audit records. Accepted proposals add explicit graph edges without moving or deleting facts. Canonical components are recomputed from active edges, so duplicate/stale acceptance is a safe no-op and edges can be undone in any order without splitting relationships supported by other edges. Owner set/clear actions are a separate append-only history; owner values never expire and only an explicit tombstone clears them.
 
 ## Limits
 
-Correlation is conservative and can leave one physical device represented by multiple IDs when stable evidence is unavailable. Undo currently targets the accepted proposal directly; callers should undo dependent later merges in reverse order. The in-memory engine is bounded but persistence and cross-restart audit storage are integrated separately.
+Correlation is conservative and can leave one physical device represented by multiple IDs when stable evidence is unavailable. Configuration, state, candidate work, graph edges, audits, and output are bounded; an operation fails atomically with a typed limit error rather than returning partial results. Persistence and cross-restart audit storage are integrated separately.
