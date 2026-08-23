@@ -1,4 +1,5 @@
 use crate::DeviceId;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -18,4 +19,9 @@ pub struct PresenceChanged {
     pub from: PresenceState,
     pub to: PresenceState,
     pub reason: String,
+    pub trigger_source: String,
+    pub trigger_kind: String,
+    pub evidence_observed_at: DateTime<Utc>,
+    pub evidence_valid_until: Option<DateTime<Utc>>,
+    pub correction_of: Option<u64>,
 }
