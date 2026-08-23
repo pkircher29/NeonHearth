@@ -37,6 +37,14 @@ fn classification_is_conservative_across_windows_and_linux_names() {
         InterfaceClass::PhysicalWired
     );
     assert_eq!(
+        classify_interface(
+            r"\\Device\\NPF_{adapter}",
+            Some("Realtek Gaming 2.5GbE Family Controller"),
+            false,
+        ),
+        InterfaceClass::PhysicalWired
+    );
+    assert_eq!(
         classify_interface("Wi-Fi", None, false),
         InterfaceClass::PhysicalWifi
     );

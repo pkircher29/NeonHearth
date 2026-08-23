@@ -63,24 +63,24 @@ async fn system_snapshot_smoke_test_uses_local_nonzero_interfaces() {
 #[cfg(windows)]
 #[tokio::test]
 async fn system_snapshot_smoke_test_uses_local_nonzero_interfaces() {
-    use lattice_sensor::neighbor::{
-        NeighborError, NeighborSnapshotSource, SystemNeighborSnapshotSource,
-    };
+    use lattice_sensor::neighbor::{NeighborSnapshotSource, SystemNeighborSnapshotSource};
+    use lattice_sensor::{InterfaceOverride, SystemInterfaceManager};
 
-    let allowed: BTreeSet<_> = pnet_datalink::interfaces()
-        .into_iter()
-        .filter_map(|interface| (interface.index != 0).then(|| InterfaceId::new(interface.index)))
+    let inventory = SystemInterfaceManager.snapshot().unwrap();
+    let allowed: BTreeSet<_> = inventory
+        .interfaces()
+        .filter(|interface| interface.discovery_eligible(InterfaceOverride::Default))
+        .map(|interface| interface.id)
         .collect();
-    if allowed.is_empty() {
-        return;
-    }
+    assert!(
+        !allowed.is_empty(),
+        "native smoke host must expose an eligible interface"
+    );
     let config = NeighborSnapshotConfig::new(256, allowed.clone()).unwrap();
-    match SystemNeighborSnapshotSource::new(config).snapshot().await {
-        Ok(rows) => assert!(
-            rows.iter()
-                .all(|row| { row.interface().get() != 0 && allowed.contains(&row.interface()) })
-        ),
-        Err(NeighborError::Malformed) | Err(NeighborError::Transport) => {}
-        Err(error) => panic!("unexpected sanitized snapshot status: {error}"),
-    }
+    let rows = SystemNeighborSnapshotSource::new(config)
+        .snapshot()
+        .await
+        .unwrap();
+    assert!(rows.len() <= 256);
+    assert!(rows.iter().all(|row| allowed.contains(&row.interface())));
 }

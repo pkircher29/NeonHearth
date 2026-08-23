@@ -121,7 +121,9 @@ fn valid_ip(ip: IpAddr) -> bool {
                 && !x.is_unspecified()
                 && !x.is_loopback()
                 && !x.is_multicast()
-                && x != Ipv4Addr::new(255, 255, 255, 255)
+                // Without the interface prefix, conservatively reject the standard
+                // directed-broadcast form as well as the limited broadcast address.
+                && x.octets()[3] != 255
         }
         IpAddr::V6(x) => {
             (x.is_unique_local() || x.is_unicast_link_local())
@@ -218,13 +220,24 @@ pub trait NeighborSnapshotSource: Send + Sync {
     async fn snapshot(&self) -> Result<Vec<NeighborRow>, NeighborError>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct RawNeighborRow {
     ifindex: u32,
     family: u16,
     address: [u8; 16],
     mac: Vec<u8>,
     reachability: NeighborReachability,
+}
+impl fmt::Debug for RawNeighborRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawNeighborRow")
+            .field("ifindex", &self.ifindex)
+            .field("family", &self.family)
+            .field("address", &"<redacted>")
+            .field("mac", &"<redacted>")
+            .field("reachability", &self.reachability)
+            .finish()
+    }
 }
 
 const ADDRESS_FAMILY_INET: u16 = 2;
@@ -282,12 +295,6 @@ fn normalize_raw_rows(
         {
             continue;
         }
-        if r.mac.len() != 6 {
-            return Err(NeighborError::Malformed);
-        }
-        let mut mac = [0; 6];
-        mac.copy_from_slice(&r.mac);
-        let link = LinkAddress::try_from(mac).map_err(|_| NeighborError::Malformed)?;
         let ip = match r.family {
             ADDRESS_FAMILY_INET => IpAddr::V4(Ipv4Addr::from([
                 r.address[0],
@@ -301,6 +308,12 @@ fn normalize_raw_rows(
         if !valid_ip(ip) {
             continue;
         }
+        if r.mac.len() != 6 {
+            return Err(NeighborError::Malformed);
+        }
+        let mut mac = [0; 6];
+        mac.copy_from_slice(&r.mac);
+        let link = LinkAddress::try_from(mac).map_err(|_| NeighborError::Malformed)?;
         rows.push(NeighborRow::new(
             InterfaceId::new(r.ifindex),
             ip,
@@ -410,7 +423,10 @@ fn windows_snapshot(config: &NeighborSnapshotConfig) -> Result<Vec<NeighborRow>,
     }
     // SAFETY: `table` is a successful non-null MIB_IPNET_TABLE2 allocation owned by `_guard`.
     let first = unsafe { (*table).Table.as_ptr() };
-    let mut raw_rows = Vec::with_capacity(count);
+    let mut raw_rows = Vec::new();
+    raw_rows
+        .try_reserve_exact(count)
+        .map_err(|_| NeighborError::Capacity)?;
     for i in 0..count {
         // SAFETY: count is bounded by allocation-sized isize limit and Table is the first row of the table allocation.
         let row = unsafe { &*first.add(i) };
@@ -419,6 +435,12 @@ fn windows_snapshot(config: &NeighborSnapshotConfig) -> Result<Vec<NeighborRow>,
                 .allowed_interfaces()
                 .contains(&InterfaceId::new(row.InterfaceIndex))
         {
+            continue;
+        }
+        let reachability = map_windows_state_code(row.State);
+        // Incomplete, unreachable, and unknown rows have no usable neighbor identity and
+        // may legitimately omit a physical address. Do not inspect their payload unions.
+        if !reachability.present() {
             continue;
         }
         let mac_len = row.PhysicalAddressLength as usize;
@@ -444,7 +466,7 @@ fn windows_snapshot(config: &NeighborSnapshotConfig) -> Result<Vec<NeighborRow>,
             family,
             address,
             mac,
-            reachability: map_windows_state_code(row.State),
+            reachability,
         });
     }
     normalize_raw_rows(config, raw_rows)
@@ -853,6 +875,22 @@ mod tests {
     }
 
     #[test]
+    fn raw_neighbor_row_debug_redacts_network_identifiers() {
+        let row = raw(
+            2,
+            ADDRESS_FAMILY_INET,
+            [192, 168, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![2, 0, 0, 0, 0, 1],
+            5,
+        );
+        let debug = format!("{row:?}");
+        assert!(!debug.contains("192"));
+        assert!(!debug.contains("168"));
+        assert!(!debug.contains("[2, 0, 0, 0, 0, 1]"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
     fn neutral_normalizer_enforces_scope_validation_ordering_dedup_and_capacity() {
         let config = NeighborSnapshotConfig::new(2, [InterfaceId::new(2)]).unwrap();
         let v4 = |last| {
@@ -895,6 +933,7 @@ mod tests {
                 vec![2, 0, 0, 0, 0, 3],
                 5,
             ),
+            raw(2, ADDRESS_FAMILY_INET, v4(255), vec![0xff; 6], 6),
         ] {
             assert!(normalize_raw_rows(&config, [ignored]).unwrap().is_empty());
         }
