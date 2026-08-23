@@ -1207,6 +1207,7 @@ dependencies = [
  "bytes",
  "chrono",
  "etherparse",
+ "getrandom 0.3.4",
  "hickory-proto",
  "lattice-domain",
  "pcap-file",

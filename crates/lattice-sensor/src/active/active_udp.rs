@@ -21,10 +21,21 @@ enum Correlation {
     Mdns(Vec<u8>),
     Tx32(u32),
     Ntp([u8; 8]),
-    Text(&'static str),
-    Soap(&'static str),
+    Session(Vec<(String, String)>),
+    Soap(String),
     Coap { id: u16, token: [u8; 4] },
     Lifx { source: u32, sequence: u8 },
+}
+
+pub trait NonceSource: Send + Sync {
+    fn fill(&self, bytes: &mut [u8]) -> Result<(), ActiveError>;
+}
+
+struct SystemNonce;
+impl NonceSource for SystemNonce {
+    fn fill(&self, bytes: &mut [u8]) -> Result<(), ActiveError> {
+        getrandom::fill(bytes).map_err(|_| ActiveError::Unavailable)
+    }
 }
 
 pub fn build_udp_probe(
@@ -33,26 +44,38 @@ pub fn build_udp_probe(
     local_v4: Option<Ipv4Addr>,
     _credential: Option<&ProbeCredential>,
 ) -> Result<UdpProbe, ActiveError> {
+    build_udp_probe_with_nonce(id, target, local_v4, _credential, &SystemNonce)
+}
+
+pub fn build_udp_probe_with_nonce(
+    id: &str,
+    target: IpAddr,
+    local_v4: Option<Ipv4Addr>,
+    _credential: Option<&ProbeCredential>,
+    nonce: &dyn NonceSource,
+) -> Result<UdpProbe, ActiveError> {
+    let mut random = [0u8; 16];
+    nonce.fill(&mut random)?;
     let (port, bytes, correlation) = match id {
         "udp.dns.53" => {
             let port = 53;
-            let tx=0x1234u16; let mut b=vec![]; b.extend_from_slice(&tx.to_be_bytes()); b.extend_from_slice(&[0x01,0x00,0,1,0,0,0,0,0,0]); b.extend_from_slice(&[0,0,2,0,1]);
+            let tx=u16::from_be_bytes([random[0],random[1]]); let mut b=vec![]; b.extend_from_slice(&tx.to_be_bytes()); b.extend_from_slice(&[0x01,0x00,0,1,0,0,0,0,0,0]); b.extend_from_slice(&[0,0,2,0,1]);
             (port,b,Correlation::Tx16(tx))
         }
         "udp.mdns.5353" => { let mut question=vec![];for label in ["_services","_dns-sd","_udp","local"]{question.push(label.len() as u8);question.extend_from_slice(label.as_bytes())}question.push(0);question.extend_from_slice(&12u16.to_be_bytes());question.extend_from_slice(&0x8001u16.to_be_bytes());let mut b=vec![0,0,0,0,0,1,0,0,0,0,0,0];b.extend_from_slice(&question);(5353,b,Correlation::Mdns(question)) }
         "udp.dhcp.67" => {
-            let local=local_v4.filter(|ip| !ip.is_unspecified()).ok_or(ActiveError::Unavailable)?; let tx=0x4e481234u32;
+            let local=local_v4.filter(|ip| !ip.is_unspecified()).ok_or(ActiveError::Unavailable)?; let tx=u32::from_be_bytes(random[0..4].try_into().expect("fixed slice"));
             let mut b=vec![0u8;240]; b[0]=1;b[1]=0;b[2]=0;b[3]=0;b[4..8].copy_from_slice(&tx.to_be_bytes());b[12..16].copy_from_slice(&local.octets());b[236..240].copy_from_slice(&[99,130,83,99]); b.extend_from_slice(&[53,1,8,55,4,1,3,6,15,255]);
             (67,b,Correlation::Tx32(tx))
         }
-        "udp.ntp.123" => { let nonce=[0x4e,0x48,0x20,0x26,0x08,0x23,0x12,0x34]; let mut b=vec![0u8;48];b[0]=0x23;b[40..48].copy_from_slice(&nonce);(123,b,Correlation::Ntp(nonce)) }
-        "udp.ssdp.1900" => (1900,format!("M-SEARCH * HTTP/1.1\r\nHOST: {target}:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n").into_bytes(),Correlation::Text("HTTP/1.1")),
-        "udp.nbns.137" => { let tx=0x1234u16;let mut b=vec![];b.extend_from_slice(&tx.to_be_bytes());b.extend_from_slice(&[0x01,0x10,0,1,0,0,0,0,0,0,0x20]);let mut encoded=[b'A';32];encoded[0]=b'C';encoded[1]=b'K';b.extend_from_slice(&encoded);b.extend_from_slice(&[0,0,0x21,0,1]);(137,b,Correlation::Tx16(tx)) }
-        "udp.ws-discovery.3702" | "udp.onvif.3702" => { let message="urn:uuid:00000000-0000-0000-0000-000000001234";let body=format!("<e:Envelope xmlns:e='http://www.w3.org/2003/05/soap-envelope' xmlns:a='http://www.w3.org/2005/08/addressing' xmlns:d='http://schemas.xmlsoap.org/ws/2005/04/discovery'><e:Header><a:MessageID>{message}</a:MessageID><a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To><a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action></e:Header><e:Body><d:Probe/></e:Body></e:Envelope>");(3702,body.into_bytes(),Correlation::Soap(message)) }
-        "udp.sip.5060" => (5060,format!("OPTIONS sip:{target} SIP/2.0\r\nVia: SIP/2.0/UDP neonhearth.invalid;branch=z9hG4bK-1234\r\nFrom: <sip:neonhearth@invalid>;tag=1234\r\nTo: <sip:{target}>\r\nCall-ID: nh-1234\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 0\r\nContent-Length: 0\r\n\r\n").into_bytes(),Correlation::Text("nh-1234")),
-        "udp.rtsp.554" => (554,format!("OPTIONS rtsp://{target}/ RTSP/1.0\r\nCSeq: 4660\r\nUser-Agent: NeonHearth/1\r\n\r\n").into_bytes(),Correlation::Text("4660")),
-        "udp.coap.5683" => { let token=[0x4e,0x48,0x12,0x34];let id=0x1234u16;let mut b=vec![0x44,0x01];b.extend_from_slice(&id.to_be_bytes());b.extend_from_slice(&token);(5683,b,Correlation::Coap{id,token}) }
-        "udp.lifx.56700" => { let source=0x4e481234u32;let sequence=0x23;let mut b=vec![0u8;36];b[0..2].copy_from_slice(&36u16.to_le_bytes());b[2..4].copy_from_slice(&0x3400u16.to_le_bytes());b[4..8].copy_from_slice(&source.to_le_bytes());b[23]=sequence;b[32..34].copy_from_slice(&2u16.to_le_bytes());(56700,b,Correlation::Lifx{source,sequence}) }
+        "udp.ntp.123" => { let nonce: [u8; 8]=random[0..8].try_into().expect("fixed slice"); let mut b=vec![0u8;48];b[0]=0x23;b[40..48].copy_from_slice(&nonce);(123,b,Correlation::Ntp(nonce)) }
+        "udp.ssdp.1900" => (1900,format!("M-SEARCH * HTTP/1.1\r\nHOST: {target}:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n").into_bytes(),Correlation::Session(vec![])),
+        "udp.nbns.137" => { let tx=u16::from_be_bytes([random[0],random[1]]);let mut b=vec![];b.extend_from_slice(&tx.to_be_bytes());b.extend_from_slice(&[0x01,0x10,0,1,0,0,0,0,0,0,0x20]);let mut encoded=[b'A';32];encoded[0]=b'C';encoded[1]=b'K';b.extend_from_slice(&encoded);b.extend_from_slice(&[0,0,0x21,0,1]);(137,b,Correlation::Tx16(tx)) }
+        "udp.ws-discovery.3702" | "udp.onvif.3702" => { let message=format!("urn:uuid:{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",random[0],random[1],random[2],random[3],random[4],random[5],random[6],random[7],random[8],random[9],random[10],random[11],random[12],random[13],random[14],random[15]);let body=format!("<e:Envelope xmlns:e='http://www.w3.org/2003/05/soap-envelope' xmlns:a='http://www.w3.org/2005/08/addressing' xmlns:d='http://schemas.xmlsoap.org/ws/2005/04/discovery'><e:Header><a:MessageID>{message}</a:MessageID><a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To><a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action></e:Header><e:Body><d:Probe/></e:Body></e:Envelope>");(3702,body.into_bytes(),Correlation::Soap(message)) }
+        "udp.sip.5060" => {let call=format!("nh-{}",u64::from_be_bytes(random[0..8].try_into().expect("fixed slice")));let cseq=format!("{} OPTIONS",u32::from_be_bytes(random[8..12].try_into().expect("fixed slice")));(5060,format!("OPTIONS sip:{target} SIP/2.0\r\nVia: SIP/2.0/UDP neonhearth.invalid;branch=z9hG4bK-{call}\r\nFrom: <sip:neonhearth@invalid>;tag={call}\r\nTo: <sip:{target}>\r\nCall-ID: {call}\r\nCSeq: {cseq}\r\nMax-Forwards: 0\r\nContent-Length: 0\r\n\r\n").into_bytes(),Correlation::Session(vec![("call-id".into(),call),("cseq".into(),cseq)]))},
+        "udp.rtsp.554" => {let cseq=u32::from_be_bytes(random[0..4].try_into().expect("fixed slice")).to_string();(554,format!("OPTIONS rtsp://{target}/ RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: NeonHearth/1\r\n\r\n").into_bytes(),Correlation::Session(vec![("cseq".into(),cseq)]))},
+        "udp.coap.5683" => { let token: [u8; 4]=random[0..4].try_into().expect("fixed slice");let id=u16::from_be_bytes([random[4],random[5]]);let mut b=vec![0x44,0x01];b.extend_from_slice(&id.to_be_bytes());b.extend_from_slice(&token);(5683,b,Correlation::Coap{id,token}) }
+        "udp.lifx.56700" => { let source=u32::from_be_bytes(random[0..4].try_into().expect("fixed slice"));let sequence=random[4];let mut b=vec![0u8;36];b[0..2].copy_from_slice(&36u16.to_le_bytes());b[2..4].copy_from_slice(&0x3400u16.to_le_bytes());b[4..8].copy_from_slice(&source.to_le_bytes());b[23]=sequence;b[32..34].copy_from_slice(&2u16.to_le_bytes());(56700,b,Correlation::Lifx{source,sequence}) }
         _ => return Err(ActiveError::UnknownProbe),
     };
     Ok(UdpProbe {
@@ -91,7 +114,6 @@ pub fn parse_udp_reply(
             probe,
             bytes,
             "SIP/2.0",
-            &[("call-id", "nh-1234"), ("cseq", "1 OPTIONS")],
             &[
                 ("server", "server"),
                 ("user-agent", "user_agent"),
@@ -102,7 +124,6 @@ pub fn parse_udp_reply(
             probe,
             bytes,
             "RTSP/1.0",
-            &[("cseq", "4660")],
             &[("server", "server"), ("public", "public")],
         ),
         "udp.coap.5683" => coap(probe, bytes),
@@ -287,11 +308,11 @@ fn headers(
     b: &[u8],
     allowed: &[(&str, &str)],
 ) -> Result<Vec<(String, String)>, ActiveError> {
-    let Correlation::Text(needle) = probe.correlation else {
+    let Correlation::Session(correlations) = &probe.correlation else {
         return Err(ActiveError::Correlation);
     };
     let text = std::str::from_utf8(b).map_err(|_| ActiveError::Network)?;
-    if !text.contains(needle) || !text.lines().next().is_some_and(|line| line.contains("200")) {
+    if !correlations.is_empty() || !text.lines().next().is_some_and(|line| line.contains("200")) {
         return Err(ActiveError::Correlation);
     }
     let mut out = vec![];
@@ -310,17 +331,12 @@ fn session_headers(
     probe: &UdpProbe,
     b: &[u8],
     protocol: &str,
-    correlations: &[(&str, &str)],
     allowed: &[(&str, &str)],
 ) -> Result<Vec<(String, String)>, ActiveError> {
-    let Correlation::Text(configured) = probe.correlation else {
+    let Correlation::Session(correlations) = &probe.correlation else {
         return Err(ActiveError::Correlation);
     };
-    if correlations
-        .first()
-        .is_none_or(|(_, value)| *value != configured)
-        || b.len() > MAX_RESPONSE_BYTES
-    {
+    if correlations.is_empty() || b.len() > MAX_RESPONSE_BYTES {
         return Err(ActiveError::Correlation);
     }
     let text = std::str::from_utf8(b).map_err(|_| ActiveError::Network)?;
@@ -378,7 +394,7 @@ fn session_headers(
     if correlations
         .iter()
         .zip(found.iter())
-        .any(|((_, expected), value)| value.as_deref() != Some(*expected))
+        .any(|((_, expected), value)| value.as_deref() != Some(expected.as_str()))
     {
         return Err(ActiveError::Correlation);
     }
@@ -416,7 +432,7 @@ fn nbns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
     Ok(out)
 }
 fn soap(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError> {
-    let Correlation::Soap(id) = probe.correlation else {
+    let Correlation::Soap(id) = &probe.correlation else {
         return Err(ActiveError::Correlation);
     };
     const SOAP: &[u8] = b"http://www.w3.org/2003/05/soap-envelope";
@@ -510,7 +526,7 @@ fn soap(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
                     }
                     current = Some((key, at, true));
                     if key == "relates" {
-                        if value != id {
+                        if value != *id {
                             return Err(ActiveError::Correlation);
                         }
                         relates_seen = true

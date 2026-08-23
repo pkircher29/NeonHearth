@@ -25,6 +25,7 @@ x509-parser.workspace = true
 async-snmp.workspace = true
 bytes.workspace = true
 zeroize.workspace = true
+getrandom.workspace = true
 subtle.workspace = true
 
 [target.'cfg(windows)'.dependencies]

@@ -6,7 +6,7 @@
 //! shell. This crate does not open sockets or send probes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use pnet_datalink::interfaces;
 use thiserror::Error;
@@ -272,6 +272,50 @@ struct ApprovedPrefix {
 pub struct TargetGuard {
     eligible: BTreeSet<InterfaceId>,
     prefixes: Vec<ApprovedPrefix>,
+    interfaces: BTreeMap<InterfaceId, Interface>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthorizedBinding {
+    pub source: IpAddr,
+    pub interface_index: u32,
+    pub target: IpAddr,
+}
+
+impl AuthorizedBinding {
+    #[must_use]
+    pub fn target_socket(self, port: u16) -> SocketAddr {
+        match self.target {
+            IpAddr::V4(ip) => SocketAddr::from((ip, port)),
+            IpAddr::V6(ip) => SocketAddr::V6(SocketAddrV6::new(
+                ip,
+                port,
+                0,
+                if ip.is_unicast_link_local() {
+                    self.interface_index
+                } else {
+                    0
+                },
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn source_socket(self) -> SocketAddr {
+        match self.source {
+            IpAddr::V4(ip) => SocketAddr::from((ip, 0)),
+            IpAddr::V6(ip) => SocketAddr::V6(SocketAddrV6::new(
+                ip,
+                0,
+                0,
+                if ip.is_unicast_link_local() {
+                    self.interface_index
+                } else {
+                    0
+                },
+            )),
+        }
+    }
 }
 
 /// A homeowner-approved discovery range. Connected interface addresses are
@@ -346,7 +390,11 @@ impl TargetGuard {
                 address: approval.prefix,
             });
         }
-        Ok(Self { eligible, prefixes })
+        Ok(Self {
+            eligible,
+            prefixes,
+            interfaces: inventory.interfaces,
+        })
     }
 
     pub fn authorize(
@@ -369,6 +417,31 @@ impl TargetGuard {
         } else {
             Err(TargetGuardError::OutsideApprovedPrefix)
         }
+    }
+
+    pub fn authorized_binding(
+        &self,
+        interface: InterfaceId,
+        target: IpAddr,
+    ) -> Result<AuthorizedBinding, TargetGuardError> {
+        self.authorize(interface, target)?;
+        let selected = self
+            .interfaces
+            .get(&interface)
+            .ok_or(TargetGuardError::UnknownInterface)?;
+        let source = selected
+            .addresses
+            .iter()
+            .filter(|address| address.ip.is_ipv4() == target.is_ipv4())
+            .filter(|address| prefix_contains(address, target))
+            .max_by_key(|address| address.prefix)
+            .map(|address| address.ip)
+            .ok_or(TargetGuardError::ApprovalOutsideInterfaceNetwork)?;
+        Ok(AuthorizedBinding {
+            source,
+            interface_index: interface.0,
+            target,
+        })
     }
 }
 

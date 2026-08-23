@@ -1,6 +1,82 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU8, Ordering};
 
-use lattice_sensor::active::{ActiveError, build_udp_probe, parse_udp_reply};
+use lattice_sensor::active::{
+    ActiveError, NonceSource, ProbeCredential, UdpProbe, build_udp_probe_with_nonce,
+    parse_udp_reply,
+};
+
+struct FixedNonce;
+impl NonceSource for FixedNonce {
+    fn fill(&self, bytes: &mut [u8]) -> Result<(), ActiveError> {
+        bytes.copy_from_slice(&[0, 0, 0, 0, 0, 0, 4, 210, 0, 0, 0, 1, 0, 0x12, 0x34, 0]);
+        Ok(())
+    }
+}
+
+fn build_udp_probe(
+    id: &str,
+    target: IpAddr,
+    local_v4: Option<Ipv4Addr>,
+    credential: Option<&ProbeCredential>,
+) -> Result<UdpProbe, ActiveError> {
+    build_udp_probe_with_nonce(id, target, local_v4, credential, &FixedNonce)
+}
+
+struct IncrementingNonce(AtomicU8);
+impl NonceSource for IncrementingNonce {
+    fn fill(&self, bytes: &mut [u8]) -> Result<(), ActiveError> {
+        let value = self.0.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        bytes.fill(value);
+        Ok(())
+    }
+}
+
+#[test]
+fn successive_attempts_use_distinct_nonces_and_replay_is_rejected() {
+    let source = IncrementingNonce(AtomicU8::new(0));
+    let target = "192.168.50.1".parse().unwrap();
+    for id in [
+        "udp.dns.53",
+        "udp.dhcp.67",
+        "udp.ntp.123",
+        "udp.nbns.137",
+        "udp.ws-discovery.3702",
+        "udp.onvif.3702",
+        "udp.sip.5060",
+        "udp.rtsp.554",
+        "udp.coap.5683",
+        "udp.lifx.56700",
+    ] {
+        let first = build_udp_probe_with_nonce(
+            id,
+            target,
+            Some(Ipv4Addr::new(192, 168, 50, 2)),
+            None,
+            &source,
+        )
+        .unwrap();
+        let second = build_udp_probe_with_nonce(
+            id,
+            target,
+            Some(Ipv4Addr::new(192, 168, 50, 2)),
+            None,
+            &source,
+        )
+        .unwrap();
+        assert_ne!(first.bytes, second.bytes, "{id}");
+    }
+    let first = build_udp_probe_with_nonce("udp.dns.53", target, None, None, &source).unwrap();
+    let second = build_udp_probe_with_nonce("udp.dns.53", target, None, None, &source).unwrap();
+    assert_ne!(first.bytes[..2], second.bytes[..2]);
+    let mut replay = first.bytes.clone();
+    replay[2] = 0x81;
+    replay[3] = 0x80;
+    assert_eq!(
+        parse_udp_reply("udp.dns.53", &second, SocketAddr::new(target, 53), &replay).unwrap_err(),
+        ActiveError::Correlation
+    );
+}
 
 fn roundtrip_case(id: &str, response: Vec<u8>, expected_key: &str) {
     let target: IpAddr = "192.168.50.1".parse().unwrap();
@@ -105,7 +181,7 @@ fn text_discovery_protocols_correlate_and_emit_allowlisted_metadata() {
         ),
         (
             "udp.rtsp.554",
-            b"RTSP/1.0 200 OK\r\nCSeq: 4660\r\nServer: test\r\nPublic: OPTIONS\r\n\r\n".to_vec(),
+            b"RTSP/1.0 200 OK\r\nCSeq: 0\r\nServer: test\r\nPublic: OPTIONS\r\n\r\n".to_vec(),
             "server",
         ),
     ];
@@ -117,7 +193,7 @@ fn text_discovery_protocols_correlate_and_emit_allowlisted_metadata() {
 #[test]
 fn soap_discovery_requires_relates_to_and_parses_types() {
     for id in ["udp.ws-discovery.3702", "udp.onvif.3702"] {
-        let response = b"<e:Envelope xmlns:e='http://www.w3.org/2003/05/soap-envelope' xmlns:a='http://www.w3.org/2005/08/addressing' xmlns:d='http://schemas.xmlsoap.org/ws/2005/04/discovery'><e:Header><a:RelatesTo>urn:uuid:00000000-0000-0000-0000-000000001234</a:RelatesTo></e:Header><e:Body><d:ProbeMatches><d:ProbeMatch><d:Types>dn:NetworkVideoTransmitter</d:Types><d:XAddrs>http://192.168.50.1/onvif/device_service</d:XAddrs></d:ProbeMatch></d:ProbeMatches></e:Body></e:Envelope>".to_vec();
+        let response = b"<e:Envelope xmlns:e='http://www.w3.org/2003/05/soap-envelope' xmlns:a='http://www.w3.org/2005/08/addressing' xmlns:d='http://schemas.xmlsoap.org/ws/2005/04/discovery'><e:Header><a:RelatesTo>urn:uuid:00000000-0000-04d2-0000-000100123400</a:RelatesTo></e:Header><e:Body><d:ProbeMatches><d:ProbeMatch><d:Types>dn:NetworkVideoTransmitter</d:Types><d:XAddrs>http://192.168.50.1/onvif/device_service</d:XAddrs></d:ProbeMatch></d:ProbeMatches></e:Body></e:Envelope>".to_vec();
         roundtrip_case(id, response, "types");
     }
 }
@@ -280,7 +356,11 @@ fn every_transaction_bearing_protocol_rejects_a_mismatch() {
     let target = "192.168.50.1".parse().unwrap();
     let cases: [(&str, Vec<u8>); 7] = [
         ("udp.dhcp.67", vec![2; 250]),
-        ("udp.nbns.137", vec![0; 20]),
+        ("udp.nbns.137", {
+            let mut response = vec![0; 20];
+            response[0] = 1;
+            response
+        }),
         (
             "udp.ws-discovery.3702",
             b"<e:Envelope xmlns:e='http://www.w3.org/2003/05/soap-envelope' xmlns:a='http://www.w3.org/2005/08/addressing' xmlns:d='http://schemas.xmlsoap.org/ws/2005/04/discovery'><e:Header><a:RelatesTo>urn:uuid:wrong</a:RelatesTo></e:Header><e:Body><d:ProbeMatches><d:ProbeMatch><d:Types>x</d:Types></d:ProbeMatch></d:ProbeMatches></e:Body></e:Envelope>".to_vec(),

@@ -505,3 +505,71 @@ fn real_enumeration_returns_structurally_valid_records() {
     }
     let _ = (Ipv4Addr::LOCALHOST, Ipv6Addr::LOCALHOST);
 }
+
+#[test]
+fn authorized_binding_uses_the_selected_interface_when_routes_overlap() {
+    let inventory = InterfaceInventory::new(vec![
+        interface(
+            7,
+            "Ethernet",
+            true,
+            InterfaceClass::PhysicalWired,
+            vec![address("192.168.1.10", 24)],
+        ),
+        interface(
+            8,
+            "Wi-Fi",
+            true,
+            InterfaceClass::PhysicalWifi,
+            vec![address("192.168.1.20", 24)],
+        ),
+    ]);
+    let guard = TargetGuard::new(
+        inventory,
+        [],
+        [
+            TargetApproval {
+                interface: InterfaceId::new(7),
+                prefix: address("192.168.1.0", 24),
+            },
+            TargetApproval {
+                interface: InterfaceId::new(8),
+                prefix: address("192.168.1.0", 24),
+            },
+        ],
+    )
+    .unwrap();
+    let binding = guard
+        .authorized_binding(InterfaceId::new(8), "192.168.1.50".parse().unwrap())
+        .unwrap();
+    assert_eq!(binding.source, "192.168.1.20".parse::<IpAddr>().unwrap());
+    assert_eq!(binding.interface_index, 8);
+}
+
+#[test]
+fn ipv6_link_local_binding_carries_the_interface_scope() {
+    let inventory = InterfaceInventory::new(vec![interface(
+        42,
+        "Ethernet",
+        true,
+        InterfaceClass::PhysicalWired,
+        vec![address("fe80::1234", 64)],
+    )]);
+    let guard = TargetGuard::new(
+        inventory,
+        [],
+        [TargetApproval {
+            interface: InterfaceId::new(42),
+            prefix: address("fe80::", 64),
+        }],
+    )
+    .unwrap();
+    let binding = guard
+        .authorized_binding(InterfaceId::new(42), "fe80::abcd".parse().unwrap())
+        .unwrap();
+    assert_eq!(binding.source, "fe80::1234".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        binding.target_socket(5353).to_string(),
+        "[fe80::abcd%42]:5353"
+    );
+}

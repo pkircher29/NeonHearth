@@ -7,6 +7,12 @@ attempt it authorizes the immutable `(InterfaceId, numeric IP)` pair through the
 broadcast, loopback, CGNAT/Tailscale, public, and cross-interface destinations remain
 rejected by that guard.
 
+Authorization also resolves an immutable source address and interface index from the
+approved inventory. TCP, TLS, UDP, SNMP, and ICMP bind that source before connecting;
+ICMP additionally uses the platform interface-index API. IPv6 link-local destinations
+carry the selected interface as their scope ID. The local binding is verified before
+each send and there is no unbound fallback, including when routes overlap.
+
 ## Catalog
 
 Every descriptor has a stable ID/version, transport, exact port, privilege, side-effect
@@ -29,6 +35,9 @@ always correlated separately. WS-Discovery and ONVIF replies are parsed as bound
 with exact SOAP, WS-Addressing, and WS-Discovery namespaces and document containment.
 SIP and RTSP replies require syntactically valid status/header blocks with unique, exact
 Call-ID/CSeq correlation fields; bodies and unrelated headers cannot satisfy correlation.
+Transaction IDs, nonces, WS-Addressing message IDs, SIP/RTSP correlation values, CoAP
+tokens, and LIFX source/sequence values are generated independently per attempt by the
+operating-system CSPRNG. Tests inject a deterministic nonce source; production does not.
 
 HTTP uses a raw numeric-target request with a numeric `Host`, connection close, bounded
 status/header extraction, and no redirect handling. TLS certificate collection uses
