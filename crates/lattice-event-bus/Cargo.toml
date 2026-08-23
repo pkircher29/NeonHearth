@@ -1,0 +1,9 @@
+[package]
+name = "lattice-event-bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lattice-domain = { path = "../lattice-domain" }
+tokio.workspace = true
