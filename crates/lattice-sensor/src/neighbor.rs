@@ -160,20 +160,31 @@ pub enum NeighborError {
     #[error("snapshot time moved backwards")]
     ClockRollback,
     #[error("snapshot source failure")]
-    Source,
+    Transport,
+    #[error("malformed neighbor message")]
+    Malformed,
 }
 
 #[derive(Clone, Debug)]
 pub struct NeighborSnapshotConfig {
     pub max_rows: usize,
     pub allowed_interfaces: BTreeSet<InterfaceId>,
+    max_raw_messages: usize,
 }
 impl NeighborSnapshotConfig {
+    /// The source accepts at most four raw messages per requested output row.
+    /// This bounds duplicate and irrelevant netlink input without making an
+    /// otherwise valid duplicate-only stream exceed `max_rows`.
+    const RAW_MESSAGES_PER_ROW: usize = 4;
+
     pub fn new<I>(max_rows: usize, allowed_interfaces: I) -> Result<Self, NeighborError>
     where
         I: IntoIterator<Item = InterfaceId>,
     {
         let allowed_interfaces: BTreeSet<_> = allowed_interfaces.into_iter().collect();
+        let Some(max_raw_messages) = max_rows.checked_mul(Self::RAW_MESSAGES_PER_ROW) else {
+            return Err(NeighborError::InvalidConfig);
+        };
         if max_rows == 0
             || allowed_interfaces.is_empty()
             || allowed_interfaces.iter().any(|id| id.get() == 0)
@@ -183,7 +194,12 @@ impl NeighborSnapshotConfig {
         Ok(Self {
             max_rows,
             allowed_interfaces,
+            max_raw_messages,
         })
+    }
+
+    pub fn max_raw_messages(&self) -> usize {
+        self.max_raw_messages
     }
 }
 
@@ -236,14 +252,109 @@ fn reachability_rank(v: NeighborReachability) -> u8 {
 }
 
 #[cfg(target_os = "linux")]
+fn decode_linux_message(
+    config: &NeighborSnapshotConfig,
+    message: netlink_packet_route::neighbour::NeighbourMessage,
+) -> Result<Option<NeighborRow>, NeighborError> {
+    use netlink_packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
+
+    // Kernel ifindex 0 is not a usable interface. Treat it exactly like an
+    // out-of-scope message rather than letting it enter the allowlist domain.
+    if message.header.ifindex == 0 {
+        return Ok(None);
+    }
+    let interface = InterfaceId::new(message.header.ifindex);
+    if !config.allowed_interfaces.contains(&interface) {
+        return Ok(None);
+    }
+
+    let mut ip = None;
+    let mut link_address = None;
+    for attribute in message.attributes {
+        match attribute {
+            NeighbourAttribute::Destination(address) => {
+                if ip.is_some() {
+                    return Err(NeighborError::Malformed);
+                }
+                ip = Some(match address {
+                    NeighbourAddress::Inet(value) => IpAddr::V4(value),
+                    NeighbourAddress::Inet6(value) => IpAddr::V6(value),
+                    _ => return Err(NeighborError::Malformed),
+                });
+            }
+            NeighbourAttribute::LinkLayerAddress(value) => {
+                if link_address.is_some() {
+                    return Err(NeighborError::Malformed);
+                }
+                if value.len() != 6 {
+                    return Ok(None);
+                }
+                let mut bytes = [0; 6];
+                bytes.copy_from_slice(&value);
+                let Ok(address) = LinkAddress::try_from(bytes) else {
+                    return Ok(None);
+                };
+                link_address = Some(address);
+            }
+            _ => {}
+        }
+    }
+    let (Some(ip), Some(link_address)) = (ip, link_address) else {
+        return Ok(None);
+    };
+    if !valid_ip(ip) {
+        return Ok(None);
+    }
+    Ok(Some(NeighborRow::new(
+        interface,
+        ip,
+        link_address,
+        map_kernel_state(message.header.state),
+    )?))
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_linux_messages<I>(
+    config: &NeighborSnapshotConfig,
+    messages: I,
+) -> Result<Vec<NeighborRow>, NeighborError>
+where
+    I: IntoIterator<Item = netlink_packet_route::neighbour::NeighbourMessage>,
+{
+    let mut raw_count = 0usize;
+    let mut rows = Vec::new();
+    for message in messages {
+        raw_count = raw_count.checked_add(1).ok_or(NeighborError::Capacity)?;
+        if raw_count > config.max_raw_messages() {
+            return Err(NeighborError::Capacity);
+        }
+        if let Some(row) = decode_linux_message(config, message)? {
+            rows.push(row);
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.interface
+            .cmp(&b.interface)
+            .then(a.link_address.cmp(&b.link_address))
+            .then(a.ip.cmp(&b.ip))
+            .then(reachability_rank(a.reachability).cmp(&reachability_rank(b.reachability)))
+    });
+    rows.dedup();
+    if rows.len() > config.max_rows {
+        return Err(NeighborError::Capacity);
+    }
+    Ok(rows)
+}
+
+#[cfg(target_os = "linux")]
 #[async_trait]
 impl NeighborSnapshotSource for SystemNeighborSnapshotSource {
     async fn snapshot(&self) -> Result<Vec<NeighborRow>, NeighborError> {
         use futures_util::TryStreamExt;
         let (connection, handle, _) =
-            rtnetlink::new_connection().map_err(|_| NeighborError::Source)?;
+            rtnetlink::new_connection().map_err(|_| NeighborError::Transport)?;
         tokio::spawn(connection);
-        let mut rows = Vec::new();
+        let mut messages = Vec::new();
         for family in [
             netlink_packet_route::AddressFamily::Inet,
             netlink_packet_route::AddressFamily::Inet6,
@@ -253,68 +364,18 @@ impl NeighborSnapshotSource for SystemNeighborSnapshotSource {
                 .get()
                 .set_address_family(family)
                 .execute();
-            while let Some(message) = stream.try_next().await.map_err(|_| NeighborError::Source)? {
-                let interface = InterfaceId::new(message.header.ifindex);
-                if !self.config.allowed_interfaces.contains(&interface) {
-                    continue;
-                }
-                let mut ip = None;
-                let mut ll = None;
-                for attr in message.attributes {
-                    match attr {
-                        netlink_packet_route::neighbour::NeighbourAttribute::Destination(a) => {
-                            if ip.is_some() {
-                                return Err(NeighborError::Source);
-                            }
-                            ip = Some(match a {
-                                netlink_packet_route::neighbour::NeighbourAddress::Inet(v) => {
-                                    IpAddr::V4(v)
-                                }
-                                netlink_packet_route::neighbour::NeighbourAddress::Inet6(v) => {
-                                    IpAddr::V6(v)
-                                }
-                                _ => return Err(NeighborError::Source),
-                            });
-                        }
-                        netlink_packet_route::neighbour::NeighbourAttribute::LinkLayerAddress(
-                            v,
-                        ) => {
-                            if ll.is_some() || v.len() != 6 {
-                                return Err(NeighborError::Source);
-                            }
-                            let mut x = [0; 6];
-                            x.copy_from_slice(&v);
-                            ll = Some(LinkAddress::try_from(x)?);
-                        }
-                        _ => {}
-                    }
-                }
-                let (Some(ip), Some(ll)) = (ip, ll) else {
-                    continue;
-                };
-                if !valid_ip(ip) {
-                    continue;
-                }
-                rows.push(NeighborRow::new(
-                    interface,
-                    ip,
-                    ll,
-                    map_kernel_state(message.header.state),
-                )?);
-                if rows.len() > self.config.max_rows {
+            while let Some(message) = stream
+                .try_next()
+                .await
+                .map_err(|_| NeighborError::Transport)?
+            {
+                if messages.len() >= self.config.max_raw_messages() {
                     return Err(NeighborError::Capacity);
                 }
+                messages.push(message);
             }
         }
-        rows.sort_by(|a, b| {
-            a.interface
-                .cmp(&b.interface)
-                .then(a.link_address.cmp(&b.link_address))
-                .then(a.ip.cmp(&b.ip))
-                .then(reachability_rank(a.reachability).cmp(&reachability_rank(b.reachability)))
-        });
-        rows.dedup();
-        Ok(rows)
+        normalize_linux_messages(&self.config, messages)
     }
 }
 
@@ -505,6 +566,11 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    #[cfg(target_os = "linux")]
+    use netlink_packet_route::neighbour::{
+        NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState,
+    };
+
     #[test]
     fn removes_departed_state_in_the_snapshot_that_emits_departure() {
         let mut tracker = NeighborTracker::new(NeighborTrackerConfig {
@@ -587,6 +653,198 @@ mod tests {
                 .unwrap()
                 .as_slice(),
             [NeighborEvent::Departed { .. }]
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn message(
+        ifindex: u32,
+        ip: std::net::IpAddr,
+        link: &[u8],
+        state: NeighbourState,
+    ) -> NeighbourMessage {
+        let mut message = NeighbourMessage::default();
+        message.header.ifindex = ifindex;
+        message.header.state = state;
+        message.attributes = vec![
+            NeighbourAttribute::Destination(NeighbourAddress::from(ip)),
+            NeighbourAttribute::LinkLayerAddress(link.to_vec()),
+        ];
+        message
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_config(max_rows: usize) -> NeighborSnapshotConfig {
+        NeighborSnapshotConfig::new(max_rows, [InterfaceId::new(2)]).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_normalizer_decodes_private_ipv4_ipv6_and_all_kernel_states() {
+        let states = [
+            (NeighbourState::Reachable, NeighborReachability::Reachable),
+            (NeighbourState::Stale, NeighborReachability::Stale),
+            (NeighbourState::Delay, NeighborReachability::Delay),
+            (NeighbourState::Probe, NeighborReachability::Probe),
+            (NeighbourState::Permanent, NeighborReachability::Permanent),
+            (NeighbourState::Incomplete, NeighborReachability::Incomplete),
+            (NeighbourState::Failed, NeighborReachability::Failed),
+            (NeighbourState::Noarp, NeighborReachability::NoArp),
+            (NeighbourState::None, NeighborReachability::Unknown),
+            (NeighbourState::Other(0x400), NeighborReachability::Unknown),
+        ];
+        let messages = states.iter().enumerate().map(|(index, (state, _))| {
+            message(
+                2,
+                if index % 2 == 0 {
+                    format!("192.168.1.{}", index + 1).parse().unwrap()
+                } else {
+                    format!("fd00::{:x}", index + 1).parse().unwrap()
+                },
+                &[0x02, 0, 0, 0, 0, index as u8 + 1],
+                *state,
+            )
+        });
+
+        let rows = normalize_linux_messages(&snapshot_config(16), messages).unwrap();
+        assert_eq!(rows.len(), states.len());
+        assert!(
+            rows.iter()
+                .any(|row| row.reachability() == NeighborReachability::NoArp)
+        );
+        for (_, expected) in states {
+            assert!(rows.iter().any(|row| row.reachability() == expected));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_normalizer_skips_missing_out_of_scope_disallowed_and_zero_interface_messages() {
+        let mut missing_destination = NeighbourMessage::default();
+        missing_destination.header.ifindex = 2;
+        missing_destination.attributes =
+            vec![NeighbourAttribute::LinkLayerAddress(vec![2, 0, 0, 0, 0, 1])];
+        let mut missing_link = NeighbourMessage::default();
+        missing_link.header.ifindex = 2;
+        missing_link.attributes = vec![NeighbourAttribute::Destination(NeighbourAddress::Inet(
+            "192.168.1.1".parse().unwrap(),
+        ))];
+        let rows = normalize_linux_messages(
+            &snapshot_config(16),
+            [
+                missing_destination,
+                missing_link,
+                message(
+                    2,
+                    "8.8.8.8".parse().unwrap(),
+                    &[2, 0, 0, 0, 0, 2],
+                    NeighbourState::Reachable,
+                ),
+                message(
+                    3,
+                    "192.168.1.3".parse().unwrap(),
+                    &[2, 0, 0, 0, 0, 3],
+                    NeighbourState::Reachable,
+                ),
+                message(
+                    0,
+                    "192.168.1.4".parse().unwrap(),
+                    &[2, 0, 0, 0, 0, 4],
+                    NeighbourState::Reachable,
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_normalizer_rejects_malformed_attributes_and_redacts_errors() {
+        let mut duplicate_destination = NeighbourMessage::default();
+        duplicate_destination.header.ifindex = 2;
+        duplicate_destination.attributes = vec![
+            NeighbourAttribute::Destination(NeighbourAddress::Inet("192.168.1.1".parse().unwrap())),
+            NeighbourAttribute::Destination(NeighbourAddress::Inet("192.168.1.2".parse().unwrap())),
+            NeighbourAttribute::LinkLayerAddress(vec![2, 0, 0, 0, 0, 1]),
+        ];
+        let mut duplicate_link = message(
+            2,
+            "192.168.1.1".parse().unwrap(),
+            &[2, 0, 0, 0, 0, 1],
+            NeighbourState::Reachable,
+        );
+        duplicate_link
+            .attributes
+            .push(NeighbourAttribute::LinkLayerAddress(vec![2, 0, 0, 0, 0, 2]));
+        for message in [duplicate_destination, duplicate_link] {
+            let error = normalize_linux_messages(&snapshot_config(16), [message]).unwrap_err();
+            assert_eq!(error, NeighborError::Malformed);
+            let text = format!("{error:?} {error}");
+            assert!(!text.contains("192.168.1"));
+            assert!(!text.contains("02:00"));
+        }
+        let invalid_length = message(
+            2,
+            "192.168.1.1".parse().unwrap(),
+            &[1, 2, 3],
+            NeighbourState::Reachable,
+        );
+        let multicast_link = message(
+            2,
+            "192.168.1.1".parse().unwrap(),
+            &[1, 0, 0, 0, 0, 1],
+            NeighbourState::Reachable,
+        );
+        assert!(
+            normalize_linux_messages(&snapshot_config(16), [invalid_length, multicast_link])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_normalizer_deduplicates_exact_rows_sorts_and_bounds_raw_input_separately() {
+        let first = message(
+            2,
+            "192.168.1.2".parse().unwrap(),
+            &[2, 0, 0, 0, 0, 2],
+            NeighbourState::Reachable,
+        );
+        let second = message(
+            2,
+            "192.168.1.1".parse().unwrap(),
+            &[2, 0, 0, 0, 0, 1],
+            NeighbourState::Noarp,
+        );
+        let config = snapshot_config(2);
+        let rows = normalize_linux_messages(
+            &config,
+            [first.clone(), second.clone(), first.clone(), second.clone()],
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.windows(2).all(|pair| pair[0].ip() <= pair[1].ip()));
+        assert_eq!(
+            normalize_linux_messages(
+                &config,
+                std::iter::repeat_n(first, config.max_raw_messages() + 1)
+            ),
+            Err(NeighborError::Capacity)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_snapshot_config_rejects_zero_interface_and_raw_ceiling_overflow() {
+        assert!(matches!(
+            NeighborSnapshotConfig::new(1, [InterfaceId::new(0)]),
+            Err(NeighborError::InvalidConfig)
+        ));
+        assert!(matches!(
+            NeighborSnapshotConfig::new(usize::MAX, [InterfaceId::new(2)]),
+            Err(NeighborError::InvalidConfig)
         ));
     }
 }
