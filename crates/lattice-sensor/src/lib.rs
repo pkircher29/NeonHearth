@@ -14,6 +14,7 @@ use thiserror::Error;
 pub mod active;
 pub mod flow;
 pub mod live;
+pub mod neighbor;
 pub mod passive;
 pub use passive::{
     OfflinePassiveAdapter, PassiveAdapter, PassiveObservation, PassiveOptions, PassiveParseError,
@@ -26,6 +27,10 @@ impl InterfaceId {
     #[must_use]
     pub const fn new(value: u32) -> Self {
         Self(value)
+    }
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
     }
 }
 
