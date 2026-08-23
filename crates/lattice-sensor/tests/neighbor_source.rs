@@ -59,3 +59,28 @@ async fn system_snapshot_smoke_test_uses_local_nonzero_interfaces() {
         Err(error) => panic!("unexpected sanitized snapshot status: {error}"),
     }
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn system_snapshot_smoke_test_uses_local_nonzero_interfaces() {
+    use lattice_sensor::neighbor::{
+        NeighborError, NeighborSnapshotSource, SystemNeighborSnapshotSource,
+    };
+
+    let allowed: BTreeSet<_> = pnet_datalink::interfaces()
+        .into_iter()
+        .filter_map(|interface| (interface.index != 0).then(|| InterfaceId::new(interface.index)))
+        .collect();
+    if allowed.is_empty() {
+        return;
+    }
+    let config = NeighborSnapshotConfig::new(256, allowed.clone()).unwrap();
+    match SystemNeighborSnapshotSource::new(config).snapshot().await {
+        Ok(rows) => assert!(
+            rows.iter()
+                .all(|row| { row.interface().get() != 0 && allowed.contains(&row.interface()) })
+        ),
+        Err(NeighborError::Malformed) | Err(NeighborError::Transport) => {}
+        Err(error) => panic!("unexpected sanitized snapshot status: {error}"),
+    }
+}
