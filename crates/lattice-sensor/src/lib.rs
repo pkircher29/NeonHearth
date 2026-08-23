@@ -321,7 +321,7 @@ impl TargetGuard {
                 return Err(TargetGuardError::InterfaceNotEligible);
             }
             validate_prefix(&approval.prefix)?;
-            if !is_permitted_target(approval.prefix.ip) {
+            if !is_permitted_approval_range(&approval.prefix) {
                 return Err(TargetGuardError::DisallowedApproval {
                     ip: approval.prefix.ip,
                     prefix: approval.prefix.prefix,
@@ -424,12 +424,47 @@ fn is_ipv4_broadcast(prefix: &Address, target: IpAddr) -> bool {
     if target == Ipv4Addr::BROADCAST {
         return true;
     }
+    if prefix.prefix > 30 {
+        return false;
+    }
     let mask = if prefix.prefix == 0 {
         0
     } else {
         u32::MAX << (32 - prefix.prefix)
     };
     u32::from(target) == (u32::from(network) & mask) | !mask
+}
+
+fn is_permitted_approval_range(approval: &Address) -> bool {
+    let allowed_ranges = [
+        Address {
+            ip: "10.0.0.0".parse().expect("valid literal"),
+            prefix: 8,
+        },
+        Address {
+            ip: "172.16.0.0".parse().expect("valid literal"),
+            prefix: 12,
+        },
+        Address {
+            ip: "192.168.0.0".parse().expect("valid literal"),
+            prefix: 16,
+        },
+        Address {
+            ip: "169.254.0.0".parse().expect("valid literal"),
+            prefix: 16,
+        },
+        Address {
+            ip: "fc00::".parse().expect("valid literal"),
+            prefix: 7,
+        },
+        Address {
+            ip: "fe80::".parse().expect("valid literal"),
+            prefix: 10,
+        },
+    ];
+    allowed_ranges
+        .into_iter()
+        .any(|allowed| approval.prefix >= allowed.prefix && prefix_contains(&allowed, approval.ip))
 }
 
 fn is_private_or_link_local_v4(address: Ipv4Addr) -> bool {

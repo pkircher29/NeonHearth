@@ -396,6 +396,102 @@ fn target_guard_rejects_invalid_cross_interface_and_disallowed_approvals() {
 }
 
 #[test]
+fn approval_cidr_must_fit_entirely_inside_an_allowed_range() {
+    let inventory = InterfaceInventory::new(vec![interface(
+        1,
+        "Ethernet",
+        true,
+        InterfaceClass::PhysicalWired,
+        vec![
+            address("10.0.0.1", 8),
+            address("192.168.1.10", 16),
+            address("fd42::1", 7),
+        ],
+    )]);
+    for prefix in [
+        address("10.0.0.1", 0),
+        address("192.168.0.42", 8),
+        address("::", 0),
+        address("fd42::1", 6),
+    ] {
+        assert!(matches!(
+            TargetGuard::new(
+                inventory.clone(),
+                [],
+                [TargetApproval {
+                    interface: InterfaceId::new(1),
+                    prefix
+                }]
+            ),
+            Err(TargetGuardError::DisallowedApproval { .. })
+        ));
+    }
+    for prefix in [
+        address("10.55.1.9", 24),
+        address("192.168.55.9", 24),
+        address("fd42:1234::9", 64),
+    ] {
+        assert!(
+            TargetGuard::new(
+                inventory.clone(),
+                [],
+                [TargetApproval {
+                    interface: InterfaceId::new(1),
+                    prefix
+                }]
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[test]
+fn explicitly_approved_ipv4_point_to_point_and_host_addresses_are_not_broadcasts() {
+    let point_to_point = InterfaceInventory::new(vec![interface(
+        1,
+        "Ethernet",
+        true,
+        InterfaceClass::PhysicalWired,
+        vec![address("192.168.1.0", 31)],
+    )]);
+    let guard = TargetGuard::new(
+        point_to_point,
+        [],
+        [TargetApproval {
+            interface: InterfaceId::new(1),
+            prefix: address("192.168.1.0", 31),
+        }],
+    )
+    .unwrap();
+    assert!(
+        guard
+            .authorize(InterfaceId::new(1), "192.168.1.1".parse().unwrap())
+            .is_ok()
+    );
+    let host = InterfaceInventory::new(vec![interface(
+        1,
+        "Ethernet",
+        true,
+        InterfaceClass::PhysicalWired,
+        vec![address("192.168.1.9", 32)],
+    )]);
+    let guard = TargetGuard::new(
+        host,
+        [],
+        [TargetApproval {
+            interface: InterfaceId::new(1),
+            prefix: address("192.168.1.9", 32),
+        }],
+    )
+    .unwrap();
+    assert!(
+        guard
+            .authorize(InterfaceId::new(1), "192.168.1.9".parse().unwrap())
+            .is_ok()
+    );
+}
+
+#[test]
 fn real_enumeration_returns_structurally_valid_records() {
     let inventory = lattice_sensor::SystemInterfaceManager.snapshot().unwrap();
     for interface in inventory.interfaces() {
