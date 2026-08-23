@@ -109,6 +109,86 @@ fn probe_only_never_fabricates_presence() {
 }
 
 #[test]
+fn neighbor_cache_requires_two_distinct_observations_and_is_quiet_only() {
+    let mut e = eng();
+    assert!(
+        e.ingest(ev(PresenceEvidenceKind::NeighborCache, 0, Some(20)), t(0))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(e.state(id()), Some(PresenceState::Unknown));
+    assert_eq!(
+        e.ingest(
+            PresenceEvidence {
+                source: "sensor-a".into(),
+                ..ev(PresenceEvidenceKind::NeighborCache, 1, Some(20))
+            },
+            t(1),
+        )
+        .unwrap()
+        .unwrap()
+        .to,
+        PresenceState::Quiet
+    );
+    assert_ne!(e.state(id()), Some(PresenceState::Online));
+}
+
+#[test]
+fn neighbor_cache_expiry_then_failures_produce_offline() {
+    let mut e = eng();
+    e.ingest(ev(PresenceEvidenceKind::NeighborCache, 0, Some(5)), t(0))
+        .unwrap();
+    e.ingest(
+        PresenceEvidence {
+            source: "sensor-a".into(),
+            ..ev(PresenceEvidenceKind::NeighborCache, 1, Some(5))
+        },
+        t(1),
+    )
+    .unwrap();
+    assert_eq!(e.state(id()), Some(PresenceState::Quiet));
+    e.ingest(ev(PresenceEvidenceKind::ConfirmationFailure, 6, None), t(6))
+        .unwrap();
+    assert_eq!(
+        e.ingest(ev(PresenceEvidenceKind::ConfirmationFailure, 7, None), t(7))
+            .unwrap()
+            .unwrap()
+            .to,
+        PresenceState::Offline
+    );
+}
+
+#[test]
+fn neighbor_cache_serializes_and_round_trips_checkpoint() {
+    let mut e = eng();
+    e.ingest(ev(PresenceEvidenceKind::NeighborCache, 0, Some(20)), t(0))
+        .unwrap();
+    e.ingest(
+        PresenceEvidence {
+            source: "sensor-a".into(),
+            ..ev(PresenceEvidenceKind::NeighborCache, 1, Some(20))
+        },
+        t(1),
+    )
+    .unwrap();
+    let json = serde_json::to_string(&e.checkpoint()).unwrap();
+    assert!(json.contains("neighbor_cache"));
+    let restored =
+        PresenceEngine::from_checkpoint(eng_config(), serde_json::from_str(&json).unwrap())
+            .unwrap();
+    assert_eq!(restored.state(id()), Some(PresenceState::Quiet));
+}
+
+#[test]
+fn neighbor_cache_requires_valid_until() {
+    let mut e = eng();
+    let err = e
+        .ingest(ev(PresenceEvidenceKind::NeighborCache, 0, None), t(0))
+        .unwrap_err();
+    assert_eq!(err, PresenceError::InvalidEvidence("validity"));
+}
+
+#[test]
 fn confirmations_are_deduplicated_and_windowed() {
     let mut e = eng();
     let first = ev(PresenceEvidenceKind::Traffic, 0, None);

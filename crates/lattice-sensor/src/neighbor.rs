@@ -628,6 +628,11 @@ pub enum NeighborEvent {
         device: NeighborDevice,
         observed_at: DateTime<Utc>,
     },
+    Missed {
+        device: NeighborDevice,
+        observed_at: DateTime<Utc>,
+        consecutive_misses: usize,
+    },
     Departed {
         device: NeighborDevice,
         observed_at: DateTime<Utc>,
@@ -644,6 +649,11 @@ impl fmt::Debug for NeighborEvent {
                 device,
                 observed_at,
             } => ("Confirmed", device, observed_at),
+            Self::Missed {
+                device,
+                observed_at,
+                ..
+            } => ("Missed", device, observed_at),
             Self::Departed {
                 device,
                 observed_at,
@@ -654,6 +664,15 @@ impl fmt::Debug for NeighborEvent {
             .field("interface", &d.interface.get())
             .field("address_count", &d.addresses.len())
             .field("observed_at", t)
+            .field(
+                "consecutive_misses",
+                &match self {
+                    Self::Missed {
+                        consecutive_misses, ..
+                    } => Some(consecutive_misses),
+                    _ => None,
+                },
+            )
             .finish()
     }
 }
@@ -727,7 +746,7 @@ impl NeighborTracker {
         {
             return Err(NeighborError::Capacity);
         }
-        // Events are stable: present devices are key-sorted first, then departures key-sorted.
+        // Events are stable: present devices are key-sorted first, then absent devices key-sorted.
         let mut events = Vec::new();
         for (key, mut addrs) in grouped {
             addrs.sort();
@@ -765,6 +784,11 @@ impl NeighborTracker {
         for (key, s) in &mut next {
             if !present.contains(key) {
                 s.missed = s.missed.checked_add(1).ok_or(NeighborError::Capacity)?;
+                events.push(NeighborEvent::Missed {
+                    device: s.device.clone(),
+                    observed_at,
+                    consecutive_misses: s.missed,
+                });
                 if s.missed >= self.cfg.missed_snapshots_before_departure {
                     events.push(NeighborEvent::Departed {
                         device: s.device.clone(),
@@ -1010,7 +1034,13 @@ mod tests {
                 .observe(vec![], Utc.timestamp_opt(2, 0).unwrap())
                 .unwrap()
                 .as_slice(),
-            [NeighborEvent::Departed { .. }]
+            [
+                NeighborEvent::Missed {
+                    consecutive_misses: 1,
+                    ..
+                },
+                NeighborEvent::Departed { .. }
+            ]
         ));
         assert!(tracker.states.is_empty());
     }
@@ -1060,14 +1090,27 @@ mod tests {
             tracker
                 .observe(vec![], Utc.timestamp_opt(2, 0).unwrap())
                 .unwrap()
-                .is_empty()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    NeighborEvent::Missed {
+                        consecutive_misses: 1,
+                        ..
+                    }
+                ))
         );
         assert!(matches!(
             tracker
                 .observe(vec![], Utc.timestamp_opt(3, 0).unwrap())
                 .unwrap()
                 .as_slice(),
-            [NeighborEvent::Departed { .. }]
+            [
+                NeighborEvent::Missed {
+                    consecutive_misses: 2,
+                    ..
+                },
+                NeighborEvent::Departed { .. }
+            ]
         ));
     }
 

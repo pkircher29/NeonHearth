@@ -80,6 +80,7 @@ pub enum PresenceEvidenceKind {
     Traffic,
     Lease,
     RouterAssociation,
+    NeighborCache,
     ProbeSuccess,
     ConfirmationFailure,
     EnforcementBlocked,
@@ -144,6 +145,7 @@ impl PresenceEvidenceKind {
             Self::Traffic => "traffic",
             Self::Lease => "lease",
             Self::RouterAssociation => "router_association",
+            Self::NeighborCache => "neighbor_cache",
             Self::ProbeSuccess => "probe_success",
             Self::ConfirmationFailure => "confirmation_failure",
             Self::EnforcementBlocked => "enforcement_blocked",
@@ -776,6 +778,9 @@ impl PresenceEngine {
         if e.valid_until.is_some_and(|x| x < e.observed_at) {
             return Err(PresenceError::InvalidEvidence("validity"));
         }
+        if e.kind == PresenceEvidenceKind::NeighborCache && e.valid_until.is_none() {
+            return Err(PresenceError::InvalidEvidence("validity"));
+        }
         if e.kind == PresenceEvidenceKind::Traffic
             && e.observed_at
                 .checked_add_signed(self.cfg.online_window)
@@ -888,6 +893,7 @@ fn semantically_retained(e: &PresenceEvidence, arrival: DateTime<Utc>, c: &Prese
         | PresenceEvidenceKind::ContradictionCleared => true,
         PresenceEvidenceKind::Lease
         | PresenceEvidenceKind::RouterAssociation
+        | PresenceEvidenceKind::NeighborCache
         | PresenceEvidenceKind::ProbeSuccess
             if e.valid_until.is_some_and(|until| until >= arrival) =>
         {
@@ -973,6 +979,7 @@ fn candidate(d: &DevicePresence, at: DateTime<Utc>, c: &PresenceConfig) -> Prese
             e.kind,
             PresenceEvidenceKind::Lease
                 | PresenceEvidenceKind::RouterAssociation
+                | PresenceEvidenceKind::NeighborCache
                 | PresenceEvidenceKind::ProbeSuccess
         ) && e.observed_at <= at
             && e.valid_until.is_some_and(|x| x >= at)
@@ -987,6 +994,7 @@ fn candidate(d: &DevicePresence, at: DateTime<Utc>, c: &PresenceConfig) -> Prese
             PresenceEvidenceKind::Traffic => e.observed_at.checked_add_signed(c.online_window),
             PresenceEvidenceKind::Lease
             | PresenceEvidenceKind::RouterAssociation
+            | PresenceEvidenceKind::NeighborCache
             | PresenceEvidenceKind::ProbeSuccess => e.valid_until,
             _ => None,
         })
@@ -1012,6 +1020,7 @@ fn is_real_positive(k: PresenceEvidenceKind) -> bool {
         PresenceEvidenceKind::Traffic
             | PresenceEvidenceKind::Lease
             | PresenceEvidenceKind::RouterAssociation
+            | PresenceEvidenceKind::NeighborCache
     )
 }
 fn is_positive(k: PresenceEvidenceKind) -> bool {
@@ -1030,7 +1039,9 @@ fn support_at(
         PresenceEvidenceKind::Traffic if at.signed_duration_since(e.observed_at) < online => {
             Some(PresenceState::Online)
         }
-        PresenceEvidenceKind::Lease | PresenceEvidenceKind::RouterAssociation
+        PresenceEvidenceKind::Lease
+        | PresenceEvidenceKind::RouterAssociation
+        | PresenceEvidenceKind::NeighborCache
             if e.valid_until.is_some_and(|x| x >= at) =>
         {
             Some(PresenceState::Quiet)

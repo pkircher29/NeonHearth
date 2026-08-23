@@ -126,10 +126,22 @@ fn departure_debounce_and_reappearance() {
         t.observe(vec![r.clone()], at(1)).unwrap()[0],
         NeighborEvent::Appeared { .. }
     ));
-    assert!(t.observe(vec![], at(2)).unwrap().is_empty());
     assert!(matches!(
-        t.observe(vec![], at(3)).unwrap()[0],
-        NeighborEvent::Departed { .. }
+        t.observe(vec![], at(2)).unwrap().as_slice(),
+        [NeighborEvent::Missed {
+            consecutive_misses: 1,
+            ..
+        }]
+    ));
+    assert!(matches!(
+        t.observe(vec![], at(3)).unwrap().as_slice(),
+        [
+            NeighborEvent::Missed {
+                consecutive_misses: 2,
+                ..
+            },
+            NeighborEvent::Departed { .. }
+        ]
     ));
     assert!(t.observe(vec![], at(4)).unwrap().is_empty());
     assert!(matches!(
@@ -261,7 +273,10 @@ fn max_rows_failure_is_atomic_for_departure_misses() {
         NeighborReachability::Reachable,
     );
     t.observe(vec![a], at(1)).unwrap();
-    assert!(t.observe(vec![], at(2)).unwrap().is_empty());
+    assert!(matches!(
+        t.observe(vec![], at(2)).unwrap().as_slice(),
+        [NeighborEvent::Missed { .. }]
+    ));
     assert_eq!(
         t.observe(
             vec![
@@ -282,7 +297,13 @@ fn max_rows_failure_is_atomic_for_departure_misses() {
     );
     assert!(matches!(
         t.observe(vec![], at(4)).unwrap().as_slice(),
-        [NeighborEvent::Departed { .. }]
+        [
+            NeighborEvent::Missed {
+                consecutive_misses: 2,
+                ..
+            },
+            NeighborEvent::Departed { .. }
+        ]
     ));
 }
 
@@ -317,10 +338,16 @@ fn max_devices_failures_are_atomic_and_respect_live_capacity() {
         t.observe(vec![b.clone()], at(4)),
         Err(NeighborError::Capacity)
     );
-    assert!(t.observe(vec![], at(5)).unwrap().is_empty());
+    assert!(matches!(
+        t.observe(vec![], at(5)).unwrap().as_slice(),
+        [NeighborEvent::Missed {
+            consecutive_misses: 1,
+            ..
+        }]
+    ));
     assert!(matches!(
         t.observe(vec![], at(6)).unwrap().as_slice(),
-        [NeighborEvent::Departed { device, .. }] if device.link_address() == mac(1)
+        [NeighborEvent::Missed { consecutive_misses: 2, .. }, NeighborEvent::Departed { device, .. }] if device.link_address() == mac(1)
     ));
     assert!(matches!(
         t.observe(vec![b], at(7)).unwrap().as_slice(),
@@ -342,7 +369,10 @@ fn conflict_after_a_miss_is_atomic_even_for_non_present_rows() {
     );
     let conflicting_ip: IpAddr = "192.168.1.3".parse().unwrap();
     t.observe(vec![a], at(1)).unwrap();
-    assert!(t.observe(vec![], at(2)).unwrap().is_empty());
+    assert!(matches!(
+        t.observe(vec![], at(2)).unwrap().as_slice(),
+        [NeighborEvent::Missed { .. }]
+    ));
     assert_eq!(
         t.observe(
             vec![
@@ -355,7 +385,13 @@ fn conflict_after_a_miss_is_atomic_even_for_non_present_rows() {
     );
     assert!(matches!(
         t.observe(vec![], at(4)).unwrap().as_slice(),
-        [NeighborEvent::Departed { .. }]
+        [
+            NeighborEvent::Missed {
+                consecutive_misses: 2,
+                ..
+            },
+            NeighborEvent::Departed { .. }
+        ]
     ));
     assert!(t.observe(vec![], at(5)).unwrap().is_empty());
 }
@@ -407,8 +443,91 @@ fn event_order_is_present_key_sorted_then_departures_key_sorted() {
         matches!(&events[1], NeighborEvent::Appeared { device, .. } if device.link_address() == mac(2))
     );
     assert!(
-        matches!(&events[2], NeighborEvent::Departed { device, .. } if device.link_address() == mac(3))
+        matches!(&events[2], NeighborEvent::Missed { device, consecutive_misses: 1, .. } if device.link_address() == mac(3))
     );
+    assert!(
+        matches!(&events[3], NeighborEvent::Departed { device, .. } if device.link_address() == mac(3))
+    );
+}
+
+#[test]
+fn first_miss_reports_device_and_count() {
+    let mut t = NeighborTracker::new(NeighborTrackerConfig::default()).unwrap();
+    let r = row(
+        "192.168.1.2".parse().unwrap(),
+        mac(1),
+        NeighborReachability::Reachable,
+    );
+    t.observe(vec![r], at(1)).unwrap();
+    assert!(matches!(t.observe(vec![], at(2)).unwrap().as_slice(),
+        [NeighborEvent::Missed { device, observed_at, consecutive_misses: 1 }] if device.link_address() == mac(1) && *observed_at == at(2)));
+}
+
+#[test]
+fn final_miss_reports_then_departs_and_reappearance_resets_count() {
+    let mut t = NeighborTracker::new(NeighborTrackerConfig {
+        missed_snapshots_before_departure: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let r = row(
+        "192.168.1.2".parse().unwrap(),
+        mac(1),
+        NeighborReachability::Reachable,
+    );
+    t.observe(vec![r.clone()], at(1)).unwrap();
+    assert!(matches!(
+        t.observe(vec![], at(2)).unwrap().as_slice(),
+        [NeighborEvent::Missed {
+            consecutive_misses: 1,
+            ..
+        }]
+    ));
+    assert!(matches!(
+        t.observe(vec![], at(3)).unwrap().as_slice(),
+        [
+            NeighborEvent::Missed {
+                consecutive_misses: 2,
+                ..
+            },
+            NeighborEvent::Departed { .. }
+        ]
+    ));
+    t.observe(vec![r.clone()], at(4)).unwrap();
+    assert!(matches!(
+        t.observe(vec![], at(5)).unwrap().as_slice(),
+        [NeighborEvent::Missed {
+            consecutive_misses: 1,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn failed_rows_still_count_as_absent_and_missed_debug_is_redacted() {
+    let mut t = NeighborTracker::new(NeighborTrackerConfig::default()).unwrap();
+    let r = row(
+        "192.168.1.42".parse().unwrap(),
+        mac(42),
+        NeighborReachability::Reachable,
+    );
+    t.observe(vec![r.clone()], at(1)).unwrap();
+    let failed = row(
+        "192.168.1.42".parse().unwrap(),
+        mac(42),
+        NeighborReachability::Failed,
+    );
+    let event = t.observe(vec![failed], at(2)).unwrap().remove(0);
+    assert!(matches!(
+        event,
+        NeighborEvent::Missed {
+            consecutive_misses: 1,
+            ..
+        }
+    ));
+    let debug = format!("{event:?}");
+    assert!(!debug.contains("192.168.1.42"));
+    assert!(!debug.contains("02:00:00:00:00:2a"));
 }
 
 #[test]
@@ -489,11 +608,20 @@ fn clock_rollback_after_a_miss_is_atomic_and_equal_time_is_allowed() {
         NeighborReachability::Reachable,
     );
     t.observe(vec![a], at(10)).unwrap();
-    assert!(t.observe(vec![], at(11)).unwrap().is_empty());
+    assert!(matches!(
+        t.observe(vec![], at(11)).unwrap().as_slice(),
+        [NeighborEvent::Missed { .. }]
+    ));
     assert_eq!(t.observe(vec![], at(10)), Err(NeighborError::ClockRollback));
     assert!(matches!(
         t.observe(vec![], at(11)).unwrap().as_slice(),
-        [NeighborEvent::Departed { .. }]
+        [
+            NeighborEvent::Missed {
+                consecutive_misses: 2,
+                ..
+            },
+            NeighborEvent::Departed { .. }
+        ]
     ));
 }
 
