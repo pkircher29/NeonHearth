@@ -181,6 +181,31 @@ pub enum PresenceError {
     SequenceExhausted,
     #[error("presence event cursor expired")]
     CursorExpired,
+    #[error("invalid checkpoint: {0}")]
+    InvalidCheckpoint(&'static str),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PresenceCheckpoint {
+    pub version: u16,
+    pub devices: Vec<PresenceCheckpointDevice>,
+    pub next_transition: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PresenceCheckpointDevice {
+    pub device_id: DeviceId,
+    pub state: PresenceState,
+    pub evidence: Vec<PresenceEvidence>,
+    pub history: Vec<PresenceTransition>,
+    pub last_evaluation: DateTime<Utc>,
+    pub ever_supported: bool,
+    pub blocked: bool,
+    pub impaired: bool,
+    pub contradictory: bool,
+    pub enforcement_clock: Option<DateTime<Utc>>,
+    pub impairment_clock: Option<DateTime<Utc>>,
+    pub contradiction_clock: Option<DateTime<Utc>>,
+    pub evicted_through: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -205,6 +230,111 @@ pub struct PresenceEngine {
     next_transition: u64,
 }
 impl PresenceEngine {
+    pub fn checkpoint(&self) -> PresenceCheckpoint {
+        let mut devices: Vec<_> = self
+            .devices
+            .iter()
+            .map(|(id, d)| PresenceCheckpointDevice {
+                device_id: *id,
+                state: d.state,
+                evidence: d.evidence.clone(),
+                history: d.history.iter().cloned().collect(),
+                last_evaluation: d.last_evaluation,
+                ever_supported: d.ever_supported,
+                blocked: d.blocked,
+                impaired: d.impaired,
+                contradictory: d.contradictory,
+                enforcement_clock: d.enforcement_clock,
+                impairment_clock: d.impairment_clock,
+                contradiction_clock: d.contradiction_clock,
+                evicted_through: d.evicted_through,
+            })
+            .collect();
+        devices.sort_by_key(|d| d.device_id.to_string());
+        PresenceCheckpoint {
+            version: 1,
+            devices,
+            next_transition: self.next_transition,
+        }
+    }
+    pub fn from_checkpoint(
+        cfg: PresenceConfig,
+        c: PresenceCheckpoint,
+    ) -> Result<Self, PresenceError> {
+        cfg.validate()?;
+        if c.version != 1 || c.next_transition == 0 || c.devices.len() > cfg.max_devices {
+            return Err(PresenceError::InvalidCheckpoint(
+                "version, sequence, or capacity",
+            ));
+        }
+        let mut devices = HashMap::new();
+        let mut max_id = 0;
+        for x in c.devices {
+            if devices.contains_key(&x.device_id)
+                || x.evidence.len() > cfg.max_evidence_per_device
+                || x.history.len() > cfg.max_history_per_device
+            {
+                return Err(PresenceError::InvalidCheckpoint("duplicate or capacity"));
+            }
+            let mut last = 0;
+            for t in &x.history {
+                if t.transition_id == 0
+                    || t.transition_id <= last
+                    || t.device_id != x.device_id
+                    || t.occurred_at
+                        > x.last_evaluation
+                            .checked_add_signed(cfg.future_skew)
+                            .ok_or(PresenceError::InvalidCheckpoint("time"))?
+                {
+                    return Err(PresenceError::InvalidCheckpoint("history"));
+                }
+                last = t.transition_id;
+                max_id = max_id.max(t.transition_id);
+                if t.correction_of
+                    .is_some_and(|v| v == t.transition_id || v >= t.transition_id)
+                {
+                    return Err(PresenceError::InvalidCheckpoint("correction"));
+                }
+            }
+            for e in &x.evidence {
+                if e.device_id != x.device_id
+                    || e.source.is_empty()
+                    || e.source.len() > cfg.max_source_len
+                    || e.valid_until.is_some_and(|v| v < e.observed_at)
+                {
+                    return Err(PresenceError::InvalidCheckpoint("evidence"));
+                }
+            }
+            if x.evicted_through.is_some_and(|v| v > max_id) {
+                return Err(PresenceError::InvalidCheckpoint("cursor"));
+            }
+            devices.insert(
+                x.device_id,
+                DevicePresence {
+                    state: x.state,
+                    evidence: x.evidence,
+                    history: x.history.into_iter().collect(),
+                    last_evaluation: x.last_evaluation,
+                    ever_supported: x.ever_supported,
+                    blocked: x.blocked,
+                    impaired: x.impaired,
+                    contradictory: x.contradictory,
+                    enforcement_clock: x.enforcement_clock,
+                    impairment_clock: x.impairment_clock,
+                    contradiction_clock: x.contradiction_clock,
+                    evicted_through: x.evicted_through,
+                },
+            );
+        }
+        if c.next_transition <= max_id {
+            return Err(PresenceError::InvalidCheckpoint("sequence"));
+        }
+        Ok(Self {
+            cfg,
+            devices,
+            next_transition: c.next_transition,
+        })
+    }
     pub fn new(cfg: PresenceConfig) -> Result<Self, PresenceError> {
         Self::new_with_transition_sequence(cfg, 1)
     }

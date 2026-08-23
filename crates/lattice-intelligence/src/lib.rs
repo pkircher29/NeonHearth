@@ -99,6 +99,30 @@ pub enum IdentityError {
     IdSourceExhausted,
     #[error("cannot undo")]
     CannotUndo,
+    #[error("invalid checkpoint: {0}")]
+    InvalidCheckpoint(&'static str),
+}
+
+/// Versioned, stable wire representation of identity state. Private engine types are never
+/// serialized directly so the checkpoint format can evolve independently of implementation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentityCheckpoint {
+    pub version: u16,
+    pub ids: Vec<DeviceId>,
+    pub facts: Vec<(DeviceId, Vec<EvidenceFact>)>,
+    pub proposals: Vec<MergeProposal>,
+    pub edges: Vec<IdentityCheckpointEdge>,
+    pub audit: Vec<AuditRecord>,
+    pub owners: Vec<OwnerAuditRecord>,
+    pub next_proposal: u64,
+    pub next_owner: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentityCheckpointEdge {
+    pub proposal_id: u64,
+    pub left: DeviceId,
+    pub right: DeviceId,
+    pub active: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Identification {
@@ -175,6 +199,151 @@ pub struct IdentityEngine {
 }
 
 impl IdentityEngine {
+    pub fn checkpoint(&self) -> IdentityCheckpoint {
+        let mut facts: Vec<_> = self.facts.iter().map(|(id, f)| (*id, f.clone())).collect();
+        facts.sort_by_key(|x| x.0.to_string());
+        let mut edges: Vec<_> = self
+            .edges
+            .iter()
+            .map(|(id, e)| IdentityCheckpointEdge {
+                proposal_id: *id,
+                left: e.a,
+                right: e.b,
+                active: e.active,
+            })
+            .collect();
+        edges.sort_by_key(|e| e.proposal_id);
+        IdentityCheckpoint {
+            version: 1,
+            ids: self.ids.iter().copied().collect(),
+            facts,
+            proposals: self.proposals.clone(),
+            edges,
+            audit: self.audit.clone(),
+            owners: self.owners.clone(),
+            next_proposal: self.next_proposal,
+            next_owner: self.next_owner,
+        }
+    }
+    pub fn from_checkpoint(
+        cfg: IdentityConfig,
+        c: IdentityCheckpoint,
+    ) -> Result<Self, IdentityError> {
+        cfg.valid()?;
+        if c.version != 1 {
+            return Err(IdentityError::InvalidCheckpoint("version"));
+        }
+        if c.next_proposal == 0
+            || c.next_owner == 0
+            || c.ids.len() > cfg.max_devices
+            || c.facts.len() > cfg.max_devices
+            || c.proposals.len() > cfg.max_proposals
+            || c.edges.len() > cfg.max_merge_edges
+            || c.audit.len() > cfg.max_audit_records
+            || c.owners.len() > cfg.max_audit_records
+        {
+            return Err(IdentityError::InvalidCheckpoint("capacity or sequence"));
+        }
+        let mut ids = VecDeque::new();
+        let mut known = HashSet::new();
+        for id in c.ids {
+            if !known.insert(id) {
+                return Err(IdentityError::InvalidCheckpoint("duplicate id"));
+            }
+            ids.push_back(id);
+        }
+        let mut facts = HashMap::new();
+        for (id, mut fs) in c.facts {
+            if !known.insert(id) || fs.len() > cfg.max_facts_per_device {
+                return Err(IdentityError::InvalidCheckpoint("duplicate or facts"));
+            }
+            let tmp = IdentityEngine::new(cfg.clone(), std::iter::empty())?;
+            tmp.prepare(&mut fs)?;
+            facts.insert(id, fs);
+        }
+        let fact_ids: HashSet<_> = facts.keys().copied().collect();
+        let mut proposals = c.proposals;
+        let mut edges = HashMap::new();
+        for p in &mut proposals {
+            if p.id == 0
+                || !fact_ids.contains(&p.left)
+                || !fact_ids.contains(&p.right)
+                || p.left == p.right
+            {
+                return Err(IdentityError::InvalidCheckpoint("proposal"));
+            }
+            validprop(p.score, &p.families, &p.reasons)?;
+        }
+        let mut last = 0;
+        for p in &proposals {
+            if p.id <= last {
+                return Err(IdentityError::InvalidCheckpoint("proposal sequence"));
+            }
+            last = p.id;
+        }
+        for e in c.edges {
+            if edges
+                .insert(
+                    e.proposal_id,
+                    Edge {
+                        a: e.left,
+                        b: e.right,
+                        active: e.active,
+                    },
+                )
+                .is_some()
+                || !fact_ids.contains(&e.left)
+                || !fact_ids.contains(&e.right)
+            {
+                return Err(IdentityError::InvalidCheckpoint("edge"));
+            }
+        }
+        let owners = c.owners;
+        let mut seq = 0;
+        for o in &owners {
+            if o.sequence == 0
+                || o.sequence <= seq
+                || !fact_ids.contains(&o.device_id)
+                || o.key.len() > cfg.max_value_len
+            {
+                return Err(IdentityError::InvalidCheckpoint("owner audit"));
+            }
+            seq = o.sequence;
+        }
+        if c.next_owner <= seq || c.next_proposal <= last {
+            return Err(IdentityError::InvalidCheckpoint("next sequence"));
+        }
+        for a in &c.audit {
+            let Some(p) = proposals.iter().find(|p| p.id == a.proposal_id) else {
+                return Err(IdentityError::InvalidCheckpoint("audit target"));
+            };
+            if p.status != a.action
+                && !(a.action == ProposalStatus::Undone && p.status == ProposalStatus::Undone)
+            {
+                return Err(IdentityError::InvalidCheckpoint("audit action"));
+            }
+        }
+        for (id, e) in &edges {
+            let Some(p) = proposals.iter().find(|p| p.id == *id) else {
+                return Err(IdentityError::InvalidCheckpoint("edge target"));
+            };
+            if e.active != (p.status == ProposalStatus::Accepted) || e.a != p.left || e.b != p.right
+            {
+                return Err(IdentityError::InvalidCheckpoint("edge status"));
+            }
+        }
+        Ok(Self {
+            cfg,
+            ids,
+            facts,
+            proposals,
+            edges,
+            audit: c.audit,
+            owners,
+            next_proposal: c.next_proposal,
+            next_owner: c.next_owner,
+        })
+    }
     pub fn new<I: Iterator<Item = DeviceId> + Send>(
         cfg: IdentityConfig,
         ids: I,
