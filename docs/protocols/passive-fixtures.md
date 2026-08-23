@@ -23,3 +23,11 @@ IGMP, ICMPv6/NDP, and MLD Router Alert framing with checksums. The test suite
 independently verifies those properties and exact facts for all 15 fixtures. Parsing
 is intentionally limited to classic Ethernet PCAP and bounded common IPv6 extension
 headers; encrypted payload inspection and reassembly of fragmented traffic are not attempted.
+
+Normalization limits are explicit: 4 MiB per offline PCAP, 4,096 records and
+4,096 observations per PCAP, 16 observations per frame, 32 facts per observation,
+1,024 bytes per normalized value, and 1 MiB of normalized value data per PCAP.
+DHCP decoding accepts at most 64 options, 128 bytes per DUID, and eight IAADDRs;
+singleton identity/FQDN options may not be duplicated. These offline-PCAP limits
+prevent input-to-output amplification. A future live-capture path will enforce the
+same budgets incrementally while streaming rather than accumulating a PCAP.

@@ -26,6 +26,10 @@ fn eth(t: u16, p: Vec<u8>) -> Vec<u8> {
     v.extend(p);
     v
 }
+fn source_mac(mut frame: Vec<u8>, mac: [u8; 6]) -> Vec<u8> {
+    frame[6..12].copy_from_slice(&mac);
+    frame
+}
 fn set4(p: &mut [u8], s: [u8; 4], d: [u8; 4], protocol: u8) {
     let checksum_at = if protocol == 17 { 6 } else { 16 };
     p[checksum_at..checksum_at + 2].fill(0);
@@ -158,6 +162,15 @@ fn dh6() -> Vec<u8> {
     opt(39, &f, &mut d);
     d
 }
+fn dh6_request() -> Vec<u8> {
+    let mut d = vec![1, 0, 0, 1];
+    opt(1, &[0, 1, 0, 1, 0, 0, 0, 1, 0, 17, 34, 51, 68, 85], &mut d);
+    opt(3, &[0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0], &mut d);
+    let mut f = vec![0];
+    name("lab-v6.example.test", &mut f);
+    opt(39, &f, &mut d);
+    d
+}
 fn dh4() -> Vec<u8> {
     let mut d = vec![
         2, 1, 6, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 2, 100, 0, 0, 0, 0,
@@ -171,6 +184,17 @@ fn dh4() -> Vec<u8> {
     d.extend([
         61, 7, 1, 0, 17, 34, 51, 68, 85, 54, 4, 192, 0, 2, 1, 51, 4, 0, 0, 14, 16, 255,
     ]);
+    d
+}
+fn dh4_request() -> Vec<u8> {
+    let mut d = dh4();
+    d[0] = 1;
+    d[16..20].fill(0);
+    let server = d
+        .windows(6)
+        .position(|x| x == [54, 4, 192, 0, 2, 1])
+        .unwrap();
+    d.drain(server..server + 6);
     d
 }
 fn nbns() -> Vec<u8> {
@@ -187,6 +211,9 @@ fn nbns() -> Vec<u8> {
     d
 }
 fn save(n: &str, f: Vec<u8>) {
+    save_many(n, &[f])
+}
+fn save_many(n: &str, frames: &[Vec<u8>]) {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../crates/lattice-sensor/tests/fixtures/pcap");
     let mut v = Vec::new();
@@ -197,11 +224,13 @@ fn save(n: &str, f: Vec<u8>) {
     v.extend(0u32.to_le_bytes());
     v.extend(65535u32.to_le_bytes());
     v.extend(1u32.to_le_bytes());
-    v.extend(1_704_067_200u32.to_le_bytes());
-    v.extend(123_000u32.to_le_bytes());
-    v.extend((f.len() as u32).to_le_bytes());
-    v.extend((f.len() as u32).to_le_bytes());
-    v.extend(f);
+    for (index, f) in frames.iter().enumerate() {
+        v.extend((1_704_067_200u32 + index as u32).to_le_bytes());
+        v.extend(123_000u32.to_le_bytes());
+        v.extend((f.len() as u32).to_le_bytes());
+        v.extend((f.len() as u32).to_le_bytes());
+        v.extend(f);
+    }
     fs::write(p.join(format!("{n}.pcap")), v).unwrap()
 }
 fn main() {
@@ -220,15 +249,35 @@ fn main() {
     nd.extend([1, 1]);
     nd.extend(MAC);
     save("ipv6-ndp", v6(58, S6, d6, nd));
-    save("dhcpv4", v4(17, [0; 4], [255; 4], udp(68, 67, &dh4())));
-    save(
+    save_many(
+        "dhcpv4",
+        &[
+            v4(17, [0; 4], [255; 4], udp(68, 67, &dh4_request())),
+            source_mac(
+                v4(17, [192, 0, 2, 1], [255; 4], udp(67, 68, &dh4())),
+                [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            ),
+        ],
+    );
+    save_many(
         "dhcpv6",
-        v6(
-            17,
-            S6,
-            [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            udp(547, 546, &dh6()),
-        ),
+        &[
+            v6(
+                17,
+                S6,
+                [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2],
+                udp(546, 547, &dh6_request()),
+            ),
+            source_mac(
+                v6(
+                    17,
+                    [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    S6,
+                    udp(547, 546, &dh6()),
+                ),
+                [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            ),
+        ],
     );
     save(
         "mdns-dns-sd",

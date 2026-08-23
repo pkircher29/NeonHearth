@@ -16,6 +16,16 @@ use std::{
 use thiserror::Error;
 pub const MAX_FRAME_BYTES: usize = 65_535;
 pub const MAX_METADATA_BYTES: usize = 2_048;
+pub const MAX_PCAP_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PCAP_RECORDS: usize = 4_096;
+pub const MAX_OBSERVATIONS: usize = 4_096;
+pub const MAX_OBSERVATIONS_PER_FRAME: usize = 16;
+pub const MAX_FACTS_PER_OBSERVATION: usize = 32;
+pub const MAX_VALUE_BYTES: usize = 1_024;
+pub const MAX_NORMALIZED_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_DHCP_OPTIONS: usize = 64;
+const MAX_DUID_BYTES: usize = 128;
+const MAX_IAADDRS: usize = 8;
 const DEFAULT_TTL: i64 = 300;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PassiveOptions {
@@ -62,6 +72,12 @@ pub enum PassiveParseError {
     Metadata,
 }
 type Val = (&'static str, String, EvidenceFamily, i64);
+#[derive(Clone, Copy)]
+struct ActiveXmlField {
+    key: &'static str,
+    depth: usize,
+    consumed: bool,
+}
 impl OfflinePassiveAdapter {
     pub fn ingest_pcap(
         &self,
@@ -69,6 +85,9 @@ impl OfflinePassiveAdapter {
         b: &[u8],
         o: &PassiveOptions,
     ) -> Result<Vec<PassiveObservation>, PassiveParseError> {
+        if b.len() > MAX_PCAP_BYTES {
+            return Err(PassiveParseError::OversizedFrame);
+        }
         let mut r = PcapReader::new(Cursor::new(b)).map_err(|_| PassiveParseError::PcapHeader)?;
         let h = r.header();
         if h.datalink != DataLink::ETHERNET
@@ -78,7 +97,13 @@ impl OfflinePassiveAdapter {
             return Err(PassiveParseError::PcapHeader);
         }
         let mut out = Vec::new();
+        let mut records = 0usize;
+        let mut value_bytes = 0usize;
         while let Some(next) = r.next_packet() {
+            records += 1;
+            if records > MAX_PCAP_RECORDS {
+                return Err(PassiveParseError::Metadata);
+            }
             let p = next.map_err(|_| PassiveParseError::Truncated)?;
             if p.data.len() > MAX_FRAME_BYTES
                 || p.orig_len as usize > MAX_FRAME_BYTES
@@ -93,7 +118,19 @@ impl OfflinePassiveAdapter {
                 .timestamp_opt(secs, p.timestamp.subsec_nanos())
                 .single()
                 .ok_or(PassiveParseError::PcapHeader)?;
-            out.extend(self.normalize(i, t, &p.data, o)?)
+            let observations = self.normalize(i, t, &p.data, o)?;
+            if out.len() + observations.len() > MAX_OBSERVATIONS {
+                return Err(PassiveParseError::Metadata);
+            }
+            for one in &observations {
+                value_bytes = value_bytes
+                    .checked_add(one.facts.iter().map(|fact| fact.value.len()).sum::<usize>())
+                    .ok_or(PassiveParseError::Metadata)?;
+                if value_bytes > MAX_NORMALIZED_VALUE_BYTES {
+                    return Err(PassiveParseError::Metadata);
+                }
+            }
+            out.extend(observations)
         }
         Ok(out)
     }
@@ -116,12 +153,14 @@ impl PassiveAdapter for OfflinePassiveAdapter {
         // shape before the bounded protocol-specific extraction below.
         etherparse::SlicedPacket::from_ethernet(f).map_err(|_| PassiveParseError::InvalidLength)?;
         let mac = Some(mac(&f[6..12])?);
-        match u16::from_be_bytes([f[12], f[13]]) {
+        let out = match u16::from_be_bytes([f[12], f[13]]) {
             0x0806 => arp(i, t, mac, &f[14..]),
             0x0800 => ipv4(i, t, mac, &f[14..], o),
             0x86dd => ipv6(i, t, mac, &f[14..], o),
             _ => Ok(vec![]),
-        }
+        }?;
+        validate_normalized(&out, MAX_OBSERVATIONS_PER_FRAME)?;
+        Ok(out)
     }
 }
 fn fact(
@@ -131,17 +170,23 @@ fn fact(
     family: EvidenceFamily,
     t: DateTime<Utc>,
     ttl: i64,
-) -> EvidenceFact {
-    EvidenceFact {
+) -> Result<EvidenceFact, PassiveParseError> {
+    if key.len() > 64 || value.len() > MAX_VALUE_BYTES {
+        return Err(PassiveParseError::Metadata);
+    }
+    let expires_at = t
+        .checked_add_signed(Duration::seconds(ttl.clamp(1, 86400)))
+        .ok_or(PassiveParseError::Metadata)?;
+    Ok(EvidenceFact {
         family,
         source: src.into(),
         key: key.into(),
         value,
         confidence: 0.8,
         observed_at: t,
-        expires_at: Some(t + Duration::seconds(ttl.clamp(1, 86400))),
+        expires_at: Some(expires_at),
         owner_confirmed: false,
-    }
+    })
 }
 fn observation(
     i: &str,
@@ -150,7 +195,16 @@ fn observation(
     ip: Option<IpAddr>,
     p: &str,
     vals: Vec<Val>,
-) -> Vec<PassiveObservation> {
+) -> Result<Vec<PassiveObservation>, PassiveParseError> {
+    if vals.len() + usize::from(mac.is_some()) > MAX_FACTS_PER_OBSERVATION
+        || vals
+            .iter()
+            .map(|(_, value, _, _)| value.len())
+            .sum::<usize>()
+            > MAX_NORMALIZED_VALUE_BYTES
+    {
+        return Err(PassiveParseError::Metadata);
+    }
     let src = format!("passive.{p}");
     let mut facts = Vec::new();
     if let Some(m) = mac.clone() {
@@ -161,19 +215,45 @@ fn observation(
             EvidenceFamily::LinkLayer,
             t,
             DEFAULT_TTL,
-        ))
+        )?)
     }
     for (k, v, f, ttl) in vals {
-        facts.push(fact(&src, k, v, f, t, ttl))
+        facts.push(fact(&src, k, v, f, t, ttl)?)
     }
-    vec![PassiveObservation {
+    Ok(vec![PassiveObservation {
         interface: i.into(),
         observed_at: t,
         subject_mac: mac,
         subject_ip: ip,
         protocol: p.into(),
         facts,
-    }]
+    }])
+}
+fn validate_normalized(
+    out: &[PassiveObservation],
+    observation_limit: usize,
+) -> Result<(), PassiveParseError> {
+    if out.len() > observation_limit {
+        return Err(PassiveParseError::Metadata);
+    }
+    let mut total = 0usize;
+    for one in out {
+        if one.facts.len() > MAX_FACTS_PER_OBSERVATION {
+            return Err(PassiveParseError::Metadata);
+        }
+        for value in one.facts.iter().map(|f| &f.value) {
+            if value.len() > MAX_VALUE_BYTES {
+                return Err(PassiveParseError::Metadata);
+            }
+            total = total
+                .checked_add(value.len())
+                .ok_or(PassiveParseError::Metadata)?;
+        }
+    }
+    if total > MAX_NORMALIZED_VALUE_BYTES {
+        return Err(PassiveParseError::Metadata);
+    }
+    Ok(())
 }
 fn mac(b: &[u8]) -> Result<String, PassiveParseError> {
     if b.len() != 6 {
@@ -198,7 +278,7 @@ fn arp(
     }
     let sip = Ipv4Addr::new(p[14], p[15], p[16], p[17]);
     let sm = mac(&p[8..14])?;
-    Ok(observation(
+    observation(
         i,
         t,
         m,
@@ -213,7 +293,7 @@ fn arp(
             ),
             ("sender_mac", sm, EvidenceFamily::Addressing, 300),
         ],
-    ))
+    )
 }
 fn ipv4(
     i: &str,
@@ -332,7 +412,7 @@ fn udp(
                 ("dst", format!("{dst}:{d}"), EvidenceFamily::Service, 300),
                 ("bytes", q.len().to_string(), EvidenceFamily::Service, 300),
             ],
-        )),
+        )?),
     }
 }
 fn tcp(
@@ -352,7 +432,7 @@ fn tcp(
     }
     let s = u16::from_be_bytes([p[0], p[1]]);
     let d = u16::from_be_bytes([p[2], p[3]]);
-    Ok(observation(
+    observation(
         i,
         t,
         m,
@@ -368,7 +448,7 @@ fn tcp(
                 300,
             ),
         ],
-    ))
+    )
 }
 fn igmp(
     i: &str,
@@ -380,7 +460,7 @@ fn igmp(
     if p.len() < 8 {
         return Err(PassiveParseError::Truncated);
     }
-    Ok(observation(
+    observation(
         i,
         t,
         m,
@@ -392,7 +472,7 @@ fn igmp(
             EvidenceFamily::Service,
             300,
         )],
-    ))
+    )
 }
 fn icmp6(
     i: &str,
@@ -441,7 +521,7 @@ fn icmp6(
                 }
                 at += units * 8
             }
-            Ok(observation(i, t, m, Some(src), "ipv6-ndp", v))
+            Ok(observation(i, t, m, Some(src), "ipv6-ndp", v)?)
         }
         130..=132 => {
             if p.len() < 24 {
@@ -457,7 +537,7 @@ fn icmp6(
                 Some(src),
                 "mld",
                 vec![("group", g.to_string(), EvidenceFamily::Service, 300)],
-            ))
+            )?)
         }
         _ => Ok(vec![]),
     }
@@ -472,28 +552,36 @@ fn dhcp4(
     if q.len() < 240 || q[236..240] != [99, 130, 83, 99] {
         return Err(PassiveParseError::Metadata);
     }
+    if q[1] != 1 || q[2] != 6 {
+        return Err(PassiveParseError::Metadata);
+    }
     let ci = Ipv4Addr::new(q[12], q[13], q[14], q[15]);
     let yi = Ipv4Addr::new(q[16], q[17], q[18], q[19]);
-    let hlen = usize::from(q[2]).min(16);
-    if 28 + hlen > q.len() {
-        return Err(PassiveParseError::Truncated);
-    }
-    let mut v = vec![(
+    let hlen = usize::from(q[2]);
+    let client_mac = mac(&q[28..28 + hlen])?;
+    let mut client = vec![(
         "chaddr",
-        mac(&q[28..28 + hlen])?,
+        client_mac.clone(),
         EvidenceFamily::Addressing,
         300,
     )];
     if !ci.is_unspecified() {
-        v.push(("ciaddr", ci.to_string(), EvidenceFamily::Addressing, 300))
+        client.push(("ciaddr", ci.to_string(), EvidenceFamily::Addressing, 300))
     }
     if !yi.is_unspecified() {
-        v.push(("yiaddr", yi.to_string(), EvidenceFamily::Addressing, 300))
+        client.push(("yiaddr", yi.to_string(), EvidenceFamily::Addressing, 300))
     }
-    let (mut at, mut lease) = (240, 300i64);
+    let (mut at, mut lease, mut option_count) = (240, 300i64, 0usize);
+    let (mut seen_hostname, mut seen_client, mut seen_server, mut seen_lease) =
+        (false, false, false, false);
+    let mut server_id = None;
     while at < q.len() {
         let code = q[at];
         at += 1;
+        option_count += 1;
+        if option_count > MAX_DHCP_OPTIONS {
+            return Err(PassiveParseError::Metadata);
+        }
         if code == 0 {
             continue;
         }
@@ -511,27 +599,73 @@ fn dhcp4(
         let z = &q[at..at + n];
         at += n;
         match code {
-            12 => v.push(("hostname", text(z)?, EvidenceFamily::Naming, lease)),
+            12 if !seen_hostname => {
+                seen_hostname = true;
+                client.push(("hostname", text(z)?, EvidenceFamily::Naming, lease))
+            }
+            12 => return Err(PassiveParseError::Metadata),
             51 if n == 4 => {
+                if seen_lease {
+                    return Err(PassiveParseError::Metadata);
+                }
+                seen_lease = true;
                 lease = i64::from(u32::from_be_bytes(
                     z.try_into().map_err(|_| PassiveParseError::Metadata)?,
                 ))
                 .clamp(1, 86400)
             }
-            54 if n == 4 => v.push((
-                "server_id",
-                Ipv4Addr::new(z[0], z[1], z[2], z[3]).to_string(),
-                EvidenceFamily::Addressing,
-                lease,
-            )),
-            61 => v.push(("client_id", hex(z), EvidenceFamily::Addressing, lease)),
+            54 if n == 4 && !seen_server => {
+                seen_server = true;
+                server_id = Some(Ipv4Addr::new(z[0], z[1], z[2], z[3]));
+            }
+            54 => return Err(PassiveParseError::Metadata),
+            61 if !seen_client && !z.is_empty() && z.len() <= MAX_DUID_BYTES => {
+                seen_client = true;
+                client.push(("client_id", hex(z), EvidenceFamily::Addressing, lease))
+            }
+            61 => return Err(PassiveParseError::Metadata),
             _ => {}
         }
     }
-    for x in &mut v {
+    for x in &mut client {
         x.3 = lease
     }
-    Ok(observation(i, t, m, Some(src), "dhcpv4", v))
+    let client_ip = if !yi.is_unspecified() {
+        Some(yi.into())
+    } else if !ci.is_unspecified() {
+        Some(ci.into())
+    } else if q[0] == 1 && !src.is_unspecified() {
+        Some(src)
+    } else {
+        None
+    };
+    let mut out = observation(i, t, Some(client_mac), client_ip, "dhcpv4", client)?;
+    if let Some(server_id) = server_id {
+        let server_ip = IpAddr::V4(server_id);
+        let server_mac = (src == server_ip).then_some(m).flatten();
+        out.extend(observation(
+            i,
+            t,
+            server_mac,
+            Some(server_ip),
+            "dhcpv4",
+            vec![
+                (
+                    "server_id",
+                    server_id.to_string(),
+                    EvidenceFamily::Addressing,
+                    lease,
+                ),
+                (
+                    "service",
+                    "dhcp_server".into(),
+                    EvidenceFamily::Service,
+                    lease,
+                ),
+            ],
+        )?);
+    }
+    Ok(out)
 }
 fn dhcp6(
     i: &str,
@@ -543,16 +677,43 @@ fn dhcp6(
     if q.len() < 4 {
         return Err(PassiveParseError::Truncated);
     }
-    let mut v = Vec::new();
-    parse_dhcp6_options(&q[4..], &mut v, 0)?;
-    Ok(observation(i, t, m, Some(src), "dhcpv6", v))
+    let mut fields = Dhcp6Fields::default();
+    parse_dhcp6_options(&q[4..], &mut fields, 0)?;
+    let client_ip = fields.client_ip.or((q[0] != 7).then_some(src));
+    let mut out = observation(i, t, fields.client_mac, client_ip, "dhcpv6", fields.client)?;
+    if !fields.server.is_empty() {
+        fields.server.push((
+            "service",
+            "dhcpv6_server".into(),
+            EvidenceFamily::Service,
+            3600,
+        ));
+        out.extend(observation(i, t, m, Some(src), "dhcpv6", fields.server)?);
+    }
+    Ok(out)
 }
-fn parse_dhcp6_options(q: &[u8], v: &mut Vec<Val>, depth: u8) -> Result<(), PassiveParseError> {
+#[derive(Default)]
+struct Dhcp6Fields {
+    client: Vec<Val>,
+    server: Vec<Val>,
+    client_mac: Option<String>,
+    client_ip: Option<IpAddr>,
+    option_count: usize,
+    iaaddr_count: usize,
+    seen_client: bool,
+    seen_server: bool,
+    seen_fqdn: bool,
+}
+fn parse_dhcp6_options(q: &[u8], v: &mut Dhcp6Fields, depth: u8) -> Result<(), PassiveParseError> {
     if depth > 3 {
         return Err(PassiveParseError::Metadata);
     }
     let mut at = 0;
     while at < q.len() {
+        v.option_count += 1;
+        if v.option_count > MAX_DHCP_OPTIONS {
+            return Err(PassiveParseError::Metadata);
+        }
         if at + 4 > q.len() {
             return Err(PassiveParseError::Truncated);
         }
@@ -565,10 +726,25 @@ fn parse_dhcp6_options(q: &[u8], v: &mut Vec<Val>, depth: u8) -> Result<(), Pass
         let z = &q[at..at + n];
         at += n;
         match c {
-            1 => v.push(("client_duid", hex(z), EvidenceFamily::Addressing, 3600)),
-            2 => v.push(("server_duid", hex(z), EvidenceFamily::Addressing, 3600)),
+            1 if !v.seen_client && !z.is_empty() && z.len() <= MAX_DUID_BYTES => {
+                v.seen_client = true;
+                v.client_mac = duid_mac(z);
+                v.client
+                    .push(("client_duid", hex(z), EvidenceFamily::Addressing, 3600));
+            }
+            1 => return Err(PassiveParseError::Metadata),
+            2 if !v.seen_server && !z.is_empty() && z.len() <= MAX_DUID_BYTES => {
+                v.seen_server = true;
+                v.server
+                    .push(("server_duid", hex(z), EvidenceFamily::Addressing, 3600));
+            }
+            2 => return Err(PassiveParseError::Metadata),
             3 if n >= 12 => parse_dhcp6_options(&z[12..], v, depth + 1)?,
             5 if n >= 24 => {
+                v.iaaddr_count += 1;
+                if v.iaaddr_count > MAX_IAADDRS {
+                    return Err(PassiveParseError::Metadata);
+                }
                 let a = Ipv6Addr::from(
                     <[u8; 16]>::try_from(&z[..16]).map_err(|_| PassiveParseError::Metadata)?,
                 );
@@ -582,35 +758,49 @@ fn parse_dhcp6_options(q: &[u8], v: &mut Vec<Val>, depth: u8) -> Result<(), Pass
                         .try_into()
                         .map_err(|_| PassiveParseError::Metadata)?,
                 );
-                v.push((
+                v.client_ip.get_or_insert(a.into());
+                v.client.push((
                     "iaaddr",
                     a.to_string(),
                     EvidenceFamily::Addressing,
                     i64::from(valid).clamp(1, 86400),
                 ));
-                v.push((
+                v.client.push((
                     "preferred_lifetime",
                     pref.to_string(),
                     EvidenceFamily::Addressing,
                     i64::from(valid).clamp(1, 86400),
                 ));
-                v.push((
+                v.client.push((
                     "valid_lifetime",
                     valid.to_string(),
                     EvidenceFamily::Addressing,
                     i64::from(valid).clamp(1, 86400),
                 ))
             }
-            39 if n > 1 => v.push((
-                "fqdn",
-                decode_plain_name(&z[1..])?,
-                EvidenceFamily::Naming,
-                3600,
-            )),
+            39 if !v.seen_fqdn && n > 1 && n <= 256 => {
+                v.seen_fqdn = true;
+                v.client.push((
+                    "fqdn",
+                    decode_plain_name(&z[1..])?,
+                    EvidenceFamily::Naming,
+                    3600,
+                ));
+            }
+            39 => return Err(PassiveParseError::Metadata),
             _ => {}
         }
     }
     Ok(())
+}
+fn duid_mac(duid: &[u8]) -> Option<String> {
+    let ty = u16::from_be_bytes([*duid.first()?, *duid.get(1)?]);
+    let bytes = match ty {
+        1 if duid.len() >= 14 => &duid[duid.len() - 6..],
+        3 if duid.len() >= 10 => &duid[duid.len() - 6..],
+        _ => return None,
+    };
+    mac(bytes).ok()
 }
 fn dns(
     i: &str,
@@ -679,7 +869,7 @@ fn dns(
             }
         }
     }
-    Ok(observation(i, t, m, Some(src), p, v))
+    observation(i, t, m, Some(src), p, v)
 }
 fn nbns(
     i: &str,
@@ -702,7 +892,7 @@ fn nbns(
         raw[n] = (a - b'A') << 4 | (b - b'A')
     }
     let name = text(&raw[..15])?.trim_end().to_owned();
-    Ok(observation(
+    observation(
         i,
         t,
         m,
@@ -717,7 +907,7 @@ fn nbns(
                 300,
             ),
         ],
-    ))
+    )
 }
 fn ssdp(
     i: &str,
@@ -768,7 +958,7 @@ fn ssdp(
     for x in &mut v {
         x.3 = ttl
     }
-    Ok(observation(i, t, m, Some(src), "ssdp-upnp", v))
+    observation(i, t, m, Some(src), "ssdp-upnp", v)
 }
 fn soap(
     i: &str,
@@ -790,7 +980,8 @@ fn soap(
     r.config_mut().trim_text(true);
     let mut buffer = Vec::new();
     let (mut depth, mut events, mut current, mut v) =
-        (0usize, 0usize, None::<&'static str>, Vec::new());
+        (0usize, 0usize, None::<ActiveXmlField>, Vec::new());
+    let mut qname_stack: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let (mut envelope, mut body, mut matches_depth, mut probe, mut endpoint) =
         (None, None, None, None, None);
     let mut onvif = false;
@@ -799,14 +990,24 @@ fn soap(
         if events > 256 {
             return Err(PassiveParseError::Metadata);
         }
-        match r.read_event_into(&mut buffer) {
-            Ok(Event::Start(e)) => {
+        let (resolved, event) = r
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|_| PassiveParseError::Metadata)?;
+        match event {
+            Event::Start(e) => {
+                if current.is_some() {
+                    return Err(PassiveParseError::Metadata);
+                }
                 depth += 1;
                 if depth > 32 {
                     return Err(PassiveParseError::Metadata);
                 }
                 let local = e.local_name();
-                let resolved = r.resolver().resolve_element(e.name()).0;
+                let namespace = match &resolved {
+                    ResolveResult::Bound(Namespace(uri)) => Some(uri.to_vec()),
+                    _ => None,
+                };
+                qname_stack.push((e.local_name().as_ref().to_vec(), namespace));
                 let namespace_is = |expected: &[u8]| matches!(resolved, ResolveResult::Bound(Namespace(uri)) if uri == expected);
                 let is_wsd = namespace_is(WSD09) || namespace_is(WSD05);
                 match local.as_ref() {
@@ -823,20 +1024,51 @@ fn soap(
                     {
                         probe = Some(depth)
                     }
-                    b"EndpointReference" if probe.is_some() && namespace_is(WSA) => {
+                    b"EndpointReference" if probe == Some(depth - 1) && namespace_is(WSA) => {
                         endpoint = Some(depth)
                     }
-                    b"Address" if endpoint.is_some() && namespace_is(WSA) => {
-                        current = Some("endpoint")
+                    b"Address" if endpoint == Some(depth - 1) && namespace_is(WSA) => {
+                        current = Some(ActiveXmlField {
+                            key: "endpoint",
+                            depth,
+                            consumed: false,
+                        })
                     }
-                    b"Types" if probe.is_some() && is_wsd => current = Some("types"),
-                    b"Scopes" if probe.is_some() && is_wsd => current = Some("scopes"),
-                    b"XAddrs" if probe.is_some() && is_wsd => current = Some("xaddrs"),
+                    b"Types" if probe == Some(depth - 1) && is_wsd => {
+                        current = Some(ActiveXmlField {
+                            key: "types",
+                            depth,
+                            consumed: false,
+                        })
+                    }
+                    b"Scopes" if probe == Some(depth - 1) && is_wsd => {
+                        current = Some(ActiveXmlField {
+                            key: "scopes",
+                            depth,
+                            consumed: false,
+                        })
+                    }
+                    b"XAddrs" if probe == Some(depth - 1) && is_wsd => {
+                        current = Some(ActiveXmlField {
+                            key: "xaddrs",
+                            depth,
+                            consumed: false,
+                        })
+                    }
                     _ => {}
                 }
             }
-            Ok(Event::Text(e)) => {
-                if let Some(k) = current {
+            Event::Text(e) => {
+                if let Some(mut active) = current {
+                    if active.depth != depth {
+                        return Err(PassiveParseError::Metadata);
+                    }
+                    if active.consumed {
+                        return Err(PassiveParseError::Metadata);
+                    }
+                    active.consumed = true;
+                    current = Some(active);
+                    let k = active.key;
                     let z = e
                         .decode()
                         .map_err(|_| PassiveParseError::Metadata)?
@@ -857,10 +1089,23 @@ fn soap(
                             .any(|scope| scope.starts_with("onvif://www.onvif.org/"));
                     }
                     v.push((k, z, EvidenceFamily::Service, 300));
-                    current = None
                 }
             }
-            Ok(Event::End(_)) => {
+            Event::End(e) => {
+                let namespace = match &resolved {
+                    ResolveResult::Bound(Namespace(uri)) => Some(*uri),
+                    _ => None,
+                };
+                let (local, start_namespace) =
+                    qname_stack.pop().ok_or(PassiveParseError::Metadata)?;
+                if local.as_slice() != e.local_name().as_ref()
+                    || start_namespace.as_deref() != namespace
+                {
+                    return Err(PassiveParseError::Metadata);
+                }
+                if current.is_some_and(|active| active.depth == depth) {
+                    current = None;
+                }
                 if endpoint == Some(depth) {
                     endpoint = None;
                 }
@@ -875,19 +1120,21 @@ fn soap(
                 }
                 depth = depth.checked_sub(1).ok_or(PassiveParseError::Metadata)?
             }
-            Ok(Event::DocType(_) | Event::Decl(_) | Event::PI(_) | Event::GeneralRef(_)) => {
+            Event::Empty(_) | Event::CData(_) if current.is_some() => {
                 return Err(PassiveParseError::Metadata);
             }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(PassiveParseError::Metadata),
+            Event::DocType(_) | Event::Decl(_) | Event::PI(_) | Event::GeneralRef(_) => {
+                return Err(PassiveParseError::Metadata);
+            }
+            Event::Eof => break,
+            _ => {}
         }
         buffer.clear();
     }
-    if envelope.is_none() || v.is_empty() {
+    if envelope.is_none() || !qname_stack.is_empty() || depth != 0 || v.is_empty() {
         return Err(PassiveParseError::Metadata);
     }
-    Ok(observation(
+    observation(
         i,
         t,
         m,
@@ -898,7 +1145,7 @@ fn soap(
             "ws-discovery"
         },
         v,
-    ))
+    )
 }
 fn text(b: &[u8]) -> Result<String, PassiveParseError> {
     if b.len() > MAX_METADATA_BYTES {
