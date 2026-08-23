@@ -43,6 +43,7 @@ impl PresenceConfig {
             || self.correction_window <= Duration::zero()
             || self.retention < self.correction_window
             || self.retention < self.online_window
+            || self.retention < self.confirmation_window
             || self.confirmation_window <= Duration::zero()
             || self.future_skew < Duration::zero()
         {
@@ -118,9 +119,11 @@ pub struct PresenceTransition {
 impl From<&PresenceTransition> for lattice_domain::PresenceChanged {
     fn from(t: &PresenceTransition) -> Self {
         Self {
+            transition_id: t.transition_id,
             device_id: t.device_id,
             from: t.from,
             to: t.to,
+            occurred_at: t.occurred_at,
             reason: if t.correction_of.is_some() {
                 "late_evidence_correction".into()
             } else {
@@ -130,6 +133,7 @@ impl From<&PresenceTransition> for lattice_domain::PresenceChanged {
             trigger_kind: t.trigger.kind.as_str().into(),
             evidence_observed_at: t.trigger.observed_at,
             evidence_valid_until: t.trigger.valid_until,
+            trigger_arrival_at: t.trigger.arrival_at,
             correction_of: t.correction_of,
         }
     }
@@ -175,6 +179,8 @@ pub enum PresenceError {
     ClockRollback,
     #[error("transition sequence exhausted")]
     SequenceExhausted,
+    #[error("presence event cursor expired")]
+    CursorExpired,
 }
 
 #[derive(Clone)]
@@ -190,6 +196,7 @@ struct DevicePresence {
     enforcement_clock: Option<DateTime<Utc>>,
     impairment_clock: Option<DateTime<Utc>>,
     contradiction_clock: Option<DateTime<Utc>>,
+    evicted_through: Option<u64>,
 }
 pub struct PresenceEngine {
     cfg: PresenceConfig,
@@ -198,11 +205,21 @@ pub struct PresenceEngine {
 }
 impl PresenceEngine {
     pub fn new(cfg: PresenceConfig) -> Result<Self, PresenceError> {
+        Self::new_with_transition_sequence(cfg, 1)
+    }
+    /// Creates an empty engine beginning at a caller-restored, non-zero transition sequence.
+    pub fn new_with_transition_sequence(
+        cfg: PresenceConfig,
+        next_transition: u64,
+    ) -> Result<Self, PresenceError> {
         cfg.validate()?;
+        if next_transition == 0 {
+            return Err(PresenceError::InvalidConfig);
+        }
         Ok(Self {
             cfg,
             devices: HashMap::new(),
-            next_transition: 1,
+            next_transition,
         })
     }
     pub fn snapshot(&self) -> PresenceSnapshot {
@@ -224,15 +241,20 @@ impl PresenceEngine {
     }
     /// Returns the retained domain events after `transition_id` in deterministic sequence order.
     ///
-    /// This is the lossless event-bus boundary for the bounded retained history: callers can
-    /// consume both a late correction and any separate current-state transition produced by the
-    /// same ingestion, even though [`Self::ingest`] returns at most one transition for convenience.
+    /// Returns [`PresenceError::CursorExpired`] when bounded retention has evicted an event after
+    /// the supplied cursor. Event-bus consumers should use [`Self::ingest_events`] for the live
+    /// lossless boundary and this method for bounded replay.
     pub fn domain_events_since(
         &self,
         id: DeviceId,
         transition_id: u64,
     ) -> Result<Vec<lattice_domain::PresenceChanged>, PresenceError> {
         let d = self.devices.get(&id).ok_or(PresenceError::DeviceNotFound)?;
+        if d.evicted_through
+            .is_some_and(|evicted| transition_id < evicted)
+        {
+            return Err(PresenceError::CursorExpired);
+        }
         Ok(d.history
             .iter()
             .filter(|transition| transition.transition_id > transition_id)
@@ -244,6 +266,15 @@ impl PresenceEngine {
         e: PresenceEvidence,
         arrival: DateTime<Utc>,
     ) -> Result<Option<PresenceTransition>, PresenceError> {
+        Ok(self.ingest_events(e, arrival)?.pop())
+    }
+    /// Canonical ingestion API for event-bus consumers. Every transition caused by one input is
+    /// returned in sequence order, including a historical correction and a current transition.
+    pub fn ingest_events(
+        &mut self,
+        e: PresenceEvidence,
+        arrival: DateTime<Utc>,
+    ) -> Result<Vec<PresenceTransition>, PresenceError> {
         self.ingest_authorized(e, arrival, false)
     }
     pub fn record_verified_enforcement(
@@ -254,49 +285,52 @@ impl PresenceEngine {
         observed_at: DateTime<Utc>,
         arrival: DateTime<Utc>,
     ) -> Result<Option<PresenceTransition>, PresenceError> {
-        self.ingest_authorized(
-            PresenceEvidence {
-                device_id,
-                source: source.into(),
-                kind: if blocked {
-                    PresenceEvidenceKind::EnforcementBlocked
-                } else {
-                    PresenceEvidenceKind::EnforcementUnblocked
+        Ok(self
+            .ingest_authorized(
+                PresenceEvidence {
+                    device_id,
+                    source: source.into(),
+                    kind: if blocked {
+                        PresenceEvidenceKind::EnforcementBlocked
+                    } else {
+                        PresenceEvidenceKind::EnforcementUnblocked
+                    },
+                    observed_at,
+                    valid_until: None,
                 },
-                observed_at,
-                valid_until: None,
-            },
-            arrival,
-            true,
-        )
+                arrival,
+                true,
+            )?
+            .pop())
     }
     fn ingest_authorized(
         &mut self,
         e: PresenceEvidence,
         arrival: DateTime<Utc>,
         enforcement_authorized: bool,
-    ) -> Result<Option<PresenceTransition>, PresenceError> {
+    ) -> Result<Vec<PresenceTransition>, PresenceError> {
         self.validate(&e, arrival, enforcement_authorized)?;
         if !self.devices.contains_key(&e.device_id) && self.devices.len() >= self.cfg.max_devices {
             return Err(PresenceError::Capacity("devices"));
         }
+        let retain_input = semantically_retained(&e, arrival, &self.cfg);
         if let Some(d) = self.devices.get(&e.device_id) {
             if arrival < d.last_evaluation {
                 return Err(PresenceError::ClockRollback);
             }
             if d.evidence.contains(&e) || stale_control(d, &e) {
-                return Ok(None);
+                return Ok(vec![]);
             }
             let retained = d
                 .evidence
                 .iter()
-                .filter(|x| arrival.signed_duration_since(x.observed_at) <= self.cfg.retention)
+                .filter(|x| semantically_retained(x, arrival, &self.cfg))
                 .count();
-            if retained >= self.cfg.max_evidence_per_device {
+            if retain_input && retained >= self.cfg.max_evidence_per_device {
                 return Err(PresenceError::Capacity("evidence"));
             }
         }
-        if self.next_transition == u64::MAX {
+        if self.next_transition.checked_add(2).is_none() {
             return Err(PresenceError::SequenceExhausted);
         }
         let id = e.device_id;
@@ -312,11 +346,12 @@ impl PresenceEngine {
             enforcement_clock: None,
             impairment_clock: None,
             contradiction_clock: None,
+            evicted_through: None,
         };
         let correction = {
             let d = self.devices.entry(id).or_insert(initial);
             d.evidence
-                .retain(|x| arrival.signed_duration_since(x.observed_at) <= self.cfg.retention);
+                .retain(|x| semantically_retained(x, arrival, &self.cfg));
             d.last_evaluation = arrival;
             let any_departure = d
                 .history
@@ -352,7 +387,7 @@ impl PresenceEngine {
             if is_real_positive(e.kind) && (!late || current_valid) {
                 d.ever_supported = true;
             }
-            if !late || current_valid || !is_positive(e.kind) {
+            if retain_input && (!late || current_valid || !is_positive(e.kind)) {
                 d.evidence.push(e.clone());
                 sort_evidence(&mut d.evidence);
             }
@@ -361,7 +396,7 @@ impl PresenceEngine {
                 late && !current_valid,
             )
         };
-        let mut correction_event = None;
+        let mut events = Vec::with_capacity(2);
         if let Some((departure_id, target)) = correction.0 {
             let tr = self.make_transition(
                 id,
@@ -376,12 +411,15 @@ impl PresenceEngine {
                 .get_mut(&id)
                 .ok_or(PresenceError::DeviceNotFound)?;
             push_history(d, tr.clone(), self.cfg.max_history_per_device);
-            correction_event = Some(tr);
+            events.push(tr);
         }
-        if correction.1 && correction_event.is_none() {
-            return Ok(None);
+        if correction.1 && events.is_empty() {
+            return Ok(events);
         }
-        Ok(self.recompute(id, arrival, Some(&e))?.or(correction_event))
+        if let Some(current) = self.recompute(id, arrival, Some(&e))? {
+            events.push(current);
+        }
+        Ok(events)
     }
     pub fn evaluate(
         &mut self,
@@ -513,37 +551,37 @@ impl PresenceEngine {
 fn apply_flags(d: &mut DevicePresence, e: &PresenceEvidence) {
     match e.kind {
         PresenceEvidenceKind::EnforcementBlocked
-            if d.enforcement_clock.is_none_or(|x| e.observed_at > x) =>
+            if d.enforcement_clock.is_none_or(|x| e.observed_at >= x) =>
         {
             d.blocked = true;
             d.enforcement_clock = Some(e.observed_at)
         }
         PresenceEvidenceKind::EnforcementUnblocked
-            if d.enforcement_clock.is_none_or(|x| e.observed_at > x) =>
+            if d.enforcement_clock.is_none_or(|x| e.observed_at >= x) =>
         {
             d.blocked = false;
             d.enforcement_clock = Some(e.observed_at)
         }
         PresenceEvidenceKind::SensorImpaired
-            if d.impairment_clock.is_none_or(|x| e.observed_at > x) =>
+            if d.impairment_clock.is_none_or(|x| e.observed_at >= x) =>
         {
             d.impaired = true;
             d.impairment_clock = Some(e.observed_at)
         }
         PresenceEvidenceKind::SensorRecovered
-            if d.impairment_clock.is_none_or(|x| e.observed_at > x) =>
+            if d.impairment_clock.is_none_or(|x| e.observed_at >= x) =>
         {
             d.impaired = false;
             d.impairment_clock = Some(e.observed_at)
         }
         PresenceEvidenceKind::Contradiction
-            if d.contradiction_clock.is_none_or(|x| e.observed_at > x) =>
+            if d.contradiction_clock.is_none_or(|x| e.observed_at >= x) =>
         {
             d.contradictory = true;
             d.contradiction_clock = Some(e.observed_at)
         }
         PresenceEvidenceKind::ContradictionCleared
-            if d.contradiction_clock.is_none_or(|x| e.observed_at > x) =>
+            if d.contradiction_clock.is_none_or(|x| e.observed_at >= x) =>
         {
             d.contradictory = false;
             d.contradiction_clock = Some(e.observed_at)
@@ -554,15 +592,56 @@ fn apply_flags(d: &mut DevicePresence, e: &PresenceEvidence) {
 fn stale_control(d: &DevicePresence, e: &PresenceEvidence) -> bool {
     match e.kind {
         PresenceEvidenceKind::EnforcementBlocked | PresenceEvidenceKind::EnforcementUnblocked => {
-            d.enforcement_clock.is_some_and(|x| e.observed_at <= x)
+            stale_control_at(
+                d.enforcement_clock,
+                e.observed_at,
+                d.blocked,
+                e.kind == PresenceEvidenceKind::EnforcementBlocked,
+            )
         }
         PresenceEvidenceKind::SensorImpaired | PresenceEvidenceKind::SensorRecovered => {
-            d.impairment_clock.is_some_and(|x| e.observed_at <= x)
+            stale_control_at(
+                d.impairment_clock,
+                e.observed_at,
+                d.impaired,
+                e.kind == PresenceEvidenceKind::SensorImpaired,
+            )
         }
         PresenceEvidenceKind::Contradiction | PresenceEvidenceKind::ContradictionCleared => {
-            d.contradiction_clock.is_some_and(|x| e.observed_at <= x)
+            stale_control_at(
+                d.contradiction_clock,
+                e.observed_at,
+                d.contradictory,
+                e.kind == PresenceEvidenceKind::Contradiction,
+            )
         }
         _ => false,
+    }
+}
+fn stale_control_at(
+    clock: Option<DateTime<Utc>>,
+    observed_at: DateTime<Utc>,
+    active: bool,
+    incoming_active: bool,
+) -> bool {
+    clock.is_some_and(|clock| {
+        observed_at < clock || (observed_at == clock && (active || !incoming_active))
+    })
+}
+
+fn semantically_retained(e: &PresenceEvidence, arrival: DateTime<Utc>, c: &PresenceConfig) -> bool {
+    match e.kind {
+        PresenceEvidenceKind::Lease
+        | PresenceEvidenceKind::RouterAssociation
+        | PresenceEvidenceKind::ProbeSuccess
+            if e.valid_until.is_some_and(|until| until >= arrival) =>
+        {
+            true
+        }
+        PresenceEvidenceKind::ConfirmationFailure => {
+            arrival.signed_duration_since(e.observed_at) <= c.confirmation_window
+        }
+        _ => arrival.signed_duration_since(e.observed_at) <= c.retention,
     }
 }
 fn candidate(d: &DevicePresence, at: DateTime<Utc>, c: &PresenceConfig) -> PresenceState {
@@ -666,7 +745,7 @@ fn sort_evidence(v: &mut [PresenceEvidence]) {
 fn distinct_count<'a>(it: impl Iterator<Item = &'a PresenceEvidence>) -> usize {
     let mut s = std::collections::HashSet::new();
     for e in it {
-        s.insert((e.source.clone(), e.kind, e.observed_at, e.valid_until));
+        s.insert((e.source.clone(), e.kind, e.observed_at));
     }
     s.len()
 }
@@ -681,8 +760,10 @@ fn confirmations(
     }))
 }
 fn push_history(d: &mut DevicePresence, t: PresenceTransition, max: usize) {
-    if d.history.len() == max {
-        d.history.pop_front();
+    if d.history.len() == max
+        && let Some(evicted) = d.history.pop_front()
+    {
+        d.evicted_through = Some(evicted.transition_id);
     }
     d.history.push_back(t)
 }

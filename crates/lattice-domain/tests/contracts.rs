@@ -11,14 +11,17 @@ fn public_event_contract_serializes_stable_names() {
         sequence: 42,
         occurred_at,
         payload: EventPayload::PresenceChanged(PresenceChanged {
+            transition_id: 7,
             device_id,
             from: PresenceState::Quiet,
             to: PresenceState::Online,
+            occurred_at,
             reason: "arp_reply".to_owned(),
             trigger_source: "arp".to_owned(),
             trigger_kind: "traffic".to_owned(),
             evidence_observed_at: occurred_at,
             evidence_valid_until: None,
+            trigger_arrival_at: occurred_at,
             correction_of: None,
         }),
     };
@@ -32,14 +35,17 @@ fn public_event_contract_serializes_stable_names() {
             "payload": {
                 "type": "presence_changed",
                 "data": {
+                    "transition_id": 7,
                     "device_id": "018f47a0-9b5c-7a22-8a33-112233445566",
                     "from": "quiet",
                     "to": "online",
+                    "occurred_at": "2026-08-23T12:00:00Z",
                     "reason": "arp_reply",
                     "trigger_source": "arp",
                     "trigger_kind": "traffic",
                     "evidence_observed_at": "2026-08-23T12:00:00Z",
                     "evidence_valid_until": null,
+                    "trigger_arrival_at": "2026-08-23T12:00:00Z",
                     "correction_of": null
                 }
             }

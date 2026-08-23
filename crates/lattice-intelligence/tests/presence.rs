@@ -17,7 +17,10 @@ fn ev(kind: PresenceEvidenceKind, at: i64, until: Option<i64>) -> PresenceEviden
     }
 }
 fn eng() -> PresenceEngine {
-    PresenceEngine::new(PresenceConfig {
+    PresenceEngine::new(eng_config()).unwrap()
+}
+fn eng_config() -> PresenceConfig {
+    PresenceConfig {
         online_window: Duration::seconds(10),
         correction_window: Duration::seconds(30),
         retention: Duration::hours(1),
@@ -30,8 +33,7 @@ fn eng() -> PresenceEngine {
         future_skew: Duration::seconds(2),
         confirmation_window: Duration::seconds(30),
         trusted_sources: vec!["sensor-a".into()],
-    })
-    .unwrap()
+    }
 }
 
 #[test]
@@ -133,6 +135,15 @@ fn confirmations_are_deduplicated_and_windowed() {
             .is_none()
     );
     assert_eq!(wide.state(id()), Some(PresenceState::Unknown));
+
+    let mut changed_validity = eng();
+    changed_validity
+        .ingest(ev(PresenceEvidenceKind::Lease, 0, Some(10)), t(0))
+        .unwrap();
+    changed_validity
+        .ingest(ev(PresenceEvidenceKind::Lease, 0, Some(20)), t(1))
+        .unwrap();
+    assert_eq!(changed_validity.state(id()), Some(PresenceState::Unknown));
 }
 #[test]
 fn verified_block_and_unblock_override_association() {
@@ -307,6 +318,23 @@ fn stale_control_events_cannot_reverse_newer_control_state() {
             .is_none()
     );
     assert_eq!(e.state(id()), Some(PresenceState::Blocked));
+
+    let mut forward = eng();
+    forward
+        .record_verified_enforcement(id(), false, "sensor-a", t(30), t(30))
+        .unwrap();
+    forward
+        .record_verified_enforcement(id(), true, "sensor-a", t(30), t(31))
+        .unwrap();
+    let mut reversed = eng();
+    reversed
+        .record_verified_enforcement(id(), true, "sensor-a", t(30), t(30))
+        .unwrap();
+    reversed
+        .record_verified_enforcement(id(), false, "sensor-a", t(30), t(31))
+        .unwrap();
+    assert_eq!(forward.state(id()), Some(PresenceState::Blocked));
+    assert_eq!(reversed.state(id()), Some(PresenceState::Blocked));
 }
 #[test]
 fn late_evidence_corrects_only_recent_departure() {
@@ -385,6 +413,52 @@ fn late_evidence_corrects_only_recent_departure() {
     assert!(quiet.correction_of.is_some());
     assert_eq!(lease.state(id()), Some(PresenceState::Offline));
 }
+
+#[test]
+fn multi_event_corrections_are_atomic_and_never_silently_lost() {
+    let cfg = PresenceConfig {
+        join_confirmations: 1,
+        max_history_per_device: 1,
+        ..eng_config()
+    };
+    let mut e = PresenceEngine::new(cfg.clone()).unwrap();
+    e.ingest(ev(PresenceEvidenceKind::Lease, 0, Some(5)), t(0))
+        .unwrap();
+    e.ingest(ev(PresenceEvidenceKind::ConfirmationFailure, 6, None), t(6))
+        .unwrap();
+    let departure = e
+        .ingest(ev(PresenceEvidenceKind::ConfirmationFailure, 7, None), t(7))
+        .unwrap()
+        .unwrap();
+    let events = e
+        .ingest_events(ev(PresenceEvidenceKind::Traffic, 6, None), t(8))
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].correction_of, Some(departure.transition_id));
+    assert_eq!(events[1].to, PresenceState::Online);
+    assert_eq!(
+        e.domain_events_since(id(), departure.transition_id),
+        Err(PresenceError::CursorExpired)
+    );
+
+    let mut exhausted = PresenceEngine::new_with_transition_sequence(cfg, u64::MAX - 3).unwrap();
+    exhausted
+        .ingest(ev(PresenceEvidenceKind::Lease, 0, Some(5)), t(0))
+        .unwrap();
+    exhausted
+        .ingest(ev(PresenceEvidenceKind::ConfirmationFailure, 6, None), t(6))
+        .unwrap();
+    exhausted
+        .ingest(ev(PresenceEvidenceKind::ConfirmationFailure, 7, None), t(7))
+        .unwrap();
+    let before = exhausted.snapshot();
+    assert_eq!(
+        exhausted.ingest_events(ev(PresenceEvidenceKind::Traffic, 6, None), t(8)),
+        Err(PresenceError::SequenceExhausted)
+    );
+    assert_eq!(exhausted.snapshot(), before);
+    assert_eq!(exhausted.state(id()), Some(PresenceState::Offline));
+}
 #[test]
 fn rejects_bad_inputs_and_clock_rollback_atomically() {
     let mut e = eng();
@@ -412,6 +486,16 @@ fn config_overflow_provenance_and_domain_conversion_are_safe() {
             retention: Duration::seconds(10),
             online_window: Duration::seconds(11),
             correction_window: Duration::seconds(5),
+            ..PresenceConfig::default()
+        })
+        .is_err()
+    );
+    assert!(
+        PresenceEngine::new(PresenceConfig {
+            retention: Duration::seconds(29),
+            confirmation_window: Duration::seconds(30),
+            correction_window: Duration::seconds(20),
+            online_window: Duration::seconds(10),
             ..PresenceConfig::default()
         })
         .is_err()
@@ -446,6 +530,9 @@ fn config_overflow_provenance_and_domain_conversion_are_safe() {
     assert_eq!(domain.trigger_source, tr.trigger.source);
     assert_eq!(domain.evidence_observed_at, tr.trigger.observed_at);
     assert_eq!(domain.correction_of, tr.correction_of);
+    assert_eq!(domain.transition_id, tr.transition_id);
+    assert_eq!(domain.occurred_at, tr.occurred_at);
+    assert_eq!(domain.trigger_arrival_at, tr.trigger.arrival_at);
     let payload = lattice_domain::EventPayload::PresenceChanged(domain);
     assert!(
         serde_json::to_string(&payload)
@@ -457,6 +544,35 @@ fn config_overflow_provenance_and_domain_conversion_are_safe() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].correction_of, None);
     assert_eq!(events[0].trigger_source, "sensor-a");
+}
+
+#[test]
+fn semantic_retention_preserves_long_lived_protocol_support() {
+    let mut e = PresenceEngine::new(PresenceConfig {
+        retention: Duration::seconds(30),
+        correction_window: Duration::seconds(20),
+        confirmation_window: Duration::seconds(20),
+        online_window: Duration::seconds(10),
+        max_evidence_per_device: 2,
+        ..PresenceConfig::default()
+    })
+    .unwrap();
+    e.ingest(ev(PresenceEvidenceKind::Lease, 0, Some(100)), t(0))
+        .unwrap();
+    e.ingest(
+        ev(PresenceEvidenceKind::RouterAssociation, 1, Some(100)),
+        t(1),
+    )
+    .unwrap();
+    assert_eq!(e.state(id()), Some(PresenceState::Quiet));
+    assert!(e.evaluate(id(), t(50)).unwrap().is_none());
+    assert_eq!(e.state(id()), Some(PresenceState::Quiet));
+    let before = e.snapshot();
+    assert_eq!(
+        e.ingest(ev(PresenceEvidenceKind::Traffic, 50, None), t(50)),
+        Err(PresenceError::Capacity("evidence"))
+    );
+    assert_eq!(e.snapshot(), before);
 }
 #[test]
 fn capacity_retention_metadata_and_serialization_are_deterministic() {
@@ -481,6 +597,7 @@ fn capacity_retention_metadata_and_serialization_are_deterministic() {
     let mut retained = PresenceEngine::new(PresenceConfig {
         retention: Duration::seconds(40),
         correction_window: Duration::seconds(30),
+        confirmation_window: Duration::seconds(30),
         max_evidence_per_device: 2,
         ..PresenceConfig::default()
     })
