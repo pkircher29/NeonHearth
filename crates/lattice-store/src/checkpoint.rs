@@ -169,24 +169,62 @@ impl M2StateRepository {
         &self,
         input_hash: [u8; 32],
     ) -> Result<Option<StoredDiscoveryCommit>, CheckpointError> {
-        let row: Option<(String, Vec<u8>, String)> = sqlx::query_as(
-            "SELECT source,result_summary,committed_at FROM discovery_commits WHERE input_hash=?",
+        let row: Option<(String, Vec<u8>, String, Vec<u8>, i64, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT source,result_summary,committed_at,result_sha256,checkpoint_sequence,source_fingerprint,commit_digest FROM discovery_commits WHERE input_hash=?",
         )
         .bind(input_hash.to_vec())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(source, result_summary, committed_at)| {
-            Ok(StoredDiscoveryCommit {
-                source,
-                result_summary,
-                committed_at: parse_timestamp(
-                    &committed_at,
-                    "discovery commit committed_at",
-                    CheckpointError::Corrupt,
-                )?,
-            })
-        })
-        .transpose()
+        let Some((
+            source,
+            result_summary,
+            committed_at,
+            result_sha256,
+            checkpoint_sequence,
+            source_fingerprint,
+            commit_digest,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        check_string_with(
+            &source,
+            &self.config,
+            "discovery source",
+            CheckpointError::Corrupt,
+        )?;
+        if result_summary.len() > self.config.max_discovery_summary_bytes
+            || Sha256::digest(&result_summary).as_slice() != result_sha256.as_slice()
+            || commit_digest.len() != 32
+        {
+            return Err(CheckpointError::Corrupt(
+                "discovery commit checksum or bound invalid".into(),
+            ));
+        }
+        serde_json::from_slice::<serde_json::Value>(&result_summary).map_err(|e| {
+            CheckpointError::Corrupt(format!("discovery result summary is not JSON: {e}"))
+        })?;
+        let checkpoint = self.load(&source_fingerprint).await?.ok_or_else(|| {
+            CheckpointError::Corrupt("discovery record exists without checkpoint".into())
+        })?;
+        if checkpoint.commit_sequence != checkpoint_sequence {
+            return Err(CheckpointError::Corrupt(
+                "discovery checkpoint sequence mismatch".into(),
+            ));
+        }
+        Ok(Some(StoredDiscoveryCommit {
+            source,
+            result_summary,
+            committed_at: parse_timestamp(
+                &committed_at,
+                "discovery commit committed_at",
+                CheckpointError::Corrupt,
+            )?,
+        }))
+    }
+    pub fn flow_repository(&self, max_batch: usize) -> Result<FlowRepository, CheckpointError> {
+        FlowRepository::new(self.pool.clone(), max_batch)
+            .map_err(|e| CheckpointError::Invalid(e.to_string()))
     }
     pub async fn commit(&self, input: CommitInput) -> Result<(), CheckpointError> {
         validate_input(&self.config, &input)?;
@@ -265,7 +303,7 @@ impl M2StateRepository {
             insert_transition(&mut tx, transition).await?;
         }
         if let Some(discovery) = &input.discovery {
-            sqlx::query("INSERT INTO discovery_commits(input_hash,source,committed_at,result_summary,commit_digest) VALUES(?,?,?,?,?)").bind(discovery.input_hash.to_vec()).bind(&discovery.source).bind(discovery.committed_at.to_rfc3339()).bind(&discovery.result_summary).bind(digest).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO discovery_commits(input_hash,source,committed_at,result_summary,commit_digest,result_sha256,checkpoint_sequence,source_fingerprint) VALUES(?,?,?,?,?,?,?,?)").bind(discovery.input_hash.to_vec()).bind(&discovery.source).bind(discovery.committed_at.to_rfc3339()).bind(&discovery.result_summary).bind(digest).bind(Sha256::digest(&discovery.result_summary).to_vec()).bind(input.checkpoint.commit_sequence).bind(&input.checkpoint.source_fingerprint).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -332,7 +370,7 @@ impl M2StateRepository {
             insert_transition(&mut tx, t).await?;
         }
         if let Some(d) = &input.discovery {
-            sqlx::query("INSERT INTO discovery_commits(input_hash,source,committed_at,result_summary,commit_digest) VALUES(?,?,?,?,?)").bind(d.input_hash.to_vec()).bind(&d.source).bind(d.committed_at.to_rfc3339()).bind(&d.result_summary).bind(digest).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO discovery_commits(input_hash,source,committed_at,result_summary,commit_digest,result_sha256,checkpoint_sequence,source_fingerprint) VALUES(?,?,?,?,?,?,?,?)").bind(d.input_hash.to_vec()).bind(&d.source).bind(d.committed_at.to_rfc3339()).bind(&d.result_summary).bind(digest).bind(Sha256::digest(&d.result_summary).to_vec()).bind(input.checkpoint.commit_sequence).bind(&input.checkpoint.source_fingerprint).execute(&mut *tx).await?;
         }
         flow.apply_in_transaction(&mut tx, changes, now)
             .await

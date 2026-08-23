@@ -8,7 +8,7 @@ use lattice_service::discovery::{
     DiscoveryObservation, DiscoveryPipelineOutcome, DiscoverySources, PersistentDiscoveryPipeline,
 };
 use lattice_store::connect_path;
-use lattice_store::{FlowRepository, M2StateRepository, connect_memory};
+use lattice_store::{M2StateRepository, connect_memory};
 use tempfile::tempdir;
 
 fn at(second: i64) -> chrono::DateTime<Utc> {
@@ -65,13 +65,12 @@ async fn reopen_restores_checkpoint_and_duplicate_is_still_inert() -> anyhow::Re
     {
         let pool = connect_path(&path).await?;
         let repo = M2StateRepository::new(pool.clone());
-        let flow = FlowRepository::new(pool, 32)?;
         let mut pipeline = PersistentDiscoveryPipeline::open(
             repo,
-            flow,
             sources()?,
             [id(1), id(2)].into_iter(),
             Default::default(),
+            32,
             32,
         )
         .await?;
@@ -84,13 +83,12 @@ async fn reopen_restores_checkpoint_and_duplicate_is_still_inert() -> anyhow::Re
     }
     let pool = connect_path(&path).await?;
     let repo = M2StateRepository::new(pool.clone());
-    let flow = FlowRepository::new(pool.clone(), 32)?;
     let mut reopened = PersistentDiscoveryPipeline::open(
         repo.clone(),
-        flow,
         sources()?,
         [id(9)].into_iter(),
         Default::default(),
+        32,
         32,
     )
     .await?;
@@ -126,10 +124,8 @@ async fn reopen_restores_checkpoint_and_duplicate_is_still_inert() -> anyhow::Re
 async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<()> {
     let pool = connect_memory().await?;
     let repo = M2StateRepository::new(pool.clone());
-    let flow = FlowRepository::new(pool.clone(), 32)?;
     let mut pipeline = PersistentDiscoveryPipeline::open(
         repo,
-        flow,
         DiscoverySources::sensor(
             1,
             "sensor-a",
@@ -137,6 +133,7 @@ async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<
         )?,
         [id(1)].into_iter(),
         Default::default(),
+        32,
         32,
     )
     .await?;
@@ -149,7 +146,6 @@ async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<
         .await?;
     let err = PersistentDiscoveryPipeline::open(
         M2StateRepository::new(pool.clone()),
-        FlowRepository::new(pool, 32)?,
         DiscoverySources::sensor(
             1,
             "sensor-a",
@@ -158,15 +154,14 @@ async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<
         [id(2)].into_iter(),
         Default::default(),
         32,
+        32,
     )
     .await;
     assert!(err.is_err());
     let pool = connect_memory().await?;
     let repo = M2StateRepository::new(pool.clone());
-    let flow = FlowRepository::new(pool.clone(), 32)?;
     let mut pipeline = PersistentDiscoveryPipeline::open(
         repo,
-        flow,
         DiscoverySources::sensor(
             1,
             "sensor-a",
@@ -175,6 +170,7 @@ async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<
         [id(1)].into_iter(),
         Default::default(),
         32,
+        32,
     )
     .await?;
     pipeline
@@ -182,7 +178,6 @@ async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<
         .await?;
     let mismatch = PersistentDiscoveryPipeline::open(
         M2StateRepository::new(pool.clone()),
-        FlowRepository::new(pool, 32)?,
         DiscoverySources::sensor(
             1,
             "renamed-sensor",
@@ -190,6 +185,7 @@ async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<
         )?,
         [id(2)].into_iter(),
         Default::default(),
+        32,
         32,
     )
     .await;
@@ -220,10 +216,8 @@ fn rollup(device_id: DeviceId, t: chrono::DateTime<Utc>) -> RollupChange {
 async fn persistent_pipeline_commits_and_duplicate_does_not_advance() -> anyhow::Result<()> {
     let pool = connect_memory().await?;
     let repo = M2StateRepository::new(pool.clone());
-    let flow = FlowRepository::new(pool.clone(), 32)?;
     let mut pipeline = PersistentDiscoveryPipeline::open(
         repo.clone(),
-        flow,
         DiscoverySources::sensor(
             1,
             "sensor-a",
@@ -231,6 +225,7 @@ async fn persistent_pipeline_commits_and_duplicate_does_not_advance() -> anyhow:
         )?,
         [id(1), id(2)].into_iter(),
         Default::default(),
+        32,
         32,
     )
     .await?;

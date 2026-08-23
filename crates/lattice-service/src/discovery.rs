@@ -187,10 +187,10 @@ pub enum DiscoveryPipelineOutcome {
 impl PersistentDiscoveryPipeline {
     pub async fn open(
         state: M2StateRepository,
-        flow: FlowRepository,
         sources: DiscoverySources,
         remaining_ids: impl Iterator<Item = DeviceId> + Send,
         live: lattice_sensor::live::LiveConfig,
+        flow_max_batch: usize,
         max_live_rows: usize,
     ) -> Result<Self, DiscoveryError> {
         let fingerprint = sources.fingerprint();
@@ -205,6 +205,7 @@ impl PersistentDiscoveryPipeline {
             }
             None => (DiscoveryPipeline::with_sources(remaining_ids, sources)?, 0),
         };
+        let flow = state.flow_repository(flow_max_batch)?;
         Ok(Self {
             pipeline,
             live: lattice_sensor::live::FlowLiveAdapter::new(live, max_live_rows)?,
@@ -234,6 +235,7 @@ impl PersistentDiscoveryPipeline {
             }));
         }
         let facts = input.facts.clone();
+        let source_name = input.presence_source.clone();
         let mut staged_pipeline = self.pipeline.clone();
         let result = staged_pipeline.observe(input, arrival)?;
         if changes.iter().any(|c| match c {
@@ -282,7 +284,7 @@ impl PersistentDiscoveryPipeline {
             transitions,
             discovery: Some(DiscoveryCommit {
                 input_hash,
-                source: result.device_id.to_string(),
+                source: source_name,
                 result_summary: summary,
                 committed_at: arrival,
             }),
