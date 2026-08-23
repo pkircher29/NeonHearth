@@ -1,7 +1,7 @@
 use crate::FlowRepository;
 use chrono::{DateTime, Utc};
 use lattice_domain::{DeviceId, EvidenceFact, EvidenceFamily, PresenceChanged, PresenceState};
-use lattice_sensor::flow::RollupChange;
+use lattice_sensor::{flow::RollupChange, neighbor::LinkAddress};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, SqlitePool, Transaction};
@@ -259,6 +259,43 @@ impl M2StateRepository {
             result_summary,
             committed_at,
         }))
+    }
+
+    pub async fn lookup_link_layer_device(
+        &self,
+        address: LinkAddress,
+        source: &str,
+    ) -> Result<Option<DeviceId>, CheckpointError> {
+        check_string(source, &self.config, "identity source")?;
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(
+            "SELECT DISTINCT device_id FROM evidence WHERE family='link_layer' AND fact_key='mac' AND source=? AND fact_value=? LIMIT 2",
+        )
+        .bind(source)
+        .bind(address.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut devices = rows.into_iter().map(|(id,)| {
+            let id = id.ok_or_else(|| {
+                CheckpointError::Corrupt(
+                    "identity evidence contains an invalid device identifier".into(),
+                )
+            })?;
+            DeviceId::parse(&id).map_err(|_| {
+                CheckpointError::Corrupt(
+                    "identity evidence contains an invalid device identifier".into(),
+                )
+            })
+        });
+        let first = devices.next().transpose()?;
+        match (first, devices.next()) {
+            (None, None) => Ok(None),
+            (Some(id), None) => Ok(Some(id)),
+            (Some(_), Some(Ok(_))) => Err(CheckpointError::Corrupt(
+                "identity evidence is ambiguous".into(),
+            )),
+            (Some(_), Some(Err(error))) => Err(error),
+            (None, Some(_)) => unreachable!(),
+        }
     }
     pub fn flow_repository(&self, max_batch: usize) -> Result<FlowRepository, CheckpointError> {
         FlowRepository::new(self.pool.clone(), max_batch)

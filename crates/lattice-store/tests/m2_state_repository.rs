@@ -4,6 +4,7 @@ use lattice_domain::{DeviceId, EvidenceFact, EvidenceFamily, PresenceChanged, Pr
 use lattice_sensor::flow::{
     DestinationCategory, Protocol, Resolution, Rollup, RollupChange, RollupKey,
 };
+use lattice_sensor::neighbor::LinkAddress;
 use lattice_store::{
     CheckpointError, CheckpointInput, CommitInput, DeviceProjection, DiscoveryCommit,
     EvidenceProjection, FlowRepository, M2StateRepository, connect_path,
@@ -15,6 +16,97 @@ fn time(second: i64) -> chrono::DateTime<Utc> {
 }
 fn device() -> DeviceId {
     DeviceId::parse("018f47a0-9b5c-7a22-8a33-112233445599").unwrap()
+}
+fn link() -> LinkAddress {
+    LinkAddress::try_from([0x02, 0, 0, 0, 0, 1]).unwrap()
+}
+
+#[tokio::test]
+async fn link_layer_identity_lookup_returns_none_for_no_match() -> anyhow::Result<()> {
+    let repo = M2StateRepository::new(lattice_store::connect_memory().await?);
+    assert_eq!(repo.lookup_link_layer_device(link(), "mdns").await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn link_layer_identity_lookup_handles_unique_repeated_ambiguous_and_corrupt_rows()
+-> anyhow::Result<()> {
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool.clone());
+    let mac = link().to_string();
+    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at) VALUES(?,?,?)")
+        .bind(device().to_string())
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO evidence(device_id,family,source,fact_key,fact_value,confidence,observed_at) VALUES(?,?,?,?,?,?,?)")
+        .bind(device().to_string()).bind("link_layer").bind("mdns").bind("mac").bind(&mac).bind(1.0).bind("2026-01-01T00:00:00Z").execute(&pool).await?;
+    assert_eq!(
+        repo.lookup_link_layer_device(link(), "mdns").await?,
+        Some(device())
+    );
+    sqlx::query("INSERT INTO evidence(device_id,family,source,fact_key,fact_value,confidence,observed_at) VALUES(?,?,?,?,?,?,?)")
+        .bind(device().to_string()).bind("link_layer").bind("mdns").bind("mac").bind(&mac).bind(0.9).bind("2026-01-02T00:00:00Z").execute(&pool).await?;
+    assert_eq!(
+        repo.lookup_link_layer_device(link(), "mdns").await?,
+        Some(device())
+    );
+    let other = DeviceId::parse("018f47a0-9b5c-7a22-8a33-112233445598").unwrap();
+    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at) VALUES(?,?,?)")
+        .bind(other.to_string())
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO evidence(device_id,family,source,fact_key,fact_value,confidence,observed_at) VALUES(?,?,?,?,?,?,?)").bind(other.to_string()).bind("link_layer").bind("mdns").bind("mac").bind(&mac).bind(1.0).bind("2026-01-03T00:00:00Z").execute(&pool).await?;
+    assert!(matches!(
+        repo.lookup_link_layer_device(link(), "mdns").await,
+        Err(CheckpointError::Corrupt(_))
+    ));
+    sqlx::query("INSERT INTO evidence(device_id,family,source,fact_key,fact_value,confidence,observed_at) VALUES(NULL,?,?,?,?,?,?)")
+        .bind("link_layer").bind("mdns").bind("mac").bind(&mac).bind(1.0).bind("2026-01-04T00:00:00Z")
+        .execute(&pool)
+        .await?;
+    assert!(matches!(
+        repo.lookup_link_layer_device(link(), "mdns").await,
+        Err(CheckpointError::Corrupt(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn link_layer_identity_lookup_survives_reopen_and_migration_is_indexed() -> anyhow::Result<()>
+{
+    let dir = tempdir()?;
+    let path = dir.path().join("identity.db");
+    let pool = connect_path(&path).await?;
+    lattice_store::InstallRepository::new(pool.clone())
+        .initialize(time(0))
+        .await?;
+    let repo = M2StateRepository::new(pool.clone());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT schema_version FROM install_state WHERE singleton=1")
+            .fetch_one(&pool)
+            .await?,
+        4
+    );
+    let indexes: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_index_list('evidence')")
+        .fetch_all(&pool)
+        .await?;
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "evidence_link_layer_identity_idx")
+    );
+    drop(repo);
+    drop(pool);
+    let reopened = M2StateRepository::new(connect_path(&path).await?);
+    assert_eq!(
+        reopened.lookup_link_layer_device(link(), "mdns").await?,
+        None
+    );
+    Ok(())
 }
 fn input(sequence: i64, hash: [u8; 32]) -> CommitInput {
     let at = time(1_700_000_000 + sequence);
@@ -465,12 +557,12 @@ async fn migration_sets_current_version_and_enforces_m2_foreign_keys_and_indexes
     let install = lattice_store::InstallRepository::new(pool.clone())
         .initialize(time(0))
         .await?;
-    assert_eq!(install.schema_version, 3);
+    assert_eq!(install.schema_version, 4);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT schema_version FROM install_state WHERE singleton=1")
             .fetch_one(&pool)
             .await?,
-        3
+        4
     );
     let indexes: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_index_list('evidence')")
         .fetch_all(&pool)
