@@ -278,11 +278,18 @@ impl PresenceEngine {
                 return Err(PresenceError::InvalidCheckpoint("duplicate or capacity"));
             }
             let mut last = 0;
+            let mut previous_state = if x.evicted_through.is_some() {
+                None
+            } else {
+                Some(PresenceState::Unknown)
+            };
+            let mut retained = HashMap::new();
             for t in &x.history {
                 if t.transition_id == 0
                     || !global_ids.insert(t.transition_id)
                     || t.transition_id <= last
                     || t.device_id != x.device_id
+                    || previous_state.is_some_and(|state| t.from != state)
                     || t.occurred_at
                         > x.last_evaluation
                             .checked_add_signed(cfg.future_skew)
@@ -292,13 +299,10 @@ impl PresenceEngine {
                 }
                 last = t.transition_id;
                 max_id = max_id.max(t.transition_id);
-                if t.correction_of
-                    .is_some_and(|v| v == t.transition_id || v >= t.transition_id)
-                {
-                    return Err(PresenceError::InvalidCheckpoint("correction"));
-                }
                 if t.trigger.source.is_empty()
                     || t.trigger.source.len() > cfg.max_source_len
+                    || !cfg.trusted_sources.iter().any(|s| s == &t.trigger.source)
+                    || t.trigger.kind == PresenceEvidenceKind::Evaluation
                     || t.trigger.arrival_at < t.trigger.observed_at
                     || t.trigger
                         .valid_until
@@ -311,6 +315,23 @@ impl PresenceEngine {
                 {
                     return Err(PresenceError::InvalidCheckpoint("trigger"));
                 }
+                retained.insert(t.transition_id, t);
+                previous_state = Some(t.to);
+            }
+            for t in &x.history {
+                if let Some(target) = t.correction_of {
+                    let Some(target) = retained.get(&target) else {
+                        return Err(PresenceError::InvalidCheckpoint("correction target"));
+                    };
+                    if target.transition_id >= t.transition_id
+                        || target.to != PresenceState::Offline
+                    {
+                        return Err(PresenceError::InvalidCheckpoint("correction target"));
+                    }
+                }
+            }
+            if x.history.last().is_some_and(|t| t.to != x.state) {
+                return Err(PresenceError::InvalidCheckpoint("final state"));
             }
             for e in &x.evidence {
                 if e.device_id != x.device_id
@@ -329,8 +350,33 @@ impl PresenceEngine {
                     return Err(PresenceError::InvalidCheckpoint("evidence time"));
                 }
             }
-            if x.evicted_through.is_some_and(|v| v > max_id) {
+            if x.evicted_through.is_some_and(|v| v >= c.next_transition)
+                || x.evicted_through
+                    .zip(x.history.first().map(|t| t.transition_id))
+                    .is_some_and(|(evicted, first)| evicted >= first)
+            {
                 return Err(PresenceError::InvalidCheckpoint("cursor"));
+            }
+            if x.blocked && x.enforcement_clock.is_none()
+                || x.impaired && x.impairment_clock.is_none()
+                || x.contradictory && x.contradiction_clock.is_none()
+                || x.enforcement_clock
+                    .is_some_and(|clock| clock > x.last_evaluation)
+                || x.impairment_clock
+                    .is_some_and(|clock| clock > x.last_evaluation)
+                || x.contradiction_clock
+                    .is_some_and(|clock| clock > x.last_evaluation)
+            {
+                return Err(PresenceError::InvalidCheckpoint("control state"));
+            }
+            if x.history.iter().any(|transition| {
+                matches!(
+                    transition.trigger.kind,
+                    PresenceEvidenceKind::EnforcementBlocked
+                        | PresenceEvidenceKind::EnforcementUnblocked
+                ) && x.enforcement_clock.is_none()
+            }) {
+                return Err(PresenceError::InvalidCheckpoint("enforcement trigger"));
             }
             devices.insert(
                 x.device_id,
@@ -915,10 +961,19 @@ fn confirmations(
     }))
 }
 fn push_history(d: &mut DevicePresence, t: PresenceTransition, max: usize) {
-    if d.history.len() == max
-        && let Some(evicted) = d.history.pop_front()
-    {
+    while d.history.len() >= max {
+        let Some(evicted) = d.history.pop_front() else {
+            break;
+        };
         d.evicted_through = Some(evicted.transition_id);
+        while d
+            .history
+            .front()
+            .is_some_and(|next| next.correction_of == Some(evicted.transition_id))
+        {
+            let dependent = d.history.pop_front().expect("front was checked");
+            d.evicted_through = Some(dependent.transition_id);
+        }
     }
     d.history.push_back(t)
 }

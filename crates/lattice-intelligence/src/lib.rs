@@ -339,17 +339,19 @@ impl IdentityEngine {
             let Some(p) = proposals.iter().find(|p| p.id == a.proposal_id) else {
                 return Err(IdentityError::InvalidCheckpoint("audit target"));
             };
-            let ok = match (
-                prior
-                    .get(&a.proposal_id)
-                    .copied()
-                    .unwrap_or(ProposalStatus::Pending),
-                a.action,
-            ) {
-                (ProposalStatus::Pending, ProposalStatus::Accepted | ProposalStatus::Rejected)
-                | (ProposalStatus::Accepted, ProposalStatus::Undone) => true,
-                _ => false,
-            };
+            let ok = matches!(
+                (
+                    prior
+                        .get(&a.proposal_id)
+                        .copied()
+                        .unwrap_or(ProposalStatus::Pending),
+                    a.action,
+                ),
+                (
+                    ProposalStatus::Pending,
+                    ProposalStatus::Accepted | ProposalStatus::Rejected
+                ) | (ProposalStatus::Accepted, ProposalStatus::Undone)
+            );
             if !ok
                 || (p.status != a.action
                     && !(a.action == ProposalStatus::Accepted
@@ -358,6 +360,12 @@ impl IdentityEngine {
                 return Err(IdentityError::InvalidCheckpoint("audit chronology"));
             }
             prior.insert(a.proposal_id, a.action);
+        }
+        for p in &proposals {
+            let audited = prior.get(&p.id).copied().unwrap_or(ProposalStatus::Pending);
+            if audited != p.status {
+                return Err(IdentityError::InvalidCheckpoint("proposal audit state"));
+            }
         }
         for (id, e) in &edges {
             let Some(p) = proposals.iter().find(|p| p.id == *id) else {
@@ -369,6 +377,21 @@ impl IdentityEngine {
                 || !matches!(p.status, ProposalStatus::Accepted | ProposalStatus::Undone)
             {
                 return Err(IdentityError::InvalidCheckpoint("edge status"));
+            }
+        }
+        for p in &proposals {
+            let edge = edges.get(&p.id);
+            match p.status {
+                ProposalStatus::Accepted if edge.is_none() => {
+                    return Err(IdentityError::InvalidCheckpoint("accepted edge"));
+                }
+                ProposalStatus::Undone if edge.is_none() => {
+                    return Err(IdentityError::InvalidCheckpoint("undone edge"));
+                }
+                ProposalStatus::Pending | ProposalStatus::Rejected if edge.is_some() => {
+                    return Err(IdentityError::InvalidCheckpoint("unexpected edge"));
+                }
+                _ => {}
             }
         }
         Ok(Self {
