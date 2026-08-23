@@ -14,14 +14,23 @@ pub struct PlatformPaths {
 }
 
 pub fn platform_paths(platform: Platform, base: impl AsRef<Path>) -> PlatformPaths {
-    let product_dir = match platform {
-        Platform::Windows => "NeonHearth",
-        Platform::Linux => "neonhearth",
+    let state_dir = match platform {
+        Platform::Windows => {
+            let base = base.as_ref().to_string_lossy().replace('/', "\\");
+            PathBuf::from(format!(r"{}\NeonHearth", base.trim_end_matches('\\')))
+        }
+        Platform::Linux => base.as_ref().join("neonhearth"),
     };
-    let state_dir = base.as_ref().join(product_dir);
+    let (database, backups) = match platform {
+        Platform::Windows => (
+            PathBuf::from(format!(r"{}\lattice.db", state_dir.display())),
+            PathBuf::from(format!(r"{}\backups", state_dir.display())),
+        ),
+        Platform::Linux => (state_dir.join("lattice.db"), state_dir.join("backups")),
+    };
     PlatformPaths {
-        database: state_dir.join("lattice.db"),
-        backups: state_dir.join("backups"),
+        database,
+        backups,
         state_dir,
     }
 }

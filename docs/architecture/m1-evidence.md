@@ -1,10 +1,10 @@
 # M1 evidence
 
-Evidence recorded 2026-08-23 at commit `5d2a8fb4c2245afdc90c3a76b794d68baeed7808` (before this documentation change). Counts and statuses below are from commands run for this gate.
+Evidence recorded 2026-08-23 at commit `ef71911a679d714550c3fc06997ca16423b44f7e`, the code commit containing the platform tests. Counts and statuses below are from commands run for this gate; this corrected evidence document is a subsequent fix commit.
 
 | Invariant | Exact command | Observed result |
 |---|---|---|
-| Install invariant | `cargo test --workspace --locked` | PASS: 39 passed, 0 failed |
+| Install invariant | `cargo test --workspace --locked` | PASS: 33 passed, 0 failed |
 | API auth | `cargo test -p lattice-service --test api_contract --locked` | PASS: 7 passed, 0 failed |
 | WS resume/tickets | `cargo test -p lattice-service --test websocket_resume --locked` | PASS: 5 passed, 0 failed |
 | Platform paths | `cargo test -p lattice-service --test platform_contract --locked` | PASS: 3 passed, 0 failed |
@@ -22,4 +22,4 @@ npm --prefix apps/desktop run test -- --run
 npm --prefix apps/desktop run build
 ```
 
-The live smoke used `LATTICE_SERVICE_TOKEN=owner-token-0123456789abcdefghijkl`. The evidence table is updated with the observed date, commit, counts, and status from the same run.
+The live smoke used an ephemeral in-memory test token supplied only to the local test process. The evidence table is updated with the observed date, commit, counts, and status from the same run.

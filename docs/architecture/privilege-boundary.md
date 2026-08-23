@@ -1,6 +1,6 @@
 # NeonHearth privilege boundary
 
-`lattice-service` is the only privileged component. It owns capture, probes, the vault, target-bound audits, and router mutation. The Svelte/Tauri UI never performs raw capture, opens sockets, handles router secrets, or launches arbitrary processes.
+`lattice-service` is the only privileged component. It owns capture, probes, the vault, target-bound audits, and router mutation. The Svelte/Tauri UI may use authenticated service REST/WebSocket APIs, but never performs raw capture, opens raw or arbitrary sockets, handles router secrets, or launches arbitrary processes.
 
 On Windows, the service runs under a dedicated service identity and uses Npcap. On Linux, the service receives only `CAP_NET_RAW` and `CAP_NET_ADMIN` when full mode is enabled. The UI runs as the signed-in user.
 
