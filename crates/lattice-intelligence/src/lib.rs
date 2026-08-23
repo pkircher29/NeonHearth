@@ -259,9 +259,22 @@ impl IdentityEngine {
             }
             let tmp = IdentityEngine::new(cfg.clone(), std::iter::empty())?;
             tmp.prepare(&mut fs)?;
+            if fs
+                .iter()
+                .any(|f| f.expires_at.is_some_and(|x| x < f.observed_at))
+            {
+                return Err(IdentityError::InvalidCheckpoint("fact time"));
+            }
             facts.insert(id, fs);
         }
         let fact_ids: HashSet<_> = facts.keys().copied().collect();
+        if fact_ids
+            .len()
+            .checked_add(ids.len())
+            .is_none_or(|n| n > cfg.max_devices)
+        {
+            return Err(IdentityError::InvalidCheckpoint("device capacity"));
+        }
         let mut proposals = c.proposals;
         let mut edges = HashMap::new();
         for p in &mut proposals {
@@ -304,7 +317,15 @@ impl IdentityEngine {
             if o.sequence == 0
                 || o.sequence <= seq
                 || !fact_ids.contains(&o.device_id)
-                || o.key.len() > cfg.max_value_len
+                || o.key.is_empty()
+                || o.key.len() > cfg.max_key_len
+                || o.value
+                    .as_ref()
+                    .is_some_and(|v| v.is_empty() || v.len() > cfg.max_value_len)
+                || !matches!(
+                    o.key.as_str(),
+                    "vendor" | "class" | "model" | "firmware" | "name" | "room"
+                )
             {
                 return Err(IdentityError::InvalidCheckpoint("owner audit"));
             }
@@ -313,21 +334,39 @@ impl IdentityEngine {
         if c.next_owner <= seq || c.next_proposal <= last {
             return Err(IdentityError::InvalidCheckpoint("next sequence"));
         }
+        let mut prior: HashMap<u64, ProposalStatus> = HashMap::new();
         for a in &c.audit {
             let Some(p) = proposals.iter().find(|p| p.id == a.proposal_id) else {
                 return Err(IdentityError::InvalidCheckpoint("audit target"));
             };
-            if p.status != a.action
-                && !(a.action == ProposalStatus::Undone && p.status == ProposalStatus::Undone)
+            let ok = match (
+                prior
+                    .get(&a.proposal_id)
+                    .copied()
+                    .unwrap_or(ProposalStatus::Pending),
+                a.action,
+            ) {
+                (ProposalStatus::Pending, ProposalStatus::Accepted | ProposalStatus::Rejected)
+                | (ProposalStatus::Accepted, ProposalStatus::Undone) => true,
+                _ => false,
+            };
+            if !ok
+                || (p.status != a.action
+                    && !(a.action == ProposalStatus::Accepted
+                        && p.status == ProposalStatus::Undone))
             {
-                return Err(IdentityError::InvalidCheckpoint("audit action"));
+                return Err(IdentityError::InvalidCheckpoint("audit chronology"));
             }
+            prior.insert(a.proposal_id, a.action);
         }
         for (id, e) in &edges {
             let Some(p) = proposals.iter().find(|p| p.id == *id) else {
                 return Err(IdentityError::InvalidCheckpoint("edge target"));
             };
-            if e.active != (p.status == ProposalStatus::Accepted) || e.a != p.left || e.b != p.right
+            if e.active != (p.status == ProposalStatus::Accepted)
+                || e.a != p.left
+                || e.b != p.right
+                || !matches!(p.status, ProposalStatus::Accepted | ProposalStatus::Undone)
             {
                 return Err(IdentityError::InvalidCheckpoint("edge status"));
             }

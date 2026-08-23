@@ -269,6 +269,7 @@ impl PresenceEngine {
         }
         let mut devices = HashMap::new();
         let mut max_id = 0;
+        let mut global_ids = std::collections::HashSet::new();
         for x in c.devices {
             if devices.contains_key(&x.device_id)
                 || x.evidence.len() > cfg.max_evidence_per_device
@@ -279,6 +280,7 @@ impl PresenceEngine {
             let mut last = 0;
             for t in &x.history {
                 if t.transition_id == 0
+                    || !global_ids.insert(t.transition_id)
                     || t.transition_id <= last
                     || t.device_id != x.device_id
                     || t.occurred_at
@@ -295,6 +297,20 @@ impl PresenceEngine {
                 {
                     return Err(PresenceError::InvalidCheckpoint("correction"));
                 }
+                if t.trigger.source.is_empty()
+                    || t.trigger.source.len() > cfg.max_source_len
+                    || t.trigger.arrival_at < t.trigger.observed_at
+                    || t.trigger
+                        .valid_until
+                        .is_some_and(|v| v < t.trigger.observed_at)
+                    || t.trigger.observed_at
+                        > t.trigger
+                            .arrival_at
+                            .checked_add_signed(cfg.future_skew)
+                            .ok_or(PresenceError::InvalidCheckpoint("time"))?
+                {
+                    return Err(PresenceError::InvalidCheckpoint("trigger"));
+                }
             }
             for e in &x.evidence {
                 if e.device_id != x.device_id
@@ -303,6 +319,14 @@ impl PresenceEngine {
                     || e.valid_until.is_some_and(|v| v < e.observed_at)
                 {
                     return Err(PresenceError::InvalidCheckpoint("evidence"));
+                }
+                if !cfg.trusted_sources.iter().any(|s| s == &e.source) {
+                    return Err(PresenceError::InvalidCheckpoint("source"));
+                }
+                if e.observed_at > x.last_evaluation
+                    || e.valid_until.is_some_and(|v| v < e.observed_at)
+                {
+                    return Err(PresenceError::InvalidCheckpoint("evidence time"));
                 }
             }
             if x.evicted_through.is_some_and(|v| v > max_id) {
