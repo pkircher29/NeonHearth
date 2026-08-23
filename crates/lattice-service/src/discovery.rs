@@ -154,6 +154,9 @@ impl DiscoveryPipeline {
             .0
             .get(&input.source_id)
             .ok_or(DiscoveryError::InvalidSource)?;
+        if input.candidate.is_some() && !input.facts.is_empty() {
+            return Err(DiscoveryError::InvalidSource);
+        }
         if !source.presence
             || input.presence_source != source.name
             || input

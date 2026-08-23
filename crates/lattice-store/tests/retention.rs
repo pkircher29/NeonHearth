@@ -36,7 +36,7 @@ async fn defaults_retain_24h_seconds_90d_minutes_and_conserve_compacted_bytes() 
     assert_eq!(policy.hours, None);
     let pool = connect_memory().await.unwrap();
     let repo = FlowRepository::new(pool, 100).unwrap();
-    let now = Utc.timestamp_opt(1_998_000, 0).single().unwrap();
+    let now = Utc.timestamp_opt(1_999_020, 0).single().unwrap();
     let old = now
         - Duration::hours(25)
         - Duration::seconds((now - Duration::hours(25)).timestamp().rem_euclid(60));
@@ -116,8 +116,8 @@ async fn default_ninety_day_cutoff_includes_complete_hours_but_not_bisected_pare
     let repo = FlowRepository::new(pool, 100).unwrap();
     let now = Utc.timestamp_opt(1_998_000, 0).single().unwrap();
     let cutoff = now - CompactionPolicy::default().minutes;
-    let full_hour = cutoff - Duration::hours(1);
-    let bisected_hour = cutoff;
+    let bisected_hour = cutoff - Duration::seconds(cutoff.timestamp().rem_euclid(3600));
+    let full_hour = bisected_hour - Duration::hours(1);
     repo.apply(
         &[
             RollupChange::Upsert(roll_at(Resolution::Minute, full_hour, 3)),
@@ -129,6 +129,11 @@ async fn default_ninety_day_cutoff_includes_complete_hours_but_not_bisected_pare
             RollupChange::Upsert(roll_at(
                 Resolution::Minute,
                 bisected_hour + Duration::minutes(1),
+                8,
+            )),
+            RollupChange::Upsert(roll_at(
+                Resolution::Minute,
+                bisected_hour + Duration::minutes(59),
                 9,
             )),
         ],
@@ -178,7 +183,7 @@ async fn default_ninety_day_cutoff_includes_complete_hours_but_not_bisected_pare
         .await
         .unwrap()
         .len(),
-        1
+        2
     );
     let later = now + Duration::hours(2);
     repo.compact(later, &CompactionPolicy::default())
@@ -191,8 +196,8 @@ async fn default_ninety_day_cutoff_includes_complete_hours_but_not_bisected_pare
     assert_eq!(
         bisected[0].bytes,
         ByteCount {
-            upload: 9,
-            download: 18
+            upload: 17,
+            download: 34
         }
     );
     assert!(

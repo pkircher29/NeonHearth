@@ -13,6 +13,8 @@ pub enum FlowStoreError {
     Invalid,
     #[error("capacity")]
     Capacity,
+    #[error("compaction parent conflicts with existing aggregate")]
+    CompactionConflict,
     #[error("integer overflow")]
     Overflow,
     #[error(transparent)]
@@ -242,6 +244,21 @@ async fn aggregate(
     cut: &DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<(), FlowStoreError> {
+    let (child, width, parent) = if seconds_to_minutes {
+        ("second", 60, "minute")
+    } else {
+        ("minute", 3600, "hour")
+    };
+    let conflict = format!(
+        "WITH grouped AS (SELECT strftime('%Y-%m-%dT%H:%M:%SZ',unixepoch(bucket)-((unixepoch(bucket)%{width}+{width})%{width}),'unixepoch') parent_bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain,SUM(upload) upload,SUM(download) download,CASE WHEN MIN(coverage)=MAX(coverage) THEN MIN(coverage) ELSE 'estimated' END coverage FROM flow_rollups WHERE resolution='{child}' AND unixepoch(bucket)-((unixepoch(bucket)%{width}+{width})%{width})+{width}<=unixepoch(?) GROUP BY 1,device_id,protocol,destination,interface,metadata_ip,metadata_domain) SELECT COUNT(*) FROM grouped g JOIN flow_rollups p ON p.resolution='{parent}' AND p.bucket=g.parent_bucket AND p.device_id=g.device_id AND p.protocol=g.protocol AND p.destination=g.destination AND p.interface=g.interface AND p.metadata_ip=g.metadata_ip AND p.metadata_domain=g.metadata_domain WHERE p.upload<>g.upload OR p.download<>g.download OR p.coverage<>g.coverage"
+    );
+    let conflicts: i64 = sqlx::query_scalar(&conflict)
+        .bind(cut.to_rfc3339())
+        .fetch_one(&mut **tx)
+        .await?;
+    if conflicts > 0 {
+        return Err(FlowStoreError::CompactionConflict);
+    }
     let sql = if seconds_to_minutes {
         "INSERT INTO flow_rollups(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain,upload,download,coverage,updated_at) SELECT 'minute',strftime('%Y-%m-%dT%H:%M:%SZ',unixepoch(bucket)-((unixepoch(bucket)%60+60)%60),'unixepoch'),device_id,protocol,destination,interface,metadata_ip,metadata_domain,SUM(upload),SUM(download),CASE WHEN MIN(coverage)=MAX(coverage) THEN MIN(coverage) ELSE 'estimated' END,? FROM flow_rollups WHERE resolution='second' AND unixepoch(bucket)-((unixepoch(bucket)%60+60)%60)+60<=unixepoch(?) GROUP BY 2,device_id,protocol,destination,interface,metadata_ip,metadata_domain ON CONFLICT(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain) DO NOTHING"
     } else {

@@ -410,7 +410,10 @@ async fn compaction_preserves_fuller_parent_and_floors_negative_epoch() {
         hours: None,
         max_rows: 20,
     };
-    repo.compact(t(61), &p).await.unwrap();
+    assert!(matches!(
+        repo.compact(t(61), &p).await,
+        Err(lattice_store::FlowStoreError::CompactionConflict)
+    ));
     let m = repo
         .range(Resolution::Minute, t(-60), t(-60), 20)
         .await

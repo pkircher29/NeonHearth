@@ -219,3 +219,13 @@ fn source_provenance_and_router_family_are_rejected_before_mutation() {
     assert!(p.observe(input, at).is_err());
     assert_eq!(p.presence_state(id(1)), None);
 }
+
+#[test]
+fn candidate_binding_cannot_poison_identity_with_unrelated_facts() {
+    let mut p = DiscoveryPipeline::new([id(1), id(2)].into_iter()).unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+    let mut input = obs(at, PresenceEvidenceKind::Traffic);
+    input.candidate = Some(id(2));
+    assert!(p.observe(input, at).is_err());
+    assert_eq!(p.presence_state(id(2)), None);
+}
