@@ -161,6 +161,7 @@ struct Edge {
     b: DeviceId,
     active: bool,
 }
+#[derive(Clone)]
 pub struct IdentityEngine {
     cfg: IdentityConfig,
     ids: VecDeque<DeviceId>,

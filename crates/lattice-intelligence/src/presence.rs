@@ -198,6 +198,7 @@ struct DevicePresence {
     contradiction_clock: Option<DateTime<Utc>>,
     evicted_through: Option<u64>,
 }
+#[derive(Clone)]
 pub struct PresenceEngine {
     cfg: PresenceConfig,
     devices: HashMap<DeviceId, DevicePresence>,

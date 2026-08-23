@@ -1,7 +1,11 @@
 use chrono::{Duration, TimeZone, Utc};
 use lattice_domain::{DeviceId, EvidenceFact, EvidenceFamily, PresenceState};
 use lattice_intelligence::presence::PresenceEvidenceKind;
+use lattice_sensor::flow::{
+    DestinationCategory, Protocol, Resolution, Rollup, RollupChange, RollupKey,
+};
 use lattice_service::discovery::{DiscoveryObservation, DiscoveryPipeline};
+use lattice_store::{FlowIngestor, FlowRepository, connect_memory};
 
 fn id(n: u8) -> DeviceId {
     DeviceId::parse(&format!("018f47a0-9b5c-7a22-8a33-1122334455{n:02x}")).unwrap()
@@ -20,6 +24,7 @@ fn fact(family: EvidenceFamily, key: &str, value: &str, at: chrono::DateTime<Utc
 }
 fn obs(at: chrono::DateTime<Utc>, kind: PresenceEvidenceKind) -> DiscoveryObservation {
     DiscoveryObservation {
+        source_id: 1,
         candidate: None,
         facts: vec![
             fact(EvidenceFamily::LinkLayer, "mac", "00:11:22:33:44:55", at),
@@ -88,6 +93,7 @@ fn departure_requires_hysteresis_and_late_evidence_corrects_it() {
     let _ = pipeline
         .observe(
             DiscoveryObservation {
+                source_id: 1,
                 candidate: Some(device),
                 facts: vec![],
                 presence_source: "sensor-a".into(),
@@ -101,6 +107,7 @@ fn departure_requires_hysteresis_and_late_evidence_corrects_it() {
     let departed = pipeline
         .observe(
             DiscoveryObservation {
+                source_id: 1,
                 candidate: Some(device),
                 facts: vec![],
                 presence_source: "sensor-a".into(),
@@ -127,4 +134,60 @@ fn departure_requires_hysteresis_and_late_evidence_corrects_it() {
         )
         .unwrap();
     assert!(late.presence.iter().any(|t| t.correction_of.is_some()));
+}
+
+#[tokio::test]
+async fn flow_boundary_emits_honest_local_only_bandwidth() {
+    let start = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+    let mut pipeline = DiscoveryPipeline::new([id(1), id(2)].into_iter()).unwrap();
+    let joined = pipeline
+        .observe(obs(start, PresenceEvidenceKind::Traffic), start)
+        .unwrap();
+    let device = joined.device_id;
+    let roll = Rollup {
+        key: RollupKey {
+            resolution: Resolution::Second,
+            bucket: start,
+            device_id: device,
+            protocol: Protocol::Tcp,
+            destination: DestinationCategory::Internet,
+            interface: 2,
+            metadata: None,
+        },
+        bytes: lattice_domain::ByteCount {
+            upload: 12,
+            download: 24,
+        },
+        coverage: lattice_domain::Coverage::LocalOnly,
+        metadata: None,
+    };
+    let mut flow = FlowIngestor::new(
+        FlowRepository::new(connect_memory().await.unwrap(), 20).unwrap(),
+        Default::default(),
+        20,
+    )
+    .unwrap();
+    let (_, payload) = pipeline
+        .observe_with_flow(
+            obs(
+                start + Duration::seconds(1),
+                PresenceEvidenceKind::ProbeSuccess,
+            ),
+            &[RollupChange::Upsert(roll)],
+            0,
+            start + Duration::seconds(1),
+            &mut flow,
+        )
+        .await
+        .unwrap();
+    let frame = payload.expect("live bandwidth frame");
+    match frame {
+        lattice_domain::EventPayload::BandwidthFrame(frame) => assert!(
+            frame
+                .samples
+                .iter()
+                .all(|s| s.coverage == lattice_domain::Coverage::LocalOnly)
+        ),
+        _ => panic!("unexpected event"),
+    }
 }

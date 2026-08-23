@@ -8,16 +8,66 @@ use lattice_intelligence::presence::{
     PresenceTransition,
 };
 use lattice_intelligence::{IdentityConfig, IdentityEngine, IdentityError};
+use lattice_sensor::flow::RollupChange;
+use lattice_store::FlowIngestor;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
 pub struct DiscoveryObservation {
+    pub source_id: u64,
     pub candidate: Option<DeviceId>,
     pub facts: Vec<EvidenceFact>,
     pub presence_source: String,
     pub presence_kind: PresenceEvidenceKind,
     pub observed_at: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiscoverySource {
+    pub id: u64,
+    pub name: String,
+    pub families: Vec<lattice_domain::EvidenceFamily>,
+    pub presence: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DiscoverySources(BTreeMap<u64, DiscoverySource>);
+impl DiscoverySources {
+    pub fn new(sources: Vec<DiscoverySource>) -> Result<Self, DiscoveryError> {
+        if sources.is_empty()
+            || sources.iter().any(|s| {
+                s.id == 0
+                    || s.name.is_empty()
+                    || s.families.is_empty()
+                    || s.families
+                        .contains(&lattice_domain::EvidenceFamily::RouterHint)
+                        && s.families.len() != 1
+            })
+        {
+            return Err(DiscoveryError::InvalidSource);
+        }
+        let mut map = BTreeMap::new();
+        for s in sources {
+            if map.insert(s.id, s).is_some() {
+                return Err(DiscoveryError::InvalidSource);
+            }
+        }
+        Ok(Self(map))
+    }
+    pub fn sensor(
+        id: u64,
+        name: impl Into<String>,
+        families: Vec<lattice_domain::EvidenceFamily>,
+    ) -> Result<Self, DiscoveryError> {
+        Self::new(vec![DiscoverySource {
+            id,
+            name: name.into(),
+            families,
+            presence: true,
+        }])
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -34,18 +84,41 @@ pub enum DiscoveryError {
     Identity(#[from] IdentityError),
     #[error("presence: {0}")]
     Presence(#[from] PresenceError),
+    #[error("invalid or unregistered discovery source")]
+    InvalidSource,
+    #[error("flow: {0}")]
+    Flow(#[from] lattice_store::FlowStoreError),
 }
 
 pub struct DiscoveryPipeline {
     identity: IdentityEngine,
     presence: PresenceEngine,
+    sources: DiscoverySources,
 }
 
 impl DiscoveryPipeline {
     pub fn new(ids: impl Iterator<Item = DeviceId> + Send) -> Result<Self, DiscoveryError> {
+        Self::with_sources(
+            ids,
+            DiscoverySources::sensor(
+                1,
+                "sensor-a",
+                vec![
+                    lattice_domain::EvidenceFamily::LinkLayer,
+                    lattice_domain::EvidenceFamily::Service,
+                    lattice_domain::EvidenceFamily::Naming,
+                ],
+            )?,
+        )
+    }
+    pub fn with_sources(
+        ids: impl Iterator<Item = DeviceId> + Send,
+        sources: DiscoverySources,
+    ) -> Result<Self, DiscoveryError> {
         Ok(Self {
             identity: IdentityEngine::new(IdentityConfig::default(), ids)?,
             presence: PresenceEngine::new(PresenceConfig::default())?,
+            sources,
         })
     }
 
@@ -54,10 +127,23 @@ impl DiscoveryPipeline {
         input: DiscoveryObservation,
         arrival: DateTime<Utc>,
     ) -> Result<DiscoveryResult, DiscoveryError> {
-        let id = self
-            .identity
-            .observe_at(input.candidate, input.facts, input.observed_at)?;
-        let presence = self.presence.ingest_events(
+        let source = self
+            .sources
+            .0
+            .get(&input.source_id)
+            .ok_or(DiscoveryError::InvalidSource)?;
+        if !source.presence
+            || input
+                .facts
+                .iter()
+                .any(|f| !source.families.contains(&f.family))
+        {
+            return Err(DiscoveryError::InvalidSource);
+        }
+        let mut identity = self.identity.clone();
+        let mut presence_engine = self.presence.clone();
+        let id = identity.observe_at(input.candidate, input.facts, input.observed_at)?;
+        let presence = presence_engine.ingest_events(
             PresenceEvidence {
                 device_id: id,
                 source: input.presence_source,
@@ -67,17 +153,32 @@ impl DiscoveryPipeline {
             },
             arrival,
         )?;
-        let identification = self.identity.identification_at(id, input.observed_at)?;
+        let identification = identity.identification_at(id, input.observed_at)?;
         let events = presence
             .iter()
             .map(|t| EventPayload::PresenceChanged(PresenceChanged::from(t)))
             .collect();
+        self.identity = identity;
+        self.presence = presence_engine;
         Ok(DiscoveryResult {
             device_id: id,
             identification,
             presence,
             events,
         })
+    }
+
+    pub async fn observe_with_flow(
+        &mut self,
+        input: DiscoveryObservation,
+        changes: &[RollupChange],
+        tick_ms: u64,
+        arrival: DateTime<Utc>,
+        flow: &mut FlowIngestor,
+    ) -> Result<(DiscoveryResult, Option<EventPayload>), DiscoveryError> {
+        let result = self.observe(input, arrival)?;
+        let payload = flow.apply(changes, tick_ms, arrival).await?;
+        Ok((result, payload))
     }
 
     pub fn evaluate(
