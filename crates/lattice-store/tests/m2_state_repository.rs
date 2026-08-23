@@ -272,6 +272,39 @@ async fn concurrent_first_sequences_return_a_typed_conflict() -> anyhow::Result<
 }
 
 #[tokio::test]
+async fn reversed_correction_batch_persists_in_id_order_and_retries_idempotently()
+-> anyhow::Result<()> {
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool.clone());
+    repo.commit(input(1, [31; 32])).await?;
+    let mut batch = input(2, [32; 32]);
+    let mut correction = batch.transitions[0].clone();
+    correction.transition_id = 3;
+    correction.from = PresenceState::Online;
+    correction.to = PresenceState::Quiet;
+    correction.correction_of = Some(2);
+    batch.transitions.push(correction);
+    batch.transitions.reverse();
+    repo.commit(batch.clone()).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM presence_transitions")
+            .fetch_one(&pool)
+            .await?,
+        3
+    );
+    batch.transitions.reverse();
+    repo.commit(batch).await?;
+    assert_eq!(
+        repo.load("sensor-config-v1")
+            .await?
+            .unwrap()
+            .commit_sequence,
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn migration_sets_current_version_and_enforces_m2_foreign_keys_and_indexes()
 -> anyhow::Result<()> {
     let pool = lattice_store::connect_memory().await?;

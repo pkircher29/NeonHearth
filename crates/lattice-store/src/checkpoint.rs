@@ -228,7 +228,9 @@ impl M2StateRepository {
         for evidence in &input.evidence {
             insert_evidence(&mut tx, evidence).await?;
         }
-        for transition in &input.transitions {
+        let mut transitions: Vec<_> = input.transitions.iter().collect();
+        transitions.sort_by_key(|transition| transition.transition_id);
+        for transition in transitions {
             insert_transition(&mut tx, transition).await?;
         }
         if let Some(discovery) = &input.discovery {
