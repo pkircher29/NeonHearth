@@ -31,3 +31,9 @@ DHCP decoding accepts at most 64 options, 128 bytes per DUID, and eight IAADDRs;
 singleton identity/FQDN options may not be duplicated. These offline-PCAP limits
 prevent input-to-output amplification. A future live-capture path will enforce the
 same budgets incrementally while streaming rather than accumulating a PCAP.
+
+DHCPv6 identity assignment is message-direction aware. Direct client messages may
+use their packet source only for the client; direct server messages may use it only
+for the server. Relay-forward/reply envelopes are decoded to a maximum nesting of
+two, with exactly one Relay Message option and a 16 KiB encapsulated-message limit;
+relay link identities never become encapsulated client or server identities.

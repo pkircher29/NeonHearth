@@ -165,10 +165,22 @@ fn dh6() -> Vec<u8> {
 fn dh6_request() -> Vec<u8> {
     let mut d = vec![1, 0, 0, 1];
     opt(1, &[0, 1, 0, 1, 0, 0, 0, 1, 0, 17, 34, 51, 68, 85], &mut d);
+    opt(
+        2,
+        &[0, 1, 0, 1, 0, 0, 0, 2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        &mut d,
+    );
     opt(3, &[0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0], &mut d);
     let mut f = vec![0];
     name("lab-v6.example.test", &mut f);
     opt(39, &f, &mut d);
+    d
+}
+fn dh6_relay(message_type: u8, inner: &[u8]) -> Vec<u8> {
+    let mut d = vec![message_type, 0];
+    d.extend([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    d.extend(S6);
+    opt(9, inner, &mut d);
     d
 }
 fn dh4() -> Vec<u8> {
@@ -276,6 +288,24 @@ fn main() {
                     udp(547, 546, &dh6()),
                 ),
                 [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            ),
+            source_mac(
+                v6(
+                    17,
+                    [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2],
+                    udp(547, 547, &dh6_relay(12, &dh6_request())),
+                ),
+                [0x66, 0x55, 0x44, 0x33, 0x22, 0x11],
+            ),
+            source_mac(
+                v6(
+                    17,
+                    [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2],
+                    udp(547, 547, &dh6_relay(13, &dh6())),
+                ),
+                [0x66, 0x55, 0x44, 0x33, 0x22, 0x11],
             ),
         ],
     );

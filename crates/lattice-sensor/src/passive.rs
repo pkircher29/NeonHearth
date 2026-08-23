@@ -26,6 +26,7 @@ pub const MAX_NORMALIZED_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_DHCP_OPTIONS: usize = 64;
 const MAX_DUID_BYTES: usize = 128;
 const MAX_IAADDRS: usize = 8;
+const MAX_RELAY_MESSAGE_BYTES: usize = 16 * 1024;
 const DEFAULT_TTL: i64 = 300;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PassiveOptions {
@@ -674,13 +675,75 @@ fn dhcp6(
     src: IpAddr,
     q: &[u8],
 ) -> Result<Vec<PassiveObservation>, PassiveParseError> {
+    let mut budget = Dhcp6Budget::default();
+    decode_dhcp6(i, t, m, Some(src), q, 0, &mut budget)
+}
+fn decode_dhcp6(
+    i: &str,
+    t: DateTime<Utc>,
+    link_mac: Option<String>,
+    source_ip: Option<IpAddr>,
+    q: &[u8],
+    relay_depth: u8,
+    budget: &mut Dhcp6Budget,
+) -> Result<Vec<PassiveObservation>, PassiveParseError> {
     if q.len() < 4 {
         return Err(PassiveParseError::Truncated);
     }
+    let message_type = q[0];
+    if matches!(message_type, 12 | 13) {
+        if relay_depth >= 2 || q.len() < 34 || q[1] > 32 {
+            return Err(PassiveParseError::Metadata);
+        }
+        let mut at = 34;
+        let mut relay_message = None;
+        while at < q.len() {
+            budget.option_count += 1;
+            if budget.option_count > MAX_DHCP_OPTIONS || at + 4 > q.len() {
+                return Err(PassiveParseError::Metadata);
+            }
+            let code = u16::from_be_bytes([q[at], q[at + 1]]);
+            let len = usize::from(u16::from_be_bytes([q[at + 2], q[at + 3]]));
+            at += 4;
+            if at + len > q.len() {
+                return Err(PassiveParseError::Truncated);
+            }
+            if code == 9 {
+                if relay_message.is_some() || len == 0 || len > MAX_RELAY_MESSAGE_BYTES {
+                    return Err(PassiveParseError::Metadata);
+                }
+                relay_message = Some(&q[at..at + len]);
+            }
+            at += len;
+        }
+        return decode_dhcp6(
+            i,
+            t,
+            None,
+            None,
+            relay_message.ok_or(PassiveParseError::Metadata)?,
+            relay_depth + 1,
+            budget,
+        );
+    }
+    let client_origin = matches!(message_type, 1 | 3 | 4 | 5 | 6 | 8 | 9 | 11);
+    let server_origin = matches!(message_type, 2 | 7 | 10);
+    if !client_origin && !server_origin {
+        return Err(PassiveParseError::Metadata);
+    }
     let mut fields = Dhcp6Fields::default();
-    parse_dhcp6_options(&q[4..], &mut fields, 0)?;
-    let client_ip = fields.client_ip.or((q[0] != 7).then_some(src));
-    let mut out = observation(i, t, fields.client_mac, client_ip, "dhcpv6", fields.client)?;
+    parse_dhcp6_options(&q[4..], &mut fields, 0, budget)?;
+    let client_mac = fields
+        .client_mac
+        .or_else(|| client_origin.then_some(link_mac.clone()).flatten());
+    let client_ip = fields
+        .client_ip
+        .or_else(|| client_origin.then_some(source_ip).flatten());
+    let mut out = if fields.client.is_empty() {
+        Vec::new()
+    } else {
+        observation(i, t, client_mac, client_ip, "dhcpv6", fields.client)?
+    };
     if !fields.server.is_empty() {
         fields.server.push((
             "service",
@@ -688,7 +751,19 @@ fn dhcp6(
             EvidenceFamily::Service,
             3600,
         ));
-        out.extend(observation(i, t, m, Some(src), "dhcpv6", fields.server)?);
+        let (server_mac, server_ip) = if server_origin {
+            (link_mac, source_ip)
+        } else {
+            (None, None)
+        };
+        out.extend(observation(
+            i,
+            t,
+            server_mac,
+            server_ip,
+            "dhcpv6",
+            fields.server,
+        )?);
     }
     Ok(out)
 }
@@ -698,20 +773,28 @@ struct Dhcp6Fields {
     server: Vec<Val>,
     client_mac: Option<String>,
     client_ip: Option<IpAddr>,
-    option_count: usize,
-    iaaddr_count: usize,
     seen_client: bool,
     seen_server: bool,
     seen_fqdn: bool,
 }
-fn parse_dhcp6_options(q: &[u8], v: &mut Dhcp6Fields, depth: u8) -> Result<(), PassiveParseError> {
+#[derive(Default)]
+struct Dhcp6Budget {
+    option_count: usize,
+    iaaddr_count: usize,
+}
+fn parse_dhcp6_options(
+    q: &[u8],
+    v: &mut Dhcp6Fields,
+    depth: u8,
+    budget: &mut Dhcp6Budget,
+) -> Result<(), PassiveParseError> {
     if depth > 3 {
         return Err(PassiveParseError::Metadata);
     }
     let mut at = 0;
     while at < q.len() {
-        v.option_count += 1;
-        if v.option_count > MAX_DHCP_OPTIONS {
+        budget.option_count += 1;
+        if budget.option_count > MAX_DHCP_OPTIONS {
             return Err(PassiveParseError::Metadata);
         }
         if at + 4 > q.len() {
@@ -739,10 +822,10 @@ fn parse_dhcp6_options(q: &[u8], v: &mut Dhcp6Fields, depth: u8) -> Result<(), P
                     .push(("server_duid", hex(z), EvidenceFamily::Addressing, 3600));
             }
             2 => return Err(PassiveParseError::Metadata),
-            3 if n >= 12 => parse_dhcp6_options(&z[12..], v, depth + 1)?,
+            3 if n >= 12 => parse_dhcp6_options(&z[12..], v, depth + 1, budget)?,
             5 if n >= 24 => {
-                v.iaaddr_count += 1;
-                if v.iaaddr_count > MAX_IAADDRS {
+                budget.iaaddr_count += 1;
+                if budget.iaaddr_count > MAX_IAADDRS {
                     return Err(PassiveParseError::Metadata);
                 }
                 let a = Ipv6Addr::from(
@@ -1007,7 +1090,7 @@ fn soap(
                     ResolveResult::Bound(Namespace(uri)) => Some(uri.to_vec()),
                     _ => None,
                 };
-                qname_stack.push((e.local_name().as_ref().to_vec(), namespace));
+                qname_stack.push((e.name().as_ref().to_vec(), namespace));
                 let namespace_is = |expected: &[u8]| matches!(resolved, ResolveResult::Bound(Namespace(uri)) if uri == expected);
                 let is_wsd = namespace_is(WSD09) || namespace_is(WSD05);
                 match local.as_ref() {
@@ -1098,8 +1181,7 @@ fn soap(
                 };
                 let (local, start_namespace) =
                     qname_stack.pop().ok_or(PassiveParseError::Metadata)?;
-                if local.as_slice() != e.local_name().as_ref()
-                    || start_namespace.as_deref() != namespace
+                if local.as_slice() != e.name().as_ref() || start_namespace.as_deref() != namespace
                 {
                     return Err(PassiveParseError::Metadata);
                 }

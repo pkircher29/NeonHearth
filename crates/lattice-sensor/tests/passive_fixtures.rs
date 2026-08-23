@@ -129,16 +129,18 @@ fn every_fixture_normalizes_sanitized_metadata() {
             .unwrap();
         assert_eq!(
             obs.len(),
-            if matches!(*name, "dhcpv4" | "dhcpv6") {
-                3
-            } else {
-                1
+            match *name {
+                "dhcpv4" => 3,
+                "dhcpv6" => 8,
+                _ => 1,
             }
         );
         for one in &obs {
             assert_eq!(one.protocol, *name);
             assert_eq!(one.interface, "fixture0");
-            assert!(one.subject_mac.is_some());
+            if *name != "dhcpv6" {
+                assert!(one.subject_mac.is_some());
+            }
             assert!(
                 one.facts
                     .iter()
@@ -681,7 +683,7 @@ fn dhcp_client_and_server_identities_are_separate_observations() {
         }));
         let server = observations
             .iter()
-            .find(|o| o.facts.iter().any(|f| f.key == "service"))
+            .find(|o| o.subject_ip.is_some() && o.facts.iter().any(|f| f.key == "service"))
             .unwrap();
         assert_eq!(server.subject_mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
         assert_eq!(
@@ -710,6 +712,105 @@ fn dhcp_client_and_server_identities_are_separate_observations() {
             }
         );
     }
+}
+
+#[test]
+fn dhcpv6_direction_and_relay_context_never_cross_identity_subjects() {
+    let observations = OfflinePassiveAdapter
+        .ingest_pcap(
+            "x",
+            &fs::read(fixtures().join("dhcpv6.pcap")).unwrap(),
+            &PassiveOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(observations.len(), 8);
+    assert!(
+        observations
+            .iter()
+            .all(|o| o.subject_mac.as_deref() != Some("66:55:44:33:22:11"))
+    );
+    for one in &observations {
+        let client = one.facts.iter().any(|f| f.key == "client_duid");
+        let server = one.facts.iter().any(|f| f.key == "server_duid");
+        assert!(!(client && server));
+        if client {
+            assert_ne!(
+                one.subject_ip.map(|x| x.to_string()).as_deref(),
+                Some("2001:db8::1")
+            );
+        }
+    }
+    let referenced: Vec<_> = observations
+        .iter()
+        .filter(|o| o.facts.iter().any(|f| f.key == "server_duid") && o.subject_ip.is_none())
+        .collect();
+    assert!(referenced.len() >= 3);
+    assert!(referenced.iter().all(|o| o.subject_mac.is_none()));
+    let direct = observations
+        .iter()
+        .find(|o| o.facts.iter().any(|f| f.key == "server_duid") && o.subject_ip.is_some())
+        .unwrap();
+    assert_eq!(direct.subject_ip.unwrap().to_string(), "2001:db8::1");
+    assert_eq!(direct.subject_mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+}
+
+fn relay_message(kind: u8, inner: &[u8]) -> Vec<u8> {
+    let mut q = vec![kind, 0];
+    q.extend([0u8; 32]);
+    q.extend([0, 9]);
+    q.extend((inner.len() as u16).to_be_bytes());
+    q.extend(inner);
+    q
+}
+
+#[test]
+fn dhcpv6_relay_headers_messages_and_recursion_are_bounded() {
+    let missing = vec![12, 0];
+    assert!(
+        lattice_sensor::PassiveAdapter::normalize(
+            &OfflinePassiveAdapter,
+            "x",
+            chrono::Utc::now(),
+            &udp_frame(547, 547, &missing),
+            &PassiveOptions::default()
+        )
+        .is_err()
+    );
+    let inner = [1, 0, 0, 1];
+    let mut duplicate = relay_message(12, &inner);
+    duplicate.extend([0, 9, 0, 4, 1, 0, 0, 1]);
+    assert!(
+        lattice_sensor::PassiveAdapter::normalize(
+            &OfflinePassiveAdapter,
+            "x",
+            chrono::Utc::now(),
+            &udp_frame(547, 547, &duplicate),
+            &PassiveOptions::default()
+        )
+        .is_err()
+    );
+    let huge = relay_message(12, &vec![0u8; 16_385]);
+    assert!(
+        lattice_sensor::PassiveAdapter::normalize(
+            &OfflinePassiveAdapter,
+            "x",
+            chrono::Utc::now(),
+            &udp_frame(547, 547, &huge),
+            &PassiveOptions::default()
+        )
+        .is_err()
+    );
+    let nested = relay_message(12, &relay_message(12, &relay_message(12, &inner)));
+    assert!(
+        lattice_sensor::PassiveAdapter::normalize(
+            &OfflinePassiveAdapter,
+            "x",
+            chrono::Utc::now(),
+            &udp_frame(547, 547, &nested),
+            &PassiveOptions::default()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -892,6 +993,9 @@ fn xml_fields_reject_nested_or_detached_text_and_namespace_rebinding() {
         ),
         format!(
             "<s:Envelope {ns}><s:Body><d:ProbeMatch><d:Types>dn:Device</d:Scopes></d:ProbeMatch></s:Body></s:Envelope>"
+        ),
+        format!(
+            "<s:Envelope {ns} xmlns:a=\"http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01\" xmlns:b=\"http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01\"><s:Body><d:ProbeMatch><a:Types>dn:Device</b:Types></d:ProbeMatch></s:Body></s:Envelope>"
         ),
     ];
     for xml in cases {
