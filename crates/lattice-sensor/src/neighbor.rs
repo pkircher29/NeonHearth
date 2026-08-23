@@ -167,8 +167,8 @@ pub enum NeighborError {
 
 #[derive(Clone, Debug)]
 pub struct NeighborSnapshotConfig {
-    pub max_rows: usize,
-    pub allowed_interfaces: BTreeSet<InterfaceId>,
+    max_rows: usize,
+    allowed_interfaces: BTreeSet<InterfaceId>,
     max_raw_messages: usize,
 }
 impl NeighborSnapshotConfig {
@@ -200,6 +200,14 @@ impl NeighborSnapshotConfig {
 
     pub fn max_raw_messages(&self) -> usize {
         self.max_raw_messages
+    }
+
+    pub fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+
+    pub fn allowed_interfaces(&self) -> &BTreeSet<InterfaceId> {
+        &self.allowed_interfaces
     }
 }
 
@@ -264,7 +272,7 @@ fn decode_linux_message(
         return Ok(None);
     }
     let interface = InterfaceId::new(message.header.ifindex);
-    if !config.allowed_interfaces.contains(&interface) {
+    if !config.allowed_interfaces().contains(&interface) {
         return Ok(None);
     }
 
@@ -287,13 +295,11 @@ fn decode_linux_message(
                     return Err(NeighborError::Malformed);
                 }
                 if value.len() != 6 {
-                    return Ok(None);
+                    return Err(NeighborError::Malformed);
                 }
                 let mut bytes = [0; 6];
                 bytes.copy_from_slice(&value);
-                let Ok(address) = LinkAddress::try_from(bytes) else {
-                    return Ok(None);
-                };
+                let address = LinkAddress::try_from(bytes).map_err(|_| NeighborError::Malformed)?;
                 link_address = Some(address);
             }
             _ => {}
@@ -340,7 +346,7 @@ where
             .then(reachability_rank(a.reachability).cmp(&reachability_rank(b.reachability)))
     });
     rows.dedup();
-    if rows.len() > config.max_rows {
+    if rows.len() > config.max_rows() {
         return Err(NeighborError::Capacity);
     }
     Ok(rows)
@@ -796,11 +802,17 @@ mod tests {
             &[1, 0, 0, 0, 0, 1],
             NeighbourState::Reachable,
         );
-        assert!(
-            normalize_linux_messages(&snapshot_config(16), [invalid_length, multicast_link])
-                .unwrap()
-                .is_empty()
+        let broadcast_link = message(
+            2,
+            "192.168.1.1".parse().unwrap(),
+            &[0xff; 6],
+            NeighbourState::Reachable,
         );
+        for message in [invalid_length, multicast_link, broadcast_link] {
+            let error = normalize_linux_messages(&snapshot_config(16), [message]).unwrap_err();
+            assert_eq!(error, NeighborError::Malformed);
+            assert!(!format!("{error:?} {error}").contains("192.168.1"));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -824,8 +836,25 @@ mod tests {
             [first.clone(), second.clone(), first.clone(), second.clone()],
         )
         .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert!(rows.windows(2).all(|pair| pair[0].ip() <= pair[1].ip()));
+        assert_eq!(
+            rows,
+            vec![
+                NeighborRow::new(
+                    InterfaceId::new(2),
+                    "192.168.1.1".parse().unwrap(),
+                    LinkAddress::try_from([2, 0, 0, 0, 0, 1]).unwrap(),
+                    NeighborReachability::NoArp,
+                )
+                .unwrap(),
+                NeighborRow::new(
+                    InterfaceId::new(2),
+                    "192.168.1.2".parse().unwrap(),
+                    LinkAddress::try_from([2, 0, 0, 0, 0, 2]).unwrap(),
+                    NeighborReachability::Reachable,
+                )
+                .unwrap(),
+            ]
+        );
         assert_eq!(
             normalize_linux_messages(
                 &config,

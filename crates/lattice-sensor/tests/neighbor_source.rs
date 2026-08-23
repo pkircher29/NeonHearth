@@ -20,10 +20,21 @@ fn snapshot_config_rejects_zero_interface_allowlist_entry() {
     assert!(config.is_err());
 }
 
+#[test]
+fn snapshot_config_exposes_only_read_only_validated_limits() {
+    let allowed = BTreeSet::from([InterfaceId::new(2)]);
+    let config = NeighborSnapshotConfig::new(16, allowed.clone()).unwrap();
+    assert_eq!(config.max_rows(), 16);
+    assert_eq!(config.allowed_interfaces(), &allowed);
+    assert_eq!(config.max_raw_messages(), 64);
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn system_snapshot_smoke_test_uses_local_nonzero_interfaces() {
-    use lattice_sensor::neighbor::{NeighborSnapshotSource, SystemNeighborSnapshotSource};
+    use lattice_sensor::neighbor::{
+        NeighborError, NeighborSnapshotSource, SystemNeighborSnapshotSource,
+    };
 
     let allowed: BTreeSet<_> = pnet_datalink::interfaces()
         .into_iter()
@@ -33,13 +44,18 @@ async fn system_snapshot_smoke_test_uses_local_nonzero_interfaces() {
         return;
     }
     let config = NeighborSnapshotConfig::new(256, allowed.clone()).unwrap();
-    let rows = SystemNeighborSnapshotSource::new(config)
-        .snapshot()
-        .await
-        .unwrap();
-    assert!(rows.len() <= 256);
-    assert!(
-        rows.iter()
-            .all(|row| { row.interface().get() != 0 && allowed.contains(&row.interface()) })
-    );
+    match SystemNeighborSnapshotSource::new(config).snapshot().await {
+        Ok(rows) => {
+            assert!(rows.len() <= 256);
+            assert!(
+                rows.iter().all(|row| {
+                    row.interface().get() != 0 && allowed.contains(&row.interface())
+                })
+            );
+        }
+        // Some hosts expose non-Ethernet neighbor entries through a locally
+        // enumerated interface. Production must reject those malformed rows.
+        Err(NeighborError::Malformed) => {}
+        Err(error) => panic!("unexpected sanitized snapshot status: {error}"),
+    }
 }

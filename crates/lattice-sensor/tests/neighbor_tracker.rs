@@ -90,6 +90,27 @@ fn groups_sorts_and_confirms_changes() {
 }
 
 #[test]
+fn noarp_rows_are_present_and_confirmed() {
+    let mut tracker = NeighborTracker::new(NeighborTrackerConfig::default()).unwrap();
+    let row = row(
+        "192.168.1.2".parse().unwrap(),
+        mac(1),
+        NeighborReachability::NoArp,
+    );
+    assert!(matches!(
+        tracker
+            .observe(vec![row.clone()], at(1))
+            .unwrap()
+            .as_slice(),
+        [NeighborEvent::Appeared { .. }]
+    ));
+    assert!(matches!(
+        tracker.observe(vec![row], at(2)).unwrap().as_slice(),
+        [NeighborEvent::Confirmed { .. }]
+    ));
+}
+
+#[test]
 fn departure_debounce_and_reappearance() {
     let cfg = NeighborTrackerConfig {
         missed_snapshots_before_departure: 2,
