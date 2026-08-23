@@ -120,3 +120,44 @@ fn deterministic_frame_serde_and_coverage() {
     let j = serde_json::to_string(&EventPayload::BandwidthFrame(f)).unwrap();
     assert!(j.contains("bandwidth_frame") && j.contains("local-only"));
 }
+
+#[test]
+fn adapter_failure_is_atomic_and_retire_recovers_capacity() {
+    let mut a = FlowLiveAdapter::new(LiveConfig::default(), 1).unwrap();
+    a.apply(10, &[RollupChange::Upsert(roll(3))]).unwrap();
+    let before = a.cached_rollups();
+    assert_eq!(
+        a.apply(9, &[RollupChange::Correction(roll(8))]),
+        Err(LiveError::Clock)
+    );
+    assert_eq!(a.cached_rollups(), before);
+    let old = roll(3).key;
+    a.apply(
+        10,
+        &[RollupChange::Retire(Retirement {
+            key: old,
+            cache_only: true,
+        })],
+    )
+    .unwrap();
+    assert!(a.cached_rollups().is_empty());
+    let mut other = roll(4);
+    other.key.interface = 9;
+    a.apply(10, &[RollupChange::Upsert(other)]).unwrap();
+    assert_eq!(a.cached_rollups().len(), 1);
+}
+
+#[test]
+fn each_device_uses_its_own_latest_bucket() {
+    let mut a = FlowLiveAdapter::new(LiveConfig::default(), 4).unwrap();
+    let old = roll(3);
+    let mut newer = roll(5);
+    newer.key.device_id = d(2);
+    newer.key.bucket = t(2);
+    a.apply(0, &[RollupChange::Upsert(old), RollupChange::Upsert(newer)])
+        .unwrap();
+    let EventPayload::BandwidthFrame(f) = a.flush_payload(0, t(3)).unwrap().unwrap() else {
+        panic!()
+    };
+    assert_eq!(f.samples.len(), 2);
+}

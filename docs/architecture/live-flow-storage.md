@@ -2,7 +2,8 @@
 
 `FlowLiveAdapter` consumes validated current one-second rollup replacements. Upserts and
 corrections replace the same key before per-device aggregation, so corrections do not add bytes
-twice. Cache-only retirements never become traffic. The upstream flow engine has already selected
+twice. Cache-only retirements remove their live cache row without becoming traffic. Each device
+uses its own latest bucket. The upstream flow engine has already selected
 one authoritative visibility source for overlapping observations.
 
 `LiveCoalescer` uses caller-supplied monotonic millisecond ticks. It emits one global
@@ -17,7 +18,8 @@ cache retirement never deletes durable history. `protocol_rollups` is a nondupli
 view over this normalized table.
 
 Compaction defaults are exactly 24 hours for seconds, 90 days for minutes, and no automatic hour
-deletion. Only complete parent intervals at or before the cutoff are aggregated. Minute parents
+deletion; a configured hour duration is rejected because owner deletion is a separate future
+operation. Only complete parent intervals at or before the cutoff are aggregated. Minute parents
 are rebuilt from seconds and hour parents from minutes in the same transaction before eligible
 children are deleted. Repeating or restarting compaction is idempotent; a failure rolls back the
 whole bounded batch. Hours require explicit owner deletion, which D14 deliberately does not

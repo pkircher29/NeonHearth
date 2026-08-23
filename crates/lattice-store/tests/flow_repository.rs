@@ -135,6 +135,11 @@ fn retention_defaults_and_validation_are_exact() {
     let mut bad = p;
     bad.seconds = Duration::zero();
     assert!(bad.validate().is_err());
+    let unsupported = CompactionPolicy {
+        hours: Some(Duration::days(365)),
+        ..CompactionPolicy::default()
+    };
+    assert!(unsupported.validate().is_err());
 }
 #[tokio::test]
 async fn compaction_conserves_seconds_to_minutes_to_hours_and_is_repeatable() {
@@ -304,4 +309,114 @@ async fn integration_applies_durable_and_emits_replayable_frame() {
         .await
         .unwrap();
     assert_eq!(persisted[0].bytes.upload, 4);
+}
+
+#[tokio::test]
+async fn integration_live_failure_does_not_commit_durable_change() {
+    let pool = connect_memory().await.unwrap();
+    let repo = FlowRepository::new(pool.clone(), 10).unwrap();
+    let mut ingest = FlowIngestor::new(repo, LiveConfig::default(), 10).unwrap();
+    ingest
+        .apply(
+            &[RollupChange::Upsert(roll(
+                Resolution::Second,
+                1,
+                4,
+                Coverage::Complete,
+            ))],
+            10,
+            t(2),
+        )
+        .await
+        .unwrap();
+    assert!(
+        ingest
+            .apply(
+                &[RollupChange::Upsert(roll(
+                    Resolution::Second,
+                    2,
+                    8,
+                    Coverage::Complete
+                ))],
+                9,
+                t(3)
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        FlowRepository::new(pool, 10)
+            .unwrap()
+            .range(Resolution::Second, t(2), t(2), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn persistence_validates_metadata_alignment_and_updates_last_seen() {
+    let pool = connect_memory().await.unwrap();
+    let repo = FlowRepository::new(pool.clone(), 10).unwrap();
+    let mut bad = roll(Resolution::Minute, 1, 1, Coverage::Complete);
+    assert!(
+        repo.apply(&[RollupChange::Upsert(bad.clone())], t(2))
+            .await
+            .is_err()
+    );
+    bad.key.bucket = t(60);
+    bad.metadata = Some(DestinationMetadata {
+        ip: None,
+        domain: Some("example.com".into()),
+    });
+    assert!(
+        repo.apply(&[RollupChange::Upsert(bad)], t(61))
+            .await
+            .is_err()
+    );
+    repo.apply(
+        &[
+            RollupChange::Upsert(roll(Resolution::Second, 1, 1, Coverage::Complete)),
+            RollupChange::Upsert(roll(Resolution::Second, 2, 1, Coverage::Complete)),
+        ],
+        t(3),
+    )
+    .await
+    .unwrap();
+    let seen: String = sqlx::query_scalar("SELECT last_seen_at FROM devices WHERE device_id=?")
+        .bind(d().to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(seen.contains("00:00:02"));
+}
+
+#[tokio::test]
+async fn compaction_preserves_fuller_parent_and_floors_negative_epoch() {
+    let pool = connect_memory().await.unwrap();
+    let repo = FlowRepository::new(pool, 20).unwrap();
+    repo.apply(
+        &[
+            RollupChange::Upsert(roll(Resolution::Minute, -60, 50, Coverage::Complete)),
+            RollupChange::Upsert(roll(Resolution::Second, -1, 2, Coverage::Complete)),
+        ],
+        t(0),
+    )
+    .await
+    .unwrap();
+    let p = CompactionPolicy {
+        seconds: Duration::seconds(1),
+        minutes: Duration::days(1),
+        hours: None,
+        max_rows: 20,
+    };
+    repo.compact(t(61), &p).await.unwrap();
+    let m = repo
+        .range(Resolution::Minute, t(-60), t(-60), 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        (m.len(), m[0].key.bucket, m[0].bytes.upload),
+        (1, t(-60), 50)
+    );
 }

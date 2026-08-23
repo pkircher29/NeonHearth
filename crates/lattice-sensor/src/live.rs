@@ -45,6 +45,7 @@ pub enum LiveError {
     Overflow,
 }
 
+#[derive(Clone)]
 pub struct LiveCoalescer {
     cfg: LiveConfig,
     pending: BTreeMap<String, LiveSample>,
@@ -153,6 +154,7 @@ fn rate(bytes: u64, ms: u64) -> Result<u64, LiveError> {
 
 /// Replaces keyed current one-second rollups; corrections never double-add and cache retirements
 /// are ignored as traffic. Source overlap was already resolved by the flow engine.
+#[derive(Clone)]
 pub struct FlowLiveAdapter {
     current: BTreeMap<RollupKey, Rollup>,
     coalescer: LiveCoalescer,
@@ -170,6 +172,12 @@ impl FlowLiveAdapter {
         })
     }
     pub fn apply(&mut self, tick_ms: u64, changes: &[RollupChange]) -> Result<(), LiveError> {
+        let mut staged = self.clone();
+        staged.apply_inner(tick_ms, changes)?;
+        *self = staged;
+        Ok(())
+    }
+    fn apply_inner(&mut self, tick_ms: u64, changes: &[RollupChange]) -> Result<(), LiveError> {
         if changes.len() > self.coalescer.cfg.max_work {
             return Err(LiveError::Work);
         }
@@ -186,46 +194,59 @@ impl FlowLiveAdapter {
                     next.insert(r.key.clone(), r.clone());
                     traffic_changed = true;
                 }
+                RollupChange::Retire(r) if r.cache_only => {
+                    next.remove(&r.key);
+                }
                 _ => {}
             }
         }
         if !traffic_changed {
+            self.current = next;
             return Ok(());
         }
-        let latest = next.values().map(|r| r.key.bucket).max();
+        let latest: BTreeMap<String, DateTime<Utc>> =
+            next.values().fold(BTreeMap::new(), |mut m, r| {
+                m.entry(r.key.device_id.to_string())
+                    .and_modify(|x| *x = (*x).max(r.key.bucket))
+                    .or_insert(r.key.bucket);
+                m
+            });
         let mut by_device: BTreeMap<String, LiveSample> = BTreeMap::new();
-        if let Some(bucket) = latest {
-            for r in next.values().filter(|r| r.key.bucket == bucket) {
-                let k = r.key.device_id.to_string();
-                let x = by_device.entry(k).or_insert(LiveSample {
-                    device_id: r.key.device_id,
-                    delta: ByteCount {
-                        upload: 0,
-                        download: 0,
-                    },
-                    coverage: r.coverage,
-                    observed_at: bucket,
-                });
-                x.delta.upload = x
-                    .delta
-                    .upload
-                    .checked_add(r.bytes.upload)
-                    .ok_or(LiveError::Overflow)?;
-                x.delta.download = x
-                    .delta
-                    .download
-                    .checked_add(r.bytes.download)
-                    .ok_or(LiveError::Overflow)?;
-                x.coverage = if x.coverage == r.coverage {
-                    x.coverage
-                } else {
-                    Coverage::Estimated
-                };
+        for r in next.values() {
+            let bucket = r.key.bucket;
+            if latest.get(&r.key.device_id.to_string()) != Some(&bucket) {
+                continue;
             }
+            let k = r.key.device_id.to_string();
+            let x = by_device.entry(k).or_insert(LiveSample {
+                device_id: r.key.device_id,
+                delta: ByteCount {
+                    upload: 0,
+                    download: 0,
+                },
+                coverage: r.coverage,
+                observed_at: bucket,
+            });
+            x.delta.upload = x
+                .delta
+                .upload
+                .checked_add(r.bytes.upload)
+                .ok_or(LiveError::Overflow)?;
+            x.delta.download = x
+                .delta
+                .download
+                .checked_add(r.bytes.download)
+                .ok_or(LiveError::Overflow)?;
+            x.coverage = if x.coverage == r.coverage {
+                x.coverage
+            } else {
+                Coverage::Estimated
+            };
         }
-        self.current = next;
         self.coalescer
-            .replace(tick_ms, by_device.into_values().collect())
+            .replace(tick_ms, by_device.into_values().collect())?;
+        self.current = next;
+        Ok(())
     }
     pub fn flush_payload(
         &mut self,
@@ -236,5 +257,19 @@ impl FlowLiveAdapter {
             .coalescer
             .flush(tick_ms, now)?
             .map(EventPayload::BandwidthFrame))
+    }
+    pub fn staged_payload(
+        &self,
+        tick_ms: u64,
+        changes: &[RollupChange],
+        now: DateTime<Utc>,
+    ) -> Result<(Self, Option<EventPayload>), LiveError> {
+        let mut staged = self.clone();
+        staged.apply(tick_ms, changes)?;
+        let payload = staged.flush_payload(tick_ms, now)?;
+        Ok((staged, payload))
+    }
+    pub fn cached_rollups(&self) -> Vec<Rollup> {
+        self.current.values().cloned().collect()
     }
 }
