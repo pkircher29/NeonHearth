@@ -14,6 +14,7 @@ lattice-domain = { path = "../lattice-domain" }
 lattice-intelligence = { path = "../lattice-intelligence" }
 lattice-store = { path = "../lattice-store" }
 lattice-sensor = { path = "../lattice-sensor" }
+sha2.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

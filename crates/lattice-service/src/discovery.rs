@@ -10,6 +10,8 @@ use lattice_intelligence::presence::{
 use lattice_intelligence::{IdentityConfig, IdentityEngine, IdentityError};
 use lattice_sensor::flow::RollupChange;
 use lattice_store::FlowIngestor;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -35,6 +37,33 @@ pub struct DiscoverySource {
 #[derive(Clone, Debug, Default)]
 pub struct DiscoverySources(BTreeMap<u64, DiscoverySource>);
 impl DiscoverySources {
+    pub fn fingerprint(&self) -> String {
+        let rows: Vec<String> = self
+            .0
+            .values()
+            .map(|s| {
+                let mut families: Vec<_> = s.families.iter().map(|f| format!("{f:?}")).collect();
+                families.sort();
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    s.id,
+                    s.name,
+                    families.join(","),
+                    s.presence
+                )
+            })
+            .collect();
+        Sha256::digest(
+            format!(
+                "discovery-pipeline-v1\0identity-default-v1\0presence-default-v1\0{}",
+                rows.join("\n")
+            )
+            .as_bytes(),
+        )
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+    }
     pub fn new(sources: Vec<DiscoverySource>) -> Result<Self, DiscoveryError> {
         if sources.len() > 64 {
             return Err(DiscoveryError::InvalidSource);
@@ -90,6 +119,14 @@ pub struct DiscoveryResult {
     pub events: Vec<EventPayload>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveryPipelineCheckpoint {
+    pub version: u16,
+    pub source_fingerprint: String,
+    pub identity: lattice_intelligence::IdentityCheckpoint,
+    pub presence: lattice_intelligence::presence::PresenceCheckpoint,
+}
+
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
     #[error("identity: {0}")]
@@ -98,6 +135,8 @@ pub enum DiscoveryError {
     Presence(#[from] PresenceError),
     #[error("invalid or unregistered discovery source")]
     InvalidSource,
+    #[error("invalid discovery pipeline checkpoint")]
+    InvalidCheckpoint,
     #[error("flow: {0}")]
     Flow(#[from] lattice_store::FlowStoreError),
 }
@@ -140,6 +179,39 @@ impl DiscoveryPipeline {
         Ok(Self {
             identity: IdentityEngine::new(IdentityConfig::default(), ids)?,
             presence: PresenceEngine::new(pc)?,
+            sources,
+        })
+    }
+
+    pub fn checkpoint(&self) -> DiscoveryPipelineCheckpoint {
+        DiscoveryPipelineCheckpoint {
+            version: 1,
+            source_fingerprint: self.sources.fingerprint(),
+            identity: self.identity.checkpoint(),
+            presence: self.presence.checkpoint(),
+        }
+    }
+
+    pub fn from_checkpoint(
+        sources: DiscoverySources,
+        c: DiscoveryPipelineCheckpoint,
+    ) -> Result<Self, DiscoveryError> {
+        if c.version != 1 || c.source_fingerprint != sources.fingerprint() {
+            return Err(DiscoveryError::InvalidCheckpoint);
+        }
+        let trusted_sources = sources
+            .0
+            .values()
+            .filter(|s| s.presence)
+            .map(|s| s.name.clone())
+            .collect();
+        let config = PresenceConfig {
+            trusted_sources,
+            ..PresenceConfig::default()
+        };
+        Ok(Self {
+            identity: IdentityEngine::from_checkpoint(IdentityConfig::default(), c.identity)?,
+            presence: PresenceEngine::from_checkpoint(config, c.presence)?,
             sources,
         })
     }
