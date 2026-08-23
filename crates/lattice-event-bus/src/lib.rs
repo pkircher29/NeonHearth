@@ -74,6 +74,9 @@ impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.sender.subscribe()
     }
+    pub async fn current_sequence(&self) -> u64 {
+        self.state.lock().await.next_sequence.saturating_sub(1)
+    }
 
     pub async fn resume_after(&self, sequence: u64) -> Resume {
         let state = self.state.lock().await;

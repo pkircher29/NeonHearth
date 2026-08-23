@@ -1,0 +1,113 @@
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+    response::Response,
+};
+use chrono::Utc;
+use http_body_util::BodyExt;
+use lattice_domain::{EventPayload, ServiceStatus};
+use lattice_service::{AppState, app};
+use tower::ServiceExt;
+
+async fn body(response: Response) -> serde_json::Value {
+    serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+#[tokio::test]
+async fn health_is_public_and_reports_v1() {
+    let response = app(AppState::new("owner-token"))
+        .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body(response).await,
+        serde_json::json!({"status":"ok","api_version":"v1"})
+    );
+}
+
+#[tokio::test]
+async fn snapshot_requires_exact_bearer_token() {
+    for auth in [None, Some("Bearer wrong"), Some("Basic owner-token")] {
+        let mut request = Request::get("/api/v1/state");
+        if let Some(auth) = auth {
+            request = request.header("authorization", auth);
+        }
+        let response = app(AppState::new("owner-token"))
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get("www-authenticate").unwrap(),
+            "Bearer"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!String::from_utf8_lossy(&bytes).contains("owner-token"));
+    }
+    let response = app(AppState::new("owner-token"))
+        .oneshot(
+            Request::get("/api/v1/state")
+                .header("authorization", "Bearer owner-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body(response).await,
+        serde_json::json!({"sequence":0,"devices":[],"service_status":"ready"})
+    );
+}
+
+#[tokio::test]
+async fn snapshot_uses_current_event_watermark() {
+    let state = AppState::new("owner-token");
+    state
+        .events()
+        .publish(
+            Utc::now(),
+            EventPayload::ServiceStatus(ServiceStatus {
+                state: "ready".into(),
+                detail: "test".into(),
+            }),
+        )
+        .await;
+    let response = app(state)
+        .oneshot(
+            Request::get("/api/v1/state")
+                .header("authorization", "Bearer owner-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body(response).await["sequence"], 1);
+}
+
+#[tokio::test]
+async fn openapi_describes_public_and_protected_routes() {
+    let response = app(AppState::new("owner-token"))
+        .oneshot(
+            Request::get("/api/v1/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let doc = body(response).await;
+    assert!(doc["paths"]["/api/v1/health"].is_object());
+    assert!(doc["paths"]["/api/v1/state"].is_object());
+    assert!(
+        doc["paths"]["/api/v1/state"]["get"]["security"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["bearer_auth"].is_array())
+    );
+    assert_eq!(
+        doc["components"]["securitySchemes"]["bearer_auth"]["type"],
+        "http"
+    );
+}
