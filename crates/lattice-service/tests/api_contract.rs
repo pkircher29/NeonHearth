@@ -114,6 +114,36 @@ async fn snapshot_uses_current_event_watermark() {
 }
 
 #[tokio::test]
+async fn event_ticket_requires_bearer_and_is_a_uuid() {
+    for authorization in [None, Some("Bearer wrong")] {
+        let mut request = Request::post("/api/v1/events/ticket");
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        let response = app(AppState::new(TOKEN).expect("valid token"))
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let response = app(AppState::new(TOKEN).expect("valid token"))
+        .oneshot(
+            Request::post("/api/v1/events/ticket")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let ticket = body(response).await;
+    assert_eq!(ticket["expires_in_seconds"], 30);
+    assert!(uuid::Uuid::parse_str(ticket["ticket"].as_str().unwrap()).is_ok());
+    assert!(!ticket["ticket"].as_str().unwrap().contains(TOKEN));
+}
+
+#[tokio::test]
 async fn openapi_describes_public_and_protected_routes() {
     let response = app(AppState::new(TOKEN).expect("valid token"))
         .oneshot(
@@ -126,6 +156,14 @@ async fn openapi_describes_public_and_protected_routes() {
     let doc = body(response).await;
     assert!(doc["paths"]["/api/v1/health"].is_object());
     assert!(doc["paths"]["/api/v1/state"].is_object());
+    assert!(doc["paths"]["/api/v1/events/ticket"].is_object());
+    assert!(
+        doc["paths"]["/api/v1/events/ticket"]["post"]["security"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["bearer_auth"].is_array())
+    );
     assert!(
         doc["paths"]["/api/v1/state"]["get"]["security"]
             .as_array()
