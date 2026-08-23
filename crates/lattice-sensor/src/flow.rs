@@ -240,6 +240,13 @@ pub struct Rollup {
 pub enum RollupChange {
     Upsert(Rollup),
     Correction(Rollup),
+    Retire(Retirement),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Retirement {
+    pub key: RollupKey,
+    pub cache_only: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -261,18 +268,23 @@ struct SecondKey {
     interface: u32,
     metadata: Option<DestinationMetadata>,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Value {
-    bytes: ByteCount,
-    coverage: Coverage,
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct SourceSecondKey {
+    base: SecondKey,
+    source: FlowSourceId,
+}
+#[derive(Clone, Debug)]
+struct ReplayEntry {
+    arrival: DateTime<Utc>,
+    device: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct FlowEngine {
     cfg: FlowEngineConfig,
     sources: BTreeMap<FlowSourceId, VisibilityKind>,
-    seconds: BTreeMap<SecondKey, Value>,
-    replay: BTreeMap<ReplayId, DateTime<Utc>>,
+    seconds: BTreeMap<SourceSecondKey, ByteCount>,
+    replay: BTreeMap<ReplayId, ReplayEntry>,
     devices: BTreeSet<String>,
     last_arrival: Option<DateTime<Utc>>,
     watermark: Option<DateTime<Utc>>,
@@ -351,14 +363,17 @@ impl FlowEngine {
         }
         let epoch = o.event_time.timestamp();
         let close = epoch.checked_add(1).ok_or(FlowError::Overflow)?;
-        if let Some(w) = self.watermark {
-            let late_edge = DateTime::from_timestamp(close, 0)
-                .ok_or(FlowError::Overflow)?
-                .checked_add_signed(self.cfg.lateness)
-                .ok_or(FlowError::Overflow)?;
-            if w > late_edge {
-                return Err(FlowError::TooLate);
-            }
+        let late_edge = DateTime::from_timestamp(close, 0)
+            .ok_or(FlowError::Overflow)?
+            .checked_add_signed(self.cfg.lateness)
+            .ok_or(FlowError::Overflow)?;
+        if o.arrival_time > late_edge {
+            return Err(FlowError::TooLate);
+        }
+        if let Some(w) = self.watermark
+            && w > late_edge
+        {
+            return Err(FlowError::TooLate);
         }
         let cutoff = o
             .arrival_time
@@ -367,17 +382,18 @@ impl FlowEngine {
         let observe_work = self
             .replay
             .len()
-            .checked_mul(2)
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(self.seconds.len()))
             .and_then(|n| n.checked_add(1))
             .ok_or(FlowError::Overflow)?;
         if observe_work > self.cfg.max_work_per_call {
             return Err(FlowError::WorkLimit);
         }
-        let retained_replays = self.replay.values().filter(|at| **at >= cutoff).count();
+        let retained_replays = self.replay.values().filter(|e| e.arrival >= cutoff).count();
         if self
             .replay
             .get(&o.replay_id)
-            .is_some_and(|at| *at >= cutoff)
+            .is_some_and(|e| e.arrival >= cutoff)
         {
             return Err(FlowError::Replay);
         }
@@ -386,7 +402,18 @@ impl FlowEngine {
         }
         normalize_metadata(&mut o.metadata, &self.cfg)?;
         let device_key = o.device_id.to_string();
-        let key = SecondKey {
+        let mut active_devices: BTreeSet<String> = self
+            .seconds
+            .keys()
+            .map(|k| k.base.device.clone())
+            .chain(
+                self.replay
+                    .values()
+                    .filter(|e| e.arrival >= cutoff)
+                    .map(|e| e.device.clone()),
+            )
+            .collect();
+        let base = SecondKey {
             epoch,
             device: device_key.clone(),
             protocol: o.protocol,
@@ -394,93 +421,159 @@ impl FlowEngine {
             interface: o.interface,
             metadata: o.metadata,
         };
-        if !self.devices.contains(&device_key) && self.devices.len() >= self.cfg.max_devices {
+        let key = SourceSecondKey {
+            base,
+            source: o.source,
+        };
+        if !active_devices.contains(&device_key) && active_devices.len() >= self.cfg.max_devices {
             return Err(FlowError::Capacity);
         }
         if !self.seconds.contains_key(&key) && self.seconds.len() >= self.cfg.max_open_rows {
             return Err(FlowError::Capacity);
         }
-        let old = self.seconds.get(&key).copied().unwrap_or(Value {
-            bytes: ByteCount {
-                upload: 0,
-                download: 0,
-            },
-            coverage: coverage(kind),
+        let old = self.seconds.get(&key).copied().unwrap_or(ByteCount {
+            upload: 0,
+            download: 0,
         });
-        let value = Value {
-            bytes: ByteCount {
-                upload: old
-                    .bytes
-                    .upload
-                    .checked_add(o.upload)
-                    .ok_or(FlowError::Overflow)?,
-                download: old
-                    .bytes
-                    .download
-                    .checked_add(o.download)
-                    .ok_or(FlowError::Overflow)?,
-            },
-            coverage: merge_coverage(old.coverage, coverage(kind)),
+        let value = ByteCount {
+            upload: old
+                .upload
+                .checked_add(o.upload)
+                .ok_or(FlowError::Overflow)?,
+            download: old
+                .download
+                .checked_add(o.download)
+                .ok_or(FlowError::Overflow)?,
         };
         value
-            .bytes
             .upload
-            .checked_add(value.bytes.download)
+            .checked_add(value.download)
             .ok_or(FlowError::Overflow)?;
-        self.replay.retain(|_, at| *at >= cutoff);
-        self.replay.insert(o.replay_id, o.arrival_time);
-        self.devices.insert(device_key);
+        let _ = kind;
+        self.replay.retain(|_, e| e.arrival >= cutoff);
+        self.replay.insert(
+            o.replay_id,
+            ReplayEntry {
+                arrival: o.arrival_time,
+                device: device_key.clone(),
+            },
+        );
+        active_devices.insert(device_key);
+        self.devices = active_devices;
         self.seconds.insert(key, value);
         self.last_arrival = Some(o.arrival_time);
         Ok(())
     }
 
-    pub fn advance_watermark(
+    pub fn advance_watermark_at(
         &mut self,
         next: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Result<Vec<RollupChange>, FlowError> {
         checked_epoch(next)?;
+        checked_epoch(now)?;
+        if next > now {
+            return Err(FlowError::FutureSkew);
+        }
+        if self.last_arrival.is_some_and(|old| now < old) {
+            return Err(FlowError::Time);
+        }
         if self.watermark.is_some_and(|old| next < old) {
             return Err(FlowError::Time);
         }
+        let correction_cache_horizon =
+            std::cmp::min(self.cfg.correction_retention, self.cfg.lateness);
         let cutoff = next
-            .checked_sub_signed(self.cfg.correction_retention)
+            .checked_sub_signed(correction_cache_horizon)
             .ok_or(FlowError::Overflow)?
             .timestamp();
         // Filtering, three aggregation levels, and diffing are all charged before cloning.
         let required_work = self
             .seconds
             .len()
-            .checked_mul(7)
+            .checked_mul(8)
+            .and_then(|n| {
+                self.emitted
+                    .len()
+                    .checked_mul(4)
+                    .and_then(|m| n.checked_add(m))
+            })
             .ok_or(FlowError::Overflow)?;
         if required_work > self.cfg.max_work_per_call {
             return Err(FlowError::WorkLimit);
         }
-        let mut retained_seconds = self.seconds.clone();
-        retained_seconds.retain(|k, _| k.epoch.checked_add(1).is_some_and(|x| x >= cutoff));
-        let proposed = build_rollups(&retained_seconds, next, self.cfg.max_work_per_call)?;
+        let selected = select_seconds(&self.seconds, &self.sources, next)?;
+        let mut proposed = self.emitted.clone();
+        for (base, value) in &selected {
+            let second = make_rollup(Resolution::Second, base.epoch, base, value)?;
+            let old = proposed.get(&second.key).cloned();
+            if old.as_ref() != Some(&second) {
+                proposed.insert(second.key.clone(), second.clone());
+                adjust_parent(
+                    &mut proposed,
+                    Resolution::Minute,
+                    60,
+                    base,
+                    old.as_ref(),
+                    &second,
+                )?;
+                adjust_parent(
+                    &mut proposed,
+                    Resolution::Hour,
+                    3600,
+                    base,
+                    old.as_ref(),
+                    &second,
+                )?;
+            }
+        }
+        proposed.retain(|k, _| !retired(k, next, self.cfg.lateness));
         if proposed.len() > self.cfg.max_finalized_rows {
             return Err(FlowError::Capacity);
         }
         let mut changes = Vec::new();
-        let mut work = 0usize;
-        for (k, v) in &proposed {
+        let mut work = required_work;
+        let keys: BTreeSet<_> = self
+            .emitted
+            .keys()
+            .chain(proposed.keys())
+            .cloned()
+            .collect();
+        for k in keys {
             work = work.checked_add(1).ok_or(FlowError::Overflow)?;
             if work > self.cfg.max_work_per_call {
                 return Err(FlowError::WorkLimit);
             }
-            match self.emitted.get(k) {
-                None => changes.push(RollupChange::Upsert(v.clone())),
-                Some(old) if old != v => changes.push(RollupChange::Correction(v.clone())),
+            match (self.emitted.get(&k), proposed.get(&k)) {
+                (None, Some(v)) => changes.push(RollupChange::Upsert(v.clone())),
+                (Some(old), Some(v)) if old != v => {
+                    changes.push(RollupChange::Correction(v.clone()))
+                }
+                (Some(_), None) => changes.push(RollupChange::Retire(Retirement {
+                    key: k,
+                    cache_only: true,
+                })),
                 _ => {}
             }
         }
         if changes.len() > self.cfg.max_outputs_per_call {
             return Err(FlowError::OutputLimit);
         }
+        let replay_cutoff = now
+            .checked_sub_signed(self.cfg.replay_ttl)
+            .ok_or(FlowError::Overflow)?;
         self.watermark = Some(next);
         self.emitted = proposed;
-        self.seconds = retained_seconds;
+        self.seconds
+            .retain(|k, _| k.base.epoch.checked_add(1).is_some_and(|x| x >= cutoff));
+        self.replay.retain(|_, e| e.arrival >= replay_cutoff);
+        self.devices = self
+            .seconds
+            .keys()
+            .map(|k| k.base.device.clone())
+            .chain(self.replay.values().map(|e| e.device.clone()))
+            .collect();
+        self.last_arrival = Some(now);
         Ok(changes)
     }
 
@@ -489,7 +582,7 @@ impl FlowEngine {
             watermark: self.watermark,
             rollups: self.emitted.values().cloned().collect(),
             open_row_count: self.seconds.len(),
-            replay_ids: self.replay.iter().map(|(id, at)| (*id, *at)).collect(),
+            replay_ids: self.replay.iter().map(|(id, e)| (*id, e.arrival)).collect(),
             devices: self.devices.iter().cloned().collect(),
             last_arrival: self.last_arrival,
         }
@@ -549,37 +642,50 @@ fn merge_coverage(a: Coverage, b: Coverage) -> Coverage {
     if a == b { a } else { Coverage::Estimated }
 }
 
-fn build_rollups(
-    seconds: &BTreeMap<SecondKey, Value>,
+fn select_seconds(
+    seconds: &BTreeMap<SourceSecondKey, ByteCount>,
+    sources: &BTreeMap<FlowSourceId, VisibilityKind>,
     w: DateTime<Utc>,
-    limit: usize,
-) -> Result<BTreeMap<RollupKey, Rollup>, FlowError> {
-    let mut sec = BTreeMap::new();
-    let mut work = 0usize;
-    for (k, v) in seconds {
-        work = work.checked_add(1).ok_or(FlowError::Overflow)?;
-        if work > limit {
-            return Err(FlowError::WorkLimit);
+) -> Result<BTreeMap<SecondKey, Value>, FlowError> {
+    let mut out = BTreeMap::new();
+    let mut winners: BTreeMap<SecondKey, (u8, FlowSourceId)> = BTreeMap::new();
+    for (k, b) in seconds {
+        if k.base.epoch.checked_add(1).ok_or(FlowError::Overflow)? > w.timestamp() {
+            continue;
         }
-        let close = k.epoch.checked_add(1).ok_or(FlowError::Overflow)?;
-        if close <= w.timestamp() {
-            insert_rollup(&mut sec, Resolution::Second, k.epoch, k, v)?;
+        let kind = *sources.get(&k.source).ok_or(FlowError::UnknownSource)?;
+        let cov = coverage(kind);
+        let rank = coverage_rank(cov);
+        let replace = winners
+            .get(&k.base)
+            .is_none_or(|(r, id)| rank > *r || (rank == *r && k.source < *id));
+        if replace {
+            winners.insert(k.base.clone(), (rank, k.source));
+            out.insert(
+                k.base.clone(),
+                Value {
+                    bytes: *b,
+                    coverage: cov,
+                },
+            );
         }
     }
-    let min = aggregate(&sec, Resolution::Minute, 60, &mut work, limit)?;
-    let hour = aggregate(&min, Resolution::Hour, 3600, &mut work, limit)?;
-    let mut all = sec;
-    all.extend(min);
-    all.extend(hour);
-    Ok(all)
+    Ok(out)
 }
-fn insert_rollup(
-    out: &mut BTreeMap<RollupKey, Rollup>,
-    res: Resolution,
-    epoch: i64,
-    k: &SecondKey,
-    v: &Value,
-) -> Result<(), FlowError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Value {
+    bytes: ByteCount,
+    coverage: Coverage,
+}
+fn coverage_rank(c: Coverage) -> u8 {
+    match c {
+        Coverage::Complete => 4,
+        Coverage::RouterReported => 3,
+        Coverage::LocalOnly => 2,
+        Coverage::Estimated => 1,
+    }
+}
+fn make_rollup(res: Resolution, epoch: i64, k: &SecondKey, v: &Value) -> Result<Rollup, FlowError> {
     let bucket = DateTime::from_timestamp(epoch, 0).ok_or(FlowError::Overflow)?;
     let key = RollupKey {
         resolution: res,
@@ -590,67 +696,71 @@ fn insert_rollup(
         interface: k.interface,
         metadata: k.metadata.clone(),
     };
-    out.insert(
-        key.clone(),
-        Rollup {
-            key,
-            bytes: v.bytes,
-            coverage: v.coverage,
-            metadata: k.metadata.clone(),
-        },
-    );
-    Ok(())
+    Ok(Rollup {
+        key,
+        bytes: v.bytes,
+        coverage: v.coverage,
+        metadata: k.metadata.clone(),
+    })
 }
-fn aggregate(
-    input: &BTreeMap<RollupKey, Rollup>,
+fn adjust_parent(
+    out: &mut BTreeMap<RollupKey, Rollup>,
     res: Resolution,
     width: i64,
-    work: &mut usize,
-    limit: usize,
-) -> Result<BTreeMap<RollupKey, Rollup>, FlowError> {
-    let mut out: BTreeMap<RollupKey, Rollup> = BTreeMap::new();
-    for r in input.values() {
-        *work = work.checked_add(1).ok_or(FlowError::Overflow)?;
-        if *work > limit {
-            return Err(FlowError::WorkLimit);
-        }
-        let epoch = r
-            .key
-            .bucket
-            .timestamp()
-            .div_euclid(width)
-            .checked_mul(width)
-            .ok_or(FlowError::Overflow)?;
-        let mut key = r.key.clone();
-        key.resolution = res;
-        key.bucket = DateTime::from_timestamp(epoch, 0).ok_or(FlowError::Overflow)?;
-        if let Some(x) = out.get_mut(&key) {
-            x.bytes.upload = x
-                .bytes
-                .upload
-                .checked_add(r.bytes.upload)
-                .ok_or(FlowError::Overflow)?;
-            x.bytes.download = x
-                .bytes
-                .download
-                .checked_add(r.bytes.download)
-                .ok_or(FlowError::Overflow)?;
-            x.coverage = merge_coverage(x.coverage, r.coverage);
-            x.bytes
-                .upload
-                .checked_add(x.bytes.download)
-                .ok_or(FlowError::Overflow)?;
-        } else {
-            out.insert(
-                key.clone(),
-                Rollup {
-                    key,
-                    bytes: r.bytes,
-                    coverage: r.coverage,
-                    metadata: r.metadata.clone(),
-                },
-            );
-        }
-    }
-    Ok(out)
+    base: &SecondKey,
+    old: Option<&Rollup>,
+    new: &Rollup,
+) -> Result<(), FlowError> {
+    let epoch = base
+        .epoch
+        .div_euclid(width)
+        .checked_mul(width)
+        .ok_or(FlowError::Overflow)?;
+    let seed = Value {
+        bytes: ByteCount {
+            upload: 0,
+            download: 0,
+        },
+        coverage: new.coverage,
+    };
+    let template = make_rollup(res, epoch, base, &seed)?;
+    let p = out.entry(template.key.clone()).or_insert(template);
+    let oldb = old.map_or(
+        ByteCount {
+            upload: 0,
+            download: 0,
+        },
+        |r| r.bytes,
+    );
+    p.bytes.upload = p
+        .bytes
+        .upload
+        .checked_sub(oldb.upload)
+        .ok_or(FlowError::Overflow)?
+        .checked_add(new.bytes.upload)
+        .ok_or(FlowError::Overflow)?;
+    p.bytes.download = p
+        .bytes
+        .download
+        .checked_sub(oldb.download)
+        .ok_or(FlowError::Overflow)?
+        .checked_add(new.bytes.download)
+        .ok_or(FlowError::Overflow)?;
+    p.bytes
+        .upload
+        .checked_add(p.bytes.download)
+        .ok_or(FlowError::Overflow)?;
+    p.coverage = merge_coverage(p.coverage, new.coverage);
+    Ok(())
+}
+fn retired(k: &RollupKey, w: DateTime<Utc>, lateness: Duration) -> bool {
+    let width = match k.resolution {
+        Resolution::Second => 1,
+        Resolution::Minute => 60,
+        Resolution::Hour => 3600,
+    };
+    k.bucket
+        .checked_add_signed(Duration::seconds(width))
+        .and_then(|x| x.checked_add_signed(lateness))
+        .is_some_and(|edge| w > edge)
 }

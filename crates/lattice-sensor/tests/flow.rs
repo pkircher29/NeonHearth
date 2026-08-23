@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use lattice_domain::{Coverage, DeviceId};
 use lattice_sensor::flow::*;
-use std::net::IpAddr;
+use std::{collections::BTreeMap, net::IpAddr};
 
 fn t(s: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(s, 0).single().unwrap()
@@ -41,7 +41,7 @@ fn obs(id: u128, event: i64, arrival: i64, up: u64) -> FlowObservation {
     }
 }
 fn advance(e: &mut FlowEngine, s: i64) -> Vec<RollupChange> {
-    e.advance_watermark(t(s)).unwrap()
+    e.advance_watermark_at(t(s), t(s)).unwrap()
 }
 fn ups(changes: &[RollupChange], r: Resolution) -> Vec<&Rollup> {
     changes
@@ -53,6 +53,16 @@ fn ups(changes: &[RollupChange], r: Resolution) -> Vec<&Rollup> {
             _ => None,
         })
         .collect()
+}
+fn apply_durable(state: &mut BTreeMap<RollupKey, Rollup>, changes: &[RollupChange]) {
+    for change in changes {
+        match change {
+            RollupChange::Upsert(r) | RollupChange::Correction(r) => {
+                state.insert(r.key.clone(), r.clone());
+            }
+            RollupChange::Retire(r) => assert!(r.cache_only),
+        }
+    }
 }
 
 #[test]
@@ -115,8 +125,6 @@ fn all_dimensions_directions_and_devices_are_distinct_and_ordered() {
 fn exact_second_minute_hour_edges_conserve_without_early_close() {
     let mut e = engine();
     e.observe(obs(1, 59, 59, 2)).unwrap();
-    e.observe(obs(2, 60, 60, 3)).unwrap();
-    e.observe(obs(3, 3599, 3599, 5)).unwrap();
     assert!(advance(&mut e, 59).is_empty());
     let x = advance(&mut e, 60);
     assert_eq!(
@@ -127,6 +135,8 @@ fn exact_second_minute_hour_edges_conserve_without_early_close() {
         2
     );
     assert_eq!(ups(&x, Resolution::Minute).len(), 1);
+    e.observe(obs(2, 60, 60, 3)).unwrap();
+    e.observe(obs(3, 3599, 3599, 5)).unwrap();
     let x = advance(&mut e, 3600);
     assert_eq!(
         ups(&x, Resolution::Hour)
@@ -135,14 +145,6 @@ fn exact_second_minute_hour_edges_conserve_without_early_close() {
             .sum::<u64>(),
         10
     );
-    let totals = e
-        .snapshot()
-        .rollups
-        .iter()
-        .filter(|r| r.key.resolution == Resolution::Second)
-        .map(|r| r.bytes.upload)
-        .sum::<u64>();
-    assert_eq!(totals, 10);
 }
 
 #[test]
@@ -151,7 +153,12 @@ fn watermark_is_monotonic_idempotent_and_future_bounded() {
     e.observe(obs(1, 10, 10, 1)).unwrap();
     assert!(!advance(&mut e, 11).is_empty());
     assert!(advance(&mut e, 11).is_empty());
-    assert_eq!(e.advance_watermark(t(10)), Err(FlowError::Time));
+    assert_eq!(e.advance_watermark_at(t(10), t(11)), Err(FlowError::Time));
+    assert!(
+        advance(&mut e, 100)
+            .iter()
+            .all(|c| matches!(c, RollupChange::Retire(_)))
+    );
     assert!(advance(&mut e, 100).is_empty());
 }
 
@@ -194,14 +201,125 @@ fn replay_window_rejects_then_evicts_but_old_event_remains_too_late() {
 }
 
 #[test]
+fn expired_replay_without_watermark_cannot_double_count_old_event() {
+    let mut c = cfg();
+    c.replay_ttl = Duration::seconds(6);
+    c.lateness = Duration::seconds(5);
+    c.max_replay_ids = 1;
+    let mut e = FlowEngine::new(c, sources()).unwrap();
+    e.observe(obs(1, 10, 10, 2)).unwrap();
+    assert_eq!(e.observe(obs(1, 10, 20, 2)), Err(FlowError::TooLate));
+    e.observe(obs(1, 20, 20, 3)).unwrap();
+}
+
+#[test]
+fn watermark_uses_monotonic_trusted_clock_and_supports_idle_advance() {
+    let mut e = engine();
+    e.observe(obs(1, 10, 10, 1)).unwrap();
+    assert_eq!(
+        e.advance_watermark_at(t(20), t(19)),
+        Err(FlowError::FutureSkew)
+    );
+    assert!(!e.advance_watermark_at(t(11), t(11)).unwrap().is_empty());
+    assert_eq!(e.advance_watermark_at(t(10), t(10)), Err(FlowError::Time));
+    assert!(
+        e.advance_watermark_at(t(20), t(20))
+            .unwrap()
+            .iter()
+            .all(|c| matches!(c, RollupChange::Retire(_)))
+    );
+}
+
+#[test]
+fn parallel_visibility_sources_choose_one_authoritative_winner() {
+    let mut e = engine();
+    let mut gateway = obs(1, 1, 1, 7);
+    gateway.download = 0;
+    let mut router = obs(2, 1, 1, 7);
+    router.download = 0;
+    router.source = FlowSourceId(4);
+    let mut local = obs(3, 1, 1, 7);
+    local.download = 0;
+    local.source = FlowSourceId(5);
+    e.observe(local).unwrap();
+    e.observe(router).unwrap();
+    e.observe(gateway).unwrap();
+    let changes = advance(&mut e, 2);
+    let r = ups(&changes, Resolution::Second)[0];
+    assert_eq!(r.bytes.upload, 7);
+    assert_eq!(r.coverage, Coverage::Complete);
+}
+
+#[test]
+fn higher_authority_source_switch_replaces_instead_of_adding() {
+    let mut e = engine();
+    let mut local = obs(1, 1, 1, 7);
+    local.download = 0;
+    local.source = FlowSourceId(5);
+    e.observe(local).unwrap();
+    advance(&mut e, 2);
+    let mut gateway = obs(2, 1, 3, 7);
+    gateway.download = 0;
+    e.observe(gateway).unwrap();
+    let x = advance(&mut e, 3);
+    assert!(x.iter().any(|c|matches!(c,RollupChange::Correction(r) if r.key.resolution==Resolution::Second&&r.bytes.upload==7&&r.coverage==Coverage::Complete)));
+    assert!(x.iter().any(|c|matches!(c,RollupChange::Correction(r) if r.key.resolution==Resolution::Minute&&r.bytes.upload==7)));
+}
+
+#[test]
+fn cache_retirement_never_subtracts_durable_parent_totals() {
+    let mut c = cfg();
+    c.correction_retention = Duration::seconds(5);
+    let mut e = FlowEngine::new(c, sources()).unwrap();
+    e.observe(obs(1, 59, 59, 2)).unwrap();
+    let first = advance(&mut e, 60);
+    let minute = ups(&first, Resolution::Minute)[0].clone();
+    let mut durable = BTreeMap::new();
+    apply_durable(&mut durable, &first);
+    let retirement = advance(&mut e, 66);
+    apply_durable(&mut durable, &retirement);
+    assert!(retirement.iter().any(|c|matches!(c,RollupChange::Retire(r) if r.key.resolution==Resolution::Second && r.cache_only)));
+    assert!(!retirement.iter().any(|c|matches!(c,RollupChange::Correction(r) if r.key.resolution!=Resolution::Second && r.bytes.upload<minute.bytes.upload)));
+    let mut later = obs(2, 66, 66, 3);
+    later.download = 0;
+    e.observe(later).unwrap();
+    let x = advance(&mut e, 67);
+    apply_durable(&mut durable, &x);
+    let x = advance(&mut e, 3606);
+    apply_durable(&mut durable, &x);
+    assert_eq!(
+        durable
+            .values()
+            .filter(|r| r.key.resolution == Resolution::Hour && r.key.bucket == t(0))
+            .map(|r| r.bytes.upload)
+            .sum::<u64>(),
+        5
+    );
+}
+
+#[test]
+fn inactive_device_capacity_recovers_after_state_retirement() {
+    let mut c = cfg();
+    c.max_devices = 1;
+    c.correction_retention = Duration::seconds(5);
+    c.replay_ttl = Duration::seconds(5);
+    let mut e = FlowEngine::new(c, sources()).unwrap();
+    e.observe(obs(1, 1, 1, 1)).unwrap();
+    advance(&mut e, 10);
+    let mut x = obs(2, 10, 10, 1);
+    x.device_id = device(2);
+    e.observe(x).unwrap();
+}
+
+#[test]
 fn coverage_merge_is_conservative() {
     for (a, b, want) in [
         (1, 2, Coverage::Complete),
         (4, 4, Coverage::RouterReported),
         (5, 5, Coverage::LocalOnly),
-        (4, 5, Coverage::Estimated),
-        (1, 4, Coverage::Estimated),
-        (1, 6, Coverage::Estimated),
+        (4, 5, Coverage::RouterReported),
+        (1, 4, Coverage::Complete),
+        (1, 6, Coverage::Complete),
     ] {
         let mut e = engine();
         let mut x = obs(1, 1, 1, 1);
@@ -215,6 +333,19 @@ fn coverage_merge_is_conservative() {
             want
         );
     }
+}
+
+#[test]
+fn nonoverlapping_source_intervals_make_parent_coverage_conservative() {
+    let mut e = engine();
+    let mut a = obs(1, 1, 1, 1);
+    a.source = FlowSourceId(4);
+    let mut b = obs(2, 2, 2, 1);
+    b.source = FlowSourceId(5);
+    e.observe(a).unwrap();
+    e.observe(b).unwrap();
+    let x = advance(&mut e, 3);
+    assert_eq!(ups(&x, Resolution::Minute)[0].coverage, Coverage::Estimated);
 }
 
 #[test]
@@ -291,7 +422,7 @@ fn device_dimension_replay_open_row_and_finalized_row_bounds_are_atomic() {
     assert_eq!(e.snapshot(), snap);
     assert_eq!(e.observe(obs(2, 2, 1, 1)), Err(FlowError::Capacity));
     assert_eq!(e.snapshot(), snap);
-    assert_eq!(e.advance_watermark(t(2)), Err(FlowError::Capacity));
+    assert_eq!(e.advance_watermark_at(t(2), t(2)), Err(FlowError::Capacity));
     assert_eq!(e.snapshot(), snap);
 }
 
@@ -302,14 +433,20 @@ fn output_and_work_limits_are_preflighted_atomically() {
     let mut e = FlowEngine::new(c, sources()).unwrap();
     e.observe(obs(1, 1, 1, 1)).unwrap();
     let s = e.snapshot();
-    assert_eq!(e.advance_watermark(t(2)), Err(FlowError::OutputLimit));
+    assert_eq!(
+        e.advance_watermark_at(t(2), t(2)),
+        Err(FlowError::OutputLimit)
+    );
     assert_eq!(e.snapshot(), s);
     let mut c = cfg();
     c.max_work_per_call = 1;
     let mut e = FlowEngine::new(c, sources()).unwrap();
     e.observe(obs(1, 1, 1, 1)).unwrap();
     let s = e.snapshot();
-    assert_eq!(e.advance_watermark(t(2)), Err(FlowError::WorkLimit));
+    assert_eq!(
+        e.advance_watermark_at(t(2), t(2)),
+        Err(FlowError::WorkLimit)
+    );
     assert_eq!(e.snapshot(), s);
 }
 
