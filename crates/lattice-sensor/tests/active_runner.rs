@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     net::IpAddr,
     sync::{
-        Arc, Barrier, Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -207,11 +207,17 @@ async fn descriptor_cost_consumes_the_exact_subnet_budget() {
         ..SchedulerConfig::default()
     };
     struct Credentials;
+    #[async_trait]
     impl ExecutionCredentialSource for Credentials {
-        fn credential_for(&self, request: &ProbeRequest) -> Option<ProbeCredential> {
-            (request.probe_id == "udp.snmp.161").then(|| ProbeCredential::SnmpV2c {
-                community: "execution-only".into(),
-            })
+        async fn credential_for(
+            &self,
+            request: &ProbeRequest,
+        ) -> Result<Option<ProbeCredential>, ActiveError> {
+            Ok(
+                (request.probe_id == "udp.snmp.161").then(|| ProbeCredential::SnmpV2c {
+                    community: "execution-only".into(),
+                }),
+            )
         }
     }
     let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
@@ -335,11 +341,17 @@ async fn panic_releases_raii_budget_and_is_observable_without_retry() {
 #[tokio::test]
 async fn actual_dispatch_prioritizes_discovery_and_coalesces_inflight_duplicates() {
     struct InventoryCredentials;
+    #[async_trait]
     impl ExecutionCredentialSource for InventoryCredentials {
-        fn credential_for(&self, request: &ProbeRequest) -> Option<ProbeCredential> {
-            (request.mode == ProbeMode::OwnerInventory).then(|| ProbeCredential::SnmpV2c {
-                community: "execution-only".into(),
-            })
+        async fn credential_for(
+            &self,
+            request: &ProbeRequest,
+        ) -> Result<Option<ProbeCredential>, ActiveError> {
+            Ok(
+                (request.mode == ProbeMode::OwnerInventory).then(|| ProbeCredential::SnmpV2c {
+                    community: "execution-only".into(),
+                }),
+            )
         }
     }
     let transport = Arc::new(ScriptedTransport::default());
@@ -492,8 +504,12 @@ async fn closed_result_receiver_stops_without_spinning_or_consuming_budget() {
 }
 
 struct PanicCredentials;
+#[async_trait]
 impl ExecutionCredentialSource for PanicCredentials {
-    fn credential_for(&self, _: &ProbeRequest) -> Option<ProbeCredential> {
+    async fn credential_for(
+        &self,
+        _: &ProbeRequest,
+    ) -> Result<Option<ProbeCredential>, ActiveError> {
         panic!("injected credential provider panic")
     }
 }
@@ -541,23 +557,27 @@ async fn credential_provider_panic_is_terminal_observable_and_releases_pending_s
 }
 
 struct BarrierCredentials {
-    entered: Arc<Barrier>,
-    release: Arc<Barrier>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
+#[async_trait]
 impl ExecutionCredentialSource for BarrierCredentials {
-    fn credential_for(&self, _: &ProbeRequest) -> Option<ProbeCredential> {
-        self.entered.wait();
-        self.release.wait();
-        Some(ProbeCredential::SnmpV2c {
+    async fn credential_for(
+        &self,
+        _: &ProbeRequest,
+    ) -> Result<Option<ProbeCredential>, ActiveError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(Some(ProbeCredential::SnmpV2c {
             community: "execution-only".into(),
-        })
+        }))
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_serializes_with_admission_and_awaits_every_registered_attempt() {
-    let entered = Arc::new(Barrier::new(2));
-    let release = Arc::new(Barrier::new(2));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
     let transport = Arc::new(ScriptedTransport::default());
     let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
     let probes = catalog().unwrap();
@@ -582,14 +602,14 @@ async fn stop_serializes_with_admission_and_awaits_every_registered_attempt() {
     snmp.mode = ProbeMode::OwnerInventory;
     runner.enqueue(snmp).unwrap();
     assert_eq!(runner.dispatch_ready().await, 1);
-    entered.wait();
+    entered.notified().await;
 
-    let mut first_stop = tokio::spawn({
+    let first_stop = tokio::spawn({
         let runner = runner.clone();
         async move { runner.stop_and_drain().await }
     });
     tokio::task::yield_now().await;
-    let mut second_stop = tokio::spawn({
+    let second_stop = tokio::spawn({
         let runner = runner.clone();
         async move { runner.stop_and_drain().await }
     });
@@ -597,14 +617,6 @@ async fn stop_serializes_with_admission_and_awaits_every_registered_attempt() {
         let runner = runner.clone();
         async move { runner.dispatch_ready().await }
     });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), async {
-            tokio::join!(&mut first_stop, &mut second_stop)
-        })
-        .await
-        .is_err()
-    );
-    release.wait();
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::try_join!(first_stop, second_stop)
     })
@@ -619,4 +631,169 @@ async fn stop_serializes_with_admission_and_awaits_every_registered_attempt() {
     tokio::time::timeout(Duration::from_millis(20), runner.stop_and_drain())
         .await
         .expect("later stop remains idempotent");
+}
+
+struct PendingCredentials {
+    dropped: Arc<AtomicBool>,
+}
+struct DropMarker(Arc<AtomicBool>);
+impl Drop for DropMarker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+#[async_trait]
+impl ExecutionCredentialSource for PendingCredentials {
+    async fn credential_for(
+        &self,
+        _: &ProbeRequest,
+    ) -> Result<Option<ProbeCredential>, ActiveError> {
+        let _marker = DropMarker(self.dropped.clone());
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn pending_async_credential_retrieval_is_cancelled_by_stop_on_current_thread() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let transport = Arc::new(ScriptedTransport::default());
+    let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
+    let probes = catalog().unwrap();
+    let engine = Arc::new(ActiveEngine::new(
+        Arc::new(guard()),
+        transport.clone(),
+        probes.clone(),
+    ));
+    let config = SchedulerConfig {
+        credential_timeout: Duration::from_secs(30),
+        ..SchedulerConfig::default()
+    };
+    let (runner, mut results) = SchedulerRunner::new_with_credentials(
+        config,
+        clock,
+        engine,
+        probes,
+        1,
+        Arc::new(PendingCredentials {
+            dropped: dropped.clone(),
+        }),
+    )
+    .unwrap();
+    let mut snmp = request("192.168.50.9", "udp.snmp.161");
+    snmp.mode = ProbeMode::OwnerInventory;
+    runner.enqueue(snmp).unwrap();
+    assert_eq!(runner.dispatch_ready().await, 1);
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        tokio::time::sleep(Duration::from_millis(1)),
+    )
+    .await
+    .expect("credential future must not block the runtime timer");
+    tokio::time::timeout(Duration::from_millis(50), runner.stop_and_drain())
+        .await
+        .expect("stop must drop pending credential retrieval");
+    let event = results.recv().await.unwrap();
+    assert_eq!(event.result.unwrap_err(), ActiveError::Cancelled);
+    assert!(!event.will_retry);
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(transport.sends.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn credential_timeout_is_typed_terminal_and_cleans_pending_state() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let transport = Arc::new(ScriptedTransport::default());
+    let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
+    let probes = catalog().unwrap();
+    let engine = Arc::new(ActiveEngine::new(
+        Arc::new(guard()),
+        transport,
+        probes.clone(),
+    ));
+    let config = SchedulerConfig {
+        credential_timeout: Duration::from_millis(5),
+        ..SchedulerConfig::default()
+    };
+    let (runner, mut results) = SchedulerRunner::new_with_credentials(
+        config,
+        clock,
+        engine,
+        probes,
+        1,
+        Arc::new(PendingCredentials {
+            dropped: dropped.clone(),
+        }),
+    )
+    .unwrap();
+    let mut snmp = request("192.168.50.9", "udp.snmp.161");
+    snmp.mode = ProbeMode::OwnerInventory;
+    runner.enqueue(snmp.clone()).unwrap();
+    runner.dispatch_ready().await;
+    let event = results.recv().await.unwrap();
+    assert_eq!(event.result.unwrap_err(), ActiveError::CredentialTimeout);
+    assert!(!event.will_retry);
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(runner.enqueue(snmp).unwrap());
+    runner.stop_and_drain().await;
+}
+
+#[tokio::test]
+async fn idle_runner_exits_when_result_receiver_is_dropped() {
+    let transport = Arc::new(ScriptedTransport::default());
+    let (runner, results, _) = runner(SchedulerConfig::default(), transport);
+    let coordinator = runner.start();
+    drop(results);
+    tokio::time::timeout(Duration::from_millis(50), coordinator)
+        .await
+        .expect("idle coordinator must observe receiver closure")
+        .unwrap();
+    assert!(matches!(
+        runner.enqueue(request("192.168.50.9", "tcp.http.80")),
+        Err(ActiveError::Cancelled)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_denied_queue_is_scanned_once_then_parked_until_eligibility() {
+    let transport = Arc::new(ScriptedTransport::default());
+    let config = SchedulerConfig {
+        budgets: BudgetConfig::new(8, 2, 2, 1024, Duration::from_secs(1)).unwrap(),
+        queue_capacity: 2048,
+        ..SchedulerConfig::default()
+    };
+    let (runner, mut results, clock) = runner(config, transport.clone());
+    runner
+        .enqueue(request("192.168.50.8", "tcp.http.80"))
+        .unwrap();
+    runner.dispatch_ready().await;
+    results.recv().await.unwrap();
+    for port in 1..=2048 {
+        let mut work = request("192.168.50.9", &format!("full.tcp.{port}"));
+        work.mode = ProbeMode::OwnerFullPort;
+        runner.enqueue(work).unwrap();
+    }
+
+    let coordinator = runner.start();
+    for _ in 0..100 {
+        if runner.scan_count() >= 2049 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let parked_at = runner.scan_count();
+    assert_eq!(parked_at, 2049);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(runner.scan_count(), parked_at);
+
+    clock.advance(Duration::from_secs(2));
+    runner.notify_clock_advanced();
+    for _ in 0..100 {
+        if transport.sends.lock().unwrap().len() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(transport.sends.lock().unwrap().len(), 2);
+    runner.stop_and_drain().await;
+    coordinator.await.unwrap();
 }

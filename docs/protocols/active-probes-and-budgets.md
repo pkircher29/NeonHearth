@@ -95,8 +95,10 @@ Budgets and backoff use monotonic time. Wall time is used only for evidence
 may refill tokens, but never above bucket capacity, preventing a wake-up burst.
 
 The high-priority queue round-robins hosts, coalesces identical
-interface/target/probe/mode work, and always drains presence/discovery before lower-priority
-owner full-port work. A noisy or offline host therefore cannot starve another host.
+interface/target/probe/mode work, and prefers presence/discovery over lower-priority owner
+full-port work. To prevent indefinite low-priority starvation under sustained arrivals,
+one full-port item becomes eligible after at most 32 consecutive high-priority admissions,
+then preference resets. A noisy or offline host therefore cannot starve another host.
 
 `SchedulerRunner` is the asynchronous execution boundary joining this queue to
 `ActiveEngine`. Dispatch atomically consumes each descriptor's declared `rate_cost` and
@@ -109,8 +111,17 @@ every task admitted before the transition. Concurrent and later stop callers obs
 retained `Running` → `Draining` → `Drained` completion and cannot return before that shared
 drain finishes.
 Credentialed inventory obtains an owned credential from an execution-time provider only
-after dispatch; the runner neither queues nor retains it, and drops it when that attempt
-finishes.
+after dispatch. Retrieval is an asynchronous, typed-error boundary with a default two-second
+timeout (maximum 30 seconds) and is selected directly against global stop; cancellation drops
+the pending future and never retries it. Implementations must move blocking OS/keyring calls
+to a blocking worker rather than executing them on Tokio. The runner neither queues nor
+retains credentials and never exposes panic payloads.
+
+Denied admission reports either concurrency pressure or the earliest monotonic rate/state
+deadline. Each wake scans at most the queue length observed at its start, then the coordinator
+parks until that deadline, the next retry, enqueue/completion/stop, result capacity, or result
+receiver closure. There is no fixed-interval queue polling. Dropping the result receiver
+initiates shared stop, and `start()` returns a joinable coordinator handle.
 
 Only timeout outcomes and typed transient network failures retry. Unauthorized targets,
 missing approval or credentials, invalid configuration/protocol data, correlation and

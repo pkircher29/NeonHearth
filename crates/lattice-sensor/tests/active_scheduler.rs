@@ -276,6 +276,27 @@ fn queue_coalesces_duplicates_prioritizes_discovery_and_is_fair() {
 }
 
 #[test]
+fn sustained_high_priority_arrivals_cannot_starve_full_port_work() {
+    let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
+    let mut scheduler = Scheduler::new(SchedulerConfig::default(), clock).unwrap();
+    let mut low = request("192.168.50.250", "full.tcp.80");
+    low.mode = ProbeMode::OwnerFullPort;
+    scheduler.enqueue(low).unwrap();
+    for host in 1..=33 {
+        scheduler
+            .enqueue(request(&format!("192.168.50.{host}"), "tcp.http.80"))
+            .unwrap();
+    }
+    for _ in 0..32 {
+        assert_eq!(scheduler.next_request().unwrap().mode, ProbeMode::Default);
+    }
+    assert_eq!(
+        scheduler.next_request().unwrap().mode,
+        ProbeMode::OwnerFullPort
+    );
+}
+
+#[test]
 fn costly_rate_reservation_is_atomic_across_global_host_and_subnet_buckets() {
     let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
     let config = SchedulerConfig {

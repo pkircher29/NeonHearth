@@ -484,6 +484,8 @@ pub enum ActiveError {
     OwnerApprovalRequired,
     #[error("credential required")]
     CredentialRequired,
+    #[error("credential retrieval timed out")]
+    CredentialTimeout,
     #[error("operation cancelled")]
     Cancelled,
     #[error("probe unavailable")]
@@ -1851,6 +1853,7 @@ pub struct SchedulerConfig {
     pub state_capacity: usize,
     pub state_ttl: Duration,
     pub max_retry_attempts: u8,
+    pub credential_timeout: Duration,
 }
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -1863,6 +1866,7 @@ impl Default for SchedulerConfig {
             state_capacity: 2048,
             state_ttl: Duration::from_secs(30 * 60),
             max_retry_attempts: 5,
+            credential_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -1942,6 +1946,16 @@ pub struct Scheduler<C> {
     global_rate: TokenBucket,
     host_rates: HashMap<IpAddr, TokenBucket>,
     subnet_rates: HashMap<SubnetKey, TokenBucket>,
+    high_admissions_since_low: usize,
+}
+
+const HIGH_ADMISSIONS_BEFORE_LOW: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionDecision {
+    Admitted,
+    ConcurrencyLimited,
+    EligibleAt(Duration),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -2015,6 +2029,8 @@ impl<C: Clock> Scheduler<C> {
             || config.state_ttl.is_zero()
             || config.max_retry_attempts == 0
             || config.max_retry_attempts > 16
+            || config.credential_timeout.is_zero()
+            || config.credential_timeout > Duration::from_secs(30)
         {
             return Err(ActiveError::InvalidConfig);
         }
@@ -2038,6 +2054,7 @@ impl<C: Clock> Scheduler<C> {
             },
             host_rates: HashMap::new(),
             subnet_rates: HashMap::new(),
+            high_admissions_since_low: 0,
         })
     }
     pub fn enqueue(&mut self, request: ProbeRequest) -> Result<bool, ActiveError> {
@@ -2073,7 +2090,13 @@ impl<C: Clock> Scheduler<C> {
         if self.stopped {
             return None;
         }
-        let request = if let Some(host) = self.hosts.pop_front() {
+        let choose_low = !self.low.is_empty()
+            && (self.hosts.is_empty()
+                || self.high_admissions_since_low >= HIGH_ADMISSIONS_BEFORE_LOW);
+        let request = if choose_low {
+            self.high_admissions_since_low = 0;
+            self.low.pop_front()
+        } else if let Some(host) = self.hosts.pop_front() {
             let queue = self.high.get_mut(&host)?;
             let item = queue.pop_front();
             if queue.is_empty() {
@@ -2081,8 +2104,12 @@ impl<C: Clock> Scheduler<C> {
             } else {
                 self.hosts.push_back(host);
             }
+            if item.is_some() {
+                self.high_admissions_since_low = self.high_admissions_since_low.saturating_add(1);
+            }
             item
         } else {
+            self.high_admissions_since_low = 0;
             self.low.pop_front()
         }?;
         self.queued.remove(&(
@@ -2109,13 +2136,16 @@ impl<C: Clock> Scheduler<C> {
         self.try_start_cost(request, 1)
     }
     pub fn try_start_cost(&mut self, request: &ProbeRequest, cost: u8) -> bool {
+        self.admission_decision(request, cost) == AdmissionDecision::Admitted
+    }
+    pub fn admission_decision(&mut self, request: &ProbeRequest, cost: u8) -> AdmissionDecision {
         if self.stopped
             || cost == 0
             || self.active >= self.config.budgets.global_concurrency
             || self.active_hosts.get(&request.target).copied().unwrap_or(0)
                 >= self.config.budgets.per_host_concurrency
         {
-            return false;
+            return AdmissionDecision::ConcurrencyLimited;
         }
         let now = self.clock.monotonic();
         self.evict_state(now);
@@ -2123,13 +2153,25 @@ impl<C: Clock> Scheduler<C> {
         if self.host_rates.len() >= self.config.state_capacity
             && !self.host_rates.contains_key(&request.target)
         {
-            return false;
+            let deadline = self
+                .host_rates
+                .values()
+                .map(|bucket| bucket.last_used.saturating_add(self.config.state_ttl))
+                .min()
+                .unwrap_or_else(|| now.saturating_add(self.config.state_ttl));
+            return AdmissionDecision::EligibleAt(deadline);
         }
         let subnet_key = subnet(request.target);
         if self.subnet_rates.len() >= self.config.state_capacity
             && !self.subnet_rates.contains_key(&subnet_key)
         {
-            return false;
+            let deadline = self
+                .subnet_rates
+                .values()
+                .map(|bucket| bucket.last_used.saturating_add(self.config.state_ttl))
+                .min()
+                .unwrap_or_else(|| now.saturating_add(self.config.state_ttl));
+            return AdmissionDecision::EligibleAt(deadline);
         }
         let host = self
             .host_rates
@@ -2145,28 +2187,33 @@ impl<C: Clock> Scheduler<C> {
             last_used: now,
         });
         let cost = usize::from(cost);
-        if !self.global_rate.available(
+        self.global_rate.available(
             now,
             self.config.budgets.global_rate_burst,
             self.config.budgets.refill,
-        ) || self.global_rate.tokens < cost
-            || !host.available(now, host_capacity, self.config.budgets.refill)
-            || host.tokens < cost
-            || !network.available(
-                now,
-                self.config.budgets.per_subnet_burst,
-                self.config.budgets.refill,
-            )
-            || network.tokens < cost
-        {
-            return false;
+        );
+        host.available(now, host_capacity, self.config.budgets.refill);
+        network.available(
+            now,
+            self.config.budgets.per_subnet_burst,
+            self.config.budgets.refill,
+        );
+        let missing_global = cost.saturating_sub(self.global_rate.tokens);
+        let missing_host = cost.saturating_sub(host.tokens);
+        let missing_subnet = cost.saturating_sub(network.tokens);
+        let missing = missing_global.max(missing_host).max(missing_subnet);
+        if missing > 0 {
+            let periods = u32::try_from(missing).unwrap_or(u32::MAX);
+            return AdmissionDecision::EligibleAt(
+                now.saturating_add(self.config.budgets.refill.saturating_mul(periods)),
+            );
         }
         self.global_rate.tokens -= cost;
         host.tokens -= cost;
         network.tokens -= cost;
         self.active += 1;
         *self.active_hosts.entry(request.target).or_default() += 1;
-        true
+        AdmissionDecision::Admitted
     }
     pub fn finish(&mut self, request: &ProbeRequest) {
         self.active = self.active.saturating_sub(1);
