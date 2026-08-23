@@ -16,7 +16,7 @@ Automatic vendor plus device-class identification requires both fields to meet `
 
 ## Review and reversibility
 
-Merge proposals include candidate IDs, score, independent families, and sorted reasons. Accept/reject/undo decisions append audit records. Accepted proposals add explicit graph edges without moving or deleting facts. Canonical components are recomputed from active edges, so duplicate/stale acceptance is a safe no-op and edges can be undone in any order without splitting relationships supported by other edges. Owner set/clear actions are a separate append-only history; owner values never expire and only an explicit tombstone clears them.
+Merge proposals include candidate IDs, score, independent families, and sorted reasons. Accept/reject/undo decisions append audit records. Every accepted proposal adds its own graph edge without moving or deleting facts, including a proposal whose endpoints are already connected. Canonical components are recomputed from active edges, and undo disables only that proposal's edge, so other accepted decisions continue to support the relationship. Owner set/clear actions are a separate append-only history; owner values never expire and only an explicit tombstone clears them.
 
 ## Limits
 

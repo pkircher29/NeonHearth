@@ -158,7 +158,6 @@ struct Edge {
     a: DeviceId,
     b: DeviceId,
     active: bool,
-    no_op: bool,
 }
 pub struct IdentityEngine {
     cfg: IdentityConfig,
@@ -624,15 +623,12 @@ impl IdentityEngine {
             if self.edges.len() >= self.cfg.max_merge_edges {
                 return Err(IdentityError::Capacity("edges"));
             }
-            let no_op =
-                self.resolve(self.proposals[p].left)? == self.resolve(self.proposals[p].right)?;
             self.edges.insert(
                 id,
                 Edge {
                     a: self.proposals[p].left,
                     b: self.proposals[p].right,
-                    active: !no_op,
-                    no_op,
+                    active: true,
                 },
             );
         }
@@ -653,7 +649,7 @@ impl IdentityEngine {
             .position(|p| p.id == id && p.status == ProposalStatus::Accepted)
             .ok_or(IdentityError::CannotUndo)?;
         if let Some(e) = self.edges.get_mut(&id) {
-            debug_assert!(e.no_op || e.active);
+            debug_assert!(e.active);
             e.active = false
         }
         self.proposals[p].status = ProposalStatus::Undone;

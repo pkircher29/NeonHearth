@@ -217,9 +217,10 @@ fn merge_graph_undo_is_order_independent_and_duplicate_safe() {
         .unwrap();
     x.decide(duplicate, Decision::Accept).unwrap();
     x.undo(ab).unwrap();
+    assert_eq!(x.resolve(a).unwrap(), x.resolve(c).unwrap());
     assert_eq!(x.resolve(b).unwrap(), x.resolve(c).unwrap());
-    assert_ne!(x.resolve(a).unwrap(), x.resolve(b).unwrap());
     x.undo(duplicate).unwrap();
+    assert_ne!(x.resolve(a).unwrap(), x.resolve(b).unwrap());
     assert_eq!(x.resolve(b).unwrap(), x.resolve(c).unwrap());
     x.undo(bc).unwrap();
     assert_ne!(x.resolve(b).unwrap(), x.resolve(c).unwrap())
@@ -248,12 +249,13 @@ fn diamond_and_cycle_edges_recompute_without_false_splits() {
     let cd = add(2, 3, "cd");
     let cycle = add(1, 2, "cycle");
     x.undo(ab).unwrap();
-    assert_eq!(x.resolve(ids[0]).unwrap(), x.resolve(ids[2]).unwrap());
-    assert_eq!(x.resolve(ids[1]).unwrap(), x.resolve(ids[3]).unwrap());
+    assert_eq!(x.resolve(ids[0]).unwrap(), x.resolve(ids[3]).unwrap());
     x.undo(cycle).unwrap();
-    assert_eq!(x.resolve(ids[0]).unwrap(), x.resolve(ids[2]).unwrap());
+    assert_eq!(x.resolve(ids[0]).unwrap(), x.resolve(ids[3]).unwrap());
     x.undo(cd).unwrap();
+    assert_eq!(x.resolve(ids[0]).unwrap(), x.resolve(ids[2]).unwrap());
     assert_eq!(x.resolve(ids[1]).unwrap(), x.resolve(ids[3]).unwrap());
+    assert_ne!(x.resolve(ids[0]).unwrap(), x.resolve(ids[1]).unwrap());
     x.undo(ac).unwrap();
     x.undo(bd).unwrap();
 }
