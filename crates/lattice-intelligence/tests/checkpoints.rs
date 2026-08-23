@@ -345,6 +345,71 @@ fn presence_checkpoint_rejects_invalid_trigger_flags_and_cursor() {
 }
 
 #[test]
+fn presence_checkpoint_rejects_evaluation_and_unproven_enforcement_evidence() {
+    let mut engine = PresenceEngine::new(presence_config()).unwrap();
+    online_then_offline(&mut engine, id(1));
+    let mut checkpoint = engine.checkpoint();
+    checkpoint.devices[0].evidence.push(PresenceEvidence {
+        device_id: id(1),
+        source: "sensor-a".into(),
+        kind: PresenceEvidenceKind::Evaluation,
+        observed_at: at(13),
+        valid_until: None,
+    });
+    assert!(PresenceEngine::from_checkpoint(presence_config(), checkpoint).is_err());
+
+    let mut engine = PresenceEngine::new(presence_config()).unwrap();
+    online_then_offline(&mut engine, id(1));
+    let mut checkpoint = engine.checkpoint();
+    checkpoint.devices[0].evidence.push(PresenceEvidence {
+        device_id: id(1),
+        source: "sensor-a".into(),
+        kind: PresenceEvidenceKind::EnforcementBlocked,
+        observed_at: at(13),
+        valid_until: None,
+    });
+    checkpoint.devices[0].blocked = true;
+    checkpoint.devices[0].enforcement_clock = Some(at(13));
+    assert!(PresenceEngine::from_checkpoint(presence_config(), checkpoint).is_err());
+}
+
+#[test]
+fn presence_checkpoint_accepts_verified_enforcement_after_its_transition_is_evicted() {
+    let mut engine = PresenceEngine::new(presence_config()).unwrap();
+    online_then_offline(&mut engine, id(1));
+    engine
+        .record_verified_enforcement(id(1), true, "sensor-a", at(14), at(14))
+        .unwrap();
+    engine
+        .record_verified_enforcement(id(1), false, "sensor-a", at(15), at(15))
+        .unwrap();
+    engine
+        .ingest(evidence(id(1), PresenceEvidenceKind::Traffic, 16), at(16))
+        .unwrap();
+    engine
+        .ingest(evidence(id(1), PresenceEvidenceKind::Traffic, 17), at(17))
+        .unwrap();
+    engine
+        .ingest(
+            evidence(id(1), PresenceEvidenceKind::ConfirmationFailure, 28),
+            at(28),
+        )
+        .unwrap();
+    engine
+        .ingest(
+            evidence(id(1), PresenceEvidenceKind::ConfirmationFailure, 29),
+            at(29),
+        )
+        .unwrap();
+    let checkpoint = engine.checkpoint();
+    assert!(checkpoint.devices[0].evicted_through.is_some());
+    assert!(!checkpoint.devices[0].history.iter().any(|transition| {
+        transition.trigger.kind == PresenceEvidenceKind::EnforcementUnblocked
+    }));
+    assert!(PresenceEngine::from_checkpoint(presence_config(), checkpoint).is_ok());
+}
+
+#[test]
 fn presence_checkpoint_rejects_version_duplicate_ids_and_duplicate_transition_ids() {
     let mut engine = PresenceEngine::new(presence_config()).unwrap();
     online_then_offline(&mut engine, id(1));

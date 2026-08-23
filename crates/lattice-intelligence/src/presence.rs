@@ -337,6 +337,7 @@ impl PresenceEngine {
                 if e.device_id != x.device_id
                     || e.source.is_empty()
                     || e.source.len() > cfg.max_source_len
+                    || e.kind == PresenceEvidenceKind::Evaluation
                     || e.valid_until.is_some_and(|v| v < e.observed_at)
                 {
                     return Err(PresenceError::InvalidCheckpoint("evidence"));
@@ -392,6 +393,22 @@ impl PresenceEngine {
                 })
             }) {
                 return Err(PresenceError::InvalidCheckpoint("enforcement trigger"));
+            }
+            if x.evidence.iter().any(|e| {
+                matches!(
+                    e.kind,
+                    PresenceEvidenceKind::EnforcementBlocked
+                        | PresenceEvidenceKind::EnforcementUnblocked
+                ) && !x.history.iter().any(|transition| {
+                    transition.trigger.source == e.source
+                        && transition.trigger.kind == e.kind
+                        && transition.trigger.observed_at == e.observed_at
+                        && transition.trigger.valid_until == e.valid_until
+                }) && !(x.evicted_through.is_some()
+                    && x.enforcement_clock == Some(e.observed_at)
+                    && e.valid_until.is_none())
+            }) {
+                return Err(PresenceError::InvalidCheckpoint("enforcement evidence"));
             }
             devices.insert(
                 x.device_id,
