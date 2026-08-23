@@ -114,8 +114,15 @@ Credentialed inventory obtains an owned credential from an execution-time provid
 after dispatch. Retrieval is an asynchronous, typed-error boundary with a default two-second
 timeout (maximum 30 seconds) and is selected directly against global stop; cancellation drops
 the pending future and never retries it. Implementations must move blocking OS/keyring calls
-to a blocking worker rather than executing them on Tokio. The runner neither queues nor
-retains credentials and never exposes panic payloads.
+to a blocking worker rather than executing them on Tokio. Provider failures cross a closed,
+payload-free `CredentialSourceError` boundary and map only to terminal sanitized outcomes;
+arbitrary strings and source errors cannot cross it. The runner neither queues nor retains
+credentials.
+
+`catch_unwind` exists only so runner reservations and pending state are cleaned up and an
+opaque `Internal` outcome remains observable. It does **not** suppress Rust's process-global
+panic hook, which runs before unwinding is caught. Credential providers are trusted code and
+must never panic with credential material; they must return a typed redacted error instead.
 
 Denied admission reports either concurrency pressure or the earliest monotonic rate/state
 deadline. Each wake scans at most the queue length observed at its start, then the coordinator

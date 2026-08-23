@@ -31,7 +31,9 @@ mod scheduler_runner;
 pub use active_udp::{
     NonceSource, UdpProbe, build_udp_probe, build_udp_probe_with_nonce, parse_udp_reply,
 };
-pub use scheduler_runner::{ExecutionCredentialSource, RunnerEvent, SchedulerRunner};
+pub use scheduler_runner::{
+    CredentialSourceError, ExecutionCredentialSource, RunnerEvent, SchedulerRunner,
+};
 
 #[derive(Debug)]
 pub enum ProbeCredential {

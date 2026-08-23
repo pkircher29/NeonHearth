@@ -14,9 +14,9 @@ use lattice_sensor::{
     Address, Interface, InterfaceClass, InterfaceId, InterfaceInventory, InterfaceOverride,
     TargetApproval, TargetGuard,
     active::{
-        ActiveEngine, ActiveError, AttemptTransport, BudgetConfig, ExecutionCredentialSource,
-        FakeClock, ProbeCredential, ProbeMode, ProbeRequest, SchedulerConfig, SchedulerRunner,
-        TransportResponse, catalog,
+        ActiveEngine, ActiveError, AttemptTransport, BudgetConfig, CredentialSourceError,
+        ExecutionCredentialSource, FakeClock, ProbeCredential, ProbeMode, ProbeRequest,
+        SchedulerConfig, SchedulerRunner, TransportResponse, catalog,
     },
 };
 
@@ -212,7 +212,7 @@ async fn descriptor_cost_consumes_the_exact_subnet_budget() {
         async fn credential_for(
             &self,
             request: &ProbeRequest,
-        ) -> Result<Option<ProbeCredential>, ActiveError> {
+        ) -> Result<Option<ProbeCredential>, CredentialSourceError> {
             Ok(
                 (request.probe_id == "udp.snmp.161").then(|| ProbeCredential::SnmpV2c {
                     community: "execution-only".into(),
@@ -328,6 +328,7 @@ async fn panic_releases_raii_budget_and_is_observable_without_retry() {
         .unwrap();
     runner.dispatch_ready().await;
     let event = results.recv().await.unwrap();
+    assert!(!format!("{event:?}").contains("injected transport panic"));
     assert_eq!(event.result.unwrap_err(), ActiveError::Internal);
     assert!(!event.will_retry);
     runner
@@ -346,7 +347,7 @@ async fn actual_dispatch_prioritizes_discovery_and_coalesces_inflight_duplicates
         async fn credential_for(
             &self,
             request: &ProbeRequest,
-        ) -> Result<Option<ProbeCredential>, ActiveError> {
+        ) -> Result<Option<ProbeCredential>, CredentialSourceError> {
             Ok(
                 (request.mode == ProbeMode::OwnerInventory).then(|| ProbeCredential::SnmpV2c {
                     community: "execution-only".into(),
@@ -509,7 +510,7 @@ impl ExecutionCredentialSource for PanicCredentials {
     async fn credential_for(
         &self,
         _: &ProbeRequest,
-    ) -> Result<Option<ProbeCredential>, ActiveError> {
+    ) -> Result<Option<ProbeCredential>, CredentialSourceError> {
         panic!("injected credential provider panic")
     }
 }
@@ -542,6 +543,7 @@ async fn credential_provider_panic_is_terminal_observable_and_releases_pending_s
     runner.enqueue(snmp.clone()).unwrap();
     assert_eq!(runner.dispatch_ready().await, 1);
     let event = results.recv().await.unwrap();
+    assert!(!format!("{event:?}").contains("injected credential provider panic"));
     assert_eq!(event.result.unwrap_err(), ActiveError::Internal);
     assert!(!event.will_retry);
     assert!(transport.sends.lock().unwrap().is_empty());
@@ -565,7 +567,7 @@ impl ExecutionCredentialSource for BarrierCredentials {
     async fn credential_for(
         &self,
         _: &ProbeRequest,
-    ) -> Result<Option<ProbeCredential>, ActiveError> {
+    ) -> Result<Option<ProbeCredential>, CredentialSourceError> {
         self.entered.notify_one();
         self.release.notified().await;
         Ok(Some(ProbeCredential::SnmpV2c {
@@ -636,6 +638,55 @@ async fn stop_serializes_with_admission_and_awaits_every_registered_attempt() {
 struct PendingCredentials {
     dropped: Arc<AtomicBool>,
 }
+
+struct RedactedErrorCredentials {
+    supplied_secret: String,
+}
+#[async_trait]
+impl ExecutionCredentialSource for RedactedErrorCredentials {
+    async fn credential_for(
+        &self,
+        _: &ProbeRequest,
+    ) -> Result<Option<ProbeCredential>, CredentialSourceError> {
+        let _credential_was_consulted = &self.supplied_secret;
+        Err(CredentialSourceError::PermissionDenied)
+    }
+}
+
+#[tokio::test]
+async fn credential_source_error_is_payload_free_sanitized_and_terminal() {
+    let secret = "owner-keyring-secret-that-must-not-escape";
+    let transport = Arc::new(ScriptedTransport::default());
+    let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
+    let probes = catalog().unwrap();
+    let engine = Arc::new(ActiveEngine::new(
+        Arc::new(guard()),
+        transport.clone(),
+        probes.clone(),
+    ));
+    let (runner, mut results) = SchedulerRunner::new_with_credentials(
+        SchedulerConfig::default(),
+        clock,
+        engine,
+        probes,
+        1,
+        Arc::new(RedactedErrorCredentials {
+            supplied_secret: secret.into(),
+        }),
+    )
+    .unwrap();
+    let mut snmp = request("192.168.50.9", "udp.snmp.161");
+    snmp.mode = ProbeMode::OwnerInventory;
+    runner.enqueue(snmp).unwrap();
+    runner.dispatch_ready().await;
+    let event = results.recv().await.unwrap();
+    assert_eq!(event.result, Err(ActiveError::PermissionDenied));
+    assert!(!event.will_retry);
+    assert!(!format!("{event:?}").contains(secret));
+    assert!(!format!("{:?}", CredentialSourceError::PermissionDenied).contains(secret));
+    assert!(transport.sends.lock().unwrap().is_empty());
+    runner.stop_and_drain().await;
+}
 struct DropMarker(Arc<AtomicBool>);
 impl Drop for DropMarker {
     fn drop(&mut self) {
@@ -647,7 +698,7 @@ impl ExecutionCredentialSource for PendingCredentials {
     async fn credential_for(
         &self,
         _: &ProbeRequest,
-    ) -> Result<Option<ProbeCredential>, ActiveError> {
+    ) -> Result<Option<ProbeCredential>, CredentialSourceError> {
         let _marker = DropMarker(self.dropped.clone());
         std::future::pending().await
     }

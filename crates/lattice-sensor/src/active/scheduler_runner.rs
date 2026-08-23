@@ -18,6 +18,24 @@ use tokio::{
     task::JoinHandle,
 };
 
+/// Closed, payload-free failures from a trusted credential provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialSourceError {
+    Unavailable,
+    PermissionDenied,
+    InvalidConfiguration,
+}
+
+impl CredentialSourceError {
+    fn into_active(self) -> ActiveError {
+        match self {
+            Self::Unavailable => ActiveError::Unavailable,
+            Self::PermissionDenied => ActiveError::PermissionDenied,
+            Self::InvalidConfiguration => ActiveError::InvalidConfig,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ExecutionCredentialSource: Send + Sync {
     /// Implementations that call blocking OS/keyring APIs must offload them with
@@ -25,7 +43,7 @@ pub trait ExecutionCredentialSource: Send + Sync {
     async fn credential_for(
         &self,
         request: &ProbeRequest,
-    ) -> Result<Option<ProbeCredential>, ActiveError>;
+    ) -> Result<Option<ProbeCredential>, CredentialSourceError>;
 }
 struct NoCredentials;
 #[async_trait]
@@ -33,7 +51,7 @@ impl ExecutionCredentialSource for NoCredentials {
     async fn credential_for(
         &self,
         _: &ProbeRequest,
-    ) -> Result<Option<ProbeCredential>, ActiveError> {
+    ) -> Result<Option<ProbeCredential>, CredentialSourceError> {
         Ok(None)
     }
 }
@@ -333,7 +351,9 @@ impl<C: Clock + 'static, T: AttemptTransport + 'static> SchedulerRunner<C, T> {
                     result = tokio::time::timeout(
                         self.credential_timeout,
                         self.credentials.credential_for(&request),
-                    ) => result.map_err(|_| ActiveError::CredentialTimeout)??,
+                    ) => result
+                        .map_err(|_| ActiveError::CredentialTimeout)?
+                        .map_err(CredentialSourceError::into_active)?,
                 }
             } else {
                 None
