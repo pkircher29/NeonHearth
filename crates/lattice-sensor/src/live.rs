@@ -204,9 +204,12 @@ impl FlowLiveAdapter {
                     next.insert(r.key.clone(), r.clone());
                     traffic_changed = true;
                 }
-                RollupChange::Retire(r) if r.cache_only => {
+                RollupChange::Retire(r)
+                    if r.cache_only
+                        && r.key.resolution == Resolution::Second
+                        && next.remove(&r.key).is_some() =>
+                {
                     retired_devices.insert(r.key.device_id.to_string());
-                    next.remove(&r.key);
                 }
                 _ => {}
             }

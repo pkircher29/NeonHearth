@@ -200,3 +200,41 @@ fn retire_before_flush_cancels_stale_sample_but_preserves_other_devices() {
         vec![d(2)]
     );
 }
+
+#[test]
+fn absent_and_nonsecond_retire_do_not_cancel_valid_pending_sample() {
+    let mut a = FlowLiveAdapter::new(LiveConfig::default(), 4).unwrap();
+    let valid = roll(3);
+    a.apply(0, &[RollupChange::Upsert(valid.clone())]).unwrap();
+    let mut absent = valid.key.clone();
+    absent.interface = 99;
+    a.apply(
+        1,
+        &[RollupChange::Retire(Retirement {
+            key: absent,
+            cache_only: true,
+        })],
+    )
+    .unwrap();
+    let EventPayload::BandwidthFrame(f) = a.flush_payload(250, t(2)).unwrap().unwrap() else {
+        panic!()
+    };
+    assert_eq!(f.samples[0].delta.upload, 3);
+    let mut b = FlowLiveAdapter::new(LiveConfig::default(), 4).unwrap();
+    b.apply(0, &[RollupChange::Upsert(valid.clone())]).unwrap();
+    let mut minute = valid.key;
+    minute.resolution = Resolution::Minute;
+    minute.bucket = t(0);
+    b.apply(
+        1,
+        &[RollupChange::Retire(Retirement {
+            key: minute,
+            cache_only: true,
+        })],
+    )
+    .unwrap();
+    let EventPayload::BandwidthFrame(f) = b.flush_payload(250, t(2)).unwrap().unwrap() else {
+        panic!()
+    };
+    assert_eq!(f.samples[0].delta.upload, 3);
+}
