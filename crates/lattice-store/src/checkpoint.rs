@@ -1,15 +1,19 @@
 use crate::FlowRepository;
 use chrono::{DateTime, Utc};
-use lattice_domain::{DeviceId, EvidenceFact, EvidenceFamily, PresenceChanged, PresenceState};
+use lattice_domain::{
+    Coverage, DeviceId, EvidenceFact, EvidenceFamily, PresenceChanged, PresenceState,
+};
 use lattice_sensor::{flow::RollupChange, neighbor::LinkAddress};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::collections::HashSet;
 use thiserror::Error;
 
 pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_BATCH: usize = 4096;
+pub const MAX_SNAPSHOT_DEVICES: usize = 1024;
 const CURRENT_FORMAT_VERSION: i64 = 1;
 type StoredCheckpointRow = (i64, Vec<u8>, String, i64, String, Vec<u8>);
 type StoredDiscoveryRow = (
@@ -42,6 +46,7 @@ pub struct M2StateConfig {
     pub max_discovery_summary_bytes: usize,
     pub max_batch: usize,
     pub max_string_bytes: usize,
+    pub max_snapshot_devices: usize,
 }
 impl Default for M2StateConfig {
     fn default() -> Self {
@@ -50,6 +55,7 @@ impl Default for M2StateConfig {
             max_discovery_summary_bytes: 1024 * 1024,
             max_batch: MAX_BATCH,
             max_string_bytes: 4096,
+            max_snapshot_devices: MAX_SNAPSHOT_DEVICES,
         }
     }
 }
@@ -61,6 +67,39 @@ pub struct DeviceProjection {
     pub owner_name: Option<String>,
     pub owner_type: Option<String>,
     pub owner_confirmed: bool,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredPresenceSummary {
+    pub to_state: PresenceState,
+    pub occurred_at: DateTime<Utc>,
+    pub trigger_source: String,
+    pub trigger_kind: String,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredEvidenceSummary {
+    pub family: EvidenceFamily,
+    pub source: String,
+    pub confidence: f32,
+    pub observed_at: DateTime<Utc>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredBandwidthSummary {
+    pub upload: u64,
+    pub download: u64,
+    pub coverage: Coverage,
+    pub observed_at: DateTime<Utc>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredDeviceSnapshot {
+    pub device_id: DeviceId,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub owner_name: Option<String>,
+    pub owner_type: Option<String>,
+    pub owner_confirmed: bool,
+    pub presence: Option<StoredPresenceSummary>,
+    pub evidence: Option<StoredEvidenceSummary>,
+    pub bandwidth: Option<StoredBandwidthSummary>,
 }
 #[derive(Clone, Debug)]
 pub struct EvidenceProjection {
@@ -136,6 +175,7 @@ impl M2StateRepository {
             || config.max_discovery_summary_bytes == 0
             || config.max_batch == 0
             || config.max_string_bytes == 0
+            || config.max_snapshot_devices == 0
         {
             return Err(CheckpointError::Invalid(
                 "all M2 state limits must be nonzero".into(),
@@ -300,6 +340,172 @@ impl M2StateRepository {
     pub fn flow_repository(&self, max_batch: usize) -> Result<FlowRepository, CheckpointError> {
         FlowRepository::new(self.pool.clone(), max_batch)
             .map_err(|e| CheckpointError::Invalid(e.to_string()))
+    }
+
+    pub async fn list_device_snapshots(
+        &self,
+        limit: usize,
+        after: Option<DeviceId>,
+    ) -> Result<Vec<StoredDeviceSnapshot>, CheckpointError> {
+        if limit == 0 {
+            return Err(CheckpointError::Invalid(
+                "snapshot limit must be nonzero".into(),
+            ));
+        }
+        if limit > self.config.max_snapshot_devices {
+            return Err(CheckpointError::Capacity(
+                "snapshot limit exceeds configured bound".into(),
+            ));
+        }
+        let rows = if let Some(after) = after {
+            sqlx::query("SELECT device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed FROM devices WHERE device_id>? ORDER BY device_id ASC LIMIT ?").bind(after.to_string()).bind(limit as i64).fetch_all(&self.pool).await?
+        } else {
+            sqlx::query("SELECT device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed FROM devices ORDER BY device_id ASC LIMIT ?").bind(limit as i64).fetch_all(&self.pool).await?
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id =
+                DeviceId::parse(row.try_get::<String, _>("device_id")?.as_str()).map_err(|_| {
+                    CheckpointError::Corrupt(
+                        "device snapshot contains invalid device identifier".into(),
+                    )
+                })?;
+            let first = parse_timestamp(
+                &row.try_get::<String, _>("first_seen_at")?,
+                "device first_seen_at",
+                CheckpointError::Corrupt,
+            )?;
+            let last = parse_timestamp(
+                &row.try_get::<String, _>("last_seen_at")?,
+                "device last_seen_at",
+                CheckpointError::Corrupt,
+            )?;
+            if first > last {
+                return Err(CheckpointError::Corrupt(
+                    "device first_seen_at is after last_seen_at".into(),
+                ));
+            }
+            let owner_confirmed: i64 = row.try_get("owner_confirmed")?;
+            let owner_confirmed = match owner_confirmed {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(CheckpointError::Corrupt(
+                        "device owner flag is invalid".into(),
+                    ));
+                }
+            };
+            let owner_name: Option<String> = row.try_get("owner_name")?;
+            let owner_type: Option<String> = row.try_get("owner_type")?;
+            if owner_name
+                .as_ref()
+                .is_some_and(|v| v.len() > self.config.max_string_bytes)
+                || owner_type
+                    .as_ref()
+                    .is_some_and(|v| v.len() > self.config.max_string_bytes)
+            {
+                return Err(CheckpointError::Corrupt(
+                    "owner string exceeds configured bound".into(),
+                ));
+            }
+            let presence_row = sqlx::query("SELECT to_state,occurred_at,trigger_source,trigger_kind FROM presence_transitions WHERE device_id=? ORDER BY occurred_at DESC,transition_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
+            let presence = if let Some(r) = presence_row {
+                Some(StoredPresenceSummary {
+                    to_state: parse_presence_state(&r.try_get::<String, _>("to_state")?)?,
+                    occurred_at: parse_timestamp(
+                        &r.try_get::<String, _>("occurred_at")?,
+                        "presence occurred_at",
+                        CheckpointError::Corrupt,
+                    )?,
+                    trigger_source: r.try_get("trigger_source")?,
+                    trigger_kind: r.try_get("trigger_kind")?,
+                })
+                .map(|p| {
+                    if p.trigger_source.is_empty()
+                        || p.trigger_kind.is_empty()
+                        || p.trigger_source.len() > self.config.max_string_bytes
+                        || p.trigger_kind.len() > self.config.max_string_bytes
+                    {
+                        return Err(CheckpointError::Corrupt(
+                            "presence trigger string is invalid".into(),
+                        ));
+                    }
+                    Ok(p)
+                })
+                .transpose()?
+            } else {
+                None
+            };
+            let evidence_row = sqlx::query("SELECT family,source,confidence,observed_at FROM evidence WHERE device_id=? ORDER BY confidence DESC,observed_at DESC,evidence_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
+            let evidence = if let Some(r) = evidence_row {
+                Some(StoredEvidenceSummary {
+                    family: parse_evidence_family(&r.try_get::<String, _>("family")?)?,
+                    source: r.try_get("source")?,
+                    confidence: checked_confidence(r.try_get("confidence")?)?,
+                    observed_at: parse_timestamp(
+                        &r.try_get::<String, _>("observed_at")?,
+                        "evidence observed_at",
+                        CheckpointError::Corrupt,
+                    )?,
+                })
+                .map(|e| {
+                    if e.source.is_empty() || e.source.len() > self.config.max_string_bytes {
+                        return Err(CheckpointError::Corrupt(
+                            "evidence source is invalid".into(),
+                        ));
+                    }
+                    Ok(e)
+                })
+                .transpose()?
+            } else {
+                None
+            };
+            let flows = sqlx::query("SELECT bucket,upload,download,coverage FROM flow_rollups WHERE device_id=? AND resolution='second' AND bucket=(SELECT MAX(bucket) FROM flow_rollups WHERE device_id=? AND resolution='second')").bind(id.to_string()).bind(id.to_string()).fetch_all(&self.pool).await?;
+            let bandwidth = if flows.is_empty() {
+                None
+            } else {
+                let bucket = parse_timestamp(
+                    &flows[0].try_get::<String, _>("bucket")?,
+                    "flow bucket",
+                    CheckpointError::Corrupt,
+                )?;
+                let mut up = 0u64;
+                let mut down = 0u64;
+                let mut cov = None;
+                for r in flows {
+                    up = up
+                        .checked_add(i64_to_u64(r.try_get("upload")?)?)
+                        .ok_or_else(|| CheckpointError::Corrupt("flow upload overflow".into()))?;
+                    down = down
+                        .checked_add(i64_to_u64(r.try_get("download")?)?)
+                        .ok_or_else(|| CheckpointError::Corrupt("flow download overflow".into()))?;
+                    let c = parse_coverage(&r.try_get::<String, _>("coverage")?)?;
+                    if cov.is_some_and(|x| x != c) {
+                        cov = Some(Coverage::Estimated)
+                    } else if cov.is_none() {
+                        cov = Some(c)
+                    }
+                }
+                Some(StoredBandwidthSummary {
+                    upload: up,
+                    download: down,
+                    coverage: cov.unwrap_or(Coverage::Estimated),
+                    observed_at: bucket,
+                })
+            };
+            out.push(StoredDeviceSnapshot {
+                device_id: id,
+                first_seen_at: first,
+                last_seen_at: last,
+                owner_name,
+                owner_type,
+                owner_confirmed,
+                presence,
+                evidence,
+                bandwidth,
+            });
+        }
+        Ok(out)
     }
     pub async fn commit(&self, input: CommitInput) -> Result<(), CheckpointError> {
         validate_input(&self.config, &input)?;
@@ -873,6 +1079,51 @@ fn evidence_family(value: EvidenceFamily) -> &'static str {
         EvidenceFamily::RouterHint => "router_hint",
         EvidenceFamily::Owner => "owner",
     }
+}
+fn parse_presence_state(v: &str) -> Result<PresenceState, CheckpointError> {
+    match v {
+        "online" => Ok(PresenceState::Online),
+        "quiet" => Ok(PresenceState::Quiet),
+        "offline" => Ok(PresenceState::Offline),
+        "blocked" => Ok(PresenceState::Blocked),
+        "unknown" => Ok(PresenceState::Unknown),
+        _ => Err(CheckpointError::Corrupt("presence state is invalid".into())),
+    }
+}
+fn parse_evidence_family(v: &str) -> Result<EvidenceFamily, CheckpointError> {
+    match v {
+        "link_layer" => Ok(EvidenceFamily::LinkLayer),
+        "addressing" => Ok(EvidenceFamily::Addressing),
+        "naming" => Ok(EvidenceFamily::Naming),
+        "service" => Ok(EvidenceFamily::Service),
+        "cryptographic" => Ok(EvidenceFamily::Cryptographic),
+        "router_hint" => Ok(EvidenceFamily::RouterHint),
+        "owner" => Ok(EvidenceFamily::Owner),
+        _ => Err(CheckpointError::Corrupt(
+            "evidence family is invalid".into(),
+        )),
+    }
+}
+fn parse_coverage(v: &str) -> Result<Coverage, CheckpointError> {
+    match v {
+        "complete" => Ok(Coverage::Complete),
+        "router-reported" => Ok(Coverage::RouterReported),
+        "local-only" => Ok(Coverage::LocalOnly),
+        "estimated" => Ok(Coverage::Estimated),
+        _ => Err(CheckpointError::Corrupt("flow coverage is invalid".into())),
+    }
+}
+fn checked_confidence(v: f64) -> Result<f32, CheckpointError> {
+    if v.is_finite() && (0.0..=1.0).contains(&v) {
+        Ok(v as f32)
+    } else {
+        Err(CheckpointError::Corrupt(
+            "evidence confidence is invalid".into(),
+        ))
+    }
+}
+fn i64_to_u64(v: i64) -> Result<u64, CheckpointError> {
+    u64::try_from(v).map_err(|_| CheckpointError::Corrupt("flow byte count is invalid".into()))
 }
 fn presence_state(value: PresenceState) -> &'static str {
     match value {
