@@ -374,6 +374,59 @@ fn presence_checkpoint_rejects_evaluation_and_unproven_enforcement_evidence() {
 }
 
 #[test]
+fn presence_checkpoint_rejects_neighbor_cache_evidence_without_validity() {
+    let mut engine = PresenceEngine::new(presence_config()).unwrap();
+    for observed in [0, 1] {
+        engine
+            .ingest(
+                PresenceEvidence {
+                    device_id: id(1),
+                    source: "sensor-a".into(),
+                    kind: PresenceEvidenceKind::NeighborCache,
+                    observed_at: at(observed),
+                    valid_until: Some(at(30)),
+                },
+                at(observed),
+            )
+            .unwrap();
+    }
+    let mut checkpoint = engine.checkpoint();
+    assert!(PresenceEngine::from_checkpoint(presence_config(), checkpoint.clone()).is_ok());
+    checkpoint.devices[0].evidence[0].valid_until = None;
+    assert!(matches!(
+        PresenceEngine::from_checkpoint(presence_config(), checkpoint),
+        Err(PresenceError::InvalidCheckpoint("evidence"))
+    ));
+}
+
+#[test]
+fn presence_checkpoint_rejects_neighbor_cache_trigger_without_validity() {
+    let mut engine = PresenceEngine::new(presence_config()).unwrap();
+    for observed in [0, 1] {
+        engine
+            .ingest(
+                PresenceEvidence {
+                    device_id: id(1),
+                    source: "sensor-a".into(),
+                    kind: PresenceEvidenceKind::NeighborCache,
+                    observed_at: at(observed),
+                    valid_until: Some(at(30)),
+                },
+                at(observed),
+            )
+            .unwrap();
+    }
+    let mut checkpoint = engine.checkpoint();
+    assert!(PresenceEngine::from_checkpoint(presence_config(), checkpoint.clone()).is_ok());
+    checkpoint.devices[0].history[0].trigger.kind = PresenceEvidenceKind::NeighborCache;
+    checkpoint.devices[0].history[0].trigger.valid_until = None;
+    assert!(matches!(
+        PresenceEngine::from_checkpoint(presence_config(), checkpoint),
+        Err(PresenceError::InvalidCheckpoint("trigger"))
+    ));
+}
+
+#[test]
 fn presence_checkpoint_accepts_verified_enforcement_after_its_transition_is_evicted() {
     let mut engine = PresenceEngine::new(presence_config()).unwrap();
     online_then_offline(&mut engine, id(1));

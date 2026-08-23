@@ -305,6 +305,8 @@ impl PresenceEngine {
                     || t.trigger.source.len() > cfg.max_source_len
                     || !cfg.trusted_sources.iter().any(|s| s == &t.trigger.source)
                     || t.trigger.kind == PresenceEvidenceKind::Evaluation
+                    || (t.trigger.kind == PresenceEvidenceKind::NeighborCache
+                        && t.trigger.valid_until.is_none())
                     || t.trigger.arrival_at < t.trigger.observed_at
                     || t.trigger
                         .valid_until
@@ -340,6 +342,7 @@ impl PresenceEngine {
                     || e.source.is_empty()
                     || e.source.len() > cfg.max_source_len
                     || e.kind == PresenceEvidenceKind::Evaluation
+                    || (e.kind == PresenceEvidenceKind::NeighborCache && e.valid_until.is_none())
                     || e.valid_until.is_some_and(|v| v < e.observed_at)
                 {
                     return Err(PresenceError::InvalidCheckpoint("evidence"));
