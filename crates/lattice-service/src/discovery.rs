@@ -152,6 +152,8 @@ pub enum DiscoveryError {
     Presence(#[from] PresenceError),
     #[error("invalid or unregistered discovery source")]
     InvalidSource,
+    #[error("link presence has no registered binding")]
+    UnboundLink,
     #[error("invalid discovery pipeline checkpoint")]
     InvalidCheckpoint,
     #[error("flow: {0}")]
@@ -292,7 +294,10 @@ impl PersistentDiscoveryPipeline {
                 )
             }
             LinkPresenceKind::Missed => {
-                let id = binding.ok_or(DiscoveryError::InvalidSource)?;
+                if observation.observed_at.timestamp_subsec_nanos() != 0 {
+                    return Err(DiscoveryError::InvalidSource);
+                }
+                let id = binding.ok_or(DiscoveryError::UnboundLink)?;
                 (
                     Some(id),
                     Vec::new(),
