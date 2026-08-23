@@ -15,6 +15,20 @@ async fn initialize_preserves_original_first_run_time_and_install_id() -> anyhow
     assert_eq!(initial.schema_version, 1);
     assert_eq!(initial.install_id, repeated.install_id);
     assert_eq!(initial.first_run_at, repeated.first_run_at);
+    assert_eq!(repeated.schema_version, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn devices_use_owner_type_column() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('devices') ORDER BY cid")
+            .fetch_all(&pool)
+            .await?;
+
+    assert!(names.iter().any(|name| name == "owner_type"));
+    assert!(!names.iter().any(|name| name == "type"));
     Ok(())
 }
 

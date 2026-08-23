@@ -19,7 +19,7 @@ CREATE TABLE devices (
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
     owner_name TEXT,
-    type TEXT,
+    owner_type TEXT,
     owner_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (owner_confirmed IN (0, 1))
 );
 
