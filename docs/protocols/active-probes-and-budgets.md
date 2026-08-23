@@ -18,8 +18,8 @@ IDs are unique and plans are sorted deterministically.
 | Reachability | ICMPv4, ICMPv6 | Real cross-platform raw echo through `surge-ping`; typed permission/unavailable/network outcomes |
 | Link layer | ARP, NDP | Raw privilege; descriptor only until capture backend supplies a guarded send path; never fakes success |
 | TCP | FTP 21, SSH 22, Telnet 23, SMTP 25, DNS 53, HTTP 80, HTTPS 443, SMB 445, RTSP 554, IPP 631, camera/web 8000/8080, printer 9100, RDP 3389, VNC 5900, MQTT 1883/8883, AMQP 5672/5671, CoAP/TCP 5683, common databases | Normal connect; bounded read; no login or authentication attempts |
-| UDP unicast | DNS 53, DHCP 67, NTP 123, NBNS 137, SNMP 161, SSDP 1900, WS-Discovery/ONVIF 3702, SIP 5060, mDNS 5353, CoAP 5683, common IoT 6666 | One tiny deterministic unicast request; passive-only for multicast discovery |
-| SNMP inventory | 161 | Owner-started and credential-required; no default/community guessing |
+| UDP unicast | DNS 53, DHCPINFORM 67, NTP 123, NBNS 137, SNMP 161, RTSP OPTIONS 554, SSDP 1900, WS-Discovery/ONVIF 3702, SIP 5060, mDNS 5353, CoAP 5683, LIFX LAN 56700 | One tiny deterministic unicast request; passive-only for multicast discovery |
+| SNMP inventory | 161 | Owner-started v1/v2c/v3 read-only GET for sysDescr.0 and sysObjectID.0; no default/community guessing |
 | Full-port | TCP 1–65535 conceptually; the catalog exposes bounded owner-started chunks | Explicit owner start only, lower priority, never scheduled by the default plan |
 
 HTTP uses a raw numeric-target request with a numeric `Host`, connection close, bounded
@@ -28,9 +28,13 @@ pure-Rust rustls and exposes only a bounded SHA-256 fingerprint, subject, SAN an
 The fingerprint-only handshake is always labeled **unverified**, never trusted, and never
 downgrades to plaintext.
 
-SNMP credentials are borrowed only for the execution call. They are never stored,
-logged, included in errors, or returned in evidence. ONVIF authentication is deferred to
-M4. Successful protocol metadata is capped at 32 facts and 512 bytes per value, source
+SNMP credentials are typed and borrowed only for the execution call. V1/v2c community,
+v3 username-only, SHA-1/SHA-256/SHA-512 authentication, and AES-128/AES-256 privacy are
+supported through a bounded custom transport. That transport re-authorizes the exact
+interface and numeric peer before every v3 discovery/retry send, and the protocol library
+validates version, community or USM security, request/message ID, and response shape.
+Credentials are redacted by `Debug`, never logged, included in errors, or returned in
+evidence. ONVIF authentication is deferred to M4. Successful protocol metadata is capped at 32 facts and 512 bytes per value, source
 stamped as `active.<probe-id>.v<version>`, confidence-clamped by construction, and expires
 after ten minutes. Refusal and timeout are metadata-only outcomes; raw bodies,
 certificates, and secrets never leave the adapter.
@@ -47,6 +51,11 @@ certificates, and secrets never leave the adapter.
 | Queue | 2048 coalesced items | 4096 |
 | Backoff | 1, 2, 4… seconds | capped at 60 seconds; exponent bounded |
 | Jitter | deterministic 0–10% positive delay | configurable through 25% |
+
+Descriptors also declare an explicit cost class: presence (ICMP/neighbor checks),
+discovery (normal TCP/UDP), inventory (credentialed SNMP, cost 4), or owner full-port
+(cost 2 per handshake). The scheduler consumes those costs when the D6 runner dispatches
+work; the catalog never treats credentialed inventory as a cheap presence probe.
 
 Budgets and backoff use monotonic time. Wall time is used only for evidence
 `observed_at`/expiry. A wall-clock correction cannot refill a budget. Resume after sleep

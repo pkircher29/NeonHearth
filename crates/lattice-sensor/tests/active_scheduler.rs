@@ -12,11 +12,10 @@ use lattice_sensor::{
     TargetApproval, TargetGuard,
     active::{
         ActiveEngine, ActiveError, AttemptTransport, BudgetConfig, CuratedPlan, FakeClock,
-        ProbeMode, ProbeOutcome, ProbeRequest, Scheduler, SchedulerConfig, TransportResponse,
-        catalog, owner_full_port_probe_ids, parse_http_metadata,
+        ProbeCredential, ProbeMode, ProbeOutcome, ProbeRequest, Scheduler, SchedulerConfig,
+        TransportResponse, catalog, owner_full_port_probe_ids, parse_http_metadata,
     },
 };
-use secrecy::SecretString;
 
 fn guard() -> TargetGuard {
     let id = InterfaceId::new(7);
@@ -56,9 +55,10 @@ struct BlockingTransport;
 impl AttemptTransport for BlockingTransport {
     async fn attempt(
         &self,
+        _guard: &TargetGuard,
         _request: &ProbeRequest,
         _descriptor: &lattice_sensor::active::ProbeDescriptor,
-        _credential: Option<&SecretString>,
+        _credential: Option<&ProbeCredential>,
     ) -> Result<TransportResponse, ActiveError> {
         std::future::pending().await
     }
@@ -68,9 +68,10 @@ impl AttemptTransport for BlockingTransport {
 impl AttemptTransport for FakeTransport {
     async fn attempt(
         &self,
+        _guard: &TargetGuard,
         request: &ProbeRequest,
         descriptor: &lattice_sensor::active::ProbeDescriptor,
-        _credential: Option<&SecretString>,
+        _credential: Option<&ProbeCredential>,
     ) -> Result<TransportResponse, ActiveError> {
         self.sends
             .lock()
@@ -101,6 +102,11 @@ fn catalog_is_unique_deterministic_and_full_port_is_opt_in() {
     let default = catalog.plan(CuratedPlan::Default);
     assert!(default.iter().any(|p| p.id == "tcp.http.80"));
     assert!(default.iter().any(|p| p.id == "udp.dns.53"));
+    assert!(
+        default
+            .iter()
+            .all(|p| !p.potential_side_effects.is_empty() && p.rate_cost > 0)
+    );
     assert!(!default.iter().any(|p| p.id.starts_with("full.")));
     assert!(
         catalog
@@ -141,7 +147,9 @@ async fn credentials_are_required_borrowed_and_never_returned() {
         engine.execute(req.clone(), None).await.unwrap_err(),
         ActiveError::CredentialRequired
     ));
-    let secret = SecretString::from("private-community");
+    let secret = ProbeCredential::SnmpV2c {
+        community: "private-community".into(),
+    };
     let result = engine.execute(req, Some(&secret)).await.unwrap();
     assert!(!format!("{result:?}").contains("private-community"));
 }
@@ -171,6 +179,22 @@ async fn global_stop_cancels_in_flight_and_does_not_report_target_failure() {
             .unwrap_err(),
         ActiveError::Cancelled
     );
+}
+
+#[tokio::test]
+async fn descriptor_timeout_is_a_typed_timeout_outcome() {
+    let mut probes = catalog().unwrap();
+    probes
+        .override_timeout("tcp.http.80", Duration::from_millis(5))
+        .unwrap();
+    let engine = ActiveEngine::new(Arc::new(guard()), Arc::new(BlockingTransport), probes);
+    assert!(matches!(
+        engine
+            .execute(request("192.168.50.9", "tcp.http.80"), None)
+            .await
+            .unwrap(),
+        ProbeOutcome::Timeout { .. }
+    ));
 }
 
 #[tokio::test]

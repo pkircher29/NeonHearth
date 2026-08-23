@@ -12,16 +12,58 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lattice_domain::{EvidenceFact, EvidenceFamily};
+use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, UdpSocket},
     sync::Notify,
 };
+use zeroize::Zeroizing;
 
 use crate::{InterfaceId, TargetGuard};
+
+mod active_udp;
+pub use active_udp::{UdpProbe, build_udp_probe, parse_udp_reply};
+
+#[derive(Debug)]
+pub enum ProbeCredential {
+    SnmpV1 {
+        community: SecretString,
+    },
+    SnmpV2c {
+        community: SecretString,
+    },
+    SnmpV3 {
+        username: SecretString,
+        authentication: Option<SnmpAuthentication>,
+        privacy: Option<SnmpPrivacy>,
+    },
+}
+#[derive(Debug)]
+pub struct SnmpAuthentication {
+    pub protocol: SnmpAuthProtocol,
+    pub password: SecretString,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum SnmpAuthProtocol {
+    Sha1,
+    Sha256,
+    Sha512,
+}
+#[derive(Debug)]
+pub struct SnmpPrivacy {
+    pub protocol: SnmpPrivProtocol,
+    pub password: SecretString,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum SnmpPrivProtocol {
+    Aes128,
+    Aes256,
+}
 
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 pub const MAX_FACT_VALUE_BYTES: usize = 512;
@@ -42,6 +84,13 @@ pub enum RequiredPrivilege {
     Admin,
     Credential,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BudgetClass {
+    Presence,
+    Discovery,
+    Inventory,
+    OwnerFullPort,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProbeDescriptor {
@@ -55,6 +104,8 @@ pub struct ProbeDescriptor {
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub evidence_families: Vec<EvidenceFamily>,
+    pub budget_class: BudgetClass,
+    pub rate_cost: u8,
     pub credential_required: bool,
     pub owner_start_required: bool,
     request: Vec<u8>,
@@ -89,6 +140,8 @@ impl ProbeCatalog {
                 || item.max_request_bytes > 4096
                 || item.max_response_bytes > MAX_RESPONSE_BYTES
                 || item.request.len() > item.max_request_bytes
+                || item.rate_cost == 0
+                || item.potential_side_effects.is_empty()
             {
                 return Err(CatalogError::Invalid);
             }
@@ -107,6 +160,16 @@ impl ProbeCatalog {
     pub fn get(&self, id: &str) -> Option<&ProbeDescriptor> {
         self.descriptors.get(id)
     }
+    pub fn override_timeout(&mut self, id: &str, timeout: Duration) -> Result<(), CatalogError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(30) {
+            return Err(CatalogError::Invalid);
+        }
+        self.descriptors
+            .get_mut(id)
+            .ok_or(CatalogError::Invalid)?
+            .timeout = timeout;
+        Ok(())
+    }
     fn resolve(&self, id: &str) -> Option<ProbeDescriptor> {
         if let Some(descriptor) = self.descriptors.get(id) {
             return Some(descriptor.clone());
@@ -118,6 +181,10 @@ impl ProbeCatalog {
         let mut descriptor =
             descriptor(id, ProbeTransport::Tcp, port, RequiredPrivilege::None, b"");
         descriptor.owner_start_required = true;
+        descriptor.budget_class = BudgetClass::OwnerFullPort;
+        descriptor.rate_cost = 2;
+        descriptor.potential_side_effects =
+            "One TCP handshake; may be logged by the target service";
         Some(descriptor)
     }
     pub fn plan(&self, plan: CuratedPlan) -> Vec<&ProbeDescriptor> {
@@ -138,17 +205,67 @@ fn descriptor(
     privilege: RequiredPrivilege,
     request: &[u8],
 ) -> ProbeDescriptor {
+    let (side_effects, budget_class, rate_cost) = if id.starts_with("icmp.") {
+        (
+            "One ICMP echo; target may answer or log it",
+            BudgetClass::Presence,
+            1,
+        )
+    } else if id.starts_with("link.") {
+        (
+            "One local-link neighbor query through the privileged capture backend",
+            BudgetClass::Presence,
+            1,
+        )
+    } else if id.starts_with("udp.dhcp") {
+        (
+            "One unicast DHCPINFORM from the active interface address; server may audit it",
+            BudgetClass::Discovery,
+            2,
+        )
+    } else if id.starts_with("udp.snmp") {
+        (
+            "Two read-only SNMP GET varbinds; agent may audit the supplied owner credential",
+            BudgetClass::Inventory,
+            4,
+        )
+    } else if id.starts_with("udp.") {
+        (
+            "One protocol-shaped unicast discovery request; target may answer or log it",
+            BudgetClass::Discovery,
+            1,
+        )
+    } else if transport == ProbeTransport::Tls {
+        (
+            "One TLS handshake for certificate metadata; target may log it",
+            BudgetClass::Discovery,
+            3,
+        )
+    } else {
+        (
+            "One TCP handshake and optional non-auth greeting; target service may log it",
+            BudgetClass::Discovery,
+            2,
+        )
+    };
     ProbeDescriptor {
         id: id.into(),
         version: 1,
         transport,
         ports: vec![port],
         privilege,
-        potential_side_effects: "May create a normal service connection or one unicast request",
+        potential_side_effects: side_effects,
         timeout: Duration::from_secs(3),
         max_request_bytes: 1024,
         max_response_bytes: 4096,
-        evidence_families: vec![EvidenceFamily::Service],
+        evidence_families: match transport {
+            ProbeTransport::Tls => vec![EvidenceFamily::Cryptographic, EvidenceFamily::Service],
+            ProbeTransport::Icmp => vec![EvidenceFamily::Addressing],
+            ProbeTransport::LinkLayer => vec![EvidenceFamily::LinkLayer],
+            ProbeTransport::Tcp | ProbeTransport::Udp => vec![EvidenceFamily::Service],
+        },
+        budget_class,
+        rate_cost,
         credential_required: privilege == RequiredPrivilege::Credential,
         owner_start_required: false,
         request: request.to_vec(),
@@ -213,7 +330,7 @@ pub fn catalog() -> Result<ProbeCatalog, CatalogError> {
             )
         })
         .collect();
-    let udp: [(&str, u16, &[u8]); 11] = [
+    let udp: [(&str, u16, &[u8]); 12] = [
         (
             "dns",
             53,
@@ -244,7 +361,8 @@ pub fn catalog() -> Result<ProbeCatalog, CatalogError> {
             b"OPTIONS sip:device SIP/2.0\r\nContent-Length: 0\r\n\r\n",
         ),
         ("coap", 5683, b"\x40\x01\x12\x34"),
-        ("iot", 6666, b"\0\0\0\0"),
+        ("rtsp", 554, b""),
+        ("lifx", 56700, b""),
     ];
     items.extend(udp.into_iter().map(|(name, port, req)| {
         descriptor(
@@ -263,6 +381,10 @@ pub fn catalog() -> Result<ProbeCatalog, CatalogError> {
         b"",
     );
     snmp.owner_start_required = true;
+    snmp.budget_class = BudgetClass::Inventory;
+    snmp.rate_cost = 4;
+    snmp.potential_side_effects =
+        "Two read-only SNMP GET varbinds; agent may audit the supplied owner credential";
     items.push(snmp);
     items.push(descriptor(
         "icmp.echo.v4",
@@ -301,6 +423,9 @@ pub fn catalog() -> Result<ProbeCatalog, CatalogError> {
             b"",
         );
         p.owner_start_required = true;
+        p.budget_class = BudgetClass::OwnerFullPort;
+        p.rate_cost = 2;
+        p.potential_side_effects = "One TCP handshake; may be logged by the target service";
         items.push(p);
     }
     ProbeCatalog::new(items)
@@ -358,29 +483,37 @@ pub enum ActiveError {
     Network,
     #[error("response exceeded limit")]
     ResponseLimit,
+    #[error("response correlation failed")]
+    Correlation,
     #[error("invalid scheduler configuration")]
     InvalidConfig,
     #[error("scheduler queue is full")]
     QueueFull,
 }
 
-#[async_trait]
 pub trait ActiveProbeAdapter: Send + Sync {
     fn descriptor(&self) -> &ProbeDescriptor;
-    async fn execute(
+    fn build_request(
         &self,
         request: &ProbeRequest,
-        credential: Option<&SecretString>,
-    ) -> Result<TransportResponse, ActiveError>;
+        credential: Option<&ProbeCredential>,
+    ) -> Result<Vec<u8>, ActiveError>;
+    fn parse_response(
+        &self,
+        request: &ProbeRequest,
+        peer: SocketAddr,
+        response: &[u8],
+    ) -> Result<Vec<(String, String)>, ActiveError>;
 }
 
 #[async_trait]
 pub trait AttemptTransport: Send + Sync {
     async fn attempt(
         &self,
+        guard: &TargetGuard,
         request: &ProbeRequest,
         descriptor: &ProbeDescriptor,
-        credential: Option<&SecretString>,
+        credential: Option<&ProbeCredential>,
     ) -> Result<TransportResponse, ActiveError>;
 }
 
@@ -408,7 +541,7 @@ impl<T: AttemptTransport> ActiveEngine<T> {
     pub async fn execute(
         &self,
         request: ProbeRequest,
-        credential: Option<&SecretString>,
+        credential: Option<&ProbeCredential>,
     ) -> Result<ProbeOutcome, ActiveError> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(ActiveError::Cancelled);
@@ -434,8 +567,8 @@ impl<T: AttemptTransport> ActiveEngine<T> {
         let response = tokio::select! {
             biased;
             () = self.stop_notify.notified() => return Err(ActiveError::Cancelled),
-            result = tokio::time::timeout(descriptor.timeout, self.transport.attempt(&request, &descriptor, credential)) => {
-                result.map_err(|_| ActiveError::Network)??
+            result = tokio::time::timeout(descriptor.timeout, self.transport.attempt(&self.guard, &request, &descriptor, credential)) => {
+                match result { Ok(response) => response?, Err(_) => TransportResponse::Timeout }
             }
         };
         normalize(&descriptor, response)
@@ -461,7 +594,11 @@ fn normalize(
                     return Err(ActiveError::ResponseLimit);
                 }
                 facts.push(EvidenceFact {
-                    family: EvidenceFamily::Service,
+                    family: descriptor
+                        .evidence_families
+                        .first()
+                        .copied()
+                        .unwrap_or(EvidenceFamily::Service),
                     source: source.clone(),
                     key,
                     value,
@@ -482,19 +619,20 @@ pub struct SystemTransport;
 impl AttemptTransport for SystemTransport {
     async fn attempt(
         &self,
+        guard: &TargetGuard,
         request: &ProbeRequest,
         descriptor: &ProbeDescriptor,
-        _credential: Option<&SecretString>,
+        _credential: Option<&ProbeCredential>,
     ) -> Result<TransportResponse, ActiveError> {
         let port = *descriptor.ports.first().ok_or(ActiveError::Unavailable)?;
         match descriptor.transport {
-            ProbeTransport::Tcp => tcp_attempt(request.target, port, descriptor).await,
-            ProbeTransport::Udp => udp_attempt(request.target, port, descriptor).await,
+            ProbeTransport::Tcp => tcp_attempt(guard, request, port, descriptor).await,
+            ProbeTransport::Udp => udp_attempt(guard, request, port, descriptor, _credential).await,
             // Raw ICMP/link-layer access is an explicit platform boundary. Until the
             // privileged capture backend is installed it reports unavailable, never success.
-            ProbeTransport::Icmp => icmp_attempt(request.target, descriptor.timeout).await,
+            ProbeTransport::Icmp => icmp_attempt(guard, request, descriptor.timeout).await,
             ProbeTransport::LinkLayer => Err(ActiveError::PermissionDenied),
-            ProbeTransport::Tls => tls_attempt(request.target, port, descriptor).await,
+            ProbeTransport::Tls => tls_attempt(guard, request, port, descriptor).await,
         }
     }
 }
@@ -544,16 +682,21 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintOnlyVerifier {
 }
 
 async fn tls_attempt(
-    ip: IpAddr,
+    guard: &TargetGuard,
+    request: &ProbeRequest,
     port: u16,
     d: &ProbeDescriptor,
 ) -> Result<TransportResponse, ActiveError> {
     use std::sync::Arc;
+    let ip = request.target;
     let socket = match ip {
         IpAddr::V4(_) => TcpSocket::new_v4(),
         IpAddr::V6(_) => TcpSocket::new_v6(),
     }
     .map_err(|_| ActiveError::Network)?;
+    guard
+        .authorize(request.interface, ip)
+        .map_err(|_| ActiveError::Unauthorized)?;
     let stream = match socket.connect(SocketAddr::new(ip, port)).await {
         Ok(stream) => stream,
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
@@ -647,8 +790,13 @@ fn certificate_metadata(der: &[u8], max_bytes: usize) -> Result<TransportRespons
     Ok(TransportResponse::Success(facts))
 }
 
-async fn icmp_attempt(ip: IpAddr, timeout: Duration) -> Result<TransportResponse, ActiveError> {
+async fn icmp_attempt(
+    guard: &TargetGuard,
+    request: &ProbeRequest,
+    timeout: Duration,
+) -> Result<TransportResponse, ActiveError> {
     use surge_ping::{Client, Config, ICMP, PingIdentifier, PingSequence, SurgeError};
+    let ip = request.target;
     let config = Config::builder()
         .kind(if ip.is_ipv4() { ICMP::V4 } else { ICMP::V6 })
         .build();
@@ -659,6 +807,9 @@ async fn icmp_attempt(ip: IpAddr, timeout: Duration) -> Result<TransportResponse
     })?;
     let mut pinger = client.pinger(ip, PingIdentifier(0x4e48)).await;
     pinger.timeout(timeout);
+    guard
+        .authorize(request.interface, ip)
+        .map_err(|_| ActiveError::Unauthorized)?;
     match pinger.ping(PingSequence(0), b"NeonHearth").await {
         Ok((_packet, latency)) => Ok(TransportResponse::Success(vec![(
             "latency_ms".into(),
@@ -673,15 +824,20 @@ async fn icmp_attempt(ip: IpAddr, timeout: Duration) -> Result<TransportResponse
 }
 
 async fn tcp_attempt(
-    ip: IpAddr,
+    guard: &TargetGuard,
+    probe_request: &ProbeRequest,
     port: u16,
     d: &ProbeDescriptor,
 ) -> Result<TransportResponse, ActiveError> {
+    let ip = probe_request.target;
     let socket = match ip {
         IpAddr::V4(_) => TcpSocket::new_v4(),
         IpAddr::V6(_) => TcpSocket::new_v6(),
     }
     .map_err(|_| ActiveError::Network)?;
+    guard
+        .authorize(probe_request.interface, ip)
+        .map_err(|_| ActiveError::Unauthorized)?;
     let mut stream = match socket.connect(SocketAddr::new(ip, port)).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
@@ -698,6 +854,9 @@ async fn tcp_attempt(
         d.request.clone()
     };
     if !request.is_empty() {
+        guard
+            .authorize(probe_request.interface, ip)
+            .map_err(|_| ActiveError::Unauthorized)?;
         stream
             .write_all(&request)
             .await
@@ -774,37 +933,566 @@ pub fn parse_http_metadata(bytes: &[u8]) -> Result<Vec<(String, String)>, Active
 }
 
 async fn udp_attempt(
-    ip: IpAddr,
+    guard: &TargetGuard,
+    request: &ProbeRequest,
     port: u16,
     d: &ProbeDescriptor,
+    credential: Option<&ProbeCredential>,
 ) -> Result<TransportResponse, ActiveError> {
-    if d.request.is_empty() {
-        return Err(ActiveError::Unavailable);
-    }
+    let ip = request.target;
     let bind = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     let socket = UdpSocket::bind(bind)
         .await
         .map_err(|_| ActiveError::Network)?;
+    guard
+        .authorize(request.interface, ip)
+        .map_err(|_| ActiveError::Unauthorized)?;
     socket
         .connect(SocketAddr::new(ip, port))
         .await
         .map_err(|_| ActiveError::Network)?;
+    let local_v4 = match socket.local_addr().map_err(|_| ActiveError::Network)?.ip() {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(_) => None,
+    };
+    if d.id == "udp.snmp.161" {
+        return snmp_attempt(guard, request, socket, credential).await;
+    }
+    let probe = build_udp_probe(&d.id, ip, local_v4, credential)?;
+    if probe.port != port || probe.bytes.len() > d.max_request_bytes {
+        return Err(ActiveError::ResponseLimit);
+    }
+    guard
+        .authorize(request.interface, ip)
+        .map_err(|_| ActiveError::Unauthorized)?;
     socket
-        .send(&d.request)
+        .send(&probe.bytes)
         .await
         .map_err(|_| ActiveError::Network)?;
     let mut response = vec![0u8; d.max_response_bytes.min(MAX_RESPONSE_BYTES)];
-    let n = socket
-        .recv(&mut response)
+    let (n, peer) = socket
+        .recv_from(&mut response)
         .await
         .map_err(|_| ActiveError::Network)?;
     if n > d.max_response_bytes {
         return Err(ActiveError::ResponseLimit);
     }
-    Ok(TransportResponse::Success(vec![(
-        "response_bytes".into(),
-        n.to_string(),
-    )]))
+    response.truncate(n);
+    Ok(TransportResponse::Success(parse_udp_reply(
+        &d.id, &probe, peer, &response,
+    )?))
+}
+
+struct GuardedSnmpTransport {
+    guard: TargetGuard,
+    request: ProbeRequest,
+    socket: UdpSocket,
+    peer: SocketAddr,
+    local: SocketAddr,
+}
+impl async_snmp::Transport for GuardedSnmpTransport {
+    async fn send(&self, data: &[u8]) -> async_snmp::Result<()> {
+        if data.len() > 4096 {
+            return Err(Box::new(async_snmp::Error::Network {
+                target: self.peer,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bounded request rejected",
+                ),
+            }));
+        }
+        self.guard
+            .authorize(self.request.interface, self.request.target)
+            .map_err(|_| {
+                Box::new(async_snmp::Error::Network {
+                    target: self.peer,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "target authorization failed",
+                    ),
+                })
+            })?;
+        self.socket.send(data).await.map_err(|source| {
+            Box::new(async_snmp::Error::Network {
+                target: self.peer,
+                source,
+            })
+        })?;
+        Ok(())
+    }
+    async fn request_with<T, F>(
+        &self,
+        data: &[u8],
+        registration: async_snmp::RequestRegistration,
+        mut validate: F,
+    ) -> async_snmp::Result<T>
+    where
+        T: Send,
+        F: FnMut(bytes::Bytes, SocketAddr) -> async_snmp::Result<async_snmp::Candidate<T>> + Send,
+    {
+        self.send(data).await?;
+        let started = tokio::time::Instant::now();
+        let deadline = registration.deadline();
+        let elapsed = deadline.saturating_duration_since(started);
+        loop {
+            let mut buffer = vec![0u8; 4096];
+            let received = tokio::time::timeout_at(deadline, self.socket.recv_from(&mut buffer))
+                .await
+                .map_err(|_| {
+                    Box::new(async_snmp::Error::Timeout {
+                        target: self.peer,
+                        elapsed,
+                        retries: 0,
+                    })
+                })?
+                .map_err(|source| {
+                    Box::new(async_snmp::Error::Network {
+                        target: self.peer,
+                        source,
+                    })
+                })?;
+            let (n, source) = received;
+            if source != self.peer {
+                continue;
+            }
+            buffer.truncate(n);
+            if matches!(
+                registration.evaluate_response_identity(&buffer, true),
+                async_snmp::ResponseIdentity::Reject
+            ) {
+                continue;
+            }
+            match validate(bytes::Bytes::from(buffer), source)? {
+                async_snmp::Candidate::Accept(value) => return Ok(value),
+                async_snmp::Candidate::Reject => continue,
+            }
+        }
+    }
+    fn peer_addr(&self) -> SocketAddr {
+        self.peer
+    }
+    fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+    fn is_reliable(&self) -> bool {
+        false
+    }
+    fn send_capacity(&self) -> usize {
+        4096
+    }
+}
+
+async fn snmp_attempt(
+    guard: &TargetGuard,
+    request: &ProbeRequest,
+    socket: UdpSocket,
+    credential: Option<&ProbeCredential>,
+) -> Result<TransportResponse, ActiveError> {
+    let credential = credential.ok_or(ActiveError::CredentialRequired)?;
+    if matches!(
+        credential,
+        ProbeCredential::SnmpV1 { .. } | ProbeCredential::SnmpV2c { .. }
+    ) {
+        return snmp_community_attempt(guard, request, socket, credential).await;
+    }
+    let auth = match credential {
+        ProbeCredential::SnmpV1 { .. } | ProbeCredential::SnmpV2c { .. } => {
+            unreachable!("community credentials handled above")
+        }
+        ProbeCredential::SnmpV3 {
+            username,
+            authentication,
+            privacy,
+        } => {
+            let mut config = async_snmp::UsmConfig::new(username.expose_secret().to_owned());
+            if let Some(authentication) = authentication {
+                let protocol = match authentication.protocol {
+                    SnmpAuthProtocol::Sha1 => async_snmp::AuthProtocol::Sha1,
+                    SnmpAuthProtocol::Sha256 => async_snmp::AuthProtocol::Sha256,
+                    SnmpAuthProtocol::Sha512 => async_snmp::AuthProtocol::Sha512,
+                };
+                config = if let Some(privacy) = privacy {
+                    let privacy_protocol = match privacy.protocol {
+                        SnmpPrivProtocol::Aes128 => async_snmp::PrivProtocol::Aes128,
+                        SnmpPrivProtocol::Aes256 => async_snmp::PrivProtocol::Aes256Blumenthal,
+                    };
+                    config
+                        .auth_priv(
+                            protocol,
+                            authentication.password.expose_secret(),
+                            privacy_protocol,
+                            privacy.password.expose_secret(),
+                        )
+                        .map_err(|_| ActiveError::CredentialRequired)?
+                } else {
+                    config
+                        .auth(protocol, authentication.password.expose_secret())
+                        .map_err(|_| ActiveError::CredentialRequired)?
+                };
+            } else if privacy.is_some() {
+                return Err(ActiveError::CredentialRequired);
+            }
+            async_snmp::Auth::Usm(config)
+        }
+    };
+    let peer = SocketAddr::new(request.target, 161);
+    let local = socket.local_addr().map_err(|_| ActiveError::Network)?;
+    let transport = GuardedSnmpTransport {
+        guard: guard.clone(),
+        request: request.clone(),
+        socket,
+        peer,
+        local,
+    };
+    let client = async_snmp::ClientBuilder::new(auth)
+        .request_timeout(Duration::from_secs(3))
+        .response_shape_policy(async_snmp::ResponseShapePolicy::Strict)
+        .build_with_transport(transport)
+        .map_err(|_| ActiveError::CredentialRequired)?;
+    let response = match client
+        .get_many(&[
+            async_snmp::oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
+            async_snmp::oid!(1, 3, 6, 1, 2, 1, 1, 2, 0),
+        ])
+        .await
+    {
+        Ok(response) => response,
+        Err(error) if matches!(error.kind(), async_snmp::ErrorKind::Timeout) => {
+            return Ok(TransportResponse::Timeout);
+        }
+        Err(_) => return Err(ActiveError::Network),
+    };
+    Ok(TransportResponse::Success(normalize_snmp_inventory(
+        response,
+    )?))
+}
+
+const SNMP_REQUEST_ID: i32 = 0x4e48_1234;
+const SYS_DESCR_OID: &[u8] = &[0x2b, 6, 1, 2, 1, 1, 1, 0];
+const SYS_OBJECT_ID_OID: &[u8] = &[0x2b, 6, 1, 2, 1, 1, 2, 0];
+
+async fn snmp_community_attempt(
+    guard: &TargetGuard,
+    request: &ProbeRequest,
+    socket: UdpSocket,
+    credential: &ProbeCredential,
+) -> Result<TransportResponse, ActiveError> {
+    let (version, community) = match credential {
+        ProbeCredential::SnmpV1 { community } => (0, community),
+        ProbeCredential::SnmpV2c { community } => (1, community),
+        _ => return Err(ActiveError::CredentialRequired),
+    };
+    let wire = build_snmp_community_request(version, community.expose_secret(), SNMP_REQUEST_ID)?;
+    guard
+        .authorize(request.interface, request.target)
+        .map_err(|_| ActiveError::Unauthorized)?;
+    socket.send(&wire).await.map_err(|_| ActiveError::Network)?;
+    let mut response = Zeroizing::new(vec![0u8; 4096]);
+    let (n, peer) = socket
+        .recv_from(&mut response)
+        .await
+        .map_err(|_| ActiveError::Network)?;
+    if peer != SocketAddr::new(request.target, 161) {
+        return Err(ActiveError::Correlation);
+    }
+    response.truncate(n);
+    Ok(TransportResponse::Success(parse_snmp_community_response(
+        &response,
+        version,
+        community.expose_secret(),
+        SNMP_REQUEST_ID,
+    )?))
+}
+
+fn build_snmp_community_request(
+    version: i32,
+    community: &str,
+    request_id: i32,
+) -> Result<Zeroizing<Vec<u8>>, ActiveError> {
+    if community.is_empty() || community.len() > 64 || community.as_bytes().contains(&0) {
+        return Err(ActiveError::CredentialRequired);
+    }
+    let varbinds = [SYS_DESCR_OID, SYS_OBJECT_ID_OID]
+        .into_iter()
+        .map(|oid| ber(0x30, [ber(0x06, oid.to_vec()), ber(0x05, vec![])].concat()))
+        .collect::<Vec<_>>()
+        .concat();
+    let pdu = ber(
+        0xa0,
+        [
+            ber_int(request_id),
+            ber_int(0),
+            ber_int(0),
+            ber(0x30, varbinds),
+        ]
+        .concat(),
+    );
+    let message = ber(
+        0x30,
+        [
+            ber_int(version),
+            ber(0x04, community.as_bytes().to_vec()),
+            pdu,
+        ]
+        .concat(),
+    );
+    if message.len() > 4096 {
+        return Err(ActiveError::ResponseLimit);
+    }
+    Ok(Zeroizing::new(message))
+}
+fn ber(tag: u8, value: Vec<u8>) -> Vec<u8> {
+    let mut out = vec![tag];
+    if value.len() < 128 {
+        out.push(value.len() as u8)
+    } else {
+        out.extend_from_slice(&[0x82, (value.len() >> 8) as u8, value.len() as u8])
+    }
+    out.extend(value);
+    out
+}
+fn ber_int(value: i32) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(3);
+    let mut content = bytes[first..].to_vec();
+    if content.first().is_some_and(|byte| byte & 0x80 != 0) {
+        content.insert(0, 0)
+    }
+    ber(0x02, content)
+}
+fn tlv<'a>(input: &mut &'a [u8], expected: u8) -> Result<&'a [u8], ActiveError> {
+    if input.len() < 2 || input[0] != expected {
+        return Err(ActiveError::Network);
+    }
+    let first = input[1];
+    let (mut header, mut len) = (2usize, usize::from(first));
+    if first & 0x80 != 0 {
+        let count = usize::from(first & 0x7f);
+        if count == 0 || count > 2 || input.len() < 2 + count {
+            return Err(ActiveError::Network);
+        }
+        header += count;
+        len = 0;
+        for byte in &input[2..header] {
+            len = (len << 8) | usize::from(*byte)
+        }
+    }
+    if len > MAX_RESPONSE_BYTES || header + len > input.len() {
+        return Err(ActiveError::ResponseLimit);
+    }
+    let value = &input[header..header + len];
+    *input = &input[header + len..];
+    Ok(value)
+}
+fn integer(input: &mut &[u8]) -> Result<i32, ActiveError> {
+    let value = tlv(input, 0x02)?;
+    if value.is_empty() || value.len() > 5 {
+        return Err(ActiveError::Network);
+    }
+    let mut out = 0i64;
+    for byte in value {
+        out = (out << 8) | i64::from(*byte)
+    }
+    i32::try_from(out).map_err(|_| ActiveError::Network)
+}
+fn parse_snmp_community_response(
+    bytes: &[u8],
+    expected_version: i32,
+    community: &str,
+    request_id: i32,
+) -> Result<Vec<(String, String)>, ActiveError> {
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err(ActiveError::ResponseLimit);
+    }
+    let mut top = bytes;
+    let mut message = tlv(&mut top, 0x30)?;
+    if !top.is_empty() || integer(&mut message)? != expected_version {
+        return Err(ActiveError::Correlation);
+    }
+    let actual = tlv(&mut message, 0x04)?;
+    if actual.len() != community.len() || !bool::from(actual.ct_eq(community.as_bytes())) {
+        return Err(ActiveError::Correlation);
+    }
+    let mut pdu = tlv(&mut message, 0xa2)?;
+    if !message.is_empty() || integer(&mut pdu)? != request_id {
+        return Err(ActiveError::Correlation);
+    }
+    if integer(&mut pdu)? != 0 || integer(&mut pdu)? != 0 {
+        return Err(ActiveError::Network);
+    }
+    let mut list = tlv(&mut pdu, 0x30)?;
+    if !pdu.is_empty() {
+        return Err(ActiveError::Network);
+    }
+    let mut facts = vec![];
+    while !list.is_empty() {
+        if facts.len() >= 2 {
+            return Err(ActiveError::ResponseLimit);
+        }
+        let mut binding = tlv(&mut list, 0x30)?;
+        let oid = tlv(&mut binding, 0x06)?;
+        if oid == SYS_DESCR_OID {
+            let value = tlv(&mut binding, 0x04)?;
+            if value.len() > MAX_FACT_VALUE_BYTES {
+                return Err(ActiveError::ResponseLimit);
+            }
+            facts.push((
+                "sys_descr".into(),
+                String::from_utf8_lossy(value)
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect(),
+            ))
+        } else if oid == SYS_OBJECT_ID_OID {
+            let value = tlv(&mut binding, 0x06)?;
+            facts.push(("sys_object_id".into(), decode_oid(value)?))
+        } else {
+            return Err(ActiveError::Correlation);
+        }
+        if !binding.is_empty() {
+            return Err(ActiveError::Network);
+        }
+    }
+    if facts.len() != 2 {
+        return Err(ActiveError::Network);
+    }
+    Ok(facts)
+}
+fn decode_oid(bytes: &[u8]) -> Result<String, ActiveError> {
+    let first = *bytes.first().ok_or(ActiveError::Network)?;
+    let mut parts = vec![(first / 40).to_string(), (first % 40).to_string()];
+    let mut value = 0u32;
+    let mut open = false;
+    for byte in &bytes[1..] {
+        open = true;
+        value = value
+            .checked_shl(7)
+            .and_then(|v| v.checked_add(u32::from(byte & 0x7f)))
+            .ok_or(ActiveError::ResponseLimit)?;
+        if byte & 0x80 == 0 {
+            parts.push(value.to_string());
+            value = 0;
+            open = false
+        }
+    }
+    if open {
+        return Err(ActiveError::Network);
+    }
+    Ok(parts.join("."))
+}
+
+#[cfg(test)]
+mod snmp_wire_tests {
+    use super::*;
+    fn response(version: i32, community: &str, id: i32) -> Vec<u8> {
+        let bindings = [
+            ber(
+                0x30,
+                [
+                    ber(0x06, SYS_DESCR_OID.to_vec()),
+                    ber(0x04, b"Camera".to_vec()),
+                ]
+                .concat(),
+            ),
+            ber(
+                0x30,
+                [
+                    ber(0x06, SYS_OBJECT_ID_OID.to_vec()),
+                    ber(0x06, [0x2b, 6, 1, 4, 1, 0].to_vec()),
+                ]
+                .concat(),
+            ),
+        ]
+        .concat();
+        let pdu = ber(
+            0xa2,
+            [ber_int(id), ber_int(0), ber_int(0), ber(0x30, bindings)].concat(),
+        );
+        ber(
+            0x30,
+            [
+                ber_int(version),
+                ber(0x04, community.as_bytes().to_vec()),
+                pdu,
+            ]
+            .concat(),
+        )
+    }
+    #[test]
+    fn community_wire_validates_version_secret_and_request_id() {
+        let good = response(1, "owner-secret", SNMP_REQUEST_ID);
+        assert_eq!(
+            parse_snmp_community_response(&good, 1, "owner-secret", SNMP_REQUEST_ID)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            parse_snmp_community_response(&good, 0, "owner-secret", SNMP_REQUEST_ID).unwrap_err(),
+            ActiveError::Correlation
+        );
+        assert_eq!(
+            parse_snmp_community_response(&good, 1, "wrong", SNMP_REQUEST_ID).unwrap_err(),
+            ActiveError::Correlation
+        );
+        assert_eq!(
+            parse_snmp_community_response(&good, 1, "owner-secret", 1).unwrap_err(),
+            ActiveError::Correlation
+        );
+        assert_eq!(
+            parse_snmp_community_response(
+                &vec![0; MAX_RESPONSE_BYTES + 1],
+                1,
+                "owner-secret",
+                SNMP_REQUEST_ID
+            )
+            .unwrap_err(),
+            ActiveError::ResponseLimit
+        );
+    }
+    #[test]
+    fn community_request_buffer_is_zeroizing_and_bounded() {
+        let request = build_snmp_community_request(1, "owner-secret", SNMP_REQUEST_ID).unwrap();
+        assert!(request.windows(12).any(|window| window == b"owner-secret"));
+        assert!(request.len() < 4096);
+        assert_eq!(
+            build_snmp_community_request(1, &"x".repeat(65), SNMP_REQUEST_ID).unwrap_err(),
+            ActiveError::CredentialRequired
+        );
+    }
+}
+
+pub fn normalize_snmp_inventory(
+    response: async_snmp::FixedCardinalityResponse,
+) -> Result<Vec<(String, String)>, ActiveError> {
+    if !response.anomalies.is_empty() || response.varbinds.len() != 2 {
+        return Err(ActiveError::Network);
+    }
+    let mut facts = vec![];
+    for binding in response.varbinds {
+        if binding.oid == async_snmp::oid!(1, 3, 6, 1, 2, 1, 1, 1, 0) {
+            if let async_snmp::Value::OctetString(value) = binding.value {
+                if value.len() > MAX_FACT_VALUE_BYTES {
+                    return Err(ActiveError::ResponseLimit);
+                }
+                facts.push((
+                    "sys_descr".into(),
+                    String::from_utf8_lossy(&value)
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .collect(),
+                ));
+            }
+        } else if binding.oid == async_snmp::oid!(1, 3, 6, 1, 2, 1, 1, 2, 0)
+            && let async_snmp::Value::ObjectIdentifier(value) = binding.value
+        {
+            facts.push(("sys_object_id".into(), value.to_string()));
+        }
+    }
+    if facts.len() != 2 {
+        return Err(ActiveError::Network);
+    }
+    Ok(facts)
 }
 
 #[derive(Clone, Copy, Debug)]
