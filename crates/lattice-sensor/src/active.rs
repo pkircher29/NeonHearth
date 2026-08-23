@@ -491,6 +491,25 @@ pub enum ActiveError {
     QueueFull,
 }
 
+pub async fn recv_bounded_datagram(
+    socket: &UdpSocket,
+    cap: usize,
+) -> Result<(Vec<u8>, SocketAddr), ActiveError> {
+    if cap == 0 || cap > MAX_RESPONSE_BYTES {
+        return Err(ActiveError::ResponseLimit);
+    }
+    let mut buffer = vec![0u8; cap.checked_add(1).ok_or(ActiveError::ResponseLimit)?];
+    let (n, peer) = socket
+        .recv_from(&mut buffer)
+        .await
+        .map_err(|_| ActiveError::Network)?;
+    if n > cap {
+        return Err(ActiveError::ResponseLimit);
+    }
+    buffer.truncate(n);
+    Ok((buffer, peer))
+}
+
 pub trait ActiveProbeAdapter: Send + Sync {
     fn descriptor(&self) -> &ProbeDescriptor;
     fn build_request(
@@ -969,15 +988,8 @@ async fn udp_attempt(
         .send(&probe.bytes)
         .await
         .map_err(|_| ActiveError::Network)?;
-    let mut response = vec![0u8; d.max_response_bytes.min(MAX_RESPONSE_BYTES)];
-    let (n, peer) = socket
-        .recv_from(&mut response)
-        .await
-        .map_err(|_| ActiveError::Network)?;
-    if n > d.max_response_bytes {
-        return Err(ActiveError::ResponseLimit);
-    }
-    response.truncate(n);
+    let (response, peer) =
+        recv_bounded_datagram(&socket, d.max_response_bytes.min(MAX_RESPONSE_BYTES)).await?;
     Ok(TransportResponse::Success(parse_udp_reply(
         &d.id, &probe, peer, &response,
     )?))
@@ -1035,27 +1047,29 @@ impl async_snmp::Transport for GuardedSnmpTransport {
         let deadline = registration.deadline();
         let elapsed = deadline.saturating_duration_since(started);
         loop {
-            let mut buffer = vec![0u8; 4096];
-            let received = tokio::time::timeout_at(deadline, self.socket.recv_from(&mut buffer))
-                .await
-                .map_err(|_| {
-                    Box::new(async_snmp::Error::Timeout {
-                        target: self.peer,
-                        elapsed,
-                        retries: 0,
-                    })
-                })?
-                .map_err(|source| {
-                    Box::new(async_snmp::Error::Network {
-                        target: self.peer,
-                        source,
-                    })
-                })?;
-            let (n, source) = received;
+            let received =
+                tokio::time::timeout_at(deadline, recv_bounded_datagram(&self.socket, 4096))
+                    .await
+                    .map_err(|_| {
+                        Box::new(async_snmp::Error::Timeout {
+                            target: self.peer,
+                            elapsed,
+                            retries: 0,
+                        })
+                    })?
+                    .map_err(|error| {
+                        Box::new(async_snmp::Error::Network {
+                            target: self.peer,
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                error.to_string(),
+                            ),
+                        })
+                    })?;
+            let (buffer, source) = received;
             if source != self.peer {
                 continue;
             }
-            buffer.truncate(n);
             if matches!(
                 registration.evaluate_response_identity(&buffer, true),
                 async_snmp::ResponseIdentity::Reject
@@ -1187,15 +1201,11 @@ async fn snmp_community_attempt(
         .authorize(request.interface, request.target)
         .map_err(|_| ActiveError::Unauthorized)?;
     socket.send(&wire).await.map_err(|_| ActiveError::Network)?;
-    let mut response = Zeroizing::new(vec![0u8; 4096]);
-    let (n, peer) = socket
-        .recv_from(&mut response)
-        .await
-        .map_err(|_| ActiveError::Network)?;
+    let (response, peer) = recv_bounded_datagram(&socket, 4096).await?;
+    let response = Zeroizing::new(response);
     if peer != SocketAddr::new(request.target, 161) {
         return Err(ActiveError::Correlation);
     }
-    response.truncate(n);
     Ok(TransportResponse::Success(parse_snmp_community_response(
         &response,
         version,

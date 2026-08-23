@@ -1,3 +1,8 @@
+use quick_xml::{
+    NsReader,
+    events::Event,
+    name::{Namespace, ResolveResult},
+};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use super::{ActiveError, MAX_FACT_VALUE_BYTES, MAX_RESPONSE_BYTES, ProbeCredential};
@@ -13,6 +18,7 @@ pub struct UdpProbe {
 #[derive(Clone, Debug)]
 enum Correlation {
     Tx16(u16),
+    Mdns(Vec<u8>),
     Tx32(u32),
     Ntp([u8; 8]),
     Text(&'static str),
@@ -28,11 +34,12 @@ pub fn build_udp_probe(
     _credential: Option<&ProbeCredential>,
 ) -> Result<UdpProbe, ActiveError> {
     let (port, bytes, correlation) = match id {
-        "udp.dns.53" | "udp.mdns.5353" => {
-            let port = if id.contains("mdns") { 5353 } else { 53 };
+        "udp.dns.53" => {
+            let port = 53;
             let tx=0x1234u16; let mut b=vec![]; b.extend_from_slice(&tx.to_be_bytes()); b.extend_from_slice(&[0x01,0x00,0,1,0,0,0,0,0,0]); b.extend_from_slice(&[0,0,2,0,1]);
             (port,b,Correlation::Tx16(tx))
         }
+        "udp.mdns.5353" => { let mut question=vec![];for label in ["_services","_dns-sd","_udp","local"]{question.push(label.len() as u8);question.extend_from_slice(label.as_bytes())}question.push(0);question.extend_from_slice(&12u16.to_be_bytes());question.extend_from_slice(&0x8001u16.to_be_bytes());let mut b=vec![0,0,0,0,0,1,0,0,0,0,0,0];b.extend_from_slice(&question);(5353,b,Correlation::Mdns(question)) }
         "udp.dhcp.67" => {
             let local=local_v4.filter(|ip| !ip.is_unspecified()).ok_or(ActiveError::Unavailable)?; let tx=0x4e481234u32;
             let mut b=vec![0u8;240]; b[0]=1;b[1]=0;b[2]=0;b[3]=0;b[4..8].copy_from_slice(&tx.to_be_bytes());b[12..16].copy_from_slice(&local.octets());b[236..240].copy_from_slice(&[99,130,83,99]); b.extend_from_slice(&[53,1,8,55,4,1,3,6,15,255]);
@@ -69,7 +76,8 @@ pub fn parse_udp_reply(
         return Err(ActiveError::ResponseLimit);
     }
     match id {
-        "udp.dns.53" | "udp.mdns.5353" => dns(probe, bytes),
+        "udp.dns.53" => dns(probe, bytes),
+        "udp.mdns.5353" => mdns(probe, bytes),
         "udp.dhcp.67" => dhcp(probe, bytes),
         "udp.ntp.123" => ntp(probe, bytes),
         "udp.ssdp.1900" => headers(
@@ -79,16 +87,24 @@ pub fn parse_udp_reply(
         ),
         "udp.nbns.137" => nbns(probe, bytes),
         "udp.ws-discovery.3702" | "udp.onvif.3702" => soap(probe, bytes),
-        "udp.sip.5060" => headers(
+        "udp.sip.5060" => session_headers(
             probe,
             bytes,
+            "SIP/2.0",
+            &[("call-id", "nh-1234"), ("cseq", "1 OPTIONS")],
             &[
                 ("server", "server"),
                 ("user-agent", "user_agent"),
                 ("allow", "allow"),
             ],
         ),
-        "udp.rtsp.554" => headers(probe, bytes, &[("server", "server"), ("public", "public")]),
+        "udp.rtsp.554" => session_headers(
+            probe,
+            bytes,
+            "RTSP/1.0",
+            &[("cseq", "4660")],
+            &[("server", "server"), ("public", "public")],
+        ),
         "udp.coap.5683" => coap(probe, bytes),
         "udp.lifx.56700" => lifx(probe, bytes),
         _ => Err(ActiveError::UnknownProbe),
@@ -144,6 +160,50 @@ fn dns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError>
         p += len;
     }
     Ok(out)
+}
+fn mdns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError> {
+    let Correlation::Mdns(expected) = &probe.correlation else {
+        return Err(ActiveError::Correlation);
+    };
+    if b.len() < 12
+        || b[0..2] != [0, 0]
+        || b[2] & 0x80 == 0
+        || u16::from_be_bytes([b[4], b[5]]) != 1
+    {
+        return Err(ActiveError::Correlation);
+    }
+    let question_end = skip_name(b, 12)?
+        .checked_add(4)
+        .filter(|end| *end <= b.len())
+        .ok_or(ActiveError::Network)?;
+    if &b[12..question_end] != expected.as_slice() {
+        return Err(ActiveError::Correlation);
+    }
+    let count = usize::from(u16::from_be_bytes([b[6], b[7]]));
+    if count == 0 || count > 32 {
+        return Err(ActiveError::ResponseLimit);
+    }
+    let mut p = question_end;
+    let mut facts = vec![];
+    for _ in 0..count {
+        let name_start = p;
+        p = skip_name(b, p)?;
+        if p + 10 > b.len() {
+            return Err(ActiveError::Network);
+        }
+        let kind = u16::from_be_bytes([b[p], b[p + 1]]);
+        let len = usize::from(u16::from_be_bytes([b[p + 8], b[p + 9]]));
+        if kind != 12 || b[name_start] & 0xc0 != 0xc0 || b.get(name_start + 1) != Some(&12) {
+            return Err(ActiveError::Correlation);
+        }
+        p += 10;
+        if p + len > b.len() {
+            return Err(ActiveError::Network);
+        }
+        facts.push(("answer".into(), format!("ptr_bytes:{len}")));
+        p += len
+    }
+    Ok(facts)
 }
 fn skip_name(b: &[u8], mut p: usize) -> Result<usize, ActiveError> {
     for _ in 0..128 {
@@ -246,6 +306,84 @@ fn headers(
     }
     Ok(out)
 }
+fn session_headers(
+    probe: &UdpProbe,
+    b: &[u8],
+    protocol: &str,
+    correlations: &[(&str, &str)],
+    allowed: &[(&str, &str)],
+) -> Result<Vec<(String, String)>, ActiveError> {
+    let Correlation::Text(configured) = probe.correlation else {
+        return Err(ActiveError::Correlation);
+    };
+    if correlations
+        .first()
+        .is_none_or(|(_, value)| *value != configured)
+        || b.len() > MAX_RESPONSE_BYTES
+    {
+        return Err(ActiveError::Correlation);
+    }
+    let text = std::str::from_utf8(b).map_err(|_| ActiveError::Network)?;
+    let (head, _body) = text.split_once("\r\n\r\n").ok_or(ActiveError::Network)?;
+    if head
+        .as_bytes()
+        .windows(2)
+        .filter(|pair| pair[1] == b'\n')
+        .any(|pair| pair[0] != b'\r')
+        || head
+            .as_bytes()
+            .windows(2)
+            .filter(|pair| pair[0] == b'\r')
+            .any(|pair| pair[1] != b'\n')
+    {
+        return Err(ActiveError::Network);
+    }
+    let mut lines = head.split("\r\n");
+    let status = lines.next().ok_or(ActiveError::Network)?;
+    let mut parts = status.split_ascii_whitespace();
+    if parts.next() != Some(protocol)
+        || parts
+            .next()
+            .is_none_or(|code| code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(ActiveError::Correlation);
+    }
+    let (mut found, mut out) = (vec![None::<String>; correlations.len()], vec![]);
+    for line in lines.take(64) {
+        if line.is_empty() || line.starts_with([' ', '\t']) {
+            return Err(ActiveError::Network);
+        }
+        let (name, value) = line.split_once(':').ok_or(ActiveError::Network)?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ActiveError::Network);
+        }
+        let value = value.trim();
+        for (index, (correlation_name, _)) in correlations.iter().enumerate() {
+            if name.eq_ignore_ascii_case(correlation_name)
+                && found[index].replace(value.to_owned()).is_some()
+            {
+                return Err(ActiveError::Correlation);
+            }
+        }
+        for (wanted, key) in allowed {
+            if name.eq_ignore_ascii_case(wanted) {
+                out.push(((*key).into(), bounded(value)))
+            }
+        }
+    }
+    if correlations
+        .iter()
+        .zip(found.iter())
+        .any(|((_, expected), value)| value.as_deref() != Some(*expected))
+    {
+        return Err(ActiveError::Correlation);
+    }
+    Ok(out)
+}
 fn nbns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError> {
     tx16(probe, b)?;
     if b.len() < 12 || b[2] & 0x80 == 0 {
@@ -281,26 +419,149 @@ fn soap(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
     let Correlation::Soap(id) = probe.correlation else {
         return Err(ActiveError::Correlation);
     };
-    let text = std::str::from_utf8(b).map_err(|_| ActiveError::Network)?;
-    if text.contains("<!DOCTYPE") || text.contains("<!ENTITY") || !text.contains(id) {
+    const SOAP: &[u8] = b"http://www.w3.org/2003/05/soap-envelope";
+    const WSA: &[u8] = b"http://www.w3.org/2005/08/addressing";
+    const WSD05: &[u8] = b"http://schemas.xmlsoap.org/ws/2005/04/discovery";
+    const WSD09: &[u8] = b"http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01";
+    if b.len() > MAX_RESPONSE_BYTES || std::str::from_utf8(b).is_err() {
+        return Err(ActiveError::ResponseLimit);
+    }
+    let mut reader = NsReader::from_reader(b);
+    reader.config_mut().trim_text(true);
+    let mut buffer = vec![];
+    let (mut depth, mut events) = (0usize, 0usize);
+    let (mut envelope, mut header, mut body, mut matches_depth, mut probe_depth) =
+        (None, None, None, None, None);
+    let (mut root_seen, mut relates_seen) = (false, false);
+    let mut current = None::<(&'static str, usize, bool)>;
+    let mut stack: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![];
+    let mut out = vec![];
+    loop {
+        events += 1;
+        if events > 256 {
+            return Err(ActiveError::ResponseLimit);
+        }
+        let (resolved, event) = reader
+            .read_resolved_event_into(&mut buffer)
+            .map_err(|_| ActiveError::Network)?;
+        match event {
+            Event::Start(element) => {
+                if current.is_some() {
+                    return Err(ActiveError::Network);
+                }
+                depth += 1;
+                if depth > 32 {
+                    return Err(ActiveError::ResponseLimit);
+                }
+                let ns = match &resolved {
+                    ResolveResult::Bound(Namespace(uri)) => Some(uri.to_vec()),
+                    _ => None,
+                };
+                let namespace_is = |wanted: &[u8]| matches!(resolved,ResolveResult::Bound(Namespace(uri))if uri==wanted);
+                let is_wsd = namespace_is(WSD05) || namespace_is(WSD09);
+                stack.push((element.name().as_ref().to_vec(), ns));
+                match element.local_name().as_ref() {
+                    b"Envelope" if depth == 1 && namespace_is(SOAP) && !root_seen => {
+                        root_seen = true;
+                        envelope = Some(depth)
+                    }
+                    b"Header" if envelope == Some(depth - 1) && namespace_is(SOAP) => {
+                        header = Some(depth)
+                    }
+                    b"Body" if envelope == Some(depth - 1) && namespace_is(SOAP) => {
+                        body = Some(depth)
+                    }
+                    b"RelatesTo"
+                        if header == Some(depth - 1) && namespace_is(WSA) && !relates_seen =>
+                    {
+                        current = Some(("relates", depth, false))
+                    }
+                    b"RelatesTo" if namespace_is(WSA) => return Err(ActiveError::Correlation),
+                    b"ProbeMatches" if body == Some(depth - 1) && is_wsd => {
+                        matches_depth = Some(depth)
+                    }
+                    b"ProbeMatch" if matches_depth == Some(depth - 1) && is_wsd => {
+                        probe_depth = Some(depth)
+                    }
+                    b"Types" if probe_depth == Some(depth - 1) && is_wsd => {
+                        current = Some(("types", depth, false))
+                    }
+                    b"Scopes" if probe_depth == Some(depth - 1) && is_wsd => {
+                        current = Some(("scopes", depth, false))
+                    }
+                    b"XAddrs" if probe_depth == Some(depth - 1) && is_wsd => {
+                        current = Some(("xaddrs", depth, false))
+                    }
+                    _ if depth == 1 => return Err(ActiveError::Network),
+                    _ => {}
+                }
+            }
+            Event::Text(text) => {
+                if let Some((key, at, consumed)) = current {
+                    if at != depth || consumed {
+                        return Err(ActiveError::Network);
+                    }
+                    let value = text
+                        .decode()
+                        .map_err(|_| ActiveError::Network)?
+                        .into_owned();
+                    if value.len() > MAX_FACT_VALUE_BYTES {
+                        return Err(ActiveError::ResponseLimit);
+                    }
+                    current = Some((key, at, true));
+                    if key == "relates" {
+                        if value != id {
+                            return Err(ActiveError::Correlation);
+                        }
+                        relates_seen = true
+                    } else {
+                        out.push((key.into(), bounded(&value)))
+                    }
+                }
+            }
+            Event::End(element) => {
+                let ns = match &resolved {
+                    ResolveResult::Bound(Namespace(uri)) => Some(*uri),
+                    _ => None,
+                };
+                let (name, start_ns) = stack.pop().ok_or(ActiveError::Network)?;
+                if name.as_slice() != element.name().as_ref() || start_ns.as_deref() != ns {
+                    return Err(ActiveError::Network);
+                }
+                if current.is_some_and(|(_, at, _)| at == depth) {
+                    current = None
+                }
+                if probe_depth == Some(depth) {
+                    probe_depth = None
+                }
+                if matches_depth == Some(depth) {
+                    matches_depth = None
+                }
+                if header == Some(depth) {
+                    header = None
+                }
+                if body == Some(depth) {
+                    body = None
+                }
+                if envelope == Some(depth) {
+                    envelope = None
+                }
+                depth = depth.checked_sub(1).ok_or(ActiveError::Network)?
+            }
+            Event::DocType(_)
+            | Event::Decl(_)
+            | Event::PI(_)
+            | Event::GeneralRef(_)
+            | Event::CData(_) => return Err(ActiveError::Network),
+            Event::Eof => break,
+            Event::Empty(_) | Event::Comment(_) => {}
+        }
+        buffer.clear();
+    }
+    if depth != 0 || !root_seen || !relates_seen || out.is_empty() || !stack.is_empty() {
         return Err(ActiveError::Correlation);
     }
-    let mut out = vec![];
-    for (tag, key) in [
-        ("Types", "types"),
-        ("Scopes", "scopes"),
-        ("XAddrs", "xaddrs"),
-    ] {
-        if let Some(v) = xml_text(text, tag) {
-            out.push((key.into(), bounded(v)));
-        }
-    }
     Ok(out)
-}
-fn xml_text<'a>(s: &'a str, local: &str) -> Option<&'a str> {
-    let start = s.find(&format!(":{local}>"))? + local.len() + 2;
-    let end = s[start..].find('<')? + start;
-    Some(&s[start..end])
 }
 fn coap(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError> {
     let Correlation::Coap { id, token } = probe.correlation else {

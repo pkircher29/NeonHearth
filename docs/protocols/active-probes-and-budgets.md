@@ -22,6 +22,14 @@ IDs are unique and plans are sorted deterministically.
 | SNMP inventory | 161 | Owner-started v1/v2c/v3 read-only GET for sysDescr.0 and sysObjectID.0; no default/community guessing |
 | Full-port | TCP 1–65535 conceptually; the catalog exposes bounded owner-started chunks | Explicit owner start only, lower priority, never scheduled by the default plan |
 
+The mDNS adapter is distinct from conventional DNS: its unicast DNS-SD query uses
+message ID zero and requests a unicast reply in the question class. Replies must echo
+the exact question name and type and return a matching PTR owner name; peer address is
+always correlated separately. WS-Discovery and ONVIF replies are parsed as bounded XML
+with exact SOAP, WS-Addressing, and WS-Discovery namespaces and document containment.
+SIP and RTSP replies require syntactically valid status/header blocks with unique, exact
+Call-ID/CSeq correlation fields; bodies and unrelated headers cannot satisfy correlation.
+
 HTTP uses a raw numeric-target request with a numeric `Host`, connection close, bounded
 status/header extraction, and no redirect handling. TLS certificate collection uses
 pure-Rust rustls and exposes only a bounded SHA-256 fingerprint, subject, SAN and validity.
@@ -38,6 +46,10 @@ evidence. ONVIF authentication is deferred to M4. Successful protocol metadata i
 stamped as `active.<probe-id>.v<version>`, confidence-clamped by construction, and expires
 after ten minutes. Refusal and timeout are metadata-only outcomes; raw bodies,
 certificates, and secrets never leave the adapter.
+
+Every UDP receive path, including community SNMP and SNMPv3, allocates one byte beyond
+its declared cap. A cap-plus-one datagram is rejected as amplification instead of being
+silently accepted after operating-system truncation.
 
 ## Scheduler defaults and ceilings
 
