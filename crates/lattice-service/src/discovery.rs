@@ -29,6 +29,20 @@ pub struct DiscoveryObservation {
     pub valid_until: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkPresenceKind {
+    Present { valid_until: DateTime<Utc> },
+    Missed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkPresenceObservation {
+    pub source_id: u64,
+    pub link_address: lattice_sensor::neighbor::LinkAddress,
+    pub observed_at: DateTime<Utc>,
+    pub kind: LinkPresenceKind,
+}
+
 #[derive(Clone, Debug)]
 pub struct DiscoverySource {
     pub id: u64,
@@ -222,6 +236,86 @@ impl PersistentDiscoveryPipeline {
     }
     pub fn presence_state(&self, id: DeviceId) -> Option<lattice_domain::PresenceState> {
         self.pipeline.presence_state(id)
+    }
+
+    pub async fn observe_link_presence_with_flow(
+        &mut self,
+        observation: LinkPresenceObservation,
+        changes: &[RollupChange],
+        tick_ms: u64,
+        arrival: DateTime<Utc>,
+    ) -> Result<DiscoveryPipelineOutcome, DiscoveryError> {
+        let source = self
+            .pipeline
+            .sources
+            .0
+            .get(&observation.source_id)
+            .ok_or(DiscoveryError::InvalidSource)?;
+        if !source.presence
+            || !source
+                .families
+                .contains(&lattice_domain::EvidenceFamily::LinkLayer)
+        {
+            return Err(DiscoveryError::InvalidSource);
+        }
+        let binding = self
+            .state
+            .lookup_link_layer_device(observation.link_address, &source.name)
+            .await?;
+        let (candidate, facts, presence_kind, valid_until) = match observation.kind {
+            LinkPresenceKind::Present { valid_until } => {
+                if valid_until <= observation.observed_at
+                    || observation.observed_at.timestamp_subsec_nanos() != 0
+                    || valid_until.timestamp_subsec_nanos() != 0
+                {
+                    return Err(DiscoveryError::InvalidSource);
+                }
+                let facts = if binding.is_none() {
+                    vec![EvidenceFact {
+                        family: lattice_domain::EvidenceFamily::LinkLayer,
+                        source: source.name.clone(),
+                        key: "mac".into(),
+                        value: observation.link_address.to_string(),
+                        confidence: 0.9,
+                        observed_at: observation.observed_at,
+                        expires_at: None,
+                        owner_confirmed: false,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                (
+                    binding,
+                    facts,
+                    PresenceEvidenceKind::NeighborCache,
+                    Some(valid_until),
+                )
+            }
+            LinkPresenceKind::Missed => {
+                let id = binding.ok_or(DiscoveryError::InvalidSource)?;
+                (
+                    Some(id),
+                    Vec::new(),
+                    PresenceEvidenceKind::ConfirmationFailure,
+                    None,
+                )
+            }
+        };
+        self.observe_with_flow(
+            DiscoveryObservation {
+                source_id: observation.source_id,
+                candidate,
+                facts,
+                presence_source: source.name.clone(),
+                presence_kind,
+                observed_at: observation.observed_at,
+                valid_until,
+            },
+            changes,
+            tick_ms,
+            arrival,
+        )
+        .await
     }
     pub async fn observe_with_flow(
         &mut self,
