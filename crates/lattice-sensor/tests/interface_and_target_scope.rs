@@ -2,7 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use lattice_sensor::{
     Address, Interface, InterfaceClass, InterfaceId, InterfaceInventory, InterfaceOverride,
-    TargetGuard, TargetGuardError, classify_interface, diff_inventory,
+    TargetApproval, TargetGuard, TargetGuardError, classify_interface, diff_inventory,
 };
 
 fn address(ip: &str, prefix: u8) -> Address {
@@ -194,6 +194,24 @@ fn guard() -> TargetGuard {
             (InterfaceId::new(2), InterfaceOverride::Default),
             (InterfaceId::new(3), InterfaceOverride::Enable),
         ],
+        [
+            TargetApproval {
+                interface: InterfaceId::new(1),
+                prefix: address("192.168.1.0", 24),
+            },
+            TargetApproval {
+                interface: InterfaceId::new(1),
+                prefix: address("fd42::", 64),
+            },
+            TargetApproval {
+                interface: InterfaceId::new(1),
+                prefix: address("fe80::", 64),
+            },
+            TargetApproval {
+                interface: InterfaceId::new(2),
+                prefix: address("10.1.2.0", 24),
+            },
+        ],
     )
     .unwrap()
 }
@@ -255,17 +273,107 @@ fn target_guard_rejects_public_special_cgnat_and_cross_interface_targets() {
 }
 
 #[test]
-fn target_guard_rejects_invalid_prefixes_and_public_override() {
-    let invalid = InterfaceInventory::new(vec![interface(
+fn target_guard_requires_explicit_narrowed_owner_approvals() {
+    let inventory = InterfaceInventory::new(vec![interface(
         1,
         "Ethernet",
         true,
         InterfaceClass::PhysicalWired,
-        vec![address("192.168.1.1", 33)],
+        vec![address("192.168.1.10", 24)],
     )]);
+    let none = TargetGuard::new(inventory.clone(), [], []).unwrap();
+    assert_eq!(
+        none.authorize(InterfaceId::new(1), "192.168.1.10".parse().unwrap()),
+        Err(TargetGuardError::OutsideApprovedPrefix)
+    );
+    let narrowed = TargetGuard::new(
+        inventory.clone(),
+        [],
+        [TargetApproval {
+            interface: InterfaceId::new(1),
+            prefix: address("192.168.1.8", 29),
+        }],
+    )
+    .unwrap();
+    assert!(
+        narrowed
+            .authorize(InterfaceId::new(1), "192.168.1.10".parse().unwrap())
+            .is_ok()
+    );
+    assert_eq!(
+        narrowed.authorize(InterfaceId::new(1), "192.168.1.20".parse().unwrap()),
+        Err(TargetGuardError::OutsideApprovedPrefix)
+    );
     assert!(matches!(
-        TargetGuard::new(invalid, [(InterfaceId::new(1), InterfaceOverride::Default)]),
-        Err(TargetGuardError::InvalidPrefix { .. })
+        TargetGuard::new(
+            inventory,
+            [],
+            [TargetApproval {
+                interface: InterfaceId::new(1),
+                prefix: address("192.168.0.0", 16)
+            }]
+        ),
+        Err(TargetGuardError::ApprovalOutsideInterfaceNetwork)
+    ));
+}
+
+#[test]
+fn target_guard_rejects_invalid_cross_interface_and_disallowed_approvals() {
+    let inventory = InterfaceInventory::new(vec![
+        interface(
+            1,
+            "Ethernet",
+            true,
+            InterfaceClass::PhysicalWired,
+            vec![address("192.168.1.10", 24)],
+        ),
+        interface(
+            2,
+            "Wi-Fi",
+            true,
+            InterfaceClass::PhysicalWifi,
+            vec![address("10.1.2.3", 24)],
+        ),
+        interface(
+            3,
+            "tailscale0",
+            true,
+            InterfaceClass::Tailscale,
+            vec![address("100.64.0.1", 32)],
+        ),
+    ]);
+    assert!(matches!(
+        TargetGuard::new(
+            inventory.clone(),
+            [],
+            [TargetApproval {
+                interface: InterfaceId::new(1),
+                prefix: address("192.168.1.1", 33)
+            }]
+        ),
+        Err(TargetGuardError::InvalidApprovalPrefix { .. })
+    ));
+    assert!(matches!(
+        TargetGuard::new(
+            inventory.clone(),
+            [],
+            [TargetApproval {
+                interface: InterfaceId::new(2),
+                prefix: address("192.168.1.0", 24)
+            }]
+        ),
+        Err(TargetGuardError::ApprovalOutsideInterfaceNetwork)
+    ));
+    assert!(matches!(
+        TargetGuard::new(
+            inventory.clone(),
+            [(InterfaceId::new(3), InterfaceOverride::Enable)],
+            [TargetApproval {
+                interface: InterfaceId::new(3),
+                prefix: address("100.64.0.0", 10)
+            }]
+        ),
+        Err(TargetGuardError::DisallowedApproval { .. })
     ));
     let public = InterfaceInventory::new(vec![interface(
         1,
@@ -275,8 +383,15 @@ fn target_guard_rejects_invalid_prefixes_and_public_override() {
         vec![address("8.8.8.8", 24)],
     )]);
     assert!(matches!(
-        TargetGuard::new(public, [(InterfaceId::new(1), InterfaceOverride::Enable)]),
-        Err(TargetGuardError::PublicApprovedPrefix { .. })
+        TargetGuard::new(
+            public,
+            [(InterfaceId::new(1), InterfaceOverride::Enable)],
+            [TargetApproval {
+                interface: InterfaceId::new(1),
+                prefix: address("8.8.8.0", 24)
+            }]
+        ),
+        Err(TargetGuardError::DisallowedApproval { .. })
     ));
 }
 

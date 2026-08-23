@@ -156,6 +156,10 @@ impl InterfaceInventory {
     pub fn interfaces(&self) -> impl Iterator<Item = &Interface> {
         self.interfaces.values()
     }
+
+    fn get(&self, id: InterfaceId) -> Option<&Interface> {
+        self.interfaces.get(&id)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -264,14 +268,26 @@ pub struct TargetGuard {
     prefixes: Vec<ApprovedPrefix>,
 }
 
+/// A homeowner-approved discovery range. Connected interface addresses are
+/// inventory facts, never implicit authorization to probe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetApproval {
+    pub interface: InterfaceId,
+    pub prefix: Address,
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TargetGuardError {
+    #[error("approved interface does not exist")]
+    UnknownInterface,
     #[error("interface is not eligible for discovery")]
     InterfaceNotEligible,
-    #[error("approved prefix is invalid for {ip}/{prefix}")]
-    InvalidPrefix { ip: IpAddr, prefix: u8 },
-    #[error("public address cannot be used as an approved prefix: {ip}/{prefix}")]
-    PublicApprovedPrefix { ip: IpAddr, prefix: u8 },
+    #[error("owner-approved prefix is invalid for {ip}/{prefix}")]
+    InvalidApprovalPrefix { ip: IpAddr, prefix: u8 },
+    #[error("owner-approved prefix is not permitted: {ip}/{prefix}")]
+    DisallowedApproval { ip: IpAddr, prefix: u8 },
+    #[error("owner-approved prefix is outside the selected interface network")]
+    ApprovalOutsideInterfaceNetwork,
     #[error("target is not a permitted private or link-local address")]
     TargetNotPrivate,
     #[error("target does not belong to the approved prefix for the selected interface")]
@@ -282,10 +298,10 @@ impl TargetGuard {
     pub fn new(
         inventory: InterfaceInventory,
         overrides: impl IntoIterator<Item = (InterfaceId, InterfaceOverride)>,
+        approvals: impl IntoIterator<Item = TargetApproval>,
     ) -> Result<Self, TargetGuardError> {
         let overrides: BTreeMap<_, _> = overrides.into_iter().collect();
         let mut eligible = BTreeSet::new();
-        let mut prefixes = Vec::new();
         for interface in inventory.interfaces() {
             let setting = overrides
                 .get(&interface.id)
@@ -295,22 +311,34 @@ impl TargetGuard {
                 continue;
             }
             eligible.insert(interface.id);
-            for address in &interface.addresses {
-                validate_prefix(address)?;
-                if is_permitted_target(address.ip) {
-                    prefixes.push(ApprovedPrefix {
-                        interface: interface.id,
-                        address: address.clone(),
-                    });
-                } else if setting == InterfaceOverride::Enable
-                    && interface.class != InterfaceClass::Tailscale
-                {
-                    return Err(TargetGuardError::PublicApprovedPrefix {
-                        ip: address.ip,
-                        prefix: address.prefix,
-                    });
-                }
+        }
+        let mut prefixes = Vec::new();
+        for approval in approvals {
+            let interface = inventory
+                .get(approval.interface)
+                .ok_or(TargetGuardError::UnknownInterface)?;
+            if !eligible.contains(&approval.interface) {
+                return Err(TargetGuardError::InterfaceNotEligible);
             }
+            validate_prefix(&approval.prefix)?;
+            if !is_permitted_target(approval.prefix.ip) {
+                return Err(TargetGuardError::DisallowedApproval {
+                    ip: approval.prefix.ip,
+                    prefix: approval.prefix.prefix,
+                });
+            }
+            if !interface.addresses.iter().any(|attached| {
+                validate_prefix(attached).is_ok()
+                    && is_permitted_target(attached.ip)
+                    && prefix_contains(attached, approval.prefix.ip)
+                    && approval.prefix.prefix >= attached.prefix
+            }) {
+                return Err(TargetGuardError::ApprovalOutsideInterfaceNetwork);
+            }
+            prefixes.push(ApprovedPrefix {
+                interface: approval.interface,
+                address: approval.prefix,
+            });
         }
         Ok(Self { eligible, prefixes })
     }
@@ -344,7 +372,7 @@ fn validate_prefix(address: &Address) -> Result<(), TargetGuardError> {
         IpAddr::V6(_) => 128,
     };
     if address.prefix > maximum {
-        return Err(TargetGuardError::InvalidPrefix {
+        return Err(TargetGuardError::InvalidApprovalPrefix {
             ip: address.ip,
             prefix: address.prefix,
         });
