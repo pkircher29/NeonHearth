@@ -1,3 +1,8 @@
+use super::{
+    ActiveEngine, ActiveError, AttemptTransport, Clock, ProbeCatalog, ProbeCredential,
+    ProbeOutcome, ProbeRequest, Scheduler, SchedulerConfig, WorkKey,
+};
+use futures_util::FutureExt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     panic::AssertUnwindSafe,
@@ -7,16 +12,9 @@ use std::{
     },
     time::Duration,
 };
-
-use futures_util::FutureExt;
 use tokio::{
-    sync::{Notify, mpsc},
+    sync::{Mutex as AsyncMutex, Notify, mpsc},
     task::JoinHandle,
-};
-
-use super::{
-    ActiveEngine, ActiveError, AttemptTransport, Clock, ProbeCatalog, ProbeCredential,
-    ProbeOutcome, ProbeRequest, Scheduler, SchedulerConfig, WorkKey,
 };
 
 pub trait ExecutionCredentialSource: Send + Sync {
@@ -28,7 +26,6 @@ impl ExecutionCredentialSource for NoCredentials {
         None
     }
 }
-
 #[derive(Debug)]
 pub struct RunnerEvent {
     pub request: ProbeRequest,
@@ -36,13 +33,11 @@ pub struct RunnerEvent {
     pub result: Result<ProbeOutcome, ActiveError>,
     pub will_retry: bool,
 }
-
 struct RetryItem {
     due: Duration,
     request: ProbeRequest,
     attempt: u8,
 }
-
 struct Reservation<C: Clock> {
     scheduler: Arc<Mutex<Scheduler<C>>>,
     request: ProbeRequest,
@@ -55,6 +50,10 @@ impl<C: Clock> Drop for Reservation<C> {
             .finish(&self.request);
     }
 }
+struct Lifecycle {
+    stopped: bool,
+    tasks: Vec<JoinHandle<()>>,
+}
 
 pub struct SchedulerRunner<C: Clock, T: AttemptTransport> {
     scheduler: Arc<Mutex<Scheduler<C>>>,
@@ -65,19 +64,14 @@ pub struct SchedulerRunner<C: Clock, T: AttemptTransport> {
     retries: Mutex<VecDeque<RetryItem>>,
     attempts: Mutex<HashMap<WorkKey, u8>>,
     pending: Mutex<HashSet<WorkKey>>,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    lifecycle: AsyncMutex<Lifecycle>,
     results: mpsc::Sender<RunnerEvent>,
     notify: Notify,
     stopped: AtomicBool,
     queue_capacity: usize,
     max_retry_attempts: u8,
 }
-
-impl<C, T> SchedulerRunner<C, T>
-where
-    C: Clock + 'static,
-    T: AttemptTransport + 'static,
-{
+impl<C: Clock + 'static, T: AttemptTransport + 'static> SchedulerRunner<C, T> {
     pub fn new(
         config: SchedulerConfig,
         clock: Arc<C>,
@@ -94,7 +88,6 @@ where
             Arc::new(NoCredentials),
         )
     }
-
     pub fn new_with_credentials(
         config: SchedulerConfig,
         clock: Arc<C>,
@@ -120,7 +113,10 @@ where
                 retries: Mutex::new(VecDeque::new()),
                 attempts: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashSet::new()),
-                tasks: Mutex::new(Vec::new()),
+                lifecycle: AsyncMutex::new(Lifecycle {
+                    stopped: false,
+                    tasks: vec![],
+                }),
                 results,
                 notify: Notify::new(),
                 stopped: AtomicBool::new(false),
@@ -130,7 +126,6 @@ where
             receiver,
         ))
     }
-
     pub fn enqueue(&self, request: ProbeRequest) -> Result<bool, ActiveError> {
         if self.catalog.resolve(&request.probe_id).is_none() {
             return Err(ActiveError::UnknownProbe);
@@ -145,58 +140,49 @@ where
         }
         pending.insert(key.clone());
         drop(pending);
-        let inserted = self
+        match self
             .scheduler
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .enqueue(request);
-        let inserted = match inserted {
-            Ok(inserted) => inserted,
+            .enqueue(request)
+        {
+            Ok(inserted) => {
+                if inserted {
+                    self.notify.notify_one()
+                }
+                Ok(inserted)
+            }
             Err(error) => {
                 self.pending
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&key);
-                return Err(error);
+                Err(error)
             }
-        };
-        if inserted {
-            self.notify.notify_one();
         }
-        Ok(inserted)
     }
-
     fn promote_due_retries(&self) {
         let now = self.clock.monotonic();
         let mut retries = self.retries.lock().unwrap_or_else(|e| e.into_inner());
         let mut scheduler = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
         let mut remaining = VecDeque::new();
         while let Some(item) = retries.pop_front() {
-            if item.due <= now {
-                if scheduler.enqueue(item.request.clone()).is_ok() {
-                    self.attempts
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(WorkKey::from(&item.request), item.attempt);
-                } else {
-                    remaining.push_back(item);
-                }
+            if item.due <= now && scheduler.enqueue(item.request.clone()).is_ok() {
+                self.attempts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(WorkKey::from(&item.request), item.attempt);
             } else {
-                remaining.push_back(item);
+                remaining.push_back(item)
             }
         }
         *retries = remaining;
     }
-
     pub async fn dispatch_ready(self: &Arc<Self>) -> usize {
         if self.stopped.load(Ordering::Acquire) {
             return 0;
         }
         self.promote_due_retries();
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|task| !task.is_finished());
         let mut dispatched = 0;
         let mut remaining = self
             .scheduler
@@ -205,6 +191,19 @@ where
             .queue_len();
         while remaining > 0 {
             remaining -= 1;
+            let permit = match self.results.clone().try_reserve_owned() {
+                Ok(p) => p,
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.stop_and_drain().await;
+                    break;
+                }
+            };
+            let mut lifecycle = self.lifecycle.lock().await;
+            lifecycle.tasks.retain(|t| !t.is_finished());
+            if lifecycle.stopped || self.stopped.load(Ordering::Acquire) {
+                break;
+            }
             let Some(request) = self
                 .scheduler
                 .lock()
@@ -214,6 +213,10 @@ where
                 break;
             };
             let Some(descriptor) = self.catalog.resolve(&request.probe_id) else {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&WorkKey::from(&request));
                 continue;
             };
             let attempt = self
@@ -222,12 +225,12 @@ where
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&WorkKey::from(&request))
                 .unwrap_or(0);
-            let started = self
+            if !self
                 .scheduler
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .try_start_cost(&request, descriptor.rate_cost);
-            if !started {
+                .try_start_cost(&request, descriptor.rate_cost)
+            {
                 if attempt > 0 {
                     self.attempts
                         .lock()
@@ -239,101 +242,113 @@ where
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .enqueue(request);
-                break;
+                continue;
             }
             dispatched += 1;
             let runner = self.clone();
-            let task_request = request.clone();
             let task = tokio::spawn(async move {
-                let reservation = Reservation {
-                    scheduler: runner.scheduler.clone(),
-                    request: task_request.clone(),
-                };
-                let credential = runner.credentials.credential_for(&task_request);
-                let execution = AssertUnwindSafe(
-                    runner
-                        .engine
-                        .execute(task_request.clone(), credential.as_ref()),
-                )
-                .catch_unwind()
-                .await;
-                drop(reservation);
-                let result = match execution {
-                    Ok(result) => result,
-                    Err(_) => Err(ActiveError::Internal),
-                };
-                let transient = matches!(
-                    result,
-                    Ok(ProbeOutcome::Timeout { .. }) | Err(ActiveError::Network)
-                );
-                let mut will_retry = false;
-                if transient
-                    && attempt < runner.max_retry_attempts
-                    && !runner.stopped.load(Ordering::Acquire)
-                {
-                    let mut scheduler = runner.scheduler.lock().unwrap_or_else(|e| e.into_inner());
-                    let delay = scheduler.retry_delay(&task_request, attempt);
-                    let due = runner
-                        .clock
-                        .monotonic()
-                        .saturating_add(delay)
-                        .saturating_add(scheduler.jitter(delay));
-                    drop(scheduler);
-                    let mut retries = runner.retries.lock().unwrap_or_else(|e| e.into_inner());
-                    if retries.len() < runner.queue_capacity {
-                        retries.push_back(RetryItem {
-                            due,
-                            request: task_request.clone(),
-                            attempt: attempt.saturating_add(1),
-                        });
-                        will_retry = true;
-                    }
-                }
-                if !will_retry && !matches!(result, Err(ActiveError::Cancelled)) {
-                    runner
-                        .scheduler
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_success(&task_request);
-                }
-                if !will_retry {
-                    runner
-                        .pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&WorkKey::from(&task_request));
-                }
-                let _ = runner
-                    .results
-                    .send(RunnerEvent {
-                        request: task_request,
-                        attempt,
-                        result,
-                        will_retry,
-                    })
-                    .await;
-                runner.notify.notify_one();
+                runner.execute_admitted(request, attempt, permit).await;
             });
-            self.tasks
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(task);
+            lifecycle.tasks.push(task);
+            drop(lifecycle);
         }
         dispatched
     }
 
+    async fn execute_admitted(
+        self: Arc<Self>,
+        request: ProbeRequest,
+        attempt: u8,
+        permit: mpsc::OwnedPermit<RunnerEvent>,
+    ) {
+        let reservation = Reservation {
+            scheduler: self.scheduler.clone(),
+            request: request.clone(),
+        };
+        let execution = AssertUnwindSafe(async {
+            let credential = self.credentials.credential_for(&request);
+            self.engine
+                .execute(request.clone(), credential.as_ref())
+                .await
+        })
+        .catch_unwind()
+        .await;
+        drop(reservation);
+
+        let result = execution.unwrap_or(Err(ActiveError::Internal));
+        let will_retry = self
+            .schedule_retry_if_transient(&request, attempt, &result)
+            .await;
+        if !will_retry && !matches!(result, Err(ActiveError::Cancelled)) {
+            self.scheduler
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_success(&request);
+        }
+        if !will_retry {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&WorkKey::from(&request));
+        }
+        permit.send(RunnerEvent {
+            request,
+            attempt,
+            result,
+            will_retry,
+        });
+        self.notify.notify_one();
+    }
+
+    async fn schedule_retry_if_transient(
+        &self,
+        request: &ProbeRequest,
+        attempt: u8,
+        result: &Result<ProbeOutcome, ActiveError>,
+    ) -> bool {
+        let transient = matches!(
+            result,
+            Ok(ProbeOutcome::Timeout { .. }) | Err(ActiveError::Network)
+        );
+        if !transient || attempt >= self.max_retry_attempts {
+            return false;
+        }
+        // Serialize retry admission with stop so no retry can appear after stop clears state.
+        let lifecycle = self.lifecycle.lock().await;
+        if lifecycle.stopped || self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut scheduler = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
+        let delay = scheduler.retry_delay(request, attempt);
+        let due = self
+            .clock
+            .monotonic()
+            .saturating_add(delay)
+            .saturating_add(scheduler.jitter(delay));
+        drop(scheduler);
+        let mut retries = self.retries.lock().unwrap_or_else(|e| e.into_inner());
+        if retries.len() >= self.queue_capacity {
+            return false;
+        }
+        retries.push_back(RetryItem {
+            due,
+            request: request.clone(),
+            attempt: attempt.saturating_add(1),
+        });
+        drop(lifecycle);
+        true
+    }
     pub async fn run(self: Arc<Self>) {
         while !self.stopped.load(Ordering::Acquire) {
             self.dispatch_ready().await;
-            tokio::select! {
-                () = self.notify.notified() => {},
-                () = tokio::time::sleep(Duration::from_millis(10)) => {},
-            }
+            tokio::select! {()=self.notify.notified()=>{},()=tokio::time::sleep(Duration::from_millis(10))=>{}}
         }
     }
-
-    pub async fn stop_and_drain(&self) {
-        if !self.stopped.swap(true, Ordering::AcqRel) {
+    async fn transition_to_stopped(&self) -> Vec<JoinHandle<()>> {
+        let mut lifecycle = self.lifecycle.lock().await;
+        if !lifecycle.stopped {
+            lifecycle.stopped = true;
+            self.stopped.store(true, Ordering::Release);
             self.scheduler
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -353,12 +368,13 @@ where
             self.engine.stop();
             self.notify.notify_waiters();
         }
-        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()));
-        for task in tasks {
+        std::mem::take(&mut lifecycle.tasks)
+    }
+    pub async fn stop_and_drain(&self) {
+        for task in self.transition_to_stopped().await {
             let _ = task.await;
         }
     }
-
     pub fn state_sizes(&self) -> (usize, usize, usize) {
         self.scheduler
             .lock()

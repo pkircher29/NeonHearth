@@ -72,6 +72,7 @@ silently accepted after operating-system truncation.
 | --- | ---: | ---: |
 | Global in-flight | 32 | 256 |
 | Per-host in-flight | 2 | 16 and no greater than global |
+| Global rate burst | 128 cost tokens | 4096 |
 | Per-host burst | 4 × per-host concurrency | 64 |
 | Per-/24 IPv4 or /64 IPv6 subnet burst | 64 | 1024 |
 | Token refill | 1 token/second | 1–3600 seconds |
@@ -82,7 +83,9 @@ silently accepted after operating-system truncation.
 Descriptors also declare an explicit cost class: presence (ICMP/neighbor checks),
 discovery (normal TCP/UDP), inventory (credentialed SNMP, cost 4), or owner full-port
 (cost 2 per handshake). The scheduler consumes those costs when the D6 runner dispatches
-work; the catalog never treats credentialed inventory as a cheap presence probe.
+work atomically from global, host, and subnet buckets; denial cannot partially consume
+another bucket. Credentialed inventory uses the explicit `OwnerInventory` authorization
+mode and remains normal priority. Only `OwnerFullPort` work enters the low-priority queue.
 
 Budgets and backoff use monotonic time. Wall time is used only for evidence
 `observed_at`/expiry. A wall-clock correction cannot refill a budget. Resume after sleep
@@ -94,9 +97,12 @@ owner full-port work. A noisy or offline host therefore cannot starve another ho
 
 `SchedulerRunner` is the asynchronous execution boundary joining this queue to
 `ActiveEngine`. Dispatch atomically consumes each descriptor's declared `rate_cost` and
-holds global and per-host concurrency through a panic-safe RAII reservation. Completion,
-typed error, cancellation, and whether a retry was scheduled are delivered through a
-bounded result channel. Backpressure never converts a result into an implicit success.
+holds global and per-host concurrency through a panic-safe RAII reservation. Before any
+budget is consumed or task admitted, dispatch reserves a bounded result-channel slot, so
+completion, typed error, cancellation, and retry status can be published synchronously.
+Backpressure therefore pauses admission and cannot deadlock global stop. Admission and
+stop transition share one lifecycle gate: stop prevents late task registration and awaits
+every task admitted before the transition.
 Credentialed inventory obtains an owned credential from an execution-time provider only
 after dispatch; the runner neither queues nor retains it, and drops it when that attempt
 finishes.

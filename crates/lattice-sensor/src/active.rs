@@ -443,6 +443,7 @@ pub fn owner_full_port_probe_ids() -> impl Iterator<Item = String> {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ProbeMode {
     Default,
+    OwnerInventory,
     OwnerFullPort,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -578,8 +579,14 @@ impl<T: AttemptTransport> ActiveEngine<T> {
         if !request.owner_approved {
             return Err(ActiveError::OwnerApprovalRequired);
         }
-        if descriptor.owner_start_required && request.mode != ProbeMode::OwnerFullPort {
-            return Err(ActiveError::OwnerApprovalRequired);
+        if descriptor.owner_start_required {
+            let authorized_mode = match descriptor.budget_class {
+                BudgetClass::OwnerFullPort => request.mode == ProbeMode::OwnerFullPort,
+                _ => request.mode == ProbeMode::OwnerInventory,
+            };
+            if !authorized_mode {
+                return Err(ActiveError::OwnerApprovalRequired);
+            }
         }
         if descriptor.credential_required && credential.is_none() {
             return Err(ActiveError::CredentialRequired);
@@ -1781,6 +1788,7 @@ pub fn normalize_snmp_inventory(
 pub struct BudgetConfig {
     pub global_concurrency: usize,
     pub per_host_concurrency: usize,
+    pub global_rate_burst: usize,
     pub per_subnet_burst: usize,
     pub refill: Duration,
 }
@@ -1788,6 +1796,7 @@ impl BudgetConfig {
     pub fn new(
         global: usize,
         host: usize,
+        global_rate_burst: usize,
         subnet: usize,
         refill: Duration,
     ) -> Result<Self, ActiveError> {
@@ -1796,6 +1805,8 @@ impl BudgetConfig {
             || host == 0
             || host > 16
             || host > global
+            || global_rate_burst == 0
+            || global_rate_burst > 4096
             || subnet == 0
             || subnet > 1024
             || refill.is_zero()
@@ -1806,6 +1817,7 @@ impl BudgetConfig {
         Ok(Self {
             global_concurrency: global,
             per_host_concurrency: host,
+            global_rate_burst,
             per_subnet_burst: subnet,
             refill,
         })
@@ -1816,6 +1828,7 @@ impl Default for BudgetConfig {
         Self {
             global_concurrency: 32,
             per_host_concurrency: 2,
+            global_rate_burst: 128,
             per_subnet_burst: 64,
             refill: Duration::from_secs(1),
         }
@@ -1920,6 +1933,7 @@ pub struct Scheduler<C> {
     stopped: bool,
     active: usize,
     active_hosts: HashMap<IpAddr, usize>,
+    global_rate: TokenBucket,
     host_rates: HashMap<IpAddr, TokenBucket>,
     subnet_rates: HashMap<SubnetKey, TokenBucket>,
 }
@@ -1981,6 +1995,7 @@ impl<C: Clock> Scheduler<C> {
         BudgetConfig::new(
             config.budgets.global_concurrency,
             config.budgets.per_host_concurrency,
+            config.budgets.global_rate_burst,
             config.budgets.per_subnet_burst,
             config.budgets.refill,
         )?;
@@ -1997,6 +2012,8 @@ impl<C: Clock> Scheduler<C> {
         {
             return Err(ActiveError::InvalidConfig);
         }
+        let now = clock.monotonic();
+        let global_rate_burst = config.budgets.global_rate_burst;
         Ok(Self {
             config,
             clock,
@@ -2008,6 +2025,11 @@ impl<C: Clock> Scheduler<C> {
             stopped: false,
             active: 0,
             active_hosts: HashMap::new(),
+            global_rate: TokenBucket {
+                tokens: global_rate_burst,
+                last: now,
+                last_used: now,
+            },
             host_rates: HashMap::new(),
             subnet_rates: HashMap::new(),
         })
@@ -2117,7 +2139,12 @@ impl<C: Clock> Scheduler<C> {
             last_used: now,
         });
         let cost = usize::from(cost);
-        if !host.available(now, host_capacity, self.config.budgets.refill)
+        if !self.global_rate.available(
+            now,
+            self.config.budgets.global_rate_burst,
+            self.config.budgets.refill,
+        ) || self.global_rate.tokens < cost
+            || !host.available(now, host_capacity, self.config.budgets.refill)
             || host.tokens < cost
             || !network.available(
                 now,
@@ -2128,6 +2155,7 @@ impl<C: Clock> Scheduler<C> {
         {
             return false;
         }
+        self.global_rate.tokens -= cost;
         host.tokens -= cost;
         network.tokens -= cost;
         self.active += 1;

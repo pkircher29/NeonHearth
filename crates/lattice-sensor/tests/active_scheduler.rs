@@ -142,7 +142,7 @@ async fn credentials_are_required_borrowed_and_never_returned() {
     let transport = Arc::new(FakeTransport::default());
     let engine = ActiveEngine::new(Arc::new(guard()), transport, catalog().unwrap());
     let mut req = request("192.168.50.9", "udp.snmp.161");
-    req.mode = ProbeMode::OwnerFullPort;
+    req.mode = ProbeMode::OwnerInventory;
     assert!(matches!(
         engine.execute(req.clone(), None).await.unwrap_err(),
         ActiveError::CredentialRequired
@@ -221,7 +221,7 @@ async fn normalized_evidence_rejects_response_amplification() {
 
 #[test]
 fn budgets_validate_backoff_jitter_and_reset() {
-    assert!(BudgetConfig::new(0, 1, 1, Duration::from_secs(1)).is_err());
+    assert!(BudgetConfig::new(0, 1, 1, 1, Duration::from_secs(1)).is_err());
     let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
     let mut scheduler = Scheduler::new(SchedulerConfig::default(), clock).unwrap();
     let req = request("192.168.50.9", "tcp.http.80");
@@ -240,12 +240,19 @@ fn queue_coalesces_duplicates_prioritizes_discovery_and_is_fair() {
     full.mode = ProbeMode::OwnerFullPort;
     scheduler.enqueue(full.clone()).unwrap();
     assert!(!scheduler.enqueue(full).unwrap());
+    let mut inventory = request("192.168.50.12", "udp.snmp.161");
+    inventory.mode = ProbeMode::OwnerInventory;
+    scheduler.enqueue(inventory).unwrap();
     scheduler
         .enqueue(request("192.168.50.10", "tcp.ssh.22"))
         .unwrap();
     scheduler
         .enqueue(request("192.168.50.11", "tcp.ssh.22"))
         .unwrap();
+    assert_eq!(
+        scheduler.next_request().unwrap().target,
+        "192.168.50.12".parse::<IpAddr>().unwrap()
+    );
     assert_eq!(
         scheduler.next_request().unwrap().target,
         "192.168.50.10".parse::<IpAddr>().unwrap()
@@ -258,6 +265,32 @@ fn queue_coalesces_duplicates_prioritizes_discovery_and_is_fair() {
         scheduler.next_request().unwrap().mode,
         ProbeMode::OwnerFullPort
     );
+}
+
+#[test]
+fn costly_rate_reservation_is_atomic_across_global_host_and_subnet_buckets() {
+    let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
+    let config = SchedulerConfig {
+        budgets: BudgetConfig::new(8, 2, 8, 4, Duration::from_secs(10)).unwrap(),
+        ..SchedulerConfig::default()
+    };
+    let mut scheduler = Scheduler::new(config, clock.clone()).unwrap();
+    let a = request("192.168.50.9", "udp.snmp.161");
+    let same_subnet = request("192.168.50.10", "tcp.http.80");
+    let other_subnet = request("192.168.51.10", "tcp.http.80");
+    let third_subnet = request("192.168.52.10", "tcp.http.80");
+
+    assert!(scheduler.try_start_cost(&a, 4));
+    scheduler.finish(&a);
+    assert!(!scheduler.try_start(&same_subnet));
+    assert!(scheduler.try_start_cost(&other_subnet, 4));
+    scheduler.finish(&other_subnet);
+    clock.advance(Duration::from_secs(1_000));
+    assert!(scheduler.try_start_cost(&a, 4));
+    scheduler.finish(&a);
+    assert!(scheduler.try_start_cost(&other_subnet, 4));
+    scheduler.finish(&other_subnet);
+    assert!(!scheduler.try_start(&third_subnet));
 }
 
 #[test]
@@ -279,7 +312,7 @@ fn stop_clears_queue_and_prevents_new_work() {
 fn concurrency_and_rate_budgets_enforce_exact_ceiling_and_refill() {
     let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
     let config = SchedulerConfig {
-        budgets: BudgetConfig::new(2, 1, 2, Duration::from_secs(10)).unwrap(),
+        budgets: BudgetConfig::new(2, 1, 2, 2, Duration::from_secs(10)).unwrap(),
         ..SchedulerConfig::default()
     };
     let mut scheduler = Scheduler::new(config, clock.clone()).unwrap();
@@ -303,7 +336,7 @@ fn scheduler_state_is_bounded_and_ttl_evicted() {
     let config = SchedulerConfig {
         state_capacity: 2,
         state_ttl: Duration::from_secs(5),
-        budgets: BudgetConfig::new(8, 2, 16, Duration::from_secs(1)).unwrap(),
+        budgets: BudgetConfig::new(8, 2, 16, 16, Duration::from_secs(1)).unwrap(),
         ..SchedulerConfig::default()
     };
     let mut scheduler = Scheduler::new(config, clock.clone()).unwrap();
