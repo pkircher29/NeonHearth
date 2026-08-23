@@ -45,6 +45,10 @@ fn classification_is_conservative_across_windows_and_linux_names() {
         InterfaceClass::PhysicalWired
     );
     assert_eq!(
+        classify_interface("USB", Some("Realtek USB Card Reader"), false),
+        InterfaceClass::Unknown
+    );
+    assert_eq!(
         classify_interface("Wi-Fi", None, false),
         InterfaceClass::PhysicalWifi
     );

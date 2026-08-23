@@ -121,9 +121,7 @@ fn valid_ip(ip: IpAddr) -> bool {
                 && !x.is_unspecified()
                 && !x.is_loopback()
                 && !x.is_multicast()
-                // Without the interface prefix, conservatively reject the standard
-                // directed-broadcast form as well as the limited broadcast address.
-                && x.octets()[3] != 255
+                && x != Ipv4Addr::new(255, 255, 255, 255)
         }
         IpAddr::V6(x) => {
             (x.is_unique_local() || x.is_unicast_link_local())
@@ -313,6 +311,11 @@ fn normalize_raw_rows(
         }
         let mut mac = [0; 6];
         mac.copy_from_slice(&r.mac);
+        // Multicast and broadcast link-layer mappings describe protocol groups,
+        // not discoverable neighbor devices. A zero address remains malformed.
+        if mac == [0xff; 6] || mac[0] & 1 != 0 {
+            continue;
+        }
         let link = LinkAddress::try_from(mac).map_err(|_| NeighborError::Malformed)?;
         rows.push(NeighborRow::new(
             InterfaceId::new(r.ifindex),
@@ -518,13 +521,7 @@ fn decode_linux_message_raw(
                 if link_address.is_some() {
                     return Err(NeighborError::Malformed);
                 }
-                if value.len() != 6 {
-                    return Err(NeighborError::Malformed);
-                }
-                let mut bytes = [0; 6];
-                bytes.copy_from_slice(&value);
-                let address = LinkAddress::try_from(bytes).map_err(|_| NeighborError::Malformed)?;
-                link_address = Some(address);
+                link_address = Some(value);
             }
             _ => {}
         }
@@ -544,7 +541,7 @@ fn decode_linux_message_raw(
         ifindex: interface.get(),
         family,
         address,
-        mac: link_address.0.to_vec(),
+        mac: link_address,
         reachability: map_kernel_state(message.header.state),
     }))
 }
@@ -934,16 +931,30 @@ mod tests {
                 5,
             ),
             raw(2, ADDRESS_FAMILY_INET, v4(255), vec![0xff; 6], 6),
+            raw(2, ADDRESS_FAMILY_INET, v4(4), vec![1, 0, 0, 0, 0, 4], 6),
         ] {
             assert!(normalize_raw_rows(&config, [ignored]).unwrap().is_empty());
         }
+        assert_eq!(
+            normalize_raw_rows(
+                &config,
+                [raw(
+                    2,
+                    ADDRESS_FAMILY_INET,
+                    v4(255),
+                    vec![2, 0, 0, 0, 0, 5],
+                    6,
+                )],
+            )
+            .unwrap()[0]
+                .ip(),
+            "192.168.1.255".parse::<IpAddr>().unwrap()
+        );
 
         for malformed in [
             raw(2, 999, v4(3), vec![2, 0, 0, 0, 0, 3], 5),
             raw(2, ADDRESS_FAMILY_INET, v4(3), vec![2, 0], 5),
             raw(2, ADDRESS_FAMILY_INET, v4(3), vec![0; 6], 5),
-            raw(2, ADDRESS_FAMILY_INET, v4(3), vec![1, 0, 0, 0, 0, 3], 5),
-            raw(2, ADDRESS_FAMILY_INET, v4(3), vec![0xff; 6], 5),
         ] {
             assert_eq!(
                 normalize_raw_rows(&config, [malformed]),
@@ -1206,10 +1217,23 @@ mod tests {
             &[0xff; 6],
             NeighbourState::Reachable,
         );
-        for message in [invalid_length, multicast_link, broadcast_link] {
+        let zero_link = message(
+            2,
+            "192.168.1.1".parse().unwrap(),
+            &[0; 6],
+            NeighbourState::Reachable,
+        );
+        for message in [invalid_length, zero_link] {
             let error = normalize_linux_messages(&snapshot_config(16), [message]).unwrap_err();
             assert_eq!(error, NeighborError::Malformed);
             assert!(!format!("{error:?} {error}").contains("192.168.1"));
+        }
+        for message in [multicast_link, broadcast_link] {
+            assert!(
+                normalize_linux_messages(&snapshot_config(16), [message])
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

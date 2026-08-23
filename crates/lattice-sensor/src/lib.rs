@@ -139,7 +139,7 @@ pub fn classify_interface(name: &str, description: Option<&str>, loopback: bool)
         InterfaceClass::PhysicalWifi
     } else if value == "ethernet"
         || value.starts_with("ethernet ")
-        || value.contains("realtek")
+        || value.contains("gbe")
         || name.to_ascii_lowercase().starts_with("eth")
         || name.to_ascii_lowercase().starts_with("enp")
         || name.to_ascii_lowercase().starts_with("eno")
