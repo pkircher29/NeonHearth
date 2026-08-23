@@ -18,6 +18,10 @@ async-trait.workspace = true
 tokio.workspace = true
 secrecy.workspace = true
 surge-ping.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+sha2.workspace = true
+x509-parser.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }

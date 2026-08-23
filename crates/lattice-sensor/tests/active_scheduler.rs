@@ -13,7 +13,7 @@ use lattice_sensor::{
     active::{
         ActiveEngine, ActiveError, AttemptTransport, BudgetConfig, CuratedPlan, FakeClock,
         ProbeMode, ProbeOutcome, ProbeRequest, Scheduler, SchedulerConfig, TransportResponse,
-        catalog, parse_http_metadata,
+        catalog, owner_full_port_probe_ids, parse_http_metadata,
     },
 };
 use secrecy::SecretString;
@@ -108,6 +108,10 @@ fn catalog_is_unique_deterministic_and_full_port_is_opt_in() {
             .iter()
             .all(|p| p.owner_start_required)
     );
+    let ports: Vec<_> = owner_full_port_probe_ids().collect();
+    assert_eq!(ports.len(), 65_535);
+    assert_eq!(ports.first().unwrap(), "full.tcp.1");
+    assert_eq!(ports.last().unwrap(), "full.tcp.65535");
 }
 
 #[tokio::test]

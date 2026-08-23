@@ -23,10 +23,10 @@ IDs are unique and plans are sorted deterministically.
 | Full-port | TCP 1–65535 conceptually; the catalog exposes bounded owner-started chunks | Explicit owner start only, lower priority, never scheduled by the default plan |
 
 HTTP uses a raw numeric-target request with a numeric `Host`, connection close, bounded
-status/header extraction, and no redirect handling. TLS certificate collection is a
-separate pure-Rust transport boundary: certificate verification failures may produce an
-explicitly **unverified** fingerprint, never a trusted result. Until that adapter is
-present, TLS descriptors return `Unavailable`; they do not downgrade to plaintext.
+status/header extraction, and no redirect handling. TLS certificate collection uses
+pure-Rust rustls and exposes only a bounded SHA-256 fingerprint, subject, SAN and validity.
+The fingerprint-only handshake is always labeled **unverified**, never trusted, and never
+downgrades to plaintext.
 
 SNMP credentials are borrowed only for the execution call. They are never stored,
 logged, included in errors, or returned in evidence. ONVIF authentication is deferred to
@@ -66,8 +66,7 @@ silently.
 - No vulnerability scanning, exploit behavior, credential guessing, router mutation, or
   public-target mode exists in this milestone.
 - ARP/NDP require the later signed privileged capture backend. ICMP works where the OS grants raw-echo access and otherwise returns a typed permission result.
-- TLS certificate parsing and authenticated ONVIF inventory are intentionally unavailable
-  until their dedicated adapters land; no insecure fallback is used.
+- Authenticated ONVIF inventory is intentionally unavailable until M4; no insecure fallback is used.
 - DHCP, SSDP, mDNS, and WS-Discovery default discovery remains passive because normal use
   is broadcast/multicast and `TargetGuard` correctly rejects those destinations.
 - Persistence, service routes, and UI controls are separate milestones.

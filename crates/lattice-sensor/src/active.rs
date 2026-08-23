@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lattice_domain::{EvidenceFact, EvidenceFamily};
 use secrecy::SecretString;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -105,6 +106,19 @@ impl ProbeCatalog {
     }
     pub fn get(&self, id: &str) -> Option<&ProbeDescriptor> {
         self.descriptors.get(id)
+    }
+    fn resolve(&self, id: &str) -> Option<ProbeDescriptor> {
+        if let Some(descriptor) = self.descriptors.get(id) {
+            return Some(descriptor.clone());
+        }
+        let port = id.strip_prefix("full.tcp.")?.parse::<u16>().ok()?;
+        if port == 0 {
+            return None;
+        }
+        let mut descriptor =
+            descriptor(id, ProbeTransport::Tcp, port, RequiredPrivilege::None, b"");
+        descriptor.owner_start_required = true;
+        Some(descriptor)
     }
     pub fn plan(&self, plan: CuratedPlan) -> Vec<&ProbeDescriptor> {
         self.descriptors
@@ -292,6 +306,11 @@ pub fn catalog() -> Result<ProbeCatalog, CatalogError> {
     ProbeCatalog::new(items)
 }
 
+/// The explicit full TCP range, generated lazily for the bounded low-priority queue.
+pub fn owner_full_port_probe_ids() -> impl Iterator<Item = String> {
+    (1..=u16::MAX).map(|port| format!("full.tcp.{port}"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ProbeMode {
     Default,
@@ -396,7 +415,7 @@ impl<T: AttemptTransport> ActiveEngine<T> {
         }
         let descriptor = self
             .catalog
-            .get(&request.probe_id)
+            .resolve(&request.probe_id)
             .ok_or(ActiveError::UnknownProbe)?;
         if !request.owner_approved {
             return Err(ActiveError::OwnerApprovalRequired);
@@ -415,11 +434,11 @@ impl<T: AttemptTransport> ActiveEngine<T> {
         let response = tokio::select! {
             biased;
             () = self.stop_notify.notified() => return Err(ActiveError::Cancelled),
-            result = tokio::time::timeout(descriptor.timeout, self.transport.attempt(&request, descriptor, credential)) => {
+            result = tokio::time::timeout(descriptor.timeout, self.transport.attempt(&request, &descriptor, credential)) => {
                 result.map_err(|_| ActiveError::Network)??
             }
         };
-        normalize(descriptor, response)
+        normalize(&descriptor, response)
     }
 }
 
@@ -475,9 +494,157 @@ impl AttemptTransport for SystemTransport {
             // privileged capture backend is installed it reports unavailable, never success.
             ProbeTransport::Icmp => icmp_attempt(request.target, descriptor.timeout).await,
             ProbeTransport::LinkLayer => Err(ActiveError::PermissionDenied),
-            ProbeTransport::Tls => Err(ActiveError::Unavailable),
+            ProbeTransport::Tls => tls_attempt(request.target, port, descriptor).await,
         }
     }
+}
+
+#[derive(Debug)]
+struct FingerprintOnlyVerifier;
+impl rustls::client::danger::ServerCertVerifier for FingerprintOnlyVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
+}
+
+async fn tls_attempt(
+    ip: IpAddr,
+    port: u16,
+    d: &ProbeDescriptor,
+) -> Result<TransportResponse, ActiveError> {
+    use std::sync::Arc;
+    let socket = match ip {
+        IpAddr::V4(_) => TcpSocket::new_v4(),
+        IpAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .map_err(|_| ActiveError::Network)?;
+    let stream = match socket.connect(SocketAddr::new(ip, port)).await {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return Ok(TransportResponse::Refused);
+        }
+        Err(_) => return Err(ActiveError::Network),
+    };
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(FingerprintOnlyVerifier))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::IpAddress(ip.into());
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, stream)
+        .await
+        .map_err(|_| ActiveError::Network)?;
+    let cert = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .ok_or(ActiveError::Network)?;
+    certificate_metadata(cert.as_ref(), d.max_response_bytes)
+}
+
+fn certificate_metadata(der: &[u8], max_bytes: usize) -> Result<TransportResponse, ActiveError> {
+    use x509_parser::{extensions::GeneralName, parse_x509_certificate};
+    if der.len() > max_bytes.min(MAX_RESPONSE_BYTES) {
+        return Err(ActiveError::ResponseLimit);
+    }
+    let (_, certificate) = parse_x509_certificate(der).map_err(|_| ActiveError::Network)?;
+    let fingerprint = Sha256::digest(der)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut facts = vec![
+        ("certificate_sha256".into(), fingerprint),
+        ("certificate_trust".into(), "unverified".into()),
+        (
+            "certificate_subject".into(),
+            certificate
+                .subject()
+                .to_string()
+                .chars()
+                .take(MAX_FACT_VALUE_BYTES)
+                .collect(),
+        ),
+        (
+            "certificate_not_before".into(),
+            certificate
+                .validity()
+                .not_before
+                .to_rfc2822()
+                .unwrap_or_else(|_| "invalid".into()),
+        ),
+        (
+            "certificate_not_after".into(),
+            certificate
+                .validity()
+                .not_after
+                .to_rfc2822()
+                .unwrap_or_else(|_| "invalid".into()),
+        ),
+    ];
+    if let Ok(Some(san)) = certificate.subject_alternative_name() {
+        let names = san
+            .value
+            .general_names
+            .iter()
+            .filter_map(|name| match name {
+                GeneralName::DNSName(value) => Some((*value).to_owned()),
+                GeneralName::IPAddress(value) => Some(
+                    value
+                        .iter()
+                        .map(|byte| byte.to_string())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                ),
+                _ => None,
+            })
+            .take(16)
+            .collect::<Vec<_>>()
+            .join(",");
+        if !names.is_empty() {
+            facts.push((
+                "certificate_san".into(),
+                names.chars().take(MAX_FACT_VALUE_BYTES).collect(),
+            ));
+        }
+    }
+    Ok(TransportResponse::Success(facts))
 }
 
 async fn icmp_attempt(ip: IpAddr, timeout: Duration) -> Result<TransportResponse, ActiveError> {
