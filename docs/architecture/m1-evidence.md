@@ -1,6 +1,6 @@
 # M1 evidence
 
-Evidence recorded 2026-08-23 at commit `ef71911a679d714550c3fc06997ca16423b44f7e`, the code commit containing the platform tests. Counts and statuses below are from commands run for this gate; this corrected evidence document is a subsequent fix commit.
+Evidence recorded 2026-08-23 at commit `481cc215c71e7e301a3514636f71ffcf3766a701`, the code commit containing the daemon persistence test. Counts and statuses below are from commands run for this gate; this corrected evidence document is a subsequent fix commit.
 
 | Invariant | Exact command | Observed result |
 |---|---|---|
@@ -10,7 +10,7 @@ Evidence recorded 2026-08-23 at commit `ef71911a679d714550c3fc06997ca16423b44f7e
 | Platform paths | `cargo test -p lattice-service --test platform_contract --locked` | PASS on Linux host: 3 passed, 0 failed; Windows path contract simulated, Windows runtime not observed |
 | Durable daemon install state | `cargo test -p lattice-service --test service_lifecycle --locked` | PASS: 2 passed, 0 failed; restart preserves install ID and first-run timestamp on Linux temp state base |
 | Frontend unprivileged scan | `rg -n "(pcap|Npcap|CAP_NET_RAW|CAP_NET_ADMIN|std::process|Command::new|TcpStream|UdpSocket)" apps/desktop/src` | PASS: 0 matches |
-| Loopback live smoke | [Linux Bash procedure](#linux-bash-live-smoke) or [Windows PowerShell procedure](#windows-powershell-live-smoke) | PASS: health 200; state without token 401; authorized state 200; `127.0.0.1:58120` LISTEN |
+| Loopback live smoke | [Linux Bash procedure](#linux-bash-live-smoke) or [Windows PowerShell procedure](#windows-powershell-live-smoke) | Linux observed: health 200; state without token 401; authorized state 200; `127.0.0.1:58120` LISTEN. Windows procedure pending host run. |
 
 ## Full M1 gate command set
 
@@ -34,13 +34,14 @@ set -Eeuo pipefail
 token="$(openssl rand -hex 32)"
 service_pid=""
 log_file="$(mktemp)"
+state_base="$(mktemp -d)"
 cleanup() {
   if [[ -n "$service_pid" ]]; then kill -- "-$service_pid" 2>/dev/null || true; wait "$service_pid" 2>/dev/null || true; fi
-  rm -f "$log_file"
-  unset token service_pid log_file
+  rm -f "$log_file"; rm -rf "$state_base"
+  unset token service_pid log_file state_base
 }
 trap cleanup EXIT INT TERM
-LATTICE_SERVICE_TOKEN="$token" setsid cargo run -p lattice-service --quiet >"$log_file" 2>&1 &
+LATTICE_SERVICE_TOKEN="$token" LATTICE_STATE_BASE="$state_base" setsid cargo run -p lattice-service --quiet >"$log_file" 2>&1 &
 service_pid=$!
 for _ in {1..50}; do curl -fsS http://127.0.0.1:58120/api/v1/health >/dev/null 2>&1 && break; sleep 0.1; done
 [[ "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:58120/api/v1/health)" == 200 ]]
@@ -56,7 +57,10 @@ Run from the repository root in PowerShell. This requires `cargo`, `curl.exe`, a
 ```powershell
 $ErrorActionPreference = 'Stop'
 $token = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+$stateBase = Join-Path $env:TEMP ("neonhearth-smoke-" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $stateBase | Out-Null
 $env:LATTICE_SERVICE_TOKEN = $token
+$env:LATTICE_STATE_BASE = $stateBase
 $service = $null
 try {
   $service = Start-Process cargo -ArgumentList 'run','-p','lattice-service','--quiet' -PassThru -WindowStyle Hidden
@@ -72,6 +76,8 @@ try {
 } finally {
   if ($null -ne $service) { taskkill.exe /PID $service.Id /T /F *> $null; $service.WaitForExit() }
   Remove-Item Env:LATTICE_SERVICE_TOKEN -ErrorAction SilentlyContinue
-  Remove-Variable token,authHeader,service -ErrorAction SilentlyContinue
+  Remove-Item Env:LATTICE_STATE_BASE -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $stateBase -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Variable token,authHeader,service,stateBase -ErrorAction SilentlyContinue
 }
 ```
