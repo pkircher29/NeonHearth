@@ -29,18 +29,29 @@ pub struct DiscoveryObservation {
     pub valid_until: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum LinkPresenceKind {
     Present { valid_until: DateTime<Utc> },
     Missed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct LinkPresenceObservation {
     pub source_id: u64,
     pub link_address: lattice_sensor::neighbor::LinkAddress,
     pub observed_at: DateTime<Utc>,
     pub kind: LinkPresenceKind,
+}
+
+impl std::fmt::Debug for LinkPresenceObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkPresenceObservation")
+            .field("source_id", &self.source_id)
+            .field("link_address", &"[redacted]")
+            .field("observed_at", &self.observed_at)
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -247,35 +258,44 @@ impl PersistentDiscoveryPipeline {
         tick_ms: u64,
         arrival: DateTime<Utc>,
     ) -> Result<DiscoveryPipelineOutcome, DiscoveryError> {
-        let source = self
+        if observation.observed_at.timestamp_subsec_nanos() != 0
+            || arrival.timestamp_subsec_nanos() != 0
+            || arrival < observation.observed_at
+            || matches!(observation.kind, LinkPresenceKind::Present { valid_until }
+                if valid_until <= observation.observed_at || valid_until.timestamp_subsec_nanos() != 0)
+        {
+            return Err(DiscoveryError::InvalidSource);
+        }
+        let source_name = self
             .pipeline
             .sources
             .0
             .get(&observation.source_id)
+            .filter(|source| {
+                source.presence
+                    && source
+                        .families
+                        .contains(&lattice_domain::EvidenceFamily::LinkLayer)
+            })
+            .map(|source| source.name.clone())
             .ok_or(DiscoveryError::InvalidSource)?;
-        if !source.presence
-            || !source
-                .families
-                .contains(&lattice_domain::EvidenceFamily::LinkLayer)
-        {
-            return Err(DiscoveryError::InvalidSource);
+        let input_hash = link_presence_input_hash(&observation, &source_name, changes)?;
+        if let Some(existing) = self.state.discovery_commit(input_hash).await? {
+            return Ok(DiscoveryPipelineOutcome::Duplicate(DuplicateDiscovery {
+                result_summary: existing.result_summary,
+                resnapshot_required: true,
+            }));
         }
         let binding = self
             .state
-            .lookup_link_layer_device(observation.link_address, &source.name)
+            .lookup_link_layer_device(observation.link_address, &source_name)
             .await?;
         let (candidate, facts, presence_kind, valid_until) = match observation.kind {
             LinkPresenceKind::Present { valid_until } => {
-                if valid_until <= observation.observed_at
-                    || observation.observed_at.timestamp_subsec_nanos() != 0
-                    || valid_until.timestamp_subsec_nanos() != 0
-                {
-                    return Err(DiscoveryError::InvalidSource);
-                }
                 let facts = if binding.is_none() {
                     vec![EvidenceFact {
                         family: lattice_domain::EvidenceFamily::LinkLayer,
-                        source: source.name.clone(),
+                        source: source_name.clone(),
                         key: "mac".into(),
                         value: observation.link_address.to_string(),
                         confidence: 0.9,
@@ -294,9 +314,6 @@ impl PersistentDiscoveryPipeline {
                 )
             }
             LinkPresenceKind::Missed => {
-                if observation.observed_at.timestamp_subsec_nanos() != 0 {
-                    return Err(DiscoveryError::InvalidSource);
-                }
                 let id = binding.ok_or(DiscoveryError::UnboundLink)?;
                 (
                     Some(id),
@@ -306,12 +323,12 @@ impl PersistentDiscoveryPipeline {
                 )
             }
         };
-        self.observe_with_flow(
+        self.observe_with_flow_hashed(
             DiscoveryObservation {
                 source_id: observation.source_id,
                 candidate,
                 facts,
-                presence_source: source.name.clone(),
+                presence_source: source_name,
                 presence_kind,
                 observed_at: observation.observed_at,
                 valid_until,
@@ -319,6 +336,7 @@ impl PersistentDiscoveryPipeline {
             changes,
             tick_ms,
             arrival,
+            input_hash,
         )
         .await
     }
@@ -330,6 +348,17 @@ impl PersistentDiscoveryPipeline {
         arrival: DateTime<Utc>,
     ) -> Result<DiscoveryPipelineOutcome, DiscoveryError> {
         let input_hash = semantic_input_hash(&input, changes)?;
+        self.observe_with_flow_hashed(input, changes, tick_ms, arrival, input_hash)
+            .await
+    }
+    async fn observe_with_flow_hashed(
+        &mut self,
+        input: DiscoveryObservation,
+        changes: &[RollupChange],
+        tick_ms: u64,
+        arrival: DateTime<Utc>,
+        input_hash: [u8; 32],
+    ) -> Result<DiscoveryPipelineOutcome, DiscoveryError> {
         if let Some(existing) = self.state.discovery_commit(input_hash).await? {
             return Ok(DiscoveryPipelineOutcome::Duplicate(DuplicateDiscovery {
                 result_summary: existing.result_summary,
@@ -437,6 +466,29 @@ fn semantic_input_hash(
     let canonical = serde_json::json!({"version":1,"source_id":input.source_id,"candidate":input.candidate.map(|id|id.to_string()),"facts":facts,"presence_source":input.presence_source,"presence_kind":input.presence_kind,"observed_at":input.observed_at,"valid_until":input.valid_until,"flow":flow});
     let hash = Sha256::digest(serde_json::to_vec(&canonical)?);
     Ok(hash.into())
+}
+
+fn link_presence_input_hash(
+    observation: &LinkPresenceObservation,
+    source_name: &str,
+    changes: &[RollupChange],
+) -> Result<[u8; 32], DiscoveryError> {
+    let mut flow: Vec<_> = changes
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()?;
+    flow.sort_by_key(|value| serde_json::to_string(value).expect("JSON value serializes"));
+    let canonical = serde_json::json!({
+        "version": 1,
+        "kind": "link_presence",
+        "source_id": observation.source_id,
+        "source": source_name,
+        "link_address": observation.link_address.to_string(),
+        "observed_at": observation.observed_at,
+        "presence_kind": observation.kind,
+        "flow": flow,
+    });
+    Ok(Sha256::digest(serde_json::to_vec(&canonical)?).into())
 }
 
 impl DiscoveryPipeline {
