@@ -33,6 +33,10 @@ subtle.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = { workspace = true }
+netlink-packet-route = { workspace = true }
+
 [dev-dependencies]
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -21,6 +21,8 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
+rtnetlink = "0.23"
+netlink-packet-route = "0.33"
 fs2 = "0.4"
 http = "1"
 secrecy = "0.10"
