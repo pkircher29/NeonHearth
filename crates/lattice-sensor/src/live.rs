@@ -310,14 +310,24 @@ fn samples_for_current(
             upload: 0,
             download: 0,
         });
+        let mut reset = baseline;
+        let mut reset_changed = false;
+        if r.bytes.upload < baseline.upload {
+            reset.upload = r.bytes.upload;
+            reset_changed = true;
+        }
+        if r.bytes.download < baseline.download {
+            reset.download = r.bytes.download;
+            reset_changed = true;
+        }
+        if reset_changed {
+            resets.insert(r.key.clone(), reset);
+        }
         let delta = ByteCount {
             upload: r.bytes.upload.saturating_sub(baseline.upload),
             download: r.bytes.download.saturating_sub(baseline.download),
         };
         if delta.upload == 0 && delta.download == 0 {
-            if r.bytes.upload < baseline.upload || r.bytes.download < baseline.download {
-                resets.insert(r.key.clone(), r.bytes);
-            }
             continue;
         }
         let x = out.entry(k).or_insert(LiveSample {

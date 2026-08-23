@@ -295,3 +295,55 @@ fn adapter_prunes_superseded_seconds_but_keeps_latest_dimensions() {
         );
     }
 }
+
+#[test]
+fn mixed_direction_corrections_reset_each_baseline_before_pending_flush() {
+    let mut a = FlowLiveAdapter::new(LiveConfig::default(), 4).unwrap();
+    let mut initial = roll(100);
+    initial.bytes.download = 100;
+    a.apply(0, &[RollupChange::Upsert(initial)]).unwrap();
+    a.flush_payload(0, t(2)).unwrap().unwrap();
+
+    let mut upload_reset = roll(40);
+    upload_reset.bytes.download = 150;
+    a.apply(1, &[RollupChange::Correction(upload_reset)])
+        .unwrap();
+    let mut upload_growth = roll(70);
+    upload_growth.bytes.download = 150;
+    a.apply(250, &[RollupChange::Correction(upload_growth)])
+        .unwrap();
+    let EventPayload::BandwidthFrame(frame) = a.flush_payload(250, t(3)).unwrap().unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        frame.samples[0].delta,
+        ByteCount {
+            upload: 30,
+            download: 50
+        }
+    );
+
+    let mut b = FlowLiveAdapter::new(LiveConfig::default(), 4).unwrap();
+    let mut initial = roll(100);
+    initial.bytes.download = 100;
+    b.apply(0, &[RollupChange::Upsert(initial)]).unwrap();
+    b.flush_payload(0, t(2)).unwrap().unwrap();
+    let mut download_reset = roll(150);
+    download_reset.bytes.download = 40;
+    b.apply(1, &[RollupChange::Correction(download_reset)])
+        .unwrap();
+    let mut download_growth = roll(150);
+    download_growth.bytes.download = 70;
+    b.apply(250, &[RollupChange::Correction(download_growth)])
+        .unwrap();
+    let EventPayload::BandwidthFrame(frame) = b.flush_payload(250, t(3)).unwrap().unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        frame.samples[0].delta,
+        ByteCount {
+            upload: 50,
+            download: 30
+        }
+    );
+}

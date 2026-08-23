@@ -3,10 +3,11 @@
 `FlowLiveAdapter` consumes validated cumulative one-second rollup replacements. It retains every
 dimension of each device's latest second and prunes that device's superseded seconds. Emitted
 baselines are keyed by the full rollup key, so a replacement from 100 to 150 bytes reports only
-50 new bytes. A downward correction resets the baseline without underflow or fabricated traffic;
-later growth is measured from that corrected value. Cache-only retirements remove their live
-cache row and pending baseline without becoming traffic. The upstream flow engine has already
-selected one authoritative visibility source for overlapping observations.
+50 new bytes. Upload and download baselines reset independently: a downward correction in one
+direction cannot underflow or hide growth in the other, and later growth is measured from each
+corrected value. Cache-only retirements remove their live cache row and pending baseline without
+becoming traffic. The upstream flow engine has already selected one authoritative visibility
+source for overlapping observations.
 
 `LiveCoalescer` uses caller-supplied monotonic millisecond ticks. It emits one global
 `bandwidth_frame` no faster than every 250 ms, retains the latest pending device replacement
