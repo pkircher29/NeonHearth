@@ -24,7 +24,7 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
-use crate::{InterfaceId, TargetGuard};
+use crate::{AuthorizedBinding, InterfaceId, TargetGuard};
 
 mod active_udp;
 pub use active_udp::{
@@ -725,6 +725,7 @@ async fn tls_attempt(
         socket.local_addr().map_err(|_| ActiveError::Network)?,
         binding.source,
     )?;
+    pin_socket_to_interface(&socket, binding)?;
     guard
         .authorize(request.interface, ip)
         .map_err(|_| ActiveError::Unauthorized)?;
@@ -740,6 +741,14 @@ async fn tls_attempt(
         .with_custom_certificate_verifier(Arc::new(FingerprintOnlyVerifier))
         .with_no_client_auth();
     let name = rustls::pki_types::ServerName::IpAddress(ip.into());
+    verify_local_binding(
+        stream.local_addr().map_err(|_| ActiveError::Network)?,
+        binding.source,
+    )?;
+    pin_socket_to_interface(&stream, binding)?;
+    guard
+        .authorize(request.interface, ip)
+        .map_err(|_| ActiveError::Unauthorized)?;
     let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(name, stream)
         .await
@@ -884,6 +893,7 @@ async fn tcp_attempt(
         socket.local_addr().map_err(|_| ActiveError::Network)?,
         binding.source,
     )?;
+    pin_socket_to_interface(&socket, binding)?;
     guard
         .authorize(probe_request.interface, ip)
         .map_err(|_| ActiveError::Unauthorized)?;
@@ -907,6 +917,7 @@ async fn tcp_attempt(
             stream.local_addr().map_err(|_| ActiveError::Network)?,
             binding.source,
         )?;
+        pin_socket_to_interface(&stream, binding)?;
         guard
             .authorize(probe_request.interface, ip)
             .map_err(|_| ActiveError::Unauthorized)?;
@@ -1003,6 +1014,7 @@ async fn udp_attempt(
         socket.local_addr().map_err(|_| ActiveError::Network)?,
         binding.source,
     )?;
+    pin_socket_to_interface(&socket, binding)?;
     guard
         .authorize(request.interface, ip)
         .map_err(|_| ActiveError::Unauthorized)?;
@@ -1025,6 +1037,7 @@ async fn udp_attempt(
         socket.local_addr().map_err(|_| ActiveError::Network)?,
         binding.source,
     )?;
+    pin_socket_to_interface(&socket, binding)?;
     guard
         .authorize(request.interface, ip)
         .map_err(|_| ActiveError::Unauthorized)?;
@@ -1045,6 +1058,93 @@ fn verify_local_binding(local: SocketAddr, expected: IpAddr) -> Result<(), Activ
     } else {
         Err(ActiveError::Unavailable)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn pin_socket_to_interface<S: std::os::fd::AsFd>(
+    socket: &S,
+    binding: AuthorizedBinding,
+) -> Result<(), ActiveError> {
+    use std::num::NonZeroU32;
+    let index = NonZeroU32::new(binding.interface_index).ok_or(ActiveError::Unavailable)?;
+    let socket = socket2::SockRef::from(socket);
+    match binding.target {
+        IpAddr::V4(_) => {
+            socket
+                .bind_device_by_index_v4(Some(index))
+                .map_err(|_| ActiveError::PermissionDenied)?;
+            if socket
+                .device_index_v4()
+                .map_err(|_| ActiveError::Unavailable)?
+                != Some(index)
+            {
+                return Err(ActiveError::Unavailable);
+            }
+        }
+        IpAddr::V6(_) => {
+            socket
+                .bind_device_by_index_v6(Some(index))
+                .map_err(|_| ActiveError::PermissionDenied)?;
+            if socket
+                .device_index_v6()
+                .map_err(|_| ActiveError::Unavailable)?
+                != Some(index)
+            {
+                return Err(ActiveError::Unavailable);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pin_socket_to_interface<S: std::os::windows::io::AsRawSocket>(
+    socket: &S,
+    binding: AuthorizedBinding,
+) -> Result<(), ActiveError> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET_ERROR, getsockopt,
+        setsockopt,
+    };
+    let raw = socket.as_raw_socket() as usize;
+    let (level, option, configured) = match binding.target {
+        IpAddr::V4(_) => (IPPROTO_IP, IP_UNICAST_IF, binding.interface_index.to_be()),
+        IpAddr::V6(_) => (IPPROTO_IPV6, IPV6_UNICAST_IF, binding.interface_index),
+    };
+    let result = unsafe {
+        setsockopt(
+            raw,
+            level,
+            option,
+            (&configured as *const u32).cast(),
+            size_of::<u32>() as i32,
+        )
+    };
+    if result == SOCKET_ERROR {
+        return Err(ActiveError::PermissionDenied);
+    }
+    let mut actual = 0u32;
+    let mut len = size_of::<u32>() as i32;
+    let result = unsafe {
+        getsockopt(
+            raw,
+            level,
+            option,
+            (&mut actual as *mut u32).cast(),
+            &mut len,
+        )
+    };
+    if result == SOCKET_ERROR || len != size_of::<u32>() as i32 || actual != configured {
+        return Err(ActiveError::Unavailable);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn pin_socket_to_interface<S>(_: &S, _: AuthorizedBinding) -> Result<(), ActiveError> {
+    Err(ActiveError::Unavailable)
 }
 
 struct GuardedSnmpTransport {
@@ -1079,6 +1179,27 @@ impl async_snmp::Transport for GuardedSnmpTransport {
                 target: self.peer,
                 source: std::io::Error::new(
                     std::io::ErrorKind::AddrNotAvailable,
+                    error.to_string(),
+                ),
+            })
+        })?;
+        let binding = self
+            .guard
+            .authorized_binding(self.request.interface, self.request.target)
+            .map_err(|_| {
+                Box::new(async_snmp::Error::Network {
+                    target: self.peer,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "target authorization failed",
+                    ),
+                })
+            })?;
+        pin_socket_to_interface(&self.socket, binding).map_err(|error| {
+            Box::new(async_snmp::Error::Network {
+                target: self.peer,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
                     error.to_string(),
                 ),
             })
@@ -1271,13 +1392,14 @@ async fn snmp_community_attempt(
     getrandom::fill(&mut nonce).map_err(|_| ActiveError::Unavailable)?;
     let request_id = i32::from_be_bytes(nonce) & i32::MAX;
     let wire = build_snmp_community_request(version, community.expose_secret(), request_id)?;
+    let binding = guard
+        .authorized_binding(request.interface, request.target)
+        .map_err(|_| ActiveError::Unauthorized)?;
     verify_local_binding(
         socket.local_addr().map_err(|_| ActiveError::Network)?,
-        guard
-            .authorized_binding(request.interface, request.target)
-            .map_err(|_| ActiveError::Unauthorized)?
-            .source,
+        binding.source,
     )?;
+    pin_socket_to_interface(&socket, binding)?;
     guard
         .authorize(request.interface, request.target)
         .map_err(|_| ActiveError::Unauthorized)?;
@@ -1579,6 +1701,42 @@ mod snmp_wire_tests {
             build_snmp_community_request(1, &"x".repeat(65), SNMP_REQUEST_ID).unwrap_err(),
             ActiveError::CredentialRequired
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod interface_pin_tests {
+    use super::*;
+    use std::num::NonZeroU32;
+
+    #[tokio::test]
+    async fn linux_pin_sets_and_verifies_the_requested_interface_index() {
+        let loopback = pnet_datalink::interfaces()
+            .into_iter()
+            .find(|interface| interface.is_loopback())
+            .expect("loopback interface");
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let binding = AuthorizedBinding {
+            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            interface_index: loopback.index,
+            target: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        };
+        pin_socket_to_interface(&socket, binding).unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&socket).device_index_v4().unwrap(),
+            NonZeroU32::new(loopback.index)
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_pin_fails_closed_for_an_invalid_interface_index() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let binding = AuthorizedBinding {
+            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            interface_index: u32::MAX,
+            target: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        };
+        assert!(pin_socket_to_interface(&socket, binding).is_err());
     }
 }
 

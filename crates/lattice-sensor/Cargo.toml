@@ -26,10 +26,11 @@ async-snmp.workspace = true
 bytes.workspace = true
 zeroize.workspace = true
 getrandom.workspace = true
+socket2.workspace = true
 subtle.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 serde_json.workspace = true

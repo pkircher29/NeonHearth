@@ -50,3 +50,4 @@ async-snmp = "0.18"
 bytes = "1"
 zeroize = "1"
 getrandom = "0.3"
+socket2 = { version = "0.6", features = ["all"] }

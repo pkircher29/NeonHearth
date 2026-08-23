@@ -1218,6 +1218,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2",
  "subtle",
  "surge-ping",
  "thiserror 2.0.20",

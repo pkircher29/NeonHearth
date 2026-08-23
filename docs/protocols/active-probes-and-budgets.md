@@ -9,9 +9,15 @@ rejected by that guard.
 
 Authorization also resolves an immutable source address and interface index from the
 approved inventory. TCP, TLS, UDP, SNMP, and ICMP bind that source before connecting;
-ICMP additionally uses the platform interface-index API. IPv6 link-local destinations
-carry the selected interface as their scope ID. The local binding is verified before
-each send and there is no unbound fallback, including when routes overlap.
+every TCP/TLS/UDP/SNMP connect or send is also pinned and read-back verified with Linux
+`SO_BINDTOIFINDEX` or Windows `IP_UNICAST_IF`/`IPV6_UNICAST_IF`. ICMP uses the same
+platform interface-index boundary through its raw-socket backend. IPv6 link-local
+destinations carry the selected interface as their scope ID. The local binding and
+interface pin are verified before each send and there is no unbound fallback, including
+when routes overlap. A kernel that rejects interface pinning returns a typed
+permission/unavailable result and sends nothing. Linux kernels or security policies may
+require `CAP_NET_RAW`/`CAP_NET_ADMIN` for the relevant raw or device-binding option;
+NeonHearth never retries without the pin.
 
 ## Catalog
 
