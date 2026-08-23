@@ -6,6 +6,7 @@ members = [
     "crates/lattice-event-bus",
     "crates/lattice-sensor",
     "crates/lattice-service",
+    "tools/fixture-gen",
 ]
 
 [workspace.package]

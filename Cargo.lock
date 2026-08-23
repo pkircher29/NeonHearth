@@ -363,6 +363,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
+name = "fixture-gen"
+version = "0.1.0"
+
+[[package]]
 name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -860,8 +864,11 @@ dependencies = [
 name = "lattice-sensor"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "lattice-domain",
  "pnet_datalink",
+ "serde",
+ "serde_json",
  "thiserror",
  "windows-sys 0.61.2",
 ]

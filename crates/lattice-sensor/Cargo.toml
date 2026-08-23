@@ -8,8 +8,11 @@ license.workspace = true
 lattice-domain = { path = "../lattice-domain" }
 pnet_datalink.workspace = true
 thiserror.workspace = true
+chrono.workspace = true
+serde.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
 
 [dev-dependencies]
+serde_json.workspace = true

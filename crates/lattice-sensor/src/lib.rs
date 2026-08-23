@@ -11,6 +11,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use pnet_datalink::interfaces;
 use thiserror::Error;
 
+pub mod passive;
+pub use passive::{
+    OfflinePassiveAdapter, PassiveAdapter, PassiveObservation, PassiveOptions, PassiveParseError,
+};
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct InterfaceId(u32);
 
