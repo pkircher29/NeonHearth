@@ -94,7 +94,9 @@ try {
   Remove-Item Env:LATTICE_SERVICE_TOKEN -ErrorAction SilentlyContinue
   Remove-Item Env:LATTICE_STATE_BASE -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $stateBase -Recurse -Force -ErrorAction SilentlyContinue
+  $stateRemained = Test-Path -LiteralPath $stateBase
   Remove-Variable token,bytes,rng,authHeader,service,stateBase,remaining -ErrorAction SilentlyContinue
+  if ($stateRemained) { throw 'temporary state remained after cleanup' }
   if ($listenerRemained) { throw 'listener remained after service cleanup' }
 }
 ```
