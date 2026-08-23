@@ -224,10 +224,11 @@ fn budgets_validate_backoff_jitter_and_reset() {
     assert!(BudgetConfig::new(0, 1, 1, Duration::from_secs(1)).is_err());
     let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
     let mut scheduler = Scheduler::new(SchedulerConfig::default(), clock).unwrap();
-    assert_eq!(scheduler.retry_delay("host", 0), Duration::from_secs(1));
-    assert_eq!(scheduler.retry_delay("host", 8), Duration::from_secs(60));
-    scheduler.record_success("host");
-    assert_eq!(scheduler.retry_delay("host", 0), Duration::from_secs(1));
+    let req = request("192.168.50.9", "tcp.http.80");
+    assert_eq!(scheduler.retry_delay(&req, 0), Duration::from_secs(1));
+    assert_eq!(scheduler.retry_delay(&req, 8), Duration::from_secs(60));
+    scheduler.record_success(&req);
+    assert_eq!(scheduler.retry_delay(&req, 0), Duration::from_secs(1));
     assert!(scheduler.jitter(Duration::from_secs(10)).as_millis() <= 1_000);
 }
 
@@ -294,6 +295,30 @@ fn concurrency_and_rate_budgets_enforce_exact_ceiling_and_refill() {
     assert!(!scheduler.try_start(&c));
     clock.advance(Duration::from_secs(10));
     assert!(scheduler.try_start(&c));
+}
+
+#[test]
+fn scheduler_state_is_bounded_and_ttl_evicted() {
+    let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
+    let config = SchedulerConfig {
+        state_capacity: 2,
+        state_ttl: Duration::from_secs(5),
+        budgets: BudgetConfig::new(8, 2, 16, Duration::from_secs(1)).unwrap(),
+        ..SchedulerConfig::default()
+    };
+    let mut scheduler = Scheduler::new(config, clock.clone()).unwrap();
+    for host in ["192.168.50.9", "192.168.50.10"] {
+        let req = request(host, "tcp.http.80");
+        assert!(scheduler.try_start(&req));
+        scheduler.finish(&req);
+        scheduler.retry_delay(&req, 0);
+    }
+    assert_eq!(scheduler.state_sizes().0, 2);
+    let third = request("192.168.50.11", "tcp.http.80");
+    assert!(!scheduler.try_start(&third));
+    clock.advance(Duration::from_secs(6));
+    assert!(scheduler.try_start(&third));
+    assert!(scheduler.state_sizes().0 <= 2);
 }
 
 #[test]

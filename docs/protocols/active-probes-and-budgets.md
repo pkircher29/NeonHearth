@@ -92,6 +92,24 @@ The high-priority queue round-robins hosts, coalesces identical
 interface/target/probe/mode work, and always drains presence/discovery before lower-priority
 owner full-port work. A noisy or offline host therefore cannot starve another host.
 
+`SchedulerRunner` is the asynchronous execution boundary joining this queue to
+`ActiveEngine`. Dispatch atomically consumes each descriptor's declared `rate_cost` and
+holds global and per-host concurrency through a panic-safe RAII reservation. Completion,
+typed error, cancellation, and whether a retry was scheduled are delivered through a
+bounded result channel. Backpressure never converts a result into an implicit success.
+Credentialed inventory obtains an owned credential from an execution-time provider only
+after dispatch; the runner neither queues nor retains it, and drops it when that attempt
+finishes.
+
+Only timeout outcomes and typed transient network failures retry. Unauthorized targets,
+missing approval or credentials, invalid configuration/protocol data, correlation and
+response-limit failures are terminal. Retry state is keyed by interface, numeric target,
+and probe ID; exponential delay is capped at 60 seconds, jitter is bounded by policy, and
+the default permits at most five retries. Successful, refused, and terminal attempts reset
+their failure state. Host, subnet, retry, and failure maps have explicit capacities and a
+30-minute monotonic TTL; when safe capacity is unavailable, dispatch fails closed rather
+than creating unbounded state. Suspend can refill a bucket only to its configured cap.
+
 `stop()` rejects new work, clears queued work, and wakes every in-flight engine attempt.
 Cancellation is returned as `Cancelled` and is not recorded as a target failure. Transport
 timeouts are descriptor-specific. Result amplification is rejected rather than truncated

@@ -27,9 +27,11 @@ use zeroize::Zeroizing;
 use crate::{AuthorizedBinding, InterfaceId, TargetGuard};
 
 mod active_udp;
+mod scheduler_runner;
 pub use active_udp::{
     NonceSource, UdpProbe, build_udp_probe, build_udp_probe_with_nonce, parse_udp_reply,
 };
+pub use scheduler_runner::{ExecutionCredentialSource, RunnerEvent, SchedulerRunner};
 
 #[derive(Debug)]
 pub enum ProbeCredential {
@@ -483,6 +485,8 @@ pub enum ActiveError {
     PermissionDenied,
     #[error("bounded network operation failed")]
     Network,
+    #[error("internal probe execution failed")]
+    Internal,
     #[error("response exceeded limit")]
     ResponseLimit,
     #[error("response correlation failed")]
@@ -1825,6 +1829,9 @@ pub struct SchedulerConfig {
     pub base_backoff: Duration,
     pub max_backoff: Duration,
     pub jitter_percent: u8,
+    pub state_capacity: usize,
+    pub state_ttl: Duration,
+    pub max_retry_attempts: u8,
 }
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -1834,6 +1841,9 @@ impl Default for SchedulerConfig {
             base_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
             jitter_percent: 10,
+            state_capacity: 2048,
+            state_ttl: Duration::from_secs(30 * 60),
+            max_retry_attempts: 5,
         }
     }
 }
@@ -1906,12 +1916,32 @@ pub struct Scheduler<C> {
     low: VecDeque<ProbeRequest>,
     hosts: VecDeque<IpAddr>,
     queued: BTreeSet<(InterfaceId, IpAddr, String, ProbeMode)>,
-    failures: HashMap<String, u8>,
+    failures: HashMap<WorkKey, FailureState>,
     stopped: bool,
     active: usize,
     active_hosts: HashMap<IpAddr, usize>,
     host_rates: HashMap<IpAddr, TokenBucket>,
     subnet_rates: HashMap<SubnetKey, TokenBucket>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct WorkKey {
+    pub interface: InterfaceId,
+    pub target: IpAddr,
+    pub probe_id: String,
+}
+impl From<&ProbeRequest> for WorkKey {
+    fn from(request: &ProbeRequest) -> Self {
+        Self {
+            interface: request.interface,
+            target: request.target,
+            probe_id: request.probe_id.clone(),
+        }
+    }
+}
+struct FailureState {
+    count: u8,
+    last_used: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1928,9 +1958,11 @@ fn subnet(ip: IpAddr) -> SubnetKey {
 struct TokenBucket {
     tokens: usize,
     last: Duration,
+    last_used: Duration,
 }
 impl TokenBucket {
     fn available(&mut self, now: Duration, capacity: usize, refill: Duration) -> bool {
+        self.last_used = now;
         if now > self.last && now.saturating_sub(self.last) >= refill {
             let periods = now.saturating_sub(self.last).as_nanos() / refill.as_nanos();
             self.tokens = self
@@ -1957,6 +1989,11 @@ impl<C: Clock> Scheduler<C> {
             || config.base_backoff.is_zero()
             || config.max_backoff < config.base_backoff
             || config.jitter_percent > 25
+            || config.state_capacity == 0
+            || config.state_capacity > MAX_QUEUE
+            || config.state_ttl.is_zero()
+            || config.max_retry_attempts == 0
+            || config.max_retry_attempts > 16
         {
             return Err(ActiveError::InvalidConfig);
         }
@@ -2028,6 +2065,9 @@ impl<C: Clock> Scheduler<C> {
         ));
         Some(request)
     }
+    pub fn queue_len(&self) -> usize {
+        self.queued.len()
+    }
     pub fn stop(&mut self) {
         self.stopped = true;
         self.high.clear();
@@ -2038,7 +2078,11 @@ impl<C: Clock> Scheduler<C> {
     /// Atomically reserves concurrency and rate budgets. Uses monotonic time, so wall-clock
     /// corrections do not create bursts. After suspend, refill is capped at bucket capacity.
     pub fn try_start(&mut self, request: &ProbeRequest) -> bool {
+        self.try_start_cost(request, 1)
+    }
+    pub fn try_start_cost(&mut self, request: &ProbeRequest, cost: u8) -> bool {
         if self.stopped
+            || cost == 0
             || self.active >= self.config.budgets.global_concurrency
             || self.active_hosts.get(&request.target).copied().unwrap_or(0)
                 >= self.config.budgets.per_host_concurrency
@@ -2046,32 +2090,46 @@ impl<C: Clock> Scheduler<C> {
             return false;
         }
         let now = self.clock.monotonic();
+        self.evict_state(now);
         let host_capacity = self.config.budgets.per_host_concurrency.saturating_mul(4);
+        if self.host_rates.len() >= self.config.state_capacity
+            && !self.host_rates.contains_key(&request.target)
+        {
+            return false;
+        }
+        let subnet_key = subnet(request.target);
+        if self.subnet_rates.len() >= self.config.state_capacity
+            && !self.subnet_rates.contains_key(&subnet_key)
+        {
+            return false;
+        }
         let host = self
             .host_rates
             .entry(request.target)
             .or_insert(TokenBucket {
                 tokens: host_capacity,
                 last: now,
+                last_used: now,
             });
-        let network = self
-            .subnet_rates
-            .entry(subnet(request.target))
-            .or_insert(TokenBucket {
-                tokens: self.config.budgets.per_subnet_burst,
-                last: now,
-            });
+        let network = self.subnet_rates.entry(subnet_key).or_insert(TokenBucket {
+            tokens: self.config.budgets.per_subnet_burst,
+            last: now,
+            last_used: now,
+        });
+        let cost = usize::from(cost);
         if !host.available(now, host_capacity, self.config.budgets.refill)
+            || host.tokens < cost
             || !network.available(
                 now,
                 self.config.budgets.per_subnet_burst,
                 self.config.budgets.refill,
             )
+            || network.tokens < cost
         {
             return false;
         }
-        host.tokens -= 1;
-        network.tokens -= 1;
+        host.tokens -= cost;
+        network.tokens -= cost;
         self.active += 1;
         *self.active_hosts.entry(request.target).or_default() += 1;
         true
@@ -2085,11 +2143,21 @@ impl<C: Clock> Scheduler<C> {
             }
         }
     }
-    pub fn retry_delay(&mut self, host: &str, attempt: u8) -> Duration {
-        let failures = self.failures.entry(host.into()).or_insert(0);
-        *failures = (*failures).max(attempt.saturating_add(1)).min(16);
+    pub fn retry_delay(&mut self, request: &ProbeRequest, attempt: u8) -> Duration {
+        let now = self.clock.monotonic();
+        self.evict_state(now);
+        let key = WorkKey::from(request);
+        if self.failures.len() >= self.config.state_capacity && !self.failures.contains_key(&key) {
+            return self.config.max_backoff;
+        }
+        let failures = self.failures.entry(key).or_insert(FailureState {
+            count: 0,
+            last_used: now,
+        });
+        failures.last_used = now;
+        failures.count = failures.count.max(attempt.saturating_add(1)).min(16);
         let multiplier = 1u32
-            .checked_shl(u32::from((*failures - 1).min(15)))
+            .checked_shl(u32::from((failures.count - 1).min(15)))
             .unwrap_or(u32::MAX);
         self.config
             .base_backoff
@@ -2097,8 +2165,8 @@ impl<C: Clock> Scheduler<C> {
             .unwrap_or(self.config.max_backoff)
             .min(self.config.max_backoff)
     }
-    pub fn record_success(&mut self, host: &str) {
-        self.failures.remove(host);
+    pub fn record_success(&mut self, request: &ProbeRequest) {
+        self.failures.remove(&WorkKey::from(request));
     }
     pub fn jitter(&self, duration: Duration) -> Duration {
         let max = duration.mul_f64(f64::from(self.config.jitter_percent) / 100.0);
@@ -2107,5 +2175,21 @@ impl<C: Clock> Scheduler<C> {
         }
         let ceiling = max.as_nanos().min(u128::from(u32::MAX)) as u64;
         Duration::from_nanos(u64::from(self.clock.jitter_unit()) % (ceiling + 1))
+    }
+    fn evict_state(&mut self, now: Duration) {
+        let ttl = self.config.state_ttl;
+        self.host_rates
+            .retain(|_, state| now.saturating_sub(state.last_used) <= ttl);
+        self.subnet_rates
+            .retain(|_, state| now.saturating_sub(state.last_used) <= ttl);
+        self.failures
+            .retain(|_, state| now.saturating_sub(state.last_used) <= ttl);
+    }
+    pub fn state_sizes(&self) -> (usize, usize, usize) {
+        (
+            self.host_rates.len(),
+            self.subnet_rates.len(),
+            self.failures.len(),
+        )
     }
 }
