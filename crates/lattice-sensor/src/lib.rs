@@ -12,6 +12,7 @@ use pnet_datalink::interfaces;
 use thiserror::Error;
 
 pub mod active;
+pub mod flow;
 pub mod passive;
 pub use passive::{
     OfflinePassiveAdapter, PassiveAdapter, PassiveObservation, PassiveOptions, PassiveParseError,
