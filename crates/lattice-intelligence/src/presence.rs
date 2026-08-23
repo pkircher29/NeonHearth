@@ -351,6 +351,21 @@ impl PresenceEngine {
                     return Err(PresenceError::InvalidCheckpoint("evidence time"));
                 }
             }
+            if conflicting_controls(
+                &x.evidence,
+                PresenceEvidenceKind::EnforcementBlocked,
+                PresenceEvidenceKind::EnforcementUnblocked,
+            ) || conflicting_controls(
+                &x.evidence,
+                PresenceEvidenceKind::SensorImpaired,
+                PresenceEvidenceKind::SensorRecovered,
+            ) || conflicting_controls(
+                &x.evidence,
+                PresenceEvidenceKind::Contradiction,
+                PresenceEvidenceKind::ContradictionCleared,
+            ) {
+                return Err(PresenceError::InvalidCheckpoint("conflicting controls"));
+            }
             let (blocked, enforcement_clock) = control_state(
                 &x.evidence,
                 PresenceEvidenceKind::EnforcementBlocked,
@@ -903,6 +918,18 @@ fn control_state(
             .any(|e| e.kind == active && e.observed_at == clock),
         Some(clock),
     )
+}
+fn conflicting_controls(
+    evidence: &[PresenceEvidence],
+    active: PresenceEvidenceKind,
+    inactive: PresenceEvidenceKind,
+) -> bool {
+    evidence.iter().any(|left| {
+        left.kind == active
+            && evidence
+                .iter()
+                .any(|right| right.kind == inactive && right.observed_at == left.observed_at)
+    })
 }
 fn control_family(kind: PresenceEvidenceKind) -> Option<u8> {
     match kind {
