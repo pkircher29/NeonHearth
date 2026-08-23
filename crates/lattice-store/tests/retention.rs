@@ -114,8 +114,9 @@ async fn ninety_day_minute_boundary_compacts_to_hour_and_is_repeatable() {
 async fn default_ninety_day_cutoff_includes_complete_hours_but_not_bisected_parents() {
     let pool = connect_memory().await.unwrap();
     let repo = FlowRepository::new(pool, 100).unwrap();
-    let now = Utc.timestamp_opt(1_998_000, 0).single().unwrap();
+    let now = Utc.timestamp_opt(1_998_123, 0).single().unwrap();
     let cutoff = now - CompactionPolicy::default().minutes;
+    assert_ne!(cutoff.timestamp().rem_euclid(3600), 0);
     let bisected_hour = cutoff - Duration::seconds(cutoff.timestamp().rem_euclid(3600));
     let full_hour = bisected_hour - Duration::hours(1);
     repo.apply(
