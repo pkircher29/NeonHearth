@@ -34,7 +34,7 @@ fn seconds_and_minutes_conserve_bytes_and_are_deterministic() {
     e.observe(obs(1, 100, 3)).unwrap();
     e.observe(obs(2, 101, 4)).unwrap();
     let out = e
-        .advance_watermark(Utc.timestamp_opt(160, 0).unwrap())
+        .advance_watermark(Utc.timestamp_opt(105, 0).unwrap())
         .unwrap();
     assert_eq!(out.seconds.iter().map(|r| r.bytes.upload).sum::<u64>(), 7);
     assert_eq!(out.minutes.iter().map(|r| r.bytes.upload).sum::<u64>(), 7);
