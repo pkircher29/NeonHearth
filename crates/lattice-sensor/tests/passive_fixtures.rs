@@ -53,6 +53,63 @@ fn fixtures_are_real_ethernet_ip_or_arp_not_private_metadata_envelopes() {
         }
     }
 }
+
+fn wire_checksum(parts: &[&[u8]]) -> u16 {
+    let mut sum = 0u32;
+    for bytes in parts {
+        for pair in bytes.chunks(2) {
+            sum += u32::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]));
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+#[test]
+fn generated_ip_and_transport_checksums_are_wire_valid() {
+    for name in EXPECTED {
+        let pcap = fs::read(fixtures().join(format!("{name}.pcap"))).unwrap();
+        let f = &pcap[40..];
+        match u16::from_be_bytes([f[12], f[13]]) {
+            0x0800 => {
+                let ip = &f[14..];
+                let ihl = usize::from(ip[0] & 15) * 4;
+                assert_eq!(wire_checksum(&[&ip[..ihl]]), 0, "{name} IPv4");
+                let body = &ip[ihl..usize::from(u16::from_be_bytes([ip[2], ip[3]]))];
+                if matches!(ip[9], 6 | 17) {
+                    let len = (body.len() as u16).to_be_bytes();
+                    assert_eq!(
+                        wire_checksum(&[&ip[12..20], &[0, ip[9]], &len, body]),
+                        0,
+                        "{name} transport"
+                    );
+                } else if ip[9] == 2 {
+                    assert_eq!(wire_checksum(&[body]), 0, "{name} IGMP");
+                }
+            }
+            0x86dd => {
+                let ip = &f[14..];
+                let mut next = ip[6];
+                let mut at = 40;
+                if next == 0 {
+                    next = ip[at];
+                    at += (usize::from(ip[at + 1]) + 1) * 8;
+                }
+                let body = &ip[at..40 + usize::from(u16::from_be_bytes([ip[4], ip[5]]))];
+                let len = (body.len() as u32).to_be_bytes();
+                assert_eq!(
+                    wire_checksum(&[&ip[8..40], &len, &[0, 0, 0, next], body]),
+                    0,
+                    "{name} IPv6 transport"
+                );
+            }
+            _ => {}
+        }
+    }
+}
 #[test]
 fn every_fixture_normalizes_sanitized_metadata() {
     let adapter = OfflinePassiveAdapter;
@@ -86,28 +143,26 @@ fn every_fixture_normalizes_sanitized_metadata() {
 #[test]
 fn expected_facts_and_protocol_ttls_are_exact() {
     let cases = [
-        ("arp", "ip", "192.0.2.10", 300),
+        ("arp", "sender_ip", "192.0.2.10", 300),
         ("dhcpv4", "hostname", "lab-client", 3600),
-        (
-            "dhcpv6",
-            "client_id",
-            "0100000101000a000100010001000100010027000400000e10002700106c61622d76362e6578616d706c652e74657374",
-            3600,
-        ),
-        ("mdns-dns-sd", "name", "printer.example.test", 120),
-        ("ssdp-upnp", "location", "http://192.0.2.20/desc.xml", 1800),
-        ("ws-discovery", "xaddrs", "http://192.0.2.30/device", 300),
+        ("dhcpv6", "fqdn", "lab-v6.example.test", 3600),
+        ("dns-query", "query", "update.example.test", 300),
+        ("igmp", "group", "239.255.0.1", 300),
+        ("ipv6-ndp", "source_lladdr", "00:11:22:33:44:55", 300),
+        ("llmnr", "query", "workstation.local", 300),
+        ("mdns-dns-sd", "service_target", "printer.local:9000", 120),
+        ("mld", "group", "ff02::1", 300),
+        ("nbns", "name", "WORKSTATION", 300),
         (
             "onvif-discovery",
             "types",
             "dn:NetworkVideoTransmitter",
             300,
         ),
-        ("igmp", "group", "239.255.0.1", 300),
-        ("mld", "group", "ff02::1", 300),
-        ("dns-query", "query", "update.example.test", 300),
-        ("tcp-flow", "bytes", "52", 300),
-        ("udp-flow", "dst", "unknown:4243", 300),
+        ("ssdp-upnp", "location", "http://192.0.2.20/desc.xml", 1800),
+        ("ws-discovery", "xaddrs", "http://192.0.2.30/device", 300),
+        ("tcp-flow", "bytes", "15", 300),
+        ("udp-flow", "dst", "192.0.2.41:4243", 300),
     ];
     for (name, key, value, ttl) in cases {
         let observation = OfflinePassiveAdapter
@@ -135,6 +190,394 @@ fn expected_facts_and_protocol_ttls_are_exact() {
             Some("00:11:22:33:44:55")
         );
     }
+}
+
+#[test]
+fn every_fixture_has_the_exact_semantic_fact_set() {
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        (
+            "arp",
+            &[
+                ("sender_ip", "192.0.2.10"),
+                ("sender_mac", "00:11:22:33:44:55"),
+            ],
+        ),
+        (
+            "dhcpv4",
+            &[
+                ("chaddr", "00:11:22:33:44:55"),
+                ("yiaddr", "192.0.2.100"),
+                ("hostname", "lab-client"),
+                ("client_id", "01001122334455"),
+                ("server_id", "192.0.2.1"),
+            ],
+        ),
+        (
+            "dhcpv6",
+            &[
+                ("client_duid", "0001000100000001001122334455"),
+                ("server_duid", "0001000100000002aabbccddeeff"),
+                ("iaaddr", "2001:db8::2"),
+                ("preferred_lifetime", "600"),
+                ("valid_lifetime", "1200"),
+                ("fqdn", "lab-v6.example.test"),
+            ],
+        ),
+        ("dns-query", &[("query", "update.example.test")]),
+        ("igmp", &[("group", "239.255.0.1")]),
+        (
+            "ipv6-ndp",
+            &[
+                ("target", "2001:db8::10"),
+                ("source_lladdr", "00:11:22:33:44:55"),
+            ],
+        ),
+        ("llmnr", &[("query", "workstation.local")]),
+        (
+            "mdns-dns-sd",
+            &[
+                (
+                    "service_instance",
+                    "_http._tcp.local -> Neon Printer._http._tcp.local",
+                ),
+                ("service_target", "printer.local:9000"),
+                ("txt", "note=lab"),
+                ("host_address", "192.0.2.20"),
+            ],
+        ),
+        ("mld", &[("group", "ff02::1")]),
+        ("nbns", &[("name", "WORKSTATION"), ("suffix", "0x20")]),
+        (
+            "onvif-discovery",
+            &[
+                ("endpoint", "urn:uuid:camera-1"),
+                ("types", "dn:NetworkVideoTransmitter"),
+                ("scopes", "onvif://www.onvif.org/name/Camera"),
+                ("xaddrs", "http://192.0.2.30/onvif/device_service"),
+            ],
+        ),
+        (
+            "ssdp-upnp",
+            &[
+                ("service_type", "upnp:rootdevice"),
+                ("usn", "uuid:11111111-2222-3333-4444-555555555555"),
+                ("location", "http://192.0.2.20/desc.xml"),
+            ],
+        ),
+        (
+            "tcp-flow",
+            &[
+                ("src", "192.0.2.10:51515"),
+                ("dst", "192.0.2.40:443"),
+                ("bytes", "15"),
+            ],
+        ),
+        (
+            "udp-flow",
+            &[
+                ("src", "192.0.2.10:4242"),
+                ("dst", "192.0.2.41:4243"),
+                ("bytes", "15"),
+            ],
+        ),
+        (
+            "ws-discovery",
+            &[
+                ("endpoint", "urn:uuid:device-1"),
+                ("types", "dn:Device"),
+                ("scopes", "urn:example:lab"),
+                ("xaddrs", "http://192.0.2.30/device"),
+            ],
+        ),
+    ];
+    for (name, expected) in cases {
+        let one = OfflinePassiveAdapter
+            .ingest_pcap(
+                "x",
+                &fs::read(fixtures().join(format!("{name}.pcap"))).unwrap(),
+                &PassiveOptions::default(),
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let actual: Vec<_> = one
+            .facts
+            .iter()
+            .filter(|f| f.key != "mac")
+            .map(|f| (f.key.as_str(), f.value.as_str()))
+            .collect();
+        assert_eq!(&actual, expected, "{name}");
+    }
+}
+
+#[test]
+fn mdns_emits_record_semantics_with_per_record_ttls() {
+    let one = OfflinePassiveAdapter
+        .ingest_pcap(
+            "x",
+            &fs::read(fixtures().join("mdns-dns-sd.pcap")).unwrap(),
+            &PassiveOptions::default(),
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+    let expected = [
+        (
+            "service_instance",
+            "_http._tcp.local -> Neon Printer._http._tcp.local",
+            4500,
+        ),
+        ("service_target", "printer.local:9000", 120),
+        ("txt", "note=lab", 300),
+        ("host_address", "192.0.2.20", 60),
+    ];
+    for (key, value, ttl) in expected {
+        let fact = one.facts.iter().find(|f| f.key == key).unwrap();
+        assert_eq!(fact.value, value);
+        assert_eq!(
+            fact.expires_at.unwrap() - fact.observed_at,
+            chrono::Duration::seconds(ttl)
+        );
+    }
+}
+
+#[test]
+fn dhcp_fields_are_protocol_fields_not_opaque_payloads() {
+    let load = |name: &str| {
+        OfflinePassiveAdapter
+            .ingest_pcap(
+                "x",
+                &fs::read(fixtures().join(format!("{name}.pcap"))).unwrap(),
+                &PassiveOptions::default(),
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+    };
+    let v4 = load("dhcpv4");
+    for (key, value) in [
+        ("yiaddr", "192.0.2.100"),
+        ("chaddr", "00:11:22:33:44:55"),
+        ("server_id", "192.0.2.1"),
+        ("client_id", "01001122334455"),
+    ] {
+        assert_eq!(v4.facts.iter().find(|f| f.key == key).unwrap().value, value);
+    }
+    let v6 = load("dhcpv6");
+    for key in [
+        "client_duid",
+        "server_duid",
+        "fqdn",
+        "iaaddr",
+        "preferred_lifetime",
+        "valid_lifetime",
+    ] {
+        assert!(v6.facts.iter().any(|f| f.key == key), "missing {key}");
+    }
+    assert!(!v6.facts.iter().any(|f| f.key == "client_id"));
+}
+
+#[test]
+fn flow_payload_secrets_never_escape_normalized_values_or_json() {
+    for (name, secret) in [
+        ("tcp-flow", "NEON_TCP_SECRET"),
+        ("udp-flow", "NEON_UDP_SECRET"),
+    ] {
+        let obs = OfflinePassiveAdapter
+            .ingest_pcap(
+                "x",
+                &fs::read(fixtures().join(format!("{name}.pcap"))).unwrap(),
+                &PassiveOptions::default(),
+            )
+            .unwrap();
+        let json = serde_json::to_string(&obs).unwrap();
+        assert!(!json.contains(secret));
+        assert!(
+            obs.iter()
+                .flat_map(|o| &o.facts)
+                .all(|f| !f.value.contains(secret))
+        );
+    }
+}
+
+#[test]
+fn classic_pcap_supports_big_endian_and_multiple_records() {
+    let little = fs::read(fixtures().join("arp.pcap")).unwrap();
+    let mut big = Vec::new();
+    big.extend(0xa1b2c3d4u32.to_be_bytes());
+    big.extend(2u16.to_be_bytes());
+    big.extend(4u16.to_be_bytes());
+    big.extend(0i32.to_be_bytes());
+    big.extend(0u32.to_be_bytes());
+    big.extend(65535u32.to_be_bytes());
+    big.extend(1u32.to_be_bytes());
+    let frame = &little[40..];
+    for sec in [1_704_067_200u32, 1_704_067_201] {
+        big.extend(sec.to_be_bytes());
+        big.extend(123_000u32.to_be_bytes());
+        big.extend((frame.len() as u32).to_be_bytes());
+        big.extend((frame.len() as u32).to_be_bytes());
+        big.extend(frame);
+    }
+    let obs = OfflinePassiveAdapter
+        .ingest_pcap("x", &big, &PassiveOptions::default())
+        .unwrap();
+    assert_eq!(obs.len(), 2);
+    assert_eq!(obs[0].observed_at.timestamp_subsec_millis(), 123);
+}
+
+#[test]
+fn pcap_rejects_non_ethernet_and_bad_record_lengths() {
+    let mut p = fs::read(fixtures().join("arp.pcap")).unwrap();
+    p[20..24].copy_from_slice(&101u32.to_le_bytes());
+    assert!(
+        OfflinePassiveAdapter
+            .ingest_pcap("x", &p, &PassiveOptions::default())
+            .is_err()
+    );
+    let mut p = fs::read(fixtures().join("arp.pcap")).unwrap();
+    p[32..36].copy_from_slice(&70_000u32.to_le_bytes());
+    assert!(
+        OfflinePassiveAdapter
+            .ingest_pcap("x", &p, &PassiveOptions::default())
+            .is_err()
+    );
+}
+
+fn udp_frame(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0xff; 6];
+    frame.extend([0, 17, 34, 51, 68, 85]);
+    frame.extend(0x0800u16.to_be_bytes());
+    let mut ip = vec![
+        0x45, 0, 0, 0, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 10, 239, 255, 255, 250,
+    ];
+    ip[2..4].copy_from_slice(&((20 + 8 + payload.len()) as u16).to_be_bytes());
+    let mut udp = Vec::new();
+    udp.extend(src_port.to_be_bytes());
+    udp.extend(dst_port.to_be_bytes());
+    udp.extend(((8 + payload.len()) as u16).to_be_bytes());
+    udp.extend([0, 0]);
+    udp.extend(payload);
+    ip.extend(udp);
+    frame.extend(ip);
+    frame
+}
+
+#[test]
+fn dns_pointer_loops_and_malformed_counts_are_rejected() {
+    let looped = [0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 0x0c, 0, 1, 0, 1];
+    let err = lattice_sensor::PassiveAdapter::normalize(
+        &OfflinePassiveAdapter,
+        "x",
+        chrono::Utc::now(),
+        &udp_frame(53000, 53, &looped),
+        &PassiveOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, lattice_sensor::PassiveParseError::Metadata));
+    let truncated = [0, 1, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1];
+    assert!(
+        lattice_sensor::PassiveAdapter::normalize(
+            &OfflinePassiveAdapter,
+            "x",
+            chrono::Utc::now(),
+            &udp_frame(53000, 53, &truncated),
+            &PassiveOptions::default()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn xml_dtd_entities_depth_and_event_budgets_are_rejected() {
+    for xml in [
+        b"<!DOCTYPE x [<!ENTITY boom 'x'>]><Envelope>&boom;</Envelope>".as_slice(),
+        format!("{}{}", "<x>".repeat(33), "</x>".repeat(33)).as_bytes(),
+    ] {
+        assert!(
+            lattice_sensor::PassiveAdapter::normalize(
+                &OfflinePassiveAdapter,
+                "x",
+                chrono::Utc::now(),
+                &udp_frame(3702, 3702, xml),
+                &PassiveOptions::default()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn invalid_utf8_and_oversized_metadata_are_rejected() {
+    let oversized = vec![b'x'; 2_049];
+    for (label, payload) in [
+        ("invalid utf8", &[0xff, 0xfe][..]),
+        ("oversized", oversized.as_slice()),
+    ] {
+        assert!(
+            lattice_sensor::PassiveAdapter::normalize(
+                &OfflinePassiveAdapter,
+                "x",
+                chrono::Utc::now(),
+                &udp_frame(3702, 3702, payload),
+                &PassiveOptions::default(),
+            )
+            .is_err(),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn invalid_tcp_data_offset_and_udp_declared_length_are_rejected() {
+    let mut tcp = fs::read(fixtures().join("tcp-flow.pcap")).unwrap();
+    tcp[40 + 14 + 20 + 12] = 0xf0;
+    assert!(
+        OfflinePassiveAdapter
+            .ingest_pcap("x", &tcp, &PassiveOptions::default())
+            .is_err()
+    );
+    let mut udp = fs::read(fixtures().join("udp-flow.pcap")).unwrap();
+    udp[40 + 14 + 20 + 4..40 + 14 + 20 + 6].copy_from_slice(&0xffffu16.to_be_bytes());
+    assert!(
+        OfflinePassiveAdapter
+            .ingest_pcap("x", &udp, &PassiveOptions::default())
+            .is_err()
+    );
+}
+
+#[test]
+fn fragmented_ip_packets_are_not_normalized_without_reassembly() {
+    let mut v4 = fs::read(fixtures().join("udp-flow.pcap")).unwrap()[40..].to_vec();
+    v4[14 + 6..14 + 8].copy_from_slice(&1u16.to_be_bytes());
+    assert!(
+        lattice_sensor::PassiveAdapter::normalize(
+            &OfflinePassiveAdapter,
+            "x",
+            chrono::Utc::now(),
+            &v4,
+            &PassiveOptions::default()
+        )
+        .unwrap()
+        .is_empty()
+    );
+
+    let mut v6 = fs::read(fixtures().join("ipv6-ndp.pcap")).unwrap()[40..].to_vec();
+    let payload_len = u16::from_be_bytes([v6[18], v6[19]]) + 8;
+    v6[18..20].copy_from_slice(&payload_len.to_be_bytes());
+    v6[20] = 44;
+    v6.splice(54..54, [58, 0, 0, 1, 0, 0, 0, 1]);
+    assert!(
+        lattice_sensor::PassiveAdapter::normalize(
+            &OfflinePassiveAdapter,
+            "x",
+            chrono::Utc::now(),
+            &v6,
+            &PassiveOptions::default()
+        )
+        .unwrap()
+        .is_empty()
+    );
 }
 #[test]
 fn dns_queries_respect_privacy_switch() {

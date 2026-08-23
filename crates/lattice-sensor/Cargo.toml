@@ -10,6 +10,10 @@ pnet_datalink.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 serde.workspace = true
+pcap-file.workspace = true
+hickory-proto.workspace = true
+quick-xml.workspace = true
+etherparse.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }

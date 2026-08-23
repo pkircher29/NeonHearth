@@ -1,60 +1,193 @@
 use std::{fs, path::PathBuf};
-fn eth(ty: u16, p: Vec<u8>) -> Vec<u8> {
+const MAC: [u8; 6] = [0, 17, 34, 51, 68, 85];
+const S4: [u8; 4] = [192, 0, 2, 10];
+const S6: [u8; 16] = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+fn sum(mut a: u32, b: &[u8]) -> u32 {
+    for p in b.chunks(2) {
+        a += u16::from_be_bytes([p[0], *p.get(1).unwrap_or(&0)]) as u32;
+        a = (a & 65535) + (a >> 16)
+    }
+    a
+}
+fn cks(parts: &[&[u8]]) -> u16 {
+    let mut a = 0;
+    for p in parts {
+        a = sum(a, p)
+    }
+    while a >> 16 > 0 {
+        a = (a & 65535) + (a >> 16)
+    }
+    !(a as u16)
+}
+fn eth(t: u16, p: Vec<u8>) -> Vec<u8> {
     let mut v = vec![255; 6];
-    v.extend([0, 17, 34, 51, 68, 85]);
-    v.extend(ty.to_be_bytes());
+    v.extend(MAC);
+    v.extend(t.to_be_bytes());
     v.extend(p);
     v
 }
-fn v4(proto: u8, src: [u8; 4], dst: [u8; 4], p: Vec<u8>) -> Vec<u8> {
-    let mut v = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, proto, 0, 0];
-    v.extend(src);
-    v.extend(dst);
-    let n = (20 + p.len()) as u16;
-    v[2..4].copy_from_slice(&n.to_be_bytes());
-    v.extend(p);
-    eth(0x0800, v)
+fn set4(p: &mut [u8], s: [u8; 4], d: [u8; 4], protocol: u8) {
+    let checksum_at = if protocol == 17 { 6 } else { 16 };
+    p[checksum_at..checksum_at + 2].fill(0);
+    let l = (p.len() as u16).to_be_bytes();
+    let c = cks(&[&s, &d, &[0, protocol], &l, p]);
+    p[checksum_at..checksum_at + 2].copy_from_slice(&c.to_be_bytes())
 }
-fn v6(next: u8, src: [u8; 16], dst: [u8; 16], p: Vec<u8>) -> Vec<u8> {
-    let mut v = vec![0x60, 0, 0, 0];
-    v.extend(((p.len()) as u16).to_be_bytes());
-    v.extend([next, 64]);
-    v.extend(src);
-    v.extend(dst);
-    v.extend(p);
-    eth(0x86dd, v)
+fn set6(p: &mut [u8], s: [u8; 16], d: [u8; 16], n: u8) {
+    let at = if n == 17 { 6 } else { 2 };
+    p[at..at + 2].fill(0);
+    let l = (p.len() as u32).to_be_bytes();
+    let c = cks(&[&s, &d, &l, &[0, 0, 0, n], p]);
+    p[at..at + 2].copy_from_slice(&c.to_be_bytes())
 }
-fn udp(s: u16, d: u16, p: &[u8]) -> Vec<u8> {
-    let mut v = Vec::new();
-    v.extend(s.to_be_bytes());
-    v.extend(d.to_be_bytes());
-    v.extend(((8 + p.len()) as u16).to_be_bytes());
-    v.extend([0, 0]);
-    v.extend(p);
-    v
+fn v4(n: u8, s: [u8; 4], d: [u8; 4], mut p: Vec<u8>) -> Vec<u8> {
+    if matches!(n, 6 | 17) {
+        set4(&mut p, s, d, n)
+    }
+    let mut h = vec![0x45, 0, 0, 0, 0x12, 0x34, 0, 0, 64, n, 0, 0];
+    h.extend(s);
+    h.extend(d);
+    h[2..4].copy_from_slice(&((20 + p.len()) as u16).to_be_bytes());
+    let c = cks(&[&h]);
+    h[10..12].copy_from_slice(&c.to_be_bytes());
+    h.extend(p);
+    eth(0x800, h)
 }
-fn dns(name: &str, resp: bool, ttl: u32) -> Vec<u8> {
-    let mut v = vec![0x12, 0x34, if resp { 0x81 } else { 1 }, 0];
-    v.extend(if resp {
-        [0, 1, 0, 1, 0, 0, 0, 0]
-    } else {
-        [0, 1, 0, 0, 0, 0, 0, 0]
-    });
-    for x in name.split('.') {
+fn v6(n: u8, s: [u8; 16], d: [u8; 16], mut p: Vec<u8>) -> Vec<u8> {
+    if matches!(n, 17 | 58) {
+        set6(&mut p, s, d, n)
+    }
+    let mut h = vec![0x60, 0, 0, 0];
+    h.extend((p.len() as u16).to_be_bytes());
+    h.extend([n, 64]);
+    h.extend(s);
+    h.extend(d);
+    h.extend(p);
+    eth(0x86dd, h)
+}
+fn hop(s: [u8; 16], d: [u8; 16], mut p: Vec<u8>) -> Vec<u8> {
+    set6(&mut p, s, d, 58);
+    let mut x = vec![58, 0, 5, 2, 0, 0, 1, 0];
+    x.extend(p);
+    let mut h = vec![0x60, 0, 0, 0];
+    h.extend((x.len() as u16).to_be_bytes());
+    h.extend([0, 1]);
+    h.extend(s);
+    h.extend(d);
+    h.extend(x);
+    eth(0x86dd, h)
+}
+fn udp(s: u16, d: u16, b: &[u8]) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend(s.to_be_bytes());
+    p.extend(d.to_be_bytes());
+    p.extend(((8 + b.len()) as u16).to_be_bytes());
+    p.extend([0, 0]);
+    p.extend(b);
+    p
+}
+fn tcp(s: u16, d: u16, b: &[u8]) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend(s.to_be_bytes());
+    p.extend(d.to_be_bytes());
+    p.extend([0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 0x10, 0, 0, 0, 0, 0]);
+    p.extend(b);
+    p
+}
+fn name(n: &str, v: &mut Vec<u8>) {
+    for x in n.split('.') {
         v.push(x.len() as u8);
         v.extend(x.as_bytes())
     }
-    v.push(0);
+    v.push(0)
+}
+fn dns(n: &str) -> Vec<u8> {
+    let mut v = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    name(n, &mut v);
     v.extend([0, 1, 0, 1]);
-    if resp {
-        v.extend([0xc0, 12, 0, 1, 0, 1]);
-        v.extend(ttl.to_be_bytes());
-        v.extend([0, 4, 192, 0, 2, 20])
-    }
     v
 }
-fn pcap(n: &str, f: Vec<u8>) {
-    let o = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn mdns() -> Vec<u8> {
+    let mut d = vec![0, 0, 0x84, 0, 0, 0, 0, 4, 0, 0, 0, 0];
+    name("_http._tcp.local", &mut d);
+    d.extend([0, 12, 0, 1]);
+    d.extend(4500u32.to_be_bytes());
+    let mut r = Vec::new();
+    name("Neon Printer._http._tcp.local", &mut r);
+    d.extend((r.len() as u16).to_be_bytes());
+    d.extend(r);
+    name("Neon Printer._http._tcp.local", &mut d);
+    d.extend([0, 33, 0, 1]);
+    d.extend(120u32.to_be_bytes());
+    let mut r = vec![0, 0, 0, 0, 0x23, 0x28];
+    name("printer.local", &mut r);
+    d.extend((r.len() as u16).to_be_bytes());
+    d.extend(r);
+    name("Neon Printer._http._tcp.local", &mut d);
+    d.extend([0, 16, 0, 1]);
+    d.extend(300u32.to_be_bytes());
+    d.extend([0, 9, 8]);
+    d.extend(b"note=lab");
+    name("printer.local", &mut d);
+    d.extend([0, 1, 0, 1]);
+    d.extend(60u32.to_be_bytes());
+    d.extend([0, 4, 192, 0, 2, 20]);
+    d
+}
+fn opt(c: u16, b: &[u8], v: &mut Vec<u8>) {
+    v.extend(c.to_be_bytes());
+    v.extend((b.len() as u16).to_be_bytes());
+    v.extend(b)
+}
+fn dh6() -> Vec<u8> {
+    let mut d = vec![7, 0, 0, 1];
+    opt(1, &[0, 1, 0, 1, 0, 0, 0, 1, 0, 17, 34, 51, 68, 85], &mut d);
+    opt(
+        2,
+        &[0, 1, 0, 1, 0, 0, 0, 2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        &mut d,
+    );
+    let mut ia = vec![0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut a = S6.to_vec();
+    a.extend(600u32.to_be_bytes());
+    a.extend(1200u32.to_be_bytes());
+    opt(5, &a, &mut ia);
+    opt(3, &ia, &mut d);
+    let mut f = vec![0];
+    name("lab-v6.example.test", &mut f);
+    opt(39, &f, &mut d);
+    d
+}
+fn dh4() -> Vec<u8> {
+    let mut d = vec![
+        2, 1, 6, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 2, 100, 0, 0, 0, 0,
+    ];
+    d.extend([0; 4]);
+    d.extend(MAC);
+    d.extend([0; 10]);
+    d.resize(236, 0);
+    d.extend([99, 130, 83, 99, 0, 12, 10]);
+    d.extend(b"lab-client");
+    d.extend([
+        61, 7, 1, 0, 17, 34, 51, 68, 85, 54, 4, 192, 0, 2, 1, 51, 4, 0, 0, 14, 16, 255,
+    ]);
+    d
+}
+fn nbns() -> Vec<u8> {
+    let mut d = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 32];
+    let mut r = [b' '; 16];
+    r[..11].copy_from_slice(b"WORKSTATION");
+    r[15] = 0x20;
+    for b in r {
+        d.push(b'A' + (b >> 4));
+        d.push(b'A' + (b & 15))
+    }
+    d.push(0);
+    d.extend([0, 32, 0, 1]);
+    d
+}
+fn save(n: &str, f: Vec<u8>) {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../crates/lattice-sensor/tests/fixtures/pcap");
     let mut v = Vec::new();
     v.extend(0xa1b2c3d4u32.to_le_bytes());
@@ -65,155 +198,120 @@ fn pcap(n: &str, f: Vec<u8>) {
     v.extend(65535u32.to_le_bytes());
     v.extend(1u32.to_le_bytes());
     v.extend(1_704_067_200u32.to_le_bytes());
-    v.extend(0u32.to_le_bytes());
+    v.extend(123_000u32.to_le_bytes());
     v.extend((f.len() as u32).to_le_bytes());
     v.extend((f.len() as u32).to_le_bytes());
     v.extend(f);
-    fs::write(o.join(format!("{n}.pcap")), v).unwrap()
+    fs::write(p.join(format!("{n}.pcap")), v).unwrap()
 }
 fn main() {
-    let o = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../crates/lattice-sensor/tests/fixtures/pcap");
-    fs::create_dir_all(o).unwrap();
-    let s = [192, 0, 2, 10];
+    fs::create_dir_all(p).unwrap();
     let mut a = vec![0, 1, 8, 0, 6, 4, 0, 1];
-    a.extend([0, 17, 34, 51, 68, 85]);
-    a.extend(s);
+    a.extend(MAC);
+    a.extend(S4);
     a.extend([0; 6]);
     a.extend([192, 0, 2, 1]);
-    pcap("arp", eth(0x0806, a));
-    let mut nd = vec![135, 0, 0, 0];
-    nd.extend([0; 4]);
-    nd.extend([0x20, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
-    nd.extend([1, 1, 0, 17, 34, 51, 68, 85]);
-    pcap(
-        "ipv6-ndp",
-        v6(
-            58,
-            [0x20, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
-            [255, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            nd,
-        ),
-    );
-    let mut dh = vec![1, 1, 6, 0, 18, 52, 86, 120];
-    dh.extend([0; 16]);
-    dh.extend([0, 17, 34, 51, 68, 85]);
-    dh.extend([0; 206]);
-    dh.extend([99, 130, 83, 99, 12, 10]);
-    dh.extend(b"lab-client");
-    dh.extend([
-        61, 7, 1, 0, 17, 34, 51, 68, 85, 54, 4, 192, 0, 2, 1, 51, 4, 0, 0, 14, 16, 255,
-    ]);
-    pcap("dhcpv4", v4(17, [0; 4], [255; 4], udp(68, 67, &dh)));
-    let mut dh6 = vec![
-        1, 0, 0, 1, 1, 0, 10, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 39, 0, 4, 0, 0, 14, 16, 0, 39, 0, 16,
-    ];
-    dh6.extend(b"lab-v6.example.test");
-    pcap(
+    save("arp", eth(0x806, a));
+    let d6 = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0, 0, 16];
+    let mut nd = vec![135, 0, 0, 0, 0, 0, 0, 0];
+    nd.extend([0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
+    nd.extend([1, 1]);
+    nd.extend(MAC);
+    save("ipv6-ndp", v6(58, S6, d6, nd));
+    save("dhcpv4", v4(17, [0; 4], [255; 4], udp(68, 67, &dh4())));
+    save(
         "dhcpv6",
         v6(
             17,
-            [0x20, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
-            [0x20, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            udp(546, 547, &dh6),
+            S6,
+            [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            udp(547, 546, &dh6()),
         ),
     );
-    pcap(
+    save(
         "mdns-dns-sd",
         v4(
             17,
             [192, 0, 2, 20],
             [224, 0, 0, 251],
-            udp(5353, 5353, &dns("printer.example.test", true, 120)),
+            udp(5353, 5353, &mdns()),
         ),
     );
-    pcap(
+    save(
         "llmnr",
         v4(
             17,
             [192, 0, 2, 21],
             [224, 0, 0, 252],
-            udp(5355, 5355, &dns("workstation.example.test", false, 0)),
+            udp(5355, 5355, &dns("workstation.local")),
         ),
     );
-    pcap(
+    save(
+        "dns-query",
+        v4(
+            17,
+            S4,
+            [192, 0, 2, 53],
+            udp(53000, 53, &dns("update.example.test")),
+        ),
+    );
+    save(
         "nbns",
         v4(
             17,
             [192, 0, 2, 22],
             [192, 0, 2, 255],
-            udp(
-                137,
-                137,
-                b"\x12\x34\x01\x10\0\x01\0\0\0\0\0\0\x20WORKSTATION     \0\0\x20\0\x01",
-            ),
+            udp(137, 137, &nbns()),
         ),
     );
-    let ss=b"NOTIFY * HTTP/1.1\r\nNT:upnp:rootdevice\r\nUSN:uuid:11111111-2222-3333-4444-555555555555\r\nLOCATION:http://192.0.2.20/desc.xml\r\nCACHE-CONTROL:max-age=1800\r\n\r\n";
-    pcap(
+    let s=b"NOTIFY * HTTP/1.1\r\nNT: upnp:rootdevice\r\nUSN: uuid:11111111-2222-3333-4444-555555555555\r\nLOCATION: http://192.0.2.20/desc.xml\r\nCACHE-CONTROL: max-age=1800\r\n\r\n";
+    save(
         "ssdp-upnp",
         v4(
             17,
             [192, 0, 2, 20],
             [239, 255, 255, 250],
-            udp(1900, 1900, ss),
+            udp(1900, 1900, s),
         ),
     );
-    let x=b"<Envelope><ProbeMatch><EndpointReference>urn:uuid:11111111-2222-3333-4444-555555555555</EndpointReference><Types>dn:Device</Types><Scopes>urn:example:lab</Scopes><XAddrs>http://192.0.2.30/device</XAddrs></ProbeMatch></Envelope>";
-    for n in ["ws-discovery"] {
-        pcap(
-            n,
-            v4(
-                17,
-                [192, 0, 2, 30],
-                [239, 255, 255, 250],
-                udp(3702, 3702, x),
-            ),
-        )
-    }
-    let x=b"<Envelope><ProbeMatch><EndpointReference>urn:uuid:11111111-2222-3333-4444-555555555555</EndpointReference><Types>dn:NetworkVideoTransmitter</Types><Scopes>onvif://www.onvif.org/name/Camera</Scopes><XAddrs>http://192.0.2.30/onvif/device_service</XAddrs></ProbeMatch></Envelope>";
-    pcap(
+    let w=br#"<s:Envelope xmlns:s="urn:soap" xmlns:a="urn:wsa" xmlns:d="urn:wsd"><s:Body><d:ProbeMatch><a:EndpointReference><a:Address>urn:uuid:device-1</a:Address></a:EndpointReference><d:Types>dn:Device</d:Types><d:Scopes>urn:example:lab</d:Scopes><d:XAddrs>http://192.0.2.30/device</d:XAddrs></d:ProbeMatch></s:Body></s:Envelope>"#;
+    save(
+        "ws-discovery",
+        v4(
+            17,
+            [192, 0, 2, 30],
+            [239, 255, 255, 250],
+            udp(3702, 3702, w),
+        ),
+    );
+    let o=br#"<s:Envelope xmlns:s="urn:soap" xmlns:a="urn:wsa" xmlns:d="urn:wsd" xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><s:Body><d:ProbeMatch><a:EndpointReference><a:Address>urn:uuid:camera-1</a:Address></a:EndpointReference><d:Types>dn:NetworkVideoTransmitter</d:Types><d:Scopes>onvif://www.onvif.org/name/Camera</d:Scopes><d:XAddrs>http://192.0.2.30/onvif/device_service</d:XAddrs></d:ProbeMatch></s:Body></s:Envelope>"#;
+    save(
         "onvif-discovery",
         v4(
             17,
             [192, 0, 2, 30],
             [239, 255, 255, 250],
-            udp(3702, 3702, x),
+            udp(3702, 3702, o),
         ),
     );
-    pcap(
-        "igmp",
-        v4(2, s, [239, 255, 0, 1], vec![0x16, 0, 0, 0, 239, 255, 0, 1]),
-    );
-    pcap(
+    let mut g = vec![0x16, 0, 0, 0, 239, 255, 0, 1];
+    let c = cks(&[&g]);
+    g[2..4].copy_from_slice(&c.to_be_bytes());
+    save("igmp", v4(2, S4, [239, 255, 0, 1], g));
+    let mut m = vec![131, 0, 0, 0, 0, 0, 0, 0];
+    m.extend([0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    save(
         "mld",
-        v6(
-            58,
-            [0x20, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
-            [255, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            vec![
-                131, 0, 0, 0, 0, 0, 0, 0, 255, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-            ],
-        ),
+        hop(S6, [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], m),
     );
-    pcap(
-        "dns-query",
-        v4(
-            17,
-            s,
-            [192, 0, 2, 53],
-            udp(53000, 53, &dns("update.example.test", false, 0)),
-        ),
+    save(
+        "tcp-flow",
+        v4(6, S4, [192, 0, 2, 40], tcp(51515, 443, b"NEON_TCP_SECRET")),
     );
-    let mut t = Vec::new();
-    t.extend(51515u16.to_be_bytes());
-    t.extend(443u16.to_be_bytes());
-    t.extend([0; 8]);
-    t.extend([0x50, 0x18, 0, 0, 0, 0, 0, 0]);
-    t.extend([0; 32]);
-    pcap("tcp-flow", v4(6, s, [192, 0, 2, 40], t));
-    pcap(
+    save(
         "udp-flow",
-        v4(17, s, [192, 0, 2, 41], udp(4242, 4243, &[0; 16])),
-    )
+        v4(17, S4, [192, 0, 2, 41], udp(4242, 4243, b"NEON_UDP_SECRET")),
+    );
 }

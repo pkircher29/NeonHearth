@@ -6,7 +6,16 @@ WS-Discovery, ONVIF discovery, IGMP, MLD, DNS query metadata, and TCP/UDP
 flow metadata.  The normalized records retain only interface, capture time, subject
 MAC/IP, protocol and expiring `EvidenceFact` metadata; no frame bytes or bodies survive.
 
-DHCP lease, DNS/service TTL, and SSDP max-age drive expiry when present; other
-protocols use a bounded five-minute default. DNS query names require the explicit
-`metadata_enabled` option. Live capture, XML body parsing, packet export, persistence,
-and active probing are deliberately out of scope. XML entity/DOCTYPE payloads are rejected.
+DHCP lease, DNS/service-record TTL, and SSDP max-age drive per-fact expiry when
+present; other protocols use a bounded five-minute default. DNS and LLMNR query
+names require the explicit `metadata_enabled` option. The bounded normalizer parses
+namespaced WS-Discovery SOAP and distinguishes ONVIF from decoded Types/Scopes.
+DTD, entity/reference, processing-instruction, oversized, over-deep, and excessive-event
+XML inputs are rejected. Live capture, packet export, persistence, and active probing
+remain out of scope for this fixture milestone.
+
+The fixture generator writes valid classic Ethernet PCAP, IPv4, IPv6, UDP, TCP,
+IGMP, ICMPv6/NDP, and MLD Router Alert framing with checksums. The test suite
+independently verifies those properties and exact facts for all 15 fixtures. Parsing
+is intentionally limited to classic Ethernet PCAP and bounded common IPv6 extension
+headers; encrypted payload inspection and reassembly of fragmented traffic are not attempted.
