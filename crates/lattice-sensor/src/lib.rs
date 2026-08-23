@@ -13,6 +13,7 @@ use thiserror::Error;
 
 pub mod active;
 pub mod flow;
+pub mod live;
 pub mod passive;
 pub use passive::{
     OfflinePassiveAdapter, PassiveAdapter, PassiveObservation, PassiveOptions, PassiveParseError,

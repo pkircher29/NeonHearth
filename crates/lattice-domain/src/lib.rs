@@ -6,7 +6,7 @@ mod flow;
 mod presence;
 
 pub use device::DeviceId;
-pub use event::{EventEnvelope, EventPayload, ServiceStatus};
+pub use event::{BandwidthFrame, BandwidthSample, EventEnvelope, EventPayload, ServiceStatus};
 pub use evidence::{EvidenceFact, EvidenceFamily};
 pub use flow::{ByteCount, Coverage};
 pub use presence::{PresenceChanged, PresenceState};

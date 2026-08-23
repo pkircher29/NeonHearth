@@ -1275,8 +1275,11 @@ dependencies = [
  "chrono",
  "fs2",
  "lattice-domain",
+ "lattice-sensor",
+ "serde",
  "sqlx",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "uuid",
 ]

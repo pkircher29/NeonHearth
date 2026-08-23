@@ -1,8 +1,10 @@
 //! Persistence interfaces and implementations for NeonHearth.
 
+mod flow;
 mod install;
 
 use anyhow::Context;
+pub use flow::{CompactionPolicy, FlowIngestor, FlowRepository, FlowStoreError};
 use fs2::FileExt;
 pub use install::{InstallRepository, InstallState};
 use sqlx::{
