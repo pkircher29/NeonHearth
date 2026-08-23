@@ -1,4 +1,4 @@
-import type { ServerMessage } from '../api/types';
+import type { ServerMessage, Snapshot } from '../api/types';
 
 export interface LiveState {
   sequence: number;
@@ -15,6 +15,8 @@ export const initialLiveState: LiveState = {
 };
 
 export function reduceLiveMessage(state: LiveState, message: ServerMessage): LiveState {
+  if (state.needsResync) return state;
+
   if (message.type === 'resync_required') {
     return { ...state, connected: false, needsResync: true };
   }
@@ -30,5 +32,14 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
     connected: true,
     needsResync: false,
     serviceStatus: data.payload.type === 'service_status' ? data.payload.data.state : state.serviceStatus
+  };
+}
+
+export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
+  return {
+    sequence: snapshot.sequence,
+    connected: true,
+    needsResync: false,
+    serviceStatus: snapshot.service_status
   };
 }

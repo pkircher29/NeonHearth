@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { EventEnvelope } from '../api/types';
-import { initialLiveState, reduceLiveMessage } from './live';
+import { applySnapshot, initialLiveState, reduceLiveMessage } from './live';
 
 const serviceStatus = (sequence: number, state = 'ready'): EventEnvelope => ({
   sequence,
@@ -44,6 +44,21 @@ describe('reduceLiveMessage', () => {
       sequence: 4,
       connected: false,
       needsResync: true,
+      serviceStatus: 'ready'
+    });
+  });
+
+  it('latches resync until a snapshot is applied', () => {
+    const current = { ...initialLiveState, sequence: 4, connected: true, serviceStatus: 'ready' };
+    const latched = reduceLiveMessage(current, { type: 'event', data: serviceStatus(6, 'degraded') });
+
+    expect(reduceLiveMessage(latched, { type: 'event', data: serviceStatus(5, 'ready') })).toBe(latched);
+    expect(reduceLiveMessage(latched, { type: 'event', data: serviceStatus(7, 'degraded') })).toBe(latched);
+    expect(reduceLiveMessage(latched, { type: 'resync_required' })).toBe(latched);
+    expect(applySnapshot(latched, { sequence: 7, devices: [], service_status: 'ready' })).toEqual({
+      sequence: 7,
+      connected: true,
+      needsResync: false,
       serviceStatus: 'ready'
     });
   });
