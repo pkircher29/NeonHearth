@@ -4,6 +4,10 @@ use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
+#[cfg(windows)]
+use std::mem::size_of;
+#[cfg(windows)]
+use std::net::Ipv6Addr;
 use std::net::{IpAddr, Ipv4Addr};
 use thiserror::Error;
 
@@ -227,6 +231,20 @@ impl SystemNeighborSnapshotSource {
     }
 }
 
+fn reachability_rank(v: NeighborReachability) -> u8 {
+    match v {
+        NeighborReachability::Reachable => 0,
+        NeighborReachability::Stale => 1,
+        NeighborReachability::Delay => 2,
+        NeighborReachability::Probe => 3,
+        NeighborReachability::Permanent => 4,
+        NeighborReachability::Incomplete => 5,
+        NeighborReachability::Failed => 6,
+        NeighborReachability::NoArp => 7,
+        NeighborReachability::Unknown => 8,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn map_kernel_state(
     state: netlink_packet_route::neighbour::NeighbourState,
@@ -244,18 +262,125 @@ fn map_kernel_state(
         _ => NeighborReachability::Unknown,
     }
 }
-#[cfg(target_os = "linux")]
-fn reachability_rank(v: NeighborReachability) -> u8 {
-    match v {
-        NeighborReachability::Reachable => 0,
-        NeighborReachability::Stale => 1,
-        NeighborReachability::Delay => 2,
-        NeighborReachability::Probe => 3,
-        NeighborReachability::Permanent => 4,
-        NeighborReachability::Incomplete => 5,
-        NeighborReachability::Failed => 6,
-        NeighborReachability::NoArp => 7,
-        NeighborReachability::Unknown => 8,
+#[cfg(windows)]
+pub struct SystemNeighborSnapshotSource {
+    config: NeighborSnapshotConfig,
+}
+#[cfg(windows)]
+impl SystemNeighborSnapshotSource {
+    pub fn new(config: NeighborSnapshotConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[cfg(windows)]
+fn map_windows_state(
+    s: windows_sys::Win32::Networking::WinSock::NL_NEIGHBOR_STATE,
+) -> NeighborReachability {
+    use windows_sys::Win32::Networking::WinSock::*;
+    match s {
+        NlnsReachable => NeighborReachability::Reachable,
+        NlnsStale => NeighborReachability::Stale,
+        NlnsDelay => NeighborReachability::Delay,
+        NlnsProbe => NeighborReachability::Probe,
+        NlnsPermanent => NeighborReachability::Permanent,
+        NlnsIncomplete => NeighborReachability::Incomplete,
+        NlnsUnreachable => NeighborReachability::Failed,
+        _ => NeighborReachability::Unknown,
+    }
+}
+
+#[cfg(windows)]
+fn windows_snapshot(config: &NeighborSnapshotConfig) -> Result<Vec<NeighborRow>, NeighborError> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIpNetTable2, MIB_IPNET_ROW2, MIB_IPNET_TABLE2,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
+    let mut table: *mut MIB_IPNET_TABLE2 = std::ptr::null_mut();
+    // SAFETY: table is an out-pointer initialized to null; successful non-null allocations are owned by guard.
+    let rc = unsafe { GetIpNetTable2(AF_UNSPEC, &mut table) };
+    struct Guard(*mut MIB_IPNET_TABLE2);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { FreeMibTable(self.0.cast()) };
+            }
+        }
+    }
+    let _guard = Guard(table);
+    if rc != ERROR_SUCCESS {
+        return Err(NeighborError::Transport);
+    }
+    if table.is_null() {
+        return Err(NeighborError::Malformed);
+    }
+    let count = unsafe { (*table).NumEntries as usize };
+    if count > config.max_raw_messages()
+        || count > isize::MAX as usize / size_of::<MIB_IPNET_ROW2>()
+    {
+        return Err(NeighborError::Capacity);
+    }
+    let first = unsafe { (*table).Table.as_ptr() };
+    let mut rows = Vec::new();
+    for i in 0..count {
+        // SAFETY: count is bounded by allocation-sized isize limit and Table is the first row of the table allocation.
+        let row = unsafe { &*first.add(i) };
+        if row.InterfaceIndex == 0
+            || !config
+                .allowed_interfaces()
+                .contains(&InterfaceId::new(row.InterfaceIndex))
+        {
+            continue;
+        }
+        if row.PhysicalAddressLength != 6 {
+            return Err(NeighborError::Malformed);
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&row.PhysicalAddress[..6]);
+        let link = LinkAddress::try_from(mac).map_err(|_| NeighborError::Malformed)?;
+        let family = unsafe { row.Address.si_family };
+        let ip = unsafe {
+            if family == AF_INET {
+                IpAddr::V4(Ipv4Addr::from(row.Address.Ipv4.sin_addr.S_addr.to_be()))
+            } else if family == AF_INET6 {
+                IpAddr::V6(Ipv6Addr::from(row.Address.Ipv6.sin6_addr.u.Byte))
+            } else {
+                return Err(NeighborError::Malformed);
+            }
+        };
+        if !valid_ip(ip) {
+            continue;
+        }
+        rows.push(NeighborRow::new(
+            InterfaceId::new(row.InterfaceIndex),
+            ip,
+            link,
+            map_windows_state(row.State),
+        )?);
+    }
+    rows.sort_by(|a, b| {
+        a.interface
+            .cmp(&b.interface)
+            .then(a.link_address.cmp(&b.link_address))
+            .then(a.ip.cmp(&b.ip))
+            .then(reachability_rank(a.reachability).cmp(&reachability_rank(b.reachability)))
+    });
+    rows.dedup();
+    if rows.len() > config.max_rows() {
+        return Err(NeighborError::Capacity);
+    }
+    Ok(rows)
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl NeighborSnapshotSource for SystemNeighborSnapshotSource {
+    async fn snapshot(&self) -> Result<Vec<NeighborRow>, NeighborError> {
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || windows_snapshot(&config))
+            .await
+            .map_err(|_| NeighborError::Transport)?
     }
 }
 
