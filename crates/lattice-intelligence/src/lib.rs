@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
+pub mod presence;
+
 #[derive(Clone, Debug)]
 pub struct IdentityConfig {
     pub auto_identification_threshold: f32,
