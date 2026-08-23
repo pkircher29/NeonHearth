@@ -4,10 +4,11 @@ Evidence recorded 2026-08-23 at commit `ef71911a679d714550c3fc06997ca16423b44f7e
 
 | Invariant | Exact command | Observed result |
 |---|---|---|
-| Install invariant | `cargo test --workspace --locked` | PASS: 33 passed, 0 failed |
+| Install invariant | `cargo test --workspace --locked` | PASS: 34 passed, 0 failed |
 | API auth | `cargo test -p lattice-service --test api_contract --locked` | PASS: 7 passed, 0 failed |
 | WS resume/tickets | `cargo test -p lattice-service --test websocket_resume --locked` | PASS: 5 passed, 0 failed |
-| Platform paths | `cargo test -p lattice-service --test platform_contract --locked` | PASS: 3 passed, 0 failed |
+| Platform paths | `cargo test -p lattice-service --test platform_contract --locked` | PASS on Linux host: 3 passed, 0 failed; Windows path contract simulated, Windows runtime not observed |
+| Durable daemon install state | `cargo test -p lattice-service --test service_lifecycle --locked` | PASS: 2 passed, 0 failed; restart preserves install ID and first-run timestamp on Linux temp state base |
 | Frontend unprivileged scan | `rg -n "(pcap|Npcap|CAP_NET_RAW|CAP_NET_ADMIN|std::process|Command::new|TcpStream|UdpSocket)" apps/desktop/src` | PASS: 0 matches |
 | Loopback live smoke | [Linux Bash procedure](#linux-bash-live-smoke) or [Windows PowerShell procedure](#windows-powershell-live-smoke) | PASS: health 200; state without token 401; authorized state 200; `127.0.0.1:58120` LISTEN |
 

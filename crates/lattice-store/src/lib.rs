@@ -17,6 +17,19 @@ pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
         .create_if_missing(true)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
+    connect_options(options).await
+}
+
+pub async fn connect_path(path: impl AsRef<std::path::Path>) -> anyhow::Result<SqlitePool> {
+    let options = SqliteConnectOptions::new()
+        .filename(path.as_ref())
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
+    connect_options(options).await
+}
+
+async fn connect_options(options: SqliteConnectOptions) -> anyhow::Result<SqlitePool> {
     let lock_path = PathBuf::from(format!("{}.migrate.lock", options.get_filename().display()));
     let lock = tokio::task::spawn_blocking(move || {
         let file = std::fs::OpenOptions::new()

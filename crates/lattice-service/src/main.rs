@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use lattice_service::{AppState, app};
+use lattice_service::{Platform, platform_paths};
+use lattice_store::InstallRepository;
+use std::path::PathBuf;
 use tokio::net::TcpListener;
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -8,6 +12,28 @@ async fn main() -> Result<()> {
         .init();
     let token = std::env::var("LATTICE_SERVICE_TOKEN")
         .context("LATTICE_SERVICE_TOKEN must be supplied by platform secret provider")?;
+    let platform = if cfg!(target_os = "windows") {
+        Platform::Windows
+    } else {
+        Platform::Linux
+    };
+    let base = match std::env::var_os("LATTICE_STATE_BASE") {
+        Some(base) => PathBuf::from(base),
+        None if platform == Platform::Windows => PathBuf::from(
+            std::env::var_os("ProgramData").context("ProgramData is required on Windows")?,
+        ),
+        None => PathBuf::from("/var/lib"),
+    };
+    let paths = platform_paths(platform, base);
+    std::fs::create_dir_all(&paths.state_dir).context("create service state directory")?;
+    std::fs::create_dir_all(&paths.backups).context("create service backups directory")?;
+    let pool = lattice_store::connect_path(&paths.database)
+        .await
+        .context("open service database")?;
+    InstallRepository::new(pool.clone())
+        .initialize(Utc::now())
+        .await
+        .context("initialize install state")?;
     #[cfg(unix)]
     let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("register SIGTERM handler")?;
@@ -17,6 +43,7 @@ async fn main() -> Result<()> {
     axum::serve(listener, app(AppState::new(token)?))
         .with_graceful_shutdown(shutdown_signal(terminate))
         .await?;
+    drop(pool);
     Ok(())
 }
 
