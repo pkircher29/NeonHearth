@@ -95,6 +95,24 @@ pub struct FlowRepository {
     max_batch: usize,
 }
 impl FlowRepository {
+    pub(crate) async fn apply_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        changes: &[RollupChange],
+        now: DateTime<Utc>,
+    ) -> Result<(), FlowStoreError> {
+        if changes.len() > self.max_batch {
+            return Err(FlowStoreError::Capacity);
+        }
+        for c in changes {
+            match c {
+                RollupChange::Upsert(r) | RollupChange::Correction(r) => upsert(tx, r, now).await?,
+                RollupChange::Retire(r) if r.cache_only => {}
+                _ => return Err(FlowStoreError::Invalid),
+            }
+        }
+        Ok(())
+    }
     pub fn new(pool: SqlitePool, max_batch: usize) -> Result<Self, FlowStoreError> {
         if max_batch == 0 {
             return Err(FlowStoreError::Invalid);
@@ -106,19 +124,8 @@ impl FlowRepository {
         changes: &[RollupChange],
         now: DateTime<Utc>,
     ) -> Result<(), FlowStoreError> {
-        if changes.len() > self.max_batch {
-            return Err(FlowStoreError::Capacity);
-        }
         let mut tx = self.pool.begin().await?;
-        for c in changes {
-            match c {
-                RollupChange::Upsert(r) | RollupChange::Correction(r) => {
-                    upsert(&mut tx, r, now).await?
-                }
-                RollupChange::Retire(r) if r.cache_only => {}
-                _ => return Err(FlowStoreError::Invalid),
-            }
-        }
+        self.apply_in_transaction(&mut tx, changes, now).await?;
         tx.commit().await?;
         Ok(())
     }

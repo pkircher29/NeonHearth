@@ -1,5 +1,7 @@
+use crate::FlowRepository;
 use chrono::{DateTime, Utc};
 use lattice_domain::{DeviceId, EvidenceFact, EvidenceFamily, PresenceChanged, PresenceState};
+use lattice_sensor::flow::RollupChange;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, SqlitePool, Transaction};
@@ -236,6 +238,76 @@ impl M2StateRepository {
         if let Some(discovery) = &input.discovery {
             sqlx::query("INSERT INTO discovery_commits(input_hash,source,committed_at,result_summary,commit_digest) VALUES(?,?,?,?,?)").bind(discovery.input_hash.to_vec()).bind(&discovery.source).bind(discovery.committed_at.to_rfc3339()).bind(&discovery.result_summary).bind(digest).execute(&mut *tx).await?;
         }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn commit_with_flow(
+        &self,
+        input: CommitInput,
+        changes: &[RollupChange],
+        now: DateTime<Utc>,
+        flow: &FlowRepository,
+    ) -> Result<(), CheckpointError> {
+        validate_input(&self.config, &input)?;
+        let digest = logical_commit_digest(&input)?;
+        let mut tx = self.pool.begin().await?;
+        if let Some(discovery) = &input.discovery {
+            let old: Option<Vec<u8>> = sqlx::query_scalar(
+                "SELECT commit_digest FROM discovery_commits WHERE input_hash=?",
+            )
+            .bind(discovery.input_hash.to_vec())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(old) = old {
+                if old == digest {
+                    verify_idempotent_checkpoint(&mut tx, &self.config, &input).await?;
+                    tx.commit().await?;
+                    return Ok(());
+                }
+                return Err(CheckpointError::Conflict(
+                    "input hash already names a different logical commit".into(),
+                ));
+            }
+        }
+        let previous: Option<i64> =
+            sqlx::query_scalar("SELECT commit_sequence FROM state_checkpoints WHERE singleton=1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        let expected = previous.map_or(Ok(1), |v| {
+            v.checked_add(1)
+                .ok_or_else(|| CheckpointError::Conflict("sequence exhausted".into()))
+        })?;
+        if input.checkpoint.commit_sequence != expected {
+            return Err(CheckpointError::Conflict(format!(
+                "stale or out-of-order sequence: expected {expected}, got {}",
+                input.checkpoint.commit_sequence
+            )));
+        }
+        let checksum = checkpoint_checksum(&input.checkpoint);
+        let result = if let Some(previous) = previous {
+            sqlx::query("UPDATE state_checkpoints SET format_version=?,checkpoint_bytes=?,source_fingerprint=?,commit_sequence=?,written_at=?,sha256=? WHERE singleton=1 AND commit_sequence=?").bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checksum).bind(previous).execute(&mut *tx).await?
+        } else {
+            sqlx::query("INSERT INTO state_checkpoints(singleton,format_version,checkpoint_bytes,source_fingerprint,commit_sequence,written_at,sha256) VALUES(1,?,?,?,?,?,?)").bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checksum).execute(&mut *tx).await?
+        };
+        if result.rows_affected() != 1 {
+            return Err(CheckpointError::Conflict("checkpoint CAS failed".into()));
+        }
+        for d in &input.devices {
+            upsert_device(&mut tx, d).await?;
+        }
+        for e in &input.evidence {
+            insert_evidence(&mut tx, e).await?;
+        }
+        for t in input.transitions.iter().collect::<Vec<_>>() {
+            insert_transition(&mut tx, t).await?;
+        }
+        if let Some(d) = &input.discovery {
+            sqlx::query("INSERT INTO discovery_commits(input_hash,source,committed_at,result_summary,commit_digest) VALUES(?,?,?,?,?)").bind(d.input_hash.to_vec()).bind(&d.source).bind(d.committed_at.to_rfc3339()).bind(&d.result_summary).bind(digest).execute(&mut *tx).await?;
+        }
+        flow.apply_in_transaction(&mut tx, changes, now)
+            .await
+            .map_err(|e| CheckpointError::Invalid(e.to_string()))?;
         tx.commit().await?;
         Ok(())
     }
