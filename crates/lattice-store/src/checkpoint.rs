@@ -13,7 +13,8 @@ use thiserror::Error;
 
 pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_BATCH: usize = 4096;
-pub const MAX_SNAPSHOT_DEVICES: usize = 1024;
+/// Bounds the per-device snapshot follow-up reads to a small home-network page.
+pub const MAX_SNAPSHOT_DEVICES: usize = 256;
 const CURRENT_FORMAT_VERSION: i64 = 1;
 type StoredCheckpointRow = (i64, Vec<u8>, String, i64, String, Vec<u8>);
 type StoredDiscoveryRow = (
@@ -81,6 +82,8 @@ pub struct StoredEvidenceSummary {
     pub source: String,
     pub confidence: f32,
     pub observed_at: DateTime<Utc>,
+    /// The evidence expiry as recorded by the sensor, if one was supplied.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredBandwidthSummary {
@@ -347,6 +350,16 @@ impl M2StateRepository {
         limit: usize,
         after: Option<DeviceId>,
     ) -> Result<Vec<StoredDeviceSnapshot>, CheckpointError> {
+        macro_rules! corrupt_get {
+            ($row:expr, $ty:ty, $column:expr) => {
+                $row.try_get::<$ty, _>($column).map_err(|_| {
+                    CheckpointError::Corrupt(format!(
+                        "device snapshot {} has an invalid stored type",
+                        $column
+                    ))
+                })?
+            };
+        }
         if limit == 0 {
             return Err(CheckpointError::Invalid(
                 "snapshot limit must be nonzero".into(),
@@ -365,18 +378,18 @@ impl M2StateRepository {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let id =
-                DeviceId::parse(row.try_get::<String, _>("device_id")?.as_str()).map_err(|_| {
+                DeviceId::parse(corrupt_get!(row, String, "device_id").as_str()).map_err(|_| {
                     CheckpointError::Corrupt(
                         "device snapshot contains invalid device identifier".into(),
                     )
                 })?;
             let first = parse_timestamp(
-                &row.try_get::<String, _>("first_seen_at")?,
+                &corrupt_get!(row, String, "first_seen_at"),
                 "device first_seen_at",
                 CheckpointError::Corrupt,
             )?;
             let last = parse_timestamp(
-                &row.try_get::<String, _>("last_seen_at")?,
+                &corrupt_get!(row, String, "last_seen_at"),
                 "device last_seen_at",
                 CheckpointError::Corrupt,
             )?;
@@ -385,7 +398,7 @@ impl M2StateRepository {
                     "device first_seen_at is after last_seen_at".into(),
                 ));
             }
-            let owner_confirmed: i64 = row.try_get("owner_confirmed")?;
+            let owner_confirmed: i64 = corrupt_get!(row, i64, "owner_confirmed");
             let owner_confirmed = match owner_confirmed {
                 0 => false,
                 1 => true,
@@ -395,14 +408,14 @@ impl M2StateRepository {
                     ));
                 }
             };
-            let owner_name: Option<String> = row.try_get("owner_name")?;
-            let owner_type: Option<String> = row.try_get("owner_type")?;
+            let owner_name: Option<String> = corrupt_get!(row, Option<String>, "owner_name");
+            let owner_type: Option<String> = corrupt_get!(row, Option<String>, "owner_type");
             if owner_name
                 .as_ref()
-                .is_some_and(|v| v.len() > self.config.max_string_bytes)
+                .is_some_and(|v| v.is_empty() || v.len() > self.config.max_string_bytes)
                 || owner_type
                     .as_ref()
-                    .is_some_and(|v| v.len() > self.config.max_string_bytes)
+                    .is_some_and(|v| v.is_empty() || v.len() > self.config.max_string_bytes)
             {
                 return Err(CheckpointError::Corrupt(
                     "owner string exceeds configured bound".into(),
@@ -411,14 +424,14 @@ impl M2StateRepository {
             let presence_row = sqlx::query("SELECT to_state,occurred_at,trigger_source,trigger_kind FROM presence_transitions WHERE device_id=? ORDER BY occurred_at DESC,transition_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
             let presence = if let Some(r) = presence_row {
                 Some(StoredPresenceSummary {
-                    to_state: parse_presence_state(&r.try_get::<String, _>("to_state")?)?,
+                    to_state: parse_presence_state(&corrupt_get!(r, String, "to_state"))?,
                     occurred_at: parse_timestamp(
-                        &r.try_get::<String, _>("occurred_at")?,
+                        &corrupt_get!(r, String, "occurred_at"),
                         "presence occurred_at",
                         CheckpointError::Corrupt,
                     )?,
-                    trigger_source: r.try_get("trigger_source")?,
-                    trigger_kind: r.try_get("trigger_kind")?,
+                    trigger_source: corrupt_get!(r, String, "trigger_source"),
+                    trigger_kind: corrupt_get!(r, String, "trigger_kind"),
                 })
                 .map(|p| {
                     if p.trigger_source.is_empty()
@@ -436,17 +449,23 @@ impl M2StateRepository {
             } else {
                 None
             };
-            let evidence_row = sqlx::query("SELECT family,source,confidence,observed_at FROM evidence WHERE device_id=? ORDER BY confidence DESC,observed_at DESC,evidence_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
+            let evidence_row = sqlx::query("SELECT family,source,confidence,observed_at,expires_at FROM evidence WHERE device_id=? ORDER BY confidence DESC,observed_at DESC,evidence_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
             let evidence = if let Some(r) = evidence_row {
                 Some(StoredEvidenceSummary {
-                    family: parse_evidence_family(&r.try_get::<String, _>("family")?)?,
-                    source: r.try_get("source")?,
-                    confidence: checked_confidence(r.try_get("confidence")?)?,
+                    family: parse_evidence_family(&corrupt_get!(r, String, "family"))?,
+                    source: corrupt_get!(r, String, "source"),
+                    confidence: checked_confidence(corrupt_get!(r, f64, "confidence"))?,
                     observed_at: parse_timestamp(
-                        &r.try_get::<String, _>("observed_at")?,
+                        &corrupt_get!(r, String, "observed_at"),
                         "evidence observed_at",
                         CheckpointError::Corrupt,
                     )?,
+                    expires_at: corrupt_get!(r, Option<String>, "expires_at")
+                        .as_deref()
+                        .map(|value| {
+                            parse_timestamp(value, "evidence expires_at", CheckpointError::Corrupt)
+                        })
+                        .transpose()?,
                 })
                 .map(|e| {
                     if e.source.is_empty() || e.source.len() > self.config.max_string_bytes {
@@ -465,7 +484,7 @@ impl M2StateRepository {
                 None
             } else {
                 let bucket = parse_timestamp(
-                    &flows[0].try_get::<String, _>("bucket")?,
+                    &corrupt_get!(flows[0], String, "bucket"),
                     "flow bucket",
                     CheckpointError::Corrupt,
                 )?;
@@ -473,13 +492,23 @@ impl M2StateRepository {
                 let mut down = 0u64;
                 let mut cov = None;
                 for r in flows {
+                    let row_bucket = parse_timestamp(
+                        &corrupt_get!(r, String, "bucket"),
+                        "flow bucket",
+                        CheckpointError::Corrupt,
+                    )?;
+                    if row_bucket != bucket {
+                        return Err(CheckpointError::Corrupt(
+                            "flow row is outside selected bucket".into(),
+                        ));
+                    }
                     up = up
-                        .checked_add(i64_to_u64(r.try_get("upload")?)?)
+                        .checked_add(i64_to_u64(corrupt_get!(r, i64, "upload"))?)
                         .ok_or_else(|| CheckpointError::Corrupt("flow upload overflow".into()))?;
                     down = down
-                        .checked_add(i64_to_u64(r.try_get("download")?)?)
+                        .checked_add(i64_to_u64(corrupt_get!(r, i64, "download"))?)
                         .ok_or_else(|| CheckpointError::Corrupt("flow download overflow".into()))?;
-                    let c = parse_coverage(&r.try_get::<String, _>("coverage")?)?;
+                    let c = parse_coverage(&corrupt_get!(r, String, "coverage"))?;
                     if cov.is_some_and(|x| x != c) {
                         cov = Some(Coverage::Estimated)
                     } else if cov.is_none() {
