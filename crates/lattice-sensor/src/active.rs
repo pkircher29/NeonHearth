@@ -1124,7 +1124,6 @@ fn pin_socket_to_interface<S: std::os::windows::io::AsRawSocket>(
     binding: AuthorizedBinding,
 ) -> Result<(), ActiveError> {
     use std::mem::size_of;
-    use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
         IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET_ERROR, getsockopt,
         setsockopt,

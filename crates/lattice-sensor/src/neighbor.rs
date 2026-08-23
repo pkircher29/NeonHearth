@@ -6,9 +6,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 #[cfg(windows)]
 use std::mem::size_of;
-#[cfg(windows)]
-use std::net::Ipv6Addr;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -220,6 +218,82 @@ pub trait NeighborSnapshotSource: Send + Sync {
     async fn snapshot(&self) -> Result<Vec<NeighborRow>, NeighborError>;
 }
 
+#[derive(Clone, Debug)]
+struct RawNeighborRow {
+    ifindex: u32,
+    family: u16,
+    address: [u8; 16],
+    mac: Vec<u8>,
+    state: u32,
+}
+fn normalize_raw_rows(
+    config: &NeighborSnapshotConfig,
+    raw: impl IntoIterator<Item = RawNeighborRow>,
+) -> Result<Vec<NeighborRow>, NeighborError> {
+    let mut rows = Vec::new();
+    let mut count = 0usize;
+    for r in raw {
+        count = count.checked_add(1).ok_or(NeighborError::Capacity)?;
+        if count > config.max_raw_messages() {
+            return Err(NeighborError::Capacity);
+        }
+        if r.ifindex == 0
+            || !config
+                .allowed_interfaces()
+                .contains(&InterfaceId::new(r.ifindex))
+        {
+            continue;
+        }
+        if r.mac.len() != 6 {
+            return Err(NeighborError::Malformed);
+        }
+        let mut mac = [0; 6];
+        mac.copy_from_slice(&r.mac);
+        let link = LinkAddress::try_from(mac).map_err(|_| NeighborError::Malformed)?;
+        let ip = match r.family {
+            2 => IpAddr::V4(Ipv4Addr::from([
+                r.address[0],
+                r.address[1],
+                r.address[2],
+                r.address[3],
+            ])),
+            23 => IpAddr::V6(Ipv6Addr::from(r.address)),
+            _ => return Err(NeighborError::Malformed),
+        };
+        if !valid_ip(ip) {
+            continue;
+        }
+        let reach = match r.state {
+            5 => NeighborReachability::Reachable,
+            6 => NeighborReachability::Stale,
+            7 => NeighborReachability::Delay,
+            8 => NeighborReachability::Probe,
+            9 => NeighborReachability::Permanent,
+            3 => NeighborReachability::Incomplete,
+            4 => NeighborReachability::Failed,
+            _ => NeighborReachability::Unknown,
+        };
+        rows.push(NeighborRow::new(
+            InterfaceId::new(r.ifindex),
+            ip,
+            link,
+            reach,
+        )?);
+    }
+    rows.sort_by(|a, b| {
+        a.interface
+            .cmp(&b.interface)
+            .then(a.link_address.cmp(&b.link_address))
+            .then(a.ip.cmp(&b.ip))
+            .then(reachability_rank(a.reachability).cmp(&reachability_rank(b.reachability)))
+    });
+    rows.dedup();
+    if rows.len() > config.max_rows() {
+        return Err(NeighborError::Capacity);
+    }
+    Ok(rows)
+}
+
 #[cfg(target_os = "linux")]
 pub struct SystemNeighborSnapshotSource {
     config: NeighborSnapshotConfig,
@@ -300,6 +374,12 @@ fn windows_snapshot(config: &NeighborSnapshotConfig) -> Result<Vec<NeighborRow>,
     let mut table: *mut MIB_IPNET_TABLE2 = std::ptr::null_mut();
     // SAFETY: table is an out-pointer initialized to null; successful non-null allocations are owned by guard.
     let rc = unsafe { GetIpNetTable2(AF_UNSPEC, &mut table) };
+    if rc != ERROR_SUCCESS {
+        return Err(NeighborError::Transport);
+    }
+    if table.is_null() {
+        return Err(NeighborError::Malformed);
+    }
     struct Guard(*mut MIB_IPNET_TABLE2);
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -309,12 +389,6 @@ fn windows_snapshot(config: &NeighborSnapshotConfig) -> Result<Vec<NeighborRow>,
         }
     }
     let _guard = Guard(table);
-    if rc != ERROR_SUCCESS {
-        return Err(NeighborError::Transport);
-    }
-    if table.is_null() {
-        return Err(NeighborError::Malformed);
-    }
     let count = unsafe { (*table).NumEntries as usize };
     if count > config.max_raw_messages()
         || count > isize::MAX as usize / size_of::<MIB_IPNET_ROW2>()
@@ -342,7 +416,9 @@ fn windows_snapshot(config: &NeighborSnapshotConfig) -> Result<Vec<NeighborRow>,
         let family = unsafe { row.Address.si_family };
         let ip = unsafe {
             if family == AF_INET {
-                IpAddr::V4(Ipv4Addr::from(row.Address.Ipv4.sin_addr.S_addr.to_be()))
+                IpAddr::V4(Ipv4Addr::from(
+                    unsafe { row.Address.Ipv4.sin_addr.S_un.S_addr }.to_be(),
+                ))
             } else if family == AF_INET6 {
                 IpAddr::V6(Ipv6Addr::from(row.Address.Ipv6.sin6_addr.u.Byte))
             } else {
@@ -696,6 +772,51 @@ impl NeighborTracker {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn raw(
+        ifindex: u32,
+        family: u16,
+        address: [u8; 16],
+        mac: Vec<u8>,
+        state: u32,
+    ) -> RawNeighborRow {
+        RawNeighborRow {
+            ifindex,
+            family,
+            address,
+            mac,
+            state,
+        }
+    }
+    #[test]
+    fn windows_neutral_decoder_is_bounded_deterministic_and_redacted() {
+        let c = NeighborSnapshotConfig::new(2, [InterfaceId::new(2)]).unwrap();
+        let mut a = [0; 16];
+        a[..4].copy_from_slice(&[192, 168, 1, 2]);
+        let r = raw(2, 2, a, vec![2, 0, 0, 0, 0, 1], 5);
+        let rows = normalize_raw_rows(&c, [r.clone(), r.clone()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ip(), "192.168.1.2".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            normalize_raw_rows(&c, [raw(0, 2, a, vec![2, 0, 0, 0, 0, 1], 5)])
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            normalize_raw_rows(&c, [raw(2, 99, a, vec![2, 0, 0, 0, 0, 1], 5)]),
+            Err(NeighborError::Malformed)
+        );
+        assert_eq!(
+            normalize_raw_rows(&c, [raw(2, 2, a, vec![1, 2], 5)]),
+            Err(NeighborError::Malformed)
+        );
+        assert!(!format!("{:?}", NeighborError::Malformed).contains("192.168"));
+        assert_eq!(
+            normalize_raw_rows(&c, std::iter::repeat_n(r, c.max_raw_messages() + 1)),
+            Err(NeighborError::Capacity)
+        );
+    }
 
     #[cfg(target_os = "linux")]
     use netlink_packet_route::neighbour::{
