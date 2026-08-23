@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+pub mod platform;
 mod state;
 pub mod ws;
 use axum::{
@@ -9,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+pub use platform::{Platform, PlatformPaths, platform_paths};
 use serde::Deserialize;
 pub use state::{AppState, InvalidServiceToken};
 pub fn app(state: AppState) -> Router {
