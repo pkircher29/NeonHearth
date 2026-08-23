@@ -179,6 +179,7 @@ impl M2StateRepository {
             || config.max_batch == 0
             || config.max_string_bytes == 0
             || config.max_snapshot_devices == 0
+            || config.max_snapshot_devices > MAX_SNAPSHOT_DEVICES
         {
             return Err(CheckpointError::Invalid(
                 "all M2 state limits must be nonzero".into(),
@@ -365,7 +366,7 @@ impl M2StateRepository {
                 "snapshot limit must be nonzero".into(),
             ));
         }
-        if limit > self.config.max_snapshot_devices {
+        if limit > self.config.max_snapshot_devices || limit > MAX_SNAPSHOT_DEVICES {
             return Err(CheckpointError::Capacity(
                 "snapshot limit exceeds configured bound".into(),
             ));
@@ -377,12 +378,17 @@ impl M2StateRepository {
         };
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let id =
-                DeviceId::parse(corrupt_get!(row, String, "device_id").as_str()).map_err(|_| {
-                    CheckpointError::Corrupt(
-                        "device snapshot contains invalid device identifier".into(),
-                    )
-                })?;
+            let raw_device_id = corrupt_get!(row, String, "device_id");
+            let id = DeviceId::parse(raw_device_id.as_str()).map_err(|_| {
+                CheckpointError::Corrupt(
+                    "device snapshot contains invalid device identifier".into(),
+                )
+            })?;
+            if raw_device_id != id.to_string() {
+                return Err(CheckpointError::Corrupt(
+                    "device snapshot contains noncanonical device identifier".into(),
+                ));
+            }
             let first = parse_timestamp(
                 &corrupt_get!(row, String, "first_seen_at"),
                 "device first_seen_at",

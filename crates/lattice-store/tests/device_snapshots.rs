@@ -1,6 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use lattice_domain::{Coverage, DeviceId, EvidenceFamily, PresenceState};
-use lattice_store::{CheckpointError, M2StateConfig, M2StateRepository, connect_path};
+use lattice_store::{
+    CheckpointError, M2StateConfig, M2StateRepository, MAX_SNAPSHOT_DEVICES, connect_path,
+};
 use tempfile::tempdir;
 
 fn at(second: i64) -> DateTime<Utc> {
@@ -55,6 +57,23 @@ async fn snapshot_limits_order_keyset_and_reopen_are_stable() -> anyhow::Result<
         repo.list_device_snapshots(4, None).await,
         Err(CheckpointError::Capacity(_))
     ));
+    let default_repo = M2StateRepository::new(pool.clone());
+    assert!(
+        default_repo
+            .list_device_snapshots(MAX_SNAPSHOT_DEVICES, None)
+            .await?
+            .is_empty()
+    );
+    assert!(matches!(
+        M2StateRepository::with_config(
+            pool.clone(),
+            M2StateConfig {
+                max_snapshot_devices: MAX_SNAPSHOT_DEVICES + 1,
+                ..Default::default()
+            }
+        ),
+        Err(CheckpointError::Invalid(_))
+    ));
     let [a, b, c] = ids();
     for device in [&c, &a, &b] {
         insert_device(&pool, device, 10, 20).await?;
@@ -90,6 +109,26 @@ async fn snapshot_limits_order_keyset_and_reopen_are_stable() -> anyhow::Result<
             .collect::<Vec<_>>(),
         joined
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_rejects_parseable_noncanonical_device_ids_before_keyset_pagination()
+-> anyhow::Result<()> {
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool.clone());
+    let [first, _, last] = ids();
+    insert_device(&pool, &first, 1, 2).await?;
+    insert_device(&pool, &last, 1, 2).await?;
+    let noncanonical = format!("{{{last}}}");
+    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at) VALUES(?,?,?)")
+        .bind(&noncanonical)
+        .bind(at(1).to_rfc3339())
+        .bind(at(2).to_rfc3339())
+        .execute(&pool)
+        .await?;
+    corrupt(repo.list_device_snapshots(3, None).await);
+    corrupt(repo.list_device_snapshots(3, Some(first)).await);
     Ok(())
 }
 
