@@ -93,12 +93,18 @@ async fn daemon_restart_preserves_install_state() {
     ));
     wait_ready(first.child_mut()).await;
     stop(&mut first).await;
+    let state_dir = base.path().join("neonhearth");
     let db = base.path().join("neonhearth/lattice.db");
+    assert!(state_dir.is_dir());
+    assert!(state_dir.join("backups").is_dir());
+    assert!(db.is_file());
+    assert!(state_dir.join("lattice.db.migrate.lock").is_file());
     let pool = lattice_store::connect_path(&db).await.unwrap();
     let before = lattice_store::InstallRepository::new(pool)
-        .initialize(chrono::Utc::now())
+        .load()
         .await
-        .unwrap();
+        .unwrap()
+        .expect("daemon must seed install state");
 
     let mut second = ChildGuard(Some(
         Command::new(env!("CARGO_BIN_EXE_lattice-service"))
@@ -113,11 +119,13 @@ async fn daemon_restart_preserves_install_state() {
     stop(&mut second).await;
     let pool = lattice_store::connect_path(&db).await.unwrap();
     let after = lattice_store::InstallRepository::new(pool)
-        .initialize(chrono::Utc::now())
+        .load()
         .await
-        .unwrap();
+        .unwrap()
+        .expect("install state must persist");
     assert_eq!(before.install_id, after.install_id);
     assert_eq!(before.first_run_at, after.first_run_at);
+    assert_eq!(before.schema_version, after.schema_version);
 }
 
 async fn wait_ready(child: &mut Child) {
