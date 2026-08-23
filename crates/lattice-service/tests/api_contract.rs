@@ -29,7 +29,15 @@ async fn health_is_public_and_reports_v1() {
 
 #[tokio::test]
 async fn snapshot_requires_exact_bearer_token() {
-    for auth in [None, Some("Bearer wrong"), Some("Basic owner-token")] {
+    for auth in [
+        None,
+        Some("Bearer wrong"),
+        Some("Basic owner-token-0123456789abcdefghijkl"),
+        Some("Bearer "),
+        Some("Bearer"),
+        Some("bearer owner-token-0123456789abcdefghijkl"),
+        Some(" Bearer owner-token-0123456789abcdefghijkl"),
+    ] {
         let mut request = Request::get("/api/v1/state");
         if let Some(auth) = auth {
             request = request.header("authorization", auth);
@@ -46,6 +54,24 @@ async fn snapshot_requires_exact_bearer_token() {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert!(!String::from_utf8_lossy(&bytes).contains("owner-token"));
     }
+    let mut duplicate = Request::get("/api/v1/state").body(Body::empty()).unwrap();
+    duplicate.headers_mut().append(
+        "authorization",
+        "Bearer owner-token-0123456789abcdefghijkl".parse().unwrap(),
+    );
+    duplicate.headers_mut().append(
+        "authorization",
+        "Bearer owner-token-0123456789abcdefghijkl".parse().unwrap(),
+    );
+    let response = app(AppState::new(TOKEN).expect("valid token"))
+        .oneshot(duplicate)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers().get("www-authenticate").unwrap(),
+        "Bearer"
+    );
     let response = app(AppState::new(TOKEN).expect("valid token"))
         .oneshot(
             Request::get("/api/v1/state")
