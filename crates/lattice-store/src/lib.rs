@@ -1,9 +1,11 @@
 //! Persistence interfaces and implementations for NeonHearth.
 
+mod checkpoint;
 mod flow;
 mod install;
 
 use anyhow::Context;
+pub use checkpoint::*;
 pub use flow::{CompactionPolicy, FlowIngestor, FlowRepository, FlowStoreError};
 use fs2::FileExt;
 pub use install::{InstallRepository, InstallState};
