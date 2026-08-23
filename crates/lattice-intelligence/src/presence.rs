@@ -350,6 +350,21 @@ impl PresenceEngine {
                     return Err(PresenceError::InvalidCheckpoint("evidence time"));
                 }
             }
+            let (blocked, enforcement_clock) = control_state(
+                &x.evidence,
+                PresenceEvidenceKind::EnforcementBlocked,
+                PresenceEvidenceKind::EnforcementUnblocked,
+            );
+            let (impaired, impairment_clock) = control_state(
+                &x.evidence,
+                PresenceEvidenceKind::SensorImpaired,
+                PresenceEvidenceKind::SensorRecovered,
+            );
+            let (contradictory, contradiction_clock) = control_state(
+                &x.evidence,
+                PresenceEvidenceKind::Contradiction,
+                PresenceEvidenceKind::ContradictionCleared,
+            );
             if x.evicted_through.is_some_and(|v| v >= c.next_transition)
                 || x.evicted_through
                     .zip(x.history.first().map(|t| t.transition_id))
@@ -357,15 +372,9 @@ impl PresenceEngine {
             {
                 return Err(PresenceError::InvalidCheckpoint("cursor"));
             }
-            if x.blocked && x.enforcement_clock.is_none()
-                || x.impaired && x.impairment_clock.is_none()
-                || x.contradictory && x.contradiction_clock.is_none()
-                || x.enforcement_clock
-                    .is_some_and(|clock| clock > x.last_evaluation)
-                || x.impairment_clock
-                    .is_some_and(|clock| clock > x.last_evaluation)
-                || x.contradiction_clock
-                    .is_some_and(|clock| clock > x.last_evaluation)
+            if (x.blocked, x.enforcement_clock) != (blocked, enforcement_clock)
+                || (x.impaired, x.impairment_clock) != (impaired, impairment_clock)
+                || (x.contradictory, x.contradiction_clock) != (contradictory, contradiction_clock)
             {
                 return Err(PresenceError::InvalidCheckpoint("control state"));
             }
@@ -374,7 +383,13 @@ impl PresenceEngine {
                     transition.trigger.kind,
                     PresenceEvidenceKind::EnforcementBlocked
                         | PresenceEvidenceKind::EnforcementUnblocked
-                ) && x.enforcement_clock.is_none()
+                ) && !x.evidence.iter().any(|e| {
+                    e.source == transition.trigger.source
+                        && e.kind == transition.trigger.kind
+                        && e.observed_at == transition.trigger.observed_at
+                        && e.valid_until == transition.trigger.valid_until
+                        && e.observed_at <= enforcement_clock.unwrap_or(e.observed_at)
+                })
             }) {
                 return Err(PresenceError::InvalidCheckpoint("enforcement trigger"));
             }
@@ -591,6 +606,7 @@ impl PresenceEngine {
             if retain_input && (!late || current_valid || !is_positive(e.kind)) {
                 d.evidence.push(e.clone());
                 sort_evidence(&mut d.evidence);
+                prune_control_evidence(&mut d.evidence);
             }
             (
                 correct.map(|(dep, target)| (dep.transition_id, target)),
@@ -832,6 +848,12 @@ fn stale_control_at(
 
 fn semantically_retained(e: &PresenceEvidence, arrival: DateTime<Utc>, c: &PresenceConfig) -> bool {
     match e.kind {
+        PresenceEvidenceKind::EnforcementBlocked
+        | PresenceEvidenceKind::EnforcementUnblocked
+        | PresenceEvidenceKind::SensorImpaired
+        | PresenceEvidenceKind::SensorRecovered
+        | PresenceEvidenceKind::Contradiction
+        | PresenceEvidenceKind::ContradictionCleared => true,
         PresenceEvidenceKind::Lease
         | PresenceEvidenceKind::RouterAssociation
         | PresenceEvidenceKind::ProbeSuccess
@@ -843,6 +865,48 @@ fn semantically_retained(e: &PresenceEvidence, arrival: DateTime<Utc>, c: &Prese
             arrival.signed_duration_since(e.observed_at) <= c.confirmation_window
         }
         _ => arrival.signed_duration_since(e.observed_at) <= c.retention,
+    }
+}
+fn control_state(
+    evidence: &[PresenceEvidence],
+    active: PresenceEvidenceKind,
+    inactive: PresenceEvidenceKind,
+) -> (bool, Option<DateTime<Utc>>) {
+    let Some(clock) = evidence
+        .iter()
+        .filter(|e| matches!(e.kind, kind if kind == active || kind == inactive))
+        .map(|e| e.observed_at)
+        .max()
+    else {
+        return (false, None);
+    };
+    (
+        evidence
+            .iter()
+            .any(|e| e.kind == active && e.observed_at == clock),
+        Some(clock),
+    )
+}
+fn control_family(kind: PresenceEvidenceKind) -> Option<u8> {
+    match kind {
+        PresenceEvidenceKind::EnforcementBlocked | PresenceEvidenceKind::EnforcementUnblocked => {
+            Some(0)
+        }
+        PresenceEvidenceKind::SensorImpaired | PresenceEvidenceKind::SensorRecovered => Some(1),
+        PresenceEvidenceKind::Contradiction | PresenceEvidenceKind::ContradictionCleared => Some(2),
+        _ => None,
+    }
+}
+fn prune_control_evidence(evidence: &mut Vec<PresenceEvidence>) {
+    for family in 0..3 {
+        let latest = evidence
+            .iter()
+            .filter(|e| control_family(e.kind) == Some(family))
+            .map(|e| e.observed_at)
+            .max();
+        evidence.retain(|e| {
+            control_family(e.kind) != Some(family) || latest.is_none_or(|at| e.observed_at == at)
+        });
     }
 }
 fn candidate(d: &DevicePresence, at: DateTime<Utc>, c: &PresenceConfig) -> PresenceState {

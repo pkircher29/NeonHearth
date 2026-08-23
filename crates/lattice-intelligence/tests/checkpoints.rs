@@ -248,6 +248,17 @@ fn presence_checkpoint_restores_offline_state_and_monotonic_next_transition() {
 }
 
 #[test]
+fn presence_checkpoint_json_is_deterministic() {
+    let mut engine = PresenceEngine::new(presence_config()).unwrap();
+    online_then_offline(&mut engine, id(2));
+    online_then_offline(&mut engine, id(1));
+    assert_eq!(
+        serde_json::to_string(&engine.checkpoint()).unwrap(),
+        serde_json::to_string(&engine.checkpoint()).unwrap()
+    );
+}
+
+#[test]
 fn presence_checkpoint_restores_late_correction_for_exact_departure() {
     let mut engine = PresenceEngine::new(presence_config()).unwrap();
     let departure = online_then_offline(&mut engine, id(1));
@@ -308,6 +319,15 @@ fn presence_checkpoint_rejects_invalid_trigger_flags_and_cursor() {
     online_then_offline(&mut engine, id(1));
     let mut checkpoint = engine.checkpoint();
     checkpoint.devices[0].history[0].trigger.kind = PresenceEvidenceKind::EnforcementBlocked;
+    assert!(PresenceEngine::from_checkpoint(presence_config(), checkpoint).is_err());
+
+    let mut engine = PresenceEngine::new(presence_config()).unwrap();
+    online_then_offline(&mut engine, id(1));
+    engine
+        .record_verified_enforcement(id(1), true, "sensor-a", at(14), at(14))
+        .unwrap();
+    let mut checkpoint = engine.checkpoint();
+    checkpoint.devices[0].blocked = false;
     assert!(PresenceEngine::from_checkpoint(presence_config(), checkpoint).is_err());
 
     let mut engine = PresenceEngine::new(presence_config()).unwrap();
@@ -382,5 +402,62 @@ fn presence_checkpoint_preserves_per_device_eviction_boundary() {
     assert_eq!(
         restored.domain_events_since(id(1), evicted - 1),
         Err(PresenceError::CursorExpired)
+    );
+}
+
+#[test]
+fn presence_checkpoint_eviction_keeps_devices_and_cursors_independent() {
+    let mut engine = PresenceEngine::new(presence_config()).unwrap();
+    let d1_departure = online_then_offline(&mut engine, id(1));
+    let d2_departure = online_then_offline(&mut engine, id(2));
+    let corrections = engine
+        .ingest_events(
+            PresenceEvidence {
+                device_id: id(1),
+                source: "sensor-a".into(),
+                kind: PresenceEvidenceKind::Lease,
+                observed_at: at(10),
+                valid_until: Some(at(30)),
+            },
+            at(14),
+        )
+        .unwrap();
+    assert!(
+        corrections
+            .iter()
+            .any(|transition| transition.correction_of == Some(d1_departure))
+    );
+    let d1_live = engine
+        .record_verified_enforcement(id(1), true, "sensor-a", at(15), at(15))
+        .unwrap()
+        .unwrap();
+    let restored = PresenceEngine::from_checkpoint(presence_config(), engine.checkpoint()).unwrap();
+    assert_eq!(
+        restored.domain_events_since(id(1), d1_departure),
+        Err(PresenceError::CursorExpired)
+    );
+    assert_eq!(
+        restored
+            .domain_events_since(id(1), d1_live.transition_id - 1)
+            .unwrap()
+            .iter()
+            .map(|event| event.transition_id)
+            .collect::<Vec<_>>(),
+        vec![d1_live.transition_id]
+    );
+    assert!(
+        restored
+            .domain_events_since(id(1), d1_live.transition_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        restored
+            .domain_events_since(id(2), 0)
+            .unwrap()
+            .iter()
+            .map(|event| event.transition_id)
+            .collect::<Vec<_>>(),
+        vec![d2_departure - 1, d2_departure]
     );
 }
