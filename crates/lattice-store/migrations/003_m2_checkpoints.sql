@@ -15,6 +15,11 @@ CREATE TABLE presence_transitions (
 CREATE INDEX presence_transitions_device_time_idx ON presence_transitions(device_id, occurred_at DESC);
 CREATE TABLE discovery_commits (
  input_hash BLOB PRIMARY KEY CHECK(length(input_hash)=32), source TEXT NOT NULL,
- committed_at TEXT NOT NULL, result_summary BLOB NOT NULL
+ committed_at TEXT NOT NULL, result_summary BLOB NOT NULL,
+ commit_digest BLOB NOT NULL CHECK(length(commit_digest)=32)
 );
 CREATE INDEX discovery_commits_time_idx ON discovery_commits(committed_at DESC);
+CREATE UNIQUE INDEX evidence_semantic_identity_idx ON evidence
+ (device_id, family, source, fact_key, fact_value, confidence, observed_at,
+  COALESCE(expires_at, ''), owner_confirmed);
+UPDATE install_state SET schema_version=3 WHERE singleton=1 AND schema_version<3;
