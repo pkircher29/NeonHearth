@@ -1,7 +1,8 @@
 use chrono::{TimeZone, Utc};
-use lattice_domain::{Coverage, DeviceId};
+use lattice_domain::DeviceId;
 use lattice_sensor::flow::{
-    DestinationCategory, FlowEngine, FlowEngineConfig, FlowObservation, Protocol, SourceKind,
+    DestinationCategory, FlowEngine, FlowEngineConfig, FlowObservation, FlowSourceId, Protocol,
+    SourceRegistration, VisibilityKind,
 };
 
 fn device(n: u8) -> DeviceId {
@@ -17,18 +18,23 @@ fn obs(id: u64, sec: i64, bytes: u64) -> FlowObservation {
         protocol: Protocol::Tcp,
         destination: DestinationCategory::Internet,
         interface: 2,
-        source: SourceKind::CollectorCapture,
-        coverage: Coverage::LocalOnly,
+        source: FlowSourceId(1),
     }
 }
 
 #[test]
 fn seconds_and_minutes_conserve_bytes_and_are_deterministic() {
     let mut e = FlowEngine::new(FlowEngineConfig::default()).unwrap();
+    e.register_source(SourceRegistration {
+        id: FlowSourceId(1),
+        kind: VisibilityKind::CollectorLocal,
+        verified: true,
+    })
+    .unwrap();
     e.observe(obs(1, 100, 3)).unwrap();
     e.observe(obs(2, 101, 4)).unwrap();
     let out = e
-        .finalize_until(Utc.timestamp_opt(160, 0).unwrap())
+        .advance_watermark(Utc.timestamp_opt(160, 0).unwrap())
         .unwrap();
     assert_eq!(out.seconds.iter().map(|r| r.bytes.upload).sum::<u64>(), 7);
     assert_eq!(out.minutes.iter().map(|r| r.bytes.upload).sum::<u64>(), 7);
@@ -38,8 +44,14 @@ fn seconds_and_minutes_conserve_bytes_and_are_deterministic() {
 #[test]
 fn rejects_unverified_source_and_replay_atomically() {
     let mut e = FlowEngine::new(FlowEngineConfig::default()).unwrap();
+    e.register_source(SourceRegistration {
+        id: FlowSourceId(1),
+        kind: VisibilityKind::CollectorLocal,
+        verified: true,
+    })
+    .unwrap();
     let mut x = obs(1, 100, 3);
-    x.source = SourceKind::Inferred;
+    x.source = FlowSourceId(99);
     assert!(e.observe(x).is_err());
     assert!(e.observe(obs(1, 100, 3)).is_ok());
     assert!(e.observe(obs(1, 100, 3)).is_err());

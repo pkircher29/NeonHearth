@@ -1,43 +1,39 @@
-//! Bounded deterministic byte-flow aggregation. Inputs contain categories only;
-//! packet bodies and destination addresses are intentionally not represented.
+//! Bounded event-time flow rollups; source verification is engine-owned.
 use chrono::{DateTime, Duration, Utc};
 use lattice_domain::{ByteCount, Coverage, DeviceId};
-use std::collections::{BTreeMap, BTreeSet};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum Protocol {
     Tcp,
     Udp,
     Icmp,
     Other,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum DestinationCategory {
     Local,
     Lan,
     Internet,
     Unknown,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SourceKind {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct FlowSourceId(pub u64);
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum VisibilityKind {
     VerifiedGateway,
     VerifiedMirror,
     VerifiedRouterCounter,
-    CollectorCapture,
-    Inferred,
+    CollectorLocal,
+    ConfiguredInference,
 }
-impl SourceKind {
-    fn coverage(self) -> Result<Coverage, FlowError> {
-        Ok(match self {
-            Self::VerifiedGateway | Self::VerifiedMirror => Coverage::Complete,
-            Self::VerifiedRouterCounter => Coverage::RouterReported,
-            Self::CollectorCapture => Coverage::LocalOnly,
-            Self::Inferred => return Err(FlowError::UnverifiedSource),
-        })
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRegistration {
+    pub id: FlowSourceId,
+    pub kind: VisibilityKind,
+    pub verified: bool,
 }
-
 #[derive(Clone, Debug)]
 pub struct FlowObservation {
     pub observation_id: u64,
@@ -48,13 +44,14 @@ pub struct FlowObservation {
     pub protocol: Protocol,
     pub destination: DestinationCategory,
     pub interface: u32,
-    pub source: SourceKind,
-    pub coverage: Coverage,
+    pub source: FlowSourceId,
 }
 #[derive(Clone, Debug)]
 pub struct FlowEngineConfig {
     pub lateness: Duration,
+    pub future_skew: Duration,
     pub max_devices: usize,
+    pub max_sources: usize,
     pub max_open_buckets: usize,
     pub max_observation_ids: usize,
     pub max_work: usize,
@@ -63,7 +60,9 @@ impl Default for FlowEngineConfig {
     fn default() -> Self {
         Self {
             lateness: Duration::seconds(5),
+            future_skew: Duration::seconds(5),
             max_devices: 1024,
+            max_sources: 64,
             max_open_buckets: 4096,
             max_observation_ids: 8192,
             max_work: 10000,
@@ -72,29 +71,22 @@ impl Default for FlowEngineConfig {
 }
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum FlowError {
-    #[error("unverified source")]
-    UnverifiedSource,
-    #[error("replay or observation capacity")]
+    #[error("invalid configuration")]
+    Config,
+    #[error("unknown or unverified source")]
+    Source,
+    #[error("replay")]
     Replay,
     #[error("too late")]
     TooLate,
-    #[error("future skew or clock rollback")]
+    #[error("watermark time invalid")]
     Time,
     #[error("capacity")]
     Capacity,
-    #[error("byte overflow")]
+    #[error("overflow")]
     Overflow,
-    #[error("invalid coverage")]
-    Coverage,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct Key {
-    device_order: String,
-    protocol: Protocol,
-    destination: DestinationCategory,
-    interface: u32,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct Rollup {
     pub bucket: DateTime<Utc>,
     pub device_id: DeviceId,
@@ -104,93 +96,122 @@ pub struct Rollup {
     pub bytes: ByteCount,
     pub coverage: Coverage,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Finalized {
     pub seconds: Vec<Rollup>,
     pub minutes: Vec<Rollup>,
     pub hours: Vec<Rollup>,
 }
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct Key {
+    d: String,
+    p: Protocol,
+    c: DestinationCategory,
+    i: u32,
+}
 pub struct FlowEngine {
     cfg: FlowEngineConfig,
-    observations: BTreeMap<u64, FlowObservation>,
+    sources: BTreeMap<FlowSourceId, SourceRegistration>,
+    obs: BTreeMap<u64, FlowObservation>,
     max_seen: Option<DateTime<Utc>>,
-    finalized: BTreeMap<(i64, Key), (ByteCount, Coverage)>,
+    watermark: Option<DateTime<Utc>>,
+    emitted: Finalized,
 }
 impl FlowEngine {
-    pub fn new(cfg: FlowEngineConfig) -> Result<Self, FlowError> {
-        if cfg.max_devices == 0
-            || cfg.max_open_buckets == 0
-            || cfg.max_observation_ids == 0
-            || cfg.max_work == 0
+    pub fn new(c: FlowEngineConfig) -> Result<Self, FlowError> {
+        if c.lateness < Duration::zero()
+            || c.future_skew < Duration::zero()
+            || c.max_devices == 0
+            || c.max_sources == 0
+            || c.max_open_buckets == 0
+            || c.max_observation_ids == 0
+            || c.max_work == 0
         {
-            return Err(FlowError::Capacity);
+            return Err(FlowError::Config);
         }
         Ok(Self {
-            cfg,
-            observations: BTreeMap::new(),
+            cfg: c,
+            sources: BTreeMap::new(),
+            obs: BTreeMap::new(),
             max_seen: None,
-            finalized: BTreeMap::new(),
+            watermark: None,
+            emitted: Finalized::default(),
         })
     }
-    pub fn observe(&mut self, o: FlowObservation) -> Result<(), FlowError> {
-        let cov = o.source.coverage()?;
-        if o.coverage != cov {
-            return Err(FlowError::Coverage);
-        }
-        if self.observations.contains_key(&o.observation_id) {
-            return Err(FlowError::Replay);
-        }
-        if self.observations.len() >= self.cfg.max_observation_ids {
+    pub fn register_source(&mut self, s: SourceRegistration) -> Result<(), FlowError> {
+        if self.sources.len() >= self.cfg.max_sources && !self.sources.contains_key(&s.id) {
             return Err(FlowError::Capacity);
         }
-        if let Some(max) = self.max_seen {
-            if o.observed_at < max - self.cfg.lateness {
-                return Err(FlowError::TooLate);
-            }
+        if !s.verified {
+            return Err(FlowError::Source);
+        }
+        self.sources.insert(s.id, s);
+        Ok(())
+    }
+    pub fn observe(&mut self, o: FlowObservation) -> Result<(), FlowError> {
+        let s = self.sources.get(&o.source).ok_or(FlowError::Source)?;
+        if !s.verified || o.interface == 0 {
+            return Err(FlowError::Source);
+        }
+        if self.obs.contains_key(&o.observation_id) {
+            return Err(FlowError::Replay);
+        }
+        if self.obs.len() >= self.cfg.max_observation_ids {
+            return Err(FlowError::Capacity);
         }
         if o.upload.checked_add(o.download).is_none() {
             return Err(FlowError::Overflow);
         }
-        if self
-            .observations
-            .iter()
-            .any(|(_, x)| x.device_id == o.device_id)
-            == false
-            && self
-                .observations
-                .values()
-                .map(|x| x.device_id.to_string())
-                .collect::<BTreeSet<_>>()
-                .len()
-                >= self.cfg.max_devices
-        {
-            return Err(FlowError::Capacity);
+        if let Some(w) = self.watermark {
+            if o.observed_at < w - self.cfg.lateness {
+                return Err(FlowError::TooLate);
+            }
         }
         self.max_seen = Some(
             self.max_seen
                 .map_or(o.observed_at, |x| x.max(o.observed_at)),
         );
-        self.observations.insert(o.observation_id, o);
+        self.obs.insert(o.observation_id, o);
         Ok(())
     }
-    pub fn finalize_until(&mut self, until: DateTime<Utc>) -> Result<Finalized, FlowError> {
-        let max = self.max_seen.ok_or(FlowError::Time)?;
-        if until > max + self.cfg.lateness { /* permitted */ }
-        let mut sec = BTreeMap::<(i64, Key), (ByteCount, Coverage)>::new();
-        for o in self.observations.values() {
-            let s = o.observed_at.timestamp();
+    pub fn advance_watermark(&mut self, w: DateTime<Utc>) -> Result<Finalized, FlowError> {
+        if let Some(old) = self.watermark {
+            if w < old {
+                return Err(FlowError::Time);
+            }
+        }
+        if let Some(max) = self.max_seen {
+            if w > max + self.cfg.future_skew {
+                return Err(FlowError::Time);
+            }
+        }
+        self.watermark = Some(w);
+        self.build()
+    }
+    pub fn finalized(&self) -> &Finalized {
+        &self.emitted
+    }
+    fn build(&mut self) -> Result<Finalized, FlowError> {
+        let w = self.watermark.ok_or(FlowError::Time)?;
+        let mut sec = BTreeMap::new();
+        for o in self.obs.values() {
+            let t = o.observed_at.timestamp();
+            if t.checked_add(1).ok_or(FlowError::Overflow)? > w.timestamp() {
+                continue;
+            }
             let k = Key {
-                device_order: o.device_id.to_string(),
-                protocol: o.protocol,
-                destination: o.destination,
-                interface: o.interface,
+                d: o.device_id.to_string(),
+                p: o.protocol,
+                c: o.destination,
+                i: o.interface,
             };
-            let e = sec.entry((s, k)).or_insert((
+            let cov = coverage(self.sources[&o.source].kind);
+            let e = sec.entry((t, k)).or_insert((
                 ByteCount {
                     upload: 0,
                     download: 0,
                 },
-                o.coverage,
+                cov,
             ));
             e.0.upload =
                 e.0.upload
@@ -200,14 +221,24 @@ impl FlowEngine {
                 e.0.download
                     .checked_add(o.download)
                     .ok_or(FlowError::Overflow)?;
-            e.1 = merge(e.1, o.coverage);
+            e.1 = merge(e.1, cov);
         }
-        self.finalized = sec.clone();
-        Ok(Finalized {
-            seconds: rows(&sec, 1)?,
-            minutes: aggregate(&sec, 60)?,
-            hours: aggregate(&sec, 3600)?,
-        })
+        let min = agg(&sec, 60)?;
+        let hour = agg(&min, 60)?;
+        self.emitted = Finalized {
+            seconds: rows(&sec)?,
+            minutes: rows(&min)?,
+            hours: rows(&hour)?,
+        };
+        Ok(self.emitted.clone())
+    }
+}
+fn coverage(k: VisibilityKind) -> Coverage {
+    match k {
+        VisibilityKind::VerifiedGateway | VisibilityKind::VerifiedMirror => Coverage::Complete,
+        VisibilityKind::VerifiedRouterCounter => Coverage::RouterReported,
+        VisibilityKind::CollectorLocal => Coverage::LocalOnly,
+        VisibilityKind::ConfiguredInference => Coverage::Estimated,
     }
 }
 fn merge(a: Coverage, b: Coverage) -> Coverage {
@@ -221,30 +252,14 @@ fn merge(a: Coverage, b: Coverage) -> Coverage {
         Coverage::LocalOnly
     }
 }
-fn rows(
-    m: &BTreeMap<(i64, Key), (ByteCount, Coverage)>,
-    _n: i64,
-) -> Result<Vec<Rollup>, FlowError> {
-    Ok(m.iter()
-        .map(|((t, k), (b, c))| Rollup {
-            bucket: DateTime::from_timestamp(*t, 0).unwrap(),
-            device_id: DeviceId::parse(&k.device_order).unwrap(),
-            protocol: k.protocol,
-            destination: k.destination,
-            interface: k.interface,
-            bytes: *b,
-            coverage: *c,
-        })
-        .collect())
-}
-fn aggregate(
+fn agg(
     m: &BTreeMap<(i64, Key), (ByteCount, Coverage)>,
     n: i64,
-) -> Result<Vec<Rollup>, FlowError> {
-    let mut a = BTreeMap::new();
+) -> Result<BTreeMap<(i64, Key), (ByteCount, Coverage)>, FlowError> {
+    let mut x = BTreeMap::new();
     for ((t, k), (b, c)) in m {
-        let q = t.div_euclid(n) * n;
-        let e = a.entry((q, k.clone())).or_insert((
+        let q = t.div_euclid(n).checked_mul(n).ok_or(FlowError::Overflow)?;
+        let e = x.entry((q, k.clone())).or_insert((
             ByteCount {
                 upload: 0,
                 download: 0,
@@ -261,5 +276,20 @@ fn aggregate(
                 .ok_or(FlowError::Overflow)?;
         e.1 = merge(e.1, *c);
     }
-    rows(&a, n)
+    Ok(x)
+}
+fn rows(m: &BTreeMap<(i64, Key), (ByteCount, Coverage)>) -> Result<Vec<Rollup>, FlowError> {
+    m.iter()
+        .map(|((t, k), (b, c))| {
+            Ok(Rollup {
+                bucket: DateTime::from_timestamp(*t, 0).ok_or(FlowError::Overflow)?,
+                device_id: DeviceId::parse(&k.d).map_err(|_| FlowError::Config)?,
+                protocol: k.p,
+                destination: k.c,
+                interface: k.i,
+                bytes: *b,
+                coverage: *c,
+            })
+        })
+        .collect()
 }
