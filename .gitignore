@@ -1,0 +1,16 @@
+/.worktrees/
+/target/
+/node_modules/
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+/.env
+/.env.*
+!/\.env.example
+*.db
+*.db-shm
+*.db-wal
+*.pcap
+*.pcapng
+/artifacts/
+/dist/
+
