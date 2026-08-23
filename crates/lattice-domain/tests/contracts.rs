@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use lattice_domain::{
-    Coverage, DeviceId, EventEnvelope, EventPayload, PresenceChanged, PresenceState,
+    Coverage, DeviceId, EventEnvelope, EventPayload, PresenceChanged, PresenceState, ServiceStatus,
 };
 
 #[test]
@@ -18,12 +18,54 @@ fn public_event_contract_serializes_stable_names() {
         }),
     };
 
-    let json = serde_json::to_value(envelope).unwrap();
-    assert_eq!(json["sequence"], 42);
-    assert_eq!(json["payload"]["type"], "presence_changed");
-    assert_eq!(json["payload"]["data"]["to"], "online");
+    let json = serde_json::to_value(&envelope).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "sequence": 42,
+            "occurred_at": "2026-08-23T12:00:00Z",
+            "payload": {
+                "type": "presence_changed",
+                "data": {
+                    "device_id": "018f47a0-9b5c-7a22-8a33-112233445566",
+                    "from": "quiet",
+                    "to": "online",
+                    "reason": "arp_reply"
+                }
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<EventEnvelope>(json).unwrap(),
+        envelope
+    );
+
+    let service_payload = EventPayload::ServiceStatus(ServiceStatus {
+        state: "ready".to_owned(),
+        detail: "collector active".to_owned(),
+    });
+    let service_json = serde_json::to_value(&service_payload).unwrap();
+    assert_eq!(
+        service_json,
+        serde_json::json!({
+            "type": "service_status",
+            "data": { "state": "ready", "detail": "collector active" }
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<EventPayload>(service_json).unwrap(),
+        service_payload
+    );
+
     assert_eq!(
         serde_json::to_string(&Coverage::RouterReported).unwrap(),
         "\"router-reported\""
     );
+
+    assert_eq!(
+        device_id.to_string(),
+        "018f47a0-9b5c-7a22-8a33-112233445566"
+    );
+    assert_eq!(DeviceId::parse(&device_id.to_string()).unwrap(), device_id);
+    assert!(DeviceId::parse("not-a-uuid").is_err());
 }
