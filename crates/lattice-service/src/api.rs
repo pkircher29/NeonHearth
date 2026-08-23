@@ -1,5 +1,5 @@
 use crate::{AppState, auth::Authorized, state::EVENT_TICKET_TTL};
-use axum::{Json, extract::State};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Serialize;
 use tokio::time::Instant;
 use utoipa::{Modify, OpenApi, ToSchema};
@@ -34,12 +34,19 @@ pub async fn state(_: Authorized, State(state): State<AppState>) -> Json<Snapsho
         service_status: "ready",
     })
 }
-#[utoipa::path(post, path = "/api/v1/events/ticket", security(("bearer_auth" = [])), responses((status = 200, body = EventTicket), (status = 401)))]
-pub async fn event_ticket(_: Authorized, State(state): State<AppState>) -> Json<EventTicket> {
-    Json(EventTicket {
-        ticket: state.issue_event_ticket(Instant::now()).await,
+#[utoipa::path(post, path = "/api/v1/events/ticket", security(("bearer_auth" = [])), responses((status = 200, body = EventTicket), (status = 401), (status = 429)))]
+pub async fn event_ticket(
+    _: Authorized,
+    State(state): State<AppState>,
+) -> Result<Json<EventTicket>, StatusCode> {
+    let ticket = state
+        .issue_event_ticket(Instant::now())
+        .await
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    Ok(Json(EventTicket {
+        ticket,
         expires_in_seconds: EVENT_TICKET_TTL.as_secs(),
-    })
+    }))
 }
 #[derive(OpenApi)]
 #[openapi(paths(health, state, event_ticket), components(schemas(Health, Snapshot, EventTicket)), modifiers(&SecurityAddon))]

@@ -127,3 +127,22 @@ async fn websocket_stale_cursor_receives_resync_required() {
     );
     assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
 }
+
+#[tokio::test]
+async fn websocket_rejects_unsolicited_text_with_unsupported_close_code() {
+    let state = AppState::new(TOKEN).unwrap();
+    let address = start_server(state.clone()).await;
+    let ticket = issue_ticket(&state).await;
+    let (mut socket, _) = connect_async(format!("{address}?ticket={ticket}&after_sequence=0"))
+        .await
+        .unwrap();
+
+    socket.send(Message::Text("command".into())).await.unwrap();
+    let Some(Ok(Message::Close(Some(frame)))) = socket.next().await else {
+        panic!("expected close frame")
+    };
+    assert_eq!(
+        frame.code,
+        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Unsupported
+    );
+}

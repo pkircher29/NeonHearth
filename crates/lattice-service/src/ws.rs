@@ -1,4 +1,4 @@
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, close_code};
 use futures_util::{SinkExt, StreamExt};
 use lattice_domain::EventEnvelope;
 use lattice_event_bus::{EventBus, Resume};
@@ -18,17 +18,71 @@ pub async fn resume_messages(bus: &EventBus, sequence: u64) -> Vec<ServerMessage
     }
 }
 
+#[derive(Debug)]
+enum SendMessageError {
+    Serialization(serde_json::Error),
+    Transport(axum::Error),
+}
+
+impl std::fmt::Display for SendMessageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Serialization(error) => {
+                write!(formatter, "message serialization failed: {error}")
+            }
+            Self::Transport(error) => write!(formatter, "message transport failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SendMessageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Serialization(error) => Some(error),
+            Self::Transport(error) => Some(error),
+        }
+    }
+}
+
 async fn send_message(
     sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     message: ServerMessage,
-) -> Result<(), axum::Error> {
-    let encoded = serde_json::to_string(&message).expect("server messages serialize");
-    sink.send(Message::Text(encoded.into())).await
+) -> Result<(), SendMessageError> {
+    let encoded = serde_json::to_string(&message).map_err(SendMessageError::Serialization)?;
+    sink.send(Message::Text(encoded.into()))
+        .await
+        .map_err(SendMessageError::Transport)
+}
+
+async fn send_close(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    code: u16,
+    reason: &'static str,
+) {
+    let _ = sink
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
+}
+
+async fn handle_send_error(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    error: SendMessageError,
+) {
+    if matches!(error, SendMessageError::Serialization(_)) {
+        send_close(sink, close_code::ERROR, "internal server error").await;
+    }
 }
 
 async fn send_resync_and_close(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>) {
-    let _ = send_message(sink, ServerMessage::ResyncRequired).await;
-    let _ = sink.send(Message::Close(None)).await;
+    match send_message(sink, ServerMessage::ResyncRequired).await {
+        Ok(()) => {
+            let _ = sink.send(Message::Close(None)).await;
+        }
+        Err(error) => handle_send_error(sink, error).await,
+    }
 }
 
 pub(crate) async fn serve_socket(socket: WebSocket, bus: EventBus, after_sequence: u64) {
@@ -46,10 +100,8 @@ pub(crate) async fn serve_socket(socket: WebSocket, bus: EventBus, after_sequenc
             }
             ServerMessage::Event(event) => {
                 last_sent_sequence = event.sequence;
-                if send_message(&mut sink, ServerMessage::Event(event))
-                    .await
-                    .is_err()
-                {
+                if let Err(error) = send_message(&mut sink, ServerMessage::Event(event)).await {
+                    handle_send_error(&mut sink, error).await;
                     return;
                 }
             }
@@ -70,7 +122,7 @@ pub(crate) async fn serve_socket(socket: WebSocket, bus: EventBus, after_sequenc
                     return;
                 }
                 Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
-                    let _ = sink.send(Message::Close(None)).await;
+                    send_close(&mut sink, close_code::UNSUPPORTED, "unsolicited client data").await;
                     return;
                 }
                 None | Some(Err(_)) => return,
@@ -83,7 +135,8 @@ pub(crate) async fn serve_socket(socket: WebSocket, bus: EventBus, after_sequenc
                 }
                 Ok(event) => {
                     last_sent_sequence = event.sequence;
-                    if send_message(&mut sink, ServerMessage::Event(event)).await.is_err() {
+                    if let Err(error) = send_message(&mut sink, ServerMessage::Event(event)).await {
+                        handle_send_error(&mut sink, error).await;
                         return;
                     }
                 }

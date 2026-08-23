@@ -144,6 +144,43 @@ async fn event_ticket_requires_bearer_and_is_a_uuid() {
 }
 
 #[tokio::test]
+async fn event_ticket_limit_is_rate_limited() {
+    let app = app(AppState::new(TOKEN).expect("valid token"));
+    for _ in 0..64 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/events/ticket")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/events/ticket")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn openapi_describes_public_and_protected_routes() {
     let response = app(AppState::new(TOKEN).expect("valid token"))
         .oneshot(
@@ -164,6 +201,7 @@ async fn openapi_describes_public_and_protected_routes() {
             .iter()
             .any(|x| x["bearer_auth"].is_array())
     );
+    assert!(doc["paths"]["/api/v1/events/ticket"]["post"]["responses"]["429"].is_object());
     assert!(
         doc["paths"]["/api/v1/state"]["get"]["security"]
             .as_array()
