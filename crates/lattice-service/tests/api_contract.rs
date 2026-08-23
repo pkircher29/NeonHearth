@@ -8,6 +8,7 @@ use http_body_util::BodyExt;
 use lattice_domain::{EventPayload, ServiceStatus};
 use lattice_service::{AppState, app};
 use tower::ServiceExt;
+const TOKEN: &str = "owner-token-0123456789abcdefghijkl";
 
 async fn body(response: Response) -> serde_json::Value {
     serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
@@ -15,7 +16,7 @@ async fn body(response: Response) -> serde_json::Value {
 
 #[tokio::test]
 async fn health_is_public_and_reports_v1() {
-    let response = app(AppState::new("owner-token"))
+    let response = app(AppState::new(TOKEN).expect("valid token"))
         .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -33,7 +34,7 @@ async fn snapshot_requires_exact_bearer_token() {
         if let Some(auth) = auth {
             request = request.header("authorization", auth);
         }
-        let response = app(AppState::new("owner-token"))
+        let response = app(AppState::new(TOKEN).expect("valid token"))
             .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -45,10 +46,10 @@ async fn snapshot_requires_exact_bearer_token() {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert!(!String::from_utf8_lossy(&bytes).contains("owner-token"));
     }
-    let response = app(AppState::new("owner-token"))
+    let response = app(AppState::new(TOKEN).expect("valid token"))
         .oneshot(
             Request::get("/api/v1/state")
-                .header("authorization", "Bearer owner-token")
+                .header("authorization", format!("Bearer {TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -63,7 +64,7 @@ async fn snapshot_requires_exact_bearer_token() {
 
 #[tokio::test]
 async fn snapshot_uses_current_event_watermark() {
-    let state = AppState::new("owner-token");
+    let state = AppState::new(TOKEN).expect("valid token");
     state
         .events()
         .publish(
@@ -77,7 +78,7 @@ async fn snapshot_uses_current_event_watermark() {
     let response = app(state)
         .oneshot(
             Request::get("/api/v1/state")
-                .header("authorization", "Bearer owner-token")
+                .header("authorization", format!("Bearer {TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -88,7 +89,7 @@ async fn snapshot_uses_current_event_watermark() {
 
 #[tokio::test]
 async fn openapi_describes_public_and_protected_routes() {
-    let response = app(AppState::new("owner-token"))
+    let response = app(AppState::new(TOKEN).expect("valid token"))
         .oneshot(
             Request::get("/api/v1/openapi.json")
                 .body(Body::empty())
@@ -110,4 +111,19 @@ async fn openapi_describes_public_and_protected_routes() {
         doc["components"]["securitySchemes"]["bearer_auth"]["type"],
         "http"
     );
+}
+
+#[test]
+fn service_token_configuration_is_validated() {
+    for token in [
+        "",
+        " ",
+        "short",
+        " leading________________________________",
+        "trailing________________________________ ",
+        "ümlaut________________________________",
+    ] {
+        assert!(AppState::new(token).is_err());
+    }
+    assert!(AppState::new(TOKEN).is_ok());
 }
