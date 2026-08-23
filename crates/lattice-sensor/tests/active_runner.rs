@@ -334,27 +334,56 @@ async fn panic_releases_raii_budget_and_is_observable_without_retry() {
 
 #[tokio::test]
 async fn actual_dispatch_prioritizes_discovery_and_coalesces_inflight_duplicates() {
+    struct InventoryCredentials;
+    impl ExecutionCredentialSource for InventoryCredentials {
+        fn credential_for(&self, request: &ProbeRequest) -> Option<ProbeCredential> {
+            (request.mode == ProbeMode::OwnerInventory).then(|| ProbeCredential::SnmpV2c {
+                community: "execution-only".into(),
+            })
+        }
+    }
     let transport = Arc::new(ScriptedTransport::default());
     let config = SchedulerConfig {
         budgets: BudgetConfig::new(1, 1, 8, 8, Duration::from_secs(1)).unwrap(),
         ..SchedulerConfig::default()
     };
-    let (runner, mut results, _) = runner(config, transport.clone());
-    let mut low = request("192.168.50.9", "full.tcp.80");
+    let clock = Arc::new(FakeClock::new(Utc.timestamp_opt(1_700_000_000, 0).unwrap()));
+    let probes = catalog().unwrap();
+    let engine = Arc::new(ActiveEngine::new(
+        Arc::new(guard()),
+        transport.clone(),
+        probes.clone(),
+    ));
+    let (runner, mut results) = SchedulerRunner::new_with_credentials(
+        config,
+        clock,
+        engine,
+        probes,
+        8,
+        Arc::new(InventoryCredentials),
+    )
+    .unwrap();
+    let mut low = request("192.168.50.11", "full.tcp.80");
     low.mode = ProbeMode::OwnerFullPort;
     runner.enqueue(low).unwrap();
+    let mut inventory = request("192.168.50.9", "udp.snmp.161");
+    inventory.mode = ProbeMode::OwnerInventory;
+    runner.enqueue(inventory).unwrap();
     let high = request("192.168.50.10", "tcp.http.80");
     runner.enqueue(high.clone()).unwrap();
     assert!(!runner.enqueue(high).unwrap());
     assert_eq!(runner.dispatch_ready().await, 1);
-    let event = results.recv().await.unwrap();
-    assert_eq!(
-        event.request.target,
-        "192.168.50.10".parse::<IpAddr>().unwrap()
-    );
-    runner.dispatch_ready().await;
+    let first = results.recv().await.unwrap();
+    assert_eq!(first.request.mode, ProbeMode::OwnerInventory);
+    assert!(first.result.is_ok());
+    assert_eq!(runner.dispatch_ready().await, 1);
+    let second = results.recv().await.unwrap();
+    assert_eq!(second.request.mode, ProbeMode::Default);
+    assert!(second.result.is_ok());
+    assert_eq!(runner.dispatch_ready().await, 1);
     let low_event = results.recv().await.unwrap();
     assert_eq!(low_event.request.mode, ProbeMode::OwnerFullPort);
+    assert!(low_event.result.is_ok());
     runner.stop_and_drain().await;
 }
 
@@ -555,28 +584,39 @@ async fn stop_serializes_with_admission_and_awaits_every_registered_attempt() {
     assert_eq!(runner.dispatch_ready().await, 1);
     entered.wait();
 
-    let mut stopping = tokio::spawn({
+    let mut first_stop = tokio::spawn({
         let runner = runner.clone();
         async move { runner.stop_and_drain().await }
     });
     tokio::task::yield_now().await;
+    let mut second_stop = tokio::spawn({
+        let runner = runner.clone();
+        async move { runner.stop_and_drain().await }
+    });
     let late_dispatch = tokio::spawn({
         let runner = runner.clone();
         async move { runner.dispatch_ready().await }
     });
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut stopping)
-            .await
-            .is_err()
+        tokio::time::timeout(Duration::from_millis(20), async {
+            tokio::join!(&mut first_stop, &mut second_stop)
+        })
+        .await
+        .is_err()
     );
     release.wait();
-    tokio::time::timeout(Duration::from_secs(1), stopping)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::try_join!(first_stop, second_stop)
+    })
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(late_dispatch.await.unwrap(), 0);
     let event = results.recv().await.unwrap();
     assert_eq!(event.result.unwrap_err(), ActiveError::Cancelled);
     assert!(!event.will_retry);
     assert!(transport.sends.lock().unwrap().is_empty());
+    tokio::time::timeout(Duration::from_millis(20), runner.stop_and_drain())
+        .await
+        .expect("later stop remains idempotent");
 }

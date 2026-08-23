@@ -86,6 +86,9 @@ discovery (normal TCP/UDP), inventory (credentialed SNMP, cost 4), or owner full
 work atomically from global, host, and subnet buckets; denial cannot partially consume
 another bucket. Credentialed inventory uses the explicit `OwnerInventory` authorization
 mode and remains normal priority. Only `OwnerFullPort` work enters the low-priority queue.
+The curated catalog exposes the same separation: `Default` excludes all owner-started
+descriptors, `OwnerInventory` contains only credentialed inventory descriptors, and
+`OwnerFullPort` contains only full-port descriptors.
 
 Budgets and backoff use monotonic time. Wall time is used only for evidence
 `observed_at`/expiry. A wall-clock correction cannot refill a budget. Resume after sleep
@@ -102,7 +105,9 @@ budget is consumed or task admitted, dispatch reserves a bounded result-channel 
 completion, typed error, cancellation, and retry status can be published synchronously.
 Backpressure therefore pauses admission and cannot deadlock global stop. Admission and
 stop transition share one lifecycle gate: stop prevents late task registration and awaits
-every task admitted before the transition.
+every task admitted before the transition. Concurrent and later stop callers observe one
+retained `Running` → `Draining` → `Drained` completion and cannot return before that shared
+drain finishes.
 Credentialed inventory obtains an owned credential from an execution-time provider only
 after dispatch; the runner neither queues nor retains it, and drops it when that attempt
 finishes.

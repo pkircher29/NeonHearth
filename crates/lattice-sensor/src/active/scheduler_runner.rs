@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, Notify, mpsc},
+    sync::{Mutex as AsyncMutex, Notify, mpsc, watch},
     task::JoinHandle,
 };
 
@@ -50,9 +50,10 @@ impl<C: Clock> Drop for Reservation<C> {
             .finish(&self.request);
     }
 }
-struct Lifecycle {
-    stopped: bool,
-    tasks: Vec<JoinHandle<()>>,
+enum Lifecycle {
+    Running(Vec<JoinHandle<()>>),
+    Draining,
+    Drained,
 }
 
 pub struct SchedulerRunner<C: Clock, T: AttemptTransport> {
@@ -65,6 +66,7 @@ pub struct SchedulerRunner<C: Clock, T: AttemptTransport> {
     attempts: Mutex<HashMap<WorkKey, u8>>,
     pending: Mutex<HashSet<WorkKey>>,
     lifecycle: AsyncMutex<Lifecycle>,
+    drain_complete: watch::Sender<bool>,
     results: mpsc::Sender<RunnerEvent>,
     notify: Notify,
     stopped: AtomicBool,
@@ -103,6 +105,7 @@ impl<C: Clock + 'static, T: AttemptTransport + 'static> SchedulerRunner<C, T> {
         let max_retry_attempts = config.max_retry_attempts;
         let scheduler = Scheduler::new(config, clock.clone())?;
         let (results, receiver) = mpsc::channel(result_capacity);
+        let (drain_complete, _) = watch::channel(false);
         Ok((
             Arc::new(Self {
                 scheduler: Arc::new(Mutex::new(scheduler)),
@@ -113,10 +116,8 @@ impl<C: Clock + 'static, T: AttemptTransport + 'static> SchedulerRunner<C, T> {
                 retries: Mutex::new(VecDeque::new()),
                 attempts: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashSet::new()),
-                lifecycle: AsyncMutex::new(Lifecycle {
-                    stopped: false,
-                    tasks: vec![],
-                }),
+                lifecycle: AsyncMutex::new(Lifecycle::Running(Vec::new())),
+                drain_complete,
                 results,
                 notify: Notify::new(),
                 stopped: AtomicBool::new(false),
@@ -200,10 +201,10 @@ impl<C: Clock + 'static, T: AttemptTransport + 'static> SchedulerRunner<C, T> {
                 }
             };
             let mut lifecycle = self.lifecycle.lock().await;
-            lifecycle.tasks.retain(|t| !t.is_finished());
-            if lifecycle.stopped || self.stopped.load(Ordering::Acquire) {
+            let Lifecycle::Running(tasks) = &mut *lifecycle else {
                 break;
-            }
+            };
+            tasks.retain(|task| !task.is_finished());
             let Some(request) = self
                 .scheduler
                 .lock()
@@ -249,7 +250,7 @@ impl<C: Clock + 'static, T: AttemptTransport + 'static> SchedulerRunner<C, T> {
             let task = tokio::spawn(async move {
                 runner.execute_admitted(request, attempt, permit).await;
             });
-            lifecycle.tasks.push(task);
+            tasks.push(task);
             drop(lifecycle);
         }
         dispatched
@@ -315,7 +316,7 @@ impl<C: Clock + 'static, T: AttemptTransport + 'static> SchedulerRunner<C, T> {
         }
         // Serialize retry admission with stop so no retry can appear after stop clears state.
         let lifecycle = self.lifecycle.lock().await;
-        if lifecycle.stopped || self.stopped.load(Ordering::Acquire) {
+        if !matches!(*lifecycle, Lifecycle::Running(_)) || self.stopped.load(Ordering::Acquire) {
             return false;
         }
         let mut scheduler = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
@@ -344,36 +345,57 @@ impl<C: Clock + 'static, T: AttemptTransport + 'static> SchedulerRunner<C, T> {
             tokio::select! {()=self.notify.notified()=>{},()=tokio::time::sleep(Duration::from_millis(10))=>{}}
         }
     }
-    async fn transition_to_stopped(&self) -> Vec<JoinHandle<()>> {
-        let mut lifecycle = self.lifecycle.lock().await;
-        if !lifecycle.stopped {
-            lifecycle.stopped = true;
-            self.stopped.store(true, Ordering::Release);
-            self.scheduler
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .stop();
-            self.retries
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            self.attempts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            self.pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            self.engine.stop();
-            self.notify.notify_waiters();
+    pub async fn stop_and_drain(self: &Arc<Self>) {
+        let mut completion = self.drain_complete.subscribe();
+        let tasks = {
+            let mut lifecycle = self.lifecycle.lock().await;
+            match &mut *lifecycle {
+                Lifecycle::Running(tasks) => {
+                    let tasks = std::mem::take(tasks);
+                    *lifecycle = Lifecycle::Draining;
+                    self.begin_stop();
+                    Some(tasks)
+                }
+                Lifecycle::Draining => None,
+                Lifecycle::Drained => return,
+            }
+        };
+
+        if let Some(tasks) = tasks {
+            let runner = self.clone();
+            tokio::spawn(async move {
+                for task in tasks {
+                    let _ = task.await;
+                }
+                let mut lifecycle = runner.lifecycle.lock().await;
+                *lifecycle = Lifecycle::Drained;
+                runner.drain_complete.send_replace(true);
+            });
         }
-        std::mem::take(&mut lifecycle.tasks)
+
+        let _ = completion.wait_for(|drained| *drained).await;
     }
-    pub async fn stop_and_drain(&self) {
-        for task in self.transition_to_stopped().await {
-            let _ = task.await;
-        }
+
+    fn begin_stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stop();
+        self.retries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.engine.stop();
+        self.notify.notify_waiters();
     }
     pub fn state_sizes(&self) -> (usize, usize, usize) {
         self.scheduler

@@ -11,9 +11,10 @@ use lattice_sensor::{
     Address, Interface, InterfaceClass, InterfaceId, InterfaceInventory, InterfaceOverride,
     TargetApproval, TargetGuard,
     active::{
-        ActiveEngine, ActiveError, AttemptTransport, BudgetConfig, CuratedPlan, FakeClock,
-        ProbeCredential, ProbeMode, ProbeOutcome, ProbeRequest, Scheduler, SchedulerConfig,
-        TransportResponse, catalog, owner_full_port_probe_ids, parse_http_metadata,
+        ActiveEngine, ActiveError, AttemptTransport, BudgetClass, BudgetConfig, CuratedPlan,
+        FakeClock, ProbeCredential, ProbeMode, ProbeOutcome, ProbeRequest, Scheduler,
+        SchedulerConfig, TransportResponse, catalog, owner_full_port_probe_ids,
+        parse_http_metadata,
     },
 };
 
@@ -108,11 +109,18 @@ fn catalog_is_unique_deterministic_and_full_port_is_opt_in() {
             .all(|p| !p.potential_side_effects.is_empty() && p.rate_cost > 0)
     );
     assert!(!default.iter().any(|p| p.id.starts_with("full.")));
+    assert!(default.iter().all(|p| !p.owner_start_required));
+    let inventory = catalog.plan(CuratedPlan::OwnerInventory);
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].id, "udp.snmp.161");
+    assert!(inventory[0].credential_required);
+    assert_eq!(inventory[0].budget_class, BudgetClass::Inventory);
+    let full_port = catalog.plan(CuratedPlan::OwnerFullPort);
+    assert!(!full_port.is_empty());
     assert!(
-        catalog
-            .plan(CuratedPlan::OwnerFullPort)
+        full_port
             .iter()
-            .all(|p| p.owner_start_required)
+            .all(|p| p.budget_class == BudgetClass::OwnerFullPort)
     );
     let ports: Vec<_> = owner_full_port_probe_ids().collect();
     assert_eq!(ports.len(), 65_535);

@@ -131,6 +131,7 @@ pub struct ProbeCatalog {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CuratedPlan {
     Default,
+    OwnerInventory,
     OwnerFullPort,
 }
 
@@ -196,7 +197,12 @@ impl ProbeCatalog {
             .values()
             .filter(|p| match plan {
                 CuratedPlan::Default => !p.owner_start_required,
-                CuratedPlan::OwnerFullPort => p.owner_start_required,
+                CuratedPlan::OwnerInventory => {
+                    p.owner_start_required
+                        && p.budget_class == BudgetClass::Inventory
+                        && p.credential_required
+                }
+                CuratedPlan::OwnerFullPort => p.budget_class == BudgetClass::OwnerFullPort,
             })
             .collect()
     }
