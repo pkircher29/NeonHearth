@@ -2,7 +2,7 @@ mod api;
 mod auth;
 mod state;
 use axum::{Router, routing::get};
-pub use state::AppState;
+pub use state::{AppState, InvalidServiceToken};
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(api::health))
