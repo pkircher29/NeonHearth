@@ -352,6 +352,31 @@ async fn reversed_correction_batch_persists_in_id_order_and_retries_idempotently
 }
 
 #[tokio::test]
+async fn combined_flow_sorts_reversed_corrections() -> anyhow::Result<()> {
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool.clone());
+    let flow = FlowRepository::new(pool.clone(), 16)?;
+    repo.commit(input(1, [41; 32])).await?;
+    let mut batch = input(2, [42; 32]);
+    let mut correction = batch.transitions[0].clone();
+    correction.transition_id = 3;
+    correction.from = PresenceState::Online;
+    correction.to = PresenceState::Quiet;
+    correction.correction_of = Some(2);
+    batch.transitions.push(correction);
+    batch.transitions.reverse();
+    repo.commit_with_flow(batch, &[], time(1_700_000_002), &flow)
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM presence_transitions")
+            .fetch_one(&pool)
+            .await?,
+        3
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn migration_sets_current_version_and_enforces_m2_foreign_keys_and_indexes()
 -> anyhow::Result<()> {
     let pool = lattice_store::connect_memory().await?;
