@@ -161,3 +161,42 @@ fn each_device_uses_its_own_latest_bucket() {
     };
     assert_eq!(f.samples.len(), 2);
 }
+
+#[test]
+fn retire_before_flush_cancels_stale_sample_but_preserves_other_devices() {
+    let mut a = FlowLiveAdapter::new(LiveConfig::default(), 4).unwrap();
+    let one = roll(3);
+    let mut two = roll(5);
+    two.key.device_id = d(2);
+    a.apply(0, &[RollupChange::Upsert(one.clone())]).unwrap();
+    a.apply(
+        1,
+        &[RollupChange::Retire(Retirement {
+            key: one.key,
+            cache_only: true,
+        })],
+    )
+    .unwrap();
+    assert!(a.flush_payload(250, t(2)).unwrap().is_none());
+    let one = roll(3);
+    a.apply(
+        300,
+        &[RollupChange::Upsert(one.clone()), RollupChange::Upsert(two)],
+    )
+    .unwrap();
+    a.apply(
+        301,
+        &[RollupChange::Retire(Retirement {
+            key: one.key,
+            cache_only: true,
+        })],
+    )
+    .unwrap();
+    let EventPayload::BandwidthFrame(f) = a.flush_payload(550, t(3)).unwrap().unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        f.samples.iter().map(|s| s.device_id).collect::<Vec<_>>(),
+        vec![d(2)]
+    );
+}

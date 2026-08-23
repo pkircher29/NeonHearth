@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use lattice_domain::{
     BandwidthFrame, BandwidthSample, ByteCount, Coverage, DeviceId, EventPayload,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -91,6 +91,15 @@ impl LiveCoalescer {
         self.pending = next;
         self.last_tick = Some(tick_ms);
         Ok(())
+    }
+    fn sync_devices(&mut self, devices: &BTreeSet<String>, samples: &BTreeMap<String, LiveSample>) {
+        for device in devices {
+            if let Some(sample) = samples.get(device) {
+                self.pending.insert(device.clone(), sample.clone());
+            } else {
+                self.pending.remove(device);
+            }
+        }
     }
     pub fn flush(
         &mut self,
@@ -183,6 +192,7 @@ impl FlowLiveAdapter {
         }
         let mut next = self.current.clone();
         let mut traffic_changed = false;
+        let mut retired_devices = BTreeSet::new();
         for c in changes {
             match c {
                 RollupChange::Upsert(r) | RollupChange::Correction(r)
@@ -195,54 +205,19 @@ impl FlowLiveAdapter {
                     traffic_changed = true;
                 }
                 RollupChange::Retire(r) if r.cache_only => {
+                    retired_devices.insert(r.key.device_id.to_string());
                     next.remove(&r.key);
                 }
                 _ => {}
             }
         }
         if !traffic_changed {
+            let samples = samples_for_current(&next)?;
+            self.coalescer.sync_devices(&retired_devices, &samples);
             self.current = next;
             return Ok(());
         }
-        let latest: BTreeMap<String, DateTime<Utc>> =
-            next.values().fold(BTreeMap::new(), |mut m, r| {
-                m.entry(r.key.device_id.to_string())
-                    .and_modify(|x| *x = (*x).max(r.key.bucket))
-                    .or_insert(r.key.bucket);
-                m
-            });
-        let mut by_device: BTreeMap<String, LiveSample> = BTreeMap::new();
-        for r in next.values() {
-            let bucket = r.key.bucket;
-            if latest.get(&r.key.device_id.to_string()) != Some(&bucket) {
-                continue;
-            }
-            let k = r.key.device_id.to_string();
-            let x = by_device.entry(k).or_insert(LiveSample {
-                device_id: r.key.device_id,
-                delta: ByteCount {
-                    upload: 0,
-                    download: 0,
-                },
-                coverage: r.coverage,
-                observed_at: bucket,
-            });
-            x.delta.upload = x
-                .delta
-                .upload
-                .checked_add(r.bytes.upload)
-                .ok_or(LiveError::Overflow)?;
-            x.delta.download = x
-                .delta
-                .download
-                .checked_add(r.bytes.download)
-                .ok_or(LiveError::Overflow)?;
-            x.coverage = if x.coverage == r.coverage {
-                x.coverage
-            } else {
-                Coverage::Estimated
-            };
-        }
+        let by_device = samples_for_current(&next)?;
         self.coalescer
             .replace(tick_ms, by_device.into_values().collect())?;
         self.current = next;
@@ -272,4 +247,47 @@ impl FlowLiveAdapter {
     pub fn cached_rollups(&self) -> Vec<Rollup> {
         self.current.values().cloned().collect()
     }
+}
+fn samples_for_current(
+    next: &BTreeMap<RollupKey, Rollup>,
+) -> Result<BTreeMap<String, LiveSample>, LiveError> {
+    let latest: BTreeMap<String, DateTime<Utc>> =
+        next.values().fold(BTreeMap::new(), |mut m, r| {
+            m.entry(r.key.device_id.to_string())
+                .and_modify(|x| *x = (*x).max(r.key.bucket))
+                .or_insert(r.key.bucket);
+            m
+        });
+    let mut out = BTreeMap::new();
+    for r in next.values() {
+        let k = r.key.device_id.to_string();
+        if latest.get(&k) != Some(&r.key.bucket) {
+            continue;
+        }
+        let x = out.entry(k).or_insert(LiveSample {
+            device_id: r.key.device_id,
+            delta: ByteCount {
+                upload: 0,
+                download: 0,
+            },
+            coverage: r.coverage,
+            observed_at: r.key.bucket,
+        });
+        x.delta.upload = x
+            .delta
+            .upload
+            .checked_add(r.bytes.upload)
+            .ok_or(LiveError::Overflow)?;
+        x.delta.download = x
+            .delta
+            .download
+            .checked_add(r.bytes.download)
+            .ok_or(LiveError::Overflow)?;
+        x.coverage = if x.coverage == r.coverage {
+            x.coverage
+        } else {
+            Coverage::Estimated
+        };
+    }
+    Ok(out)
 }
