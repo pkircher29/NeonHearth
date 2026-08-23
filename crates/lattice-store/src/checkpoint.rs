@@ -12,6 +12,7 @@ pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_BATCH: usize = 4096;
 const CURRENT_FORMAT_VERSION: i64 = 1;
 type StoredCheckpointRow = (i64, Vec<u8>, String, i64, String, Vec<u8>);
+type StoredDiscoveryRow = (String, Vec<u8>, String, Vec<u8>, i64, String, Vec<u8>);
 type StoredTransitionRow = (
     String,
     String,
@@ -169,7 +170,7 @@ impl M2StateRepository {
         &self,
         input_hash: [u8; 32],
     ) -> Result<Option<StoredDiscoveryCommit>, CheckpointError> {
-        let row: Option<(String, Vec<u8>, String, Vec<u8>, i64, String, Vec<u8>)> = sqlx::query_as(
+        let row: Option<StoredDiscoveryRow> = sqlx::query_as(
             "SELECT source,result_summary,committed_at,result_sha256,checkpoint_sequence,source_fingerprint,commit_digest FROM discovery_commits WHERE input_hash=?",
         )
         .bind(input_hash.to_vec())
@@ -366,7 +367,9 @@ impl M2StateRepository {
         for e in &input.evidence {
             insert_evidence(&mut tx, e).await?;
         }
-        for t in input.transitions.iter().collect::<Vec<_>>() {
+        let mut transitions: Vec<_> = input.transitions.iter().collect();
+        transitions.sort_by_key(|transition| transition.transition_id);
+        for t in transitions {
             insert_transition(&mut tx, t).await?;
         }
         if let Some(d) = &input.discovery {

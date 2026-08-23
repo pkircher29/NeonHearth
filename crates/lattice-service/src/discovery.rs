@@ -289,9 +289,21 @@ impl PersistentDiscoveryPipeline {
                 committed_at: arrival,
             }),
         };
-        self.state
+        if let Err(error) = self
+            .state
             .commit_with_flow(commit, changes, arrival, &self.flow)
-            .await?;
+            .await
+        {
+            if matches!(error, CheckpointError::Conflict(_))
+                && let Some(existing) = self.state.discovery_commit(input_hash).await?
+            {
+                return Ok(DiscoveryPipelineOutcome::Duplicate(DuplicateDiscovery {
+                    result_summary: existing.result_summary,
+                    resnapshot_required: true,
+                }));
+            }
+            return Err(error.into());
+        }
         self.pipeline = staged_pipeline;
         self.live = staged_live;
         self.sequence = next_sequence;
