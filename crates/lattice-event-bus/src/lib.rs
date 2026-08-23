@@ -50,7 +50,7 @@ impl EventBus {
         occurred_at: DateTime<Utc>,
         payload: EventPayload,
     ) -> EventEnvelope {
-        let envelope = {
+        {
             let mut state = self.state.lock().await;
             let envelope = EventEnvelope {
                 sequence: state.next_sequence,
@@ -62,10 +62,9 @@ impl EventBus {
             while state.replay.len() > self.replay_capacity {
                 state.replay.pop_front();
             }
+            let _ = self.sender.send(envelope.clone());
             envelope
-        };
-        let _ = self.sender.send(envelope.clone());
-        envelope
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {

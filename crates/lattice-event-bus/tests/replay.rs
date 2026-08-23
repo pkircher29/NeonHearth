@@ -61,3 +61,29 @@ async fn concurrent_publishers_get_unique_monotonic_sequences() {
     assert_eq!(sequences, (1..=16).collect::<Vec<_>>());
     assert!(matches!(bus.resume_after(0).await, Resume::Events(events) if events.len() == 16));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribers_observe_concurrent_events_in_sequence_order() {
+    for _ in 0..20 {
+        let bus = EventBus::new(1024, 1024);
+        let mut receiver = bus.subscribe();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(256));
+        let mut tasks = Vec::new();
+        for detail in 0..256 {
+            let bus = bus.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                bus.publish(Utc::now(), payload(detail.to_string())).await;
+            }));
+        }
+        let mut observed = Vec::new();
+        for _ in 0..256 {
+            observed.push(receiver.recv().await.unwrap().sequence);
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(observed, (1..=256).collect::<Vec<_>>());
+    }
+}
