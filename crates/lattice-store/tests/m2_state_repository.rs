@@ -64,13 +64,34 @@ async fn link_layer_identity_lookup_handles_unique_repeated_ambiguous_and_corrup
         repo.lookup_link_layer_device(link(), "mdns").await,
         Err(CheckpointError::Corrupt(_))
     ));
-    sqlx::query("INSERT INTO evidence(device_id,family,source,fact_key,fact_value,confidence,observed_at) VALUES(NULL,?,?,?,?,?,?)")
-        .bind("link_layer").bind("mdns").bind("mac").bind(&mac).bind(1.0).bind("2026-01-04T00:00:00Z")
+    Ok(())
+}
+
+#[tokio::test]
+async fn link_layer_identity_lookup_rejects_a_malformed_stored_device_id() -> anyhow::Result<()> {
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool.clone());
+    let malformed = "not-a-device-id";
+    let mac = link().to_string();
+    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at) VALUES(?,?,?)")
+        .bind(malformed)
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO evidence(device_id,family,source,fact_key,fact_value,confidence,observed_at) VALUES(?,?,?,?,?,?,?)")
+        .bind(malformed)
+        .bind("link_layer")
+        .bind("mdns")
+        .bind("mac")
+        .bind(&mac)
+        .bind(1.0)
+        .bind("2026-01-01T00:00:00Z")
         .execute(&pool)
         .await?;
     assert!(matches!(
         repo.lookup_link_layer_device(link(), "mdns").await,
-        Err(CheckpointError::Corrupt(_))
+        Err(CheckpointError::Corrupt(message)) if message == "identity evidence contains an invalid device identifier"
     ));
     Ok(())
 }
@@ -85,6 +106,24 @@ async fn link_layer_identity_lookup_survives_reopen_and_migration_is_indexed() -
         .initialize(time(0))
         .await?;
     let repo = M2StateRepository::new(pool.clone());
+    let expected = device();
+    let mac = link().to_string();
+    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at) VALUES(?,?,?)")
+        .bind(expected.to_string())
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO evidence(device_id,family,source,fact_key,fact_value,confidence,observed_at) VALUES(?,?,?,?,?,?,?)")
+        .bind(expected.to_string())
+        .bind("link_layer")
+        .bind("mdns")
+        .bind("mac")
+        .bind(&mac)
+        .bind(1.0)
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await?;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT schema_version FROM install_state WHERE singleton=1")
             .fetch_one(&pool)
@@ -104,7 +143,7 @@ async fn link_layer_identity_lookup_survives_reopen_and_migration_is_indexed() -
     let reopened = M2StateRepository::new(connect_path(&path).await?);
     assert_eq!(
         reopened.lookup_link_layer_device(link(), "mdns").await?,
-        None
+        Some(expected)
     );
     Ok(())
 }
