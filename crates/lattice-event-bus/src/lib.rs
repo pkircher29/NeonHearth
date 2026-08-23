@@ -52,12 +52,16 @@ impl EventBus {
     ) -> EventEnvelope {
         {
             let mut state = self.state.lock().await;
+            let following_sequence = state
+                .next_sequence
+                .checked_add(1)
+                .expect("event sequence space exhausted");
             let envelope = EventEnvelope {
                 sequence: state.next_sequence,
                 occurred_at,
                 payload,
             };
-            state.next_sequence = state.next_sequence.saturating_add(1);
+            state.next_sequence = following_sequence;
             state.replay.push_back(envelope.clone());
             while state.replay.len() > self.replay_capacity {
                 state.replay.pop_front();
@@ -96,5 +100,26 @@ impl EventBus {
                 .cloned()
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lattice_domain::{EventPayload, ServiceStatus};
+
+    #[tokio::test]
+    #[should_panic(expected = "event sequence space exhausted")]
+    async fn publish_rejects_sequence_exhaustion() {
+        let bus = EventBus::new(1, 1);
+        bus.state.lock().await.next_sequence = u64::MAX;
+        bus.publish(
+            Utc::now(),
+            EventPayload::ServiceStatus(ServiceStatus {
+                state: "ready".to_owned(),
+                detail: "test".to_owned(),
+            }),
+        )
+        .await;
     }
 }
