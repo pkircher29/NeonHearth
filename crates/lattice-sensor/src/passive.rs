@@ -3,7 +3,11 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use hickory_proto::{op::Message, rr::RData};
 use lattice_domain::{EvidenceFact, EvidenceFamily};
 use pcap_file::{DataLink, pcap::PcapReader};
-use quick_xml::{Reader, events::Event};
+use quick_xml::{
+    NsReader,
+    events::Event,
+    name::{Namespace, QName, ResolveResult},
+};
 use serde::Serialize;
 use std::{
     io::Cursor,
@@ -773,38 +777,61 @@ fn soap(
     src: IpAddr,
     q: &[u8],
 ) -> Result<Vec<PassiveObservation>, PassiveParseError> {
+    const SOAP12: &[u8] = b"http://www.w3.org/2003/05/soap-envelope";
+    const WSA: &[u8] = b"http://www.w3.org/2005/08/addressing";
+    const WSD09: &[u8] = b"http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01";
+    const WSD05: &[u8] = b"http://schemas.xmlsoap.org/ws/2005/04/discovery";
+    const ONVIF: &[u8] = b"http://www.onvif.org/ver10/network/wsdl";
     if q.len() > MAX_METADATA_BYTES {
         return Err(PassiveParseError::Metadata);
     }
     std::str::from_utf8(q).map_err(|_| PassiveParseError::Metadata)?;
-    let mut r = Reader::from_reader(q);
+    let mut r = NsReader::from_reader(q);
     r.config_mut().trim_text(true);
-    let (mut depth, mut events, mut current, mut in_ep, mut envelope, mut v) = (
-        0usize,
-        0usize,
-        None::<&'static str>,
-        false,
-        false,
-        Vec::new(),
-    );
+    let mut buffer = Vec::new();
+    let (mut depth, mut events, mut current, mut v) =
+        (0usize, 0usize, None::<&'static str>, Vec::new());
+    let (mut envelope, mut body, mut matches_depth, mut probe, mut endpoint) =
+        (None, None, None, None, None);
+    let mut onvif = false;
     loop {
         events += 1;
         if events > 256 {
             return Err(PassiveParseError::Metadata);
         }
-        match r.read_event() {
+        match r.read_event_into(&mut buffer) {
             Ok(Event::Start(e)) => {
                 depth += 1;
                 if depth > 32 {
                     return Err(PassiveParseError::Metadata);
                 }
-                match e.local_name().as_ref() {
-                    b"Envelope" => envelope = true,
-                    b"EndpointReference" => in_ep = true,
-                    b"Address" if in_ep => current = Some("endpoint"),
-                    b"Types" => current = Some("types"),
-                    b"Scopes" => current = Some("scopes"),
-                    b"XAddrs" => current = Some("xaddrs"),
+                let local = e.local_name();
+                let resolved = r.resolver().resolve_element(e.name()).0;
+                let namespace_is = |expected: &[u8]| matches!(resolved, ResolveResult::Bound(Namespace(uri)) if uri == expected);
+                let is_wsd = namespace_is(WSD09) || namespace_is(WSD05);
+                match local.as_ref() {
+                    b"Envelope" if depth == 1 && namespace_is(SOAP12) => envelope = Some(depth),
+                    b"Body" if envelope == Some(depth - 1) && namespace_is(SOAP12) => {
+                        body = Some(depth)
+                    }
+                    b"ProbeMatches" if body == Some(depth - 1) && is_wsd => {
+                        matches_depth = Some(depth)
+                    }
+                    b"ProbeMatch"
+                        if is_wsd
+                            && (body == Some(depth - 1) || matches_depth == Some(depth - 1)) =>
+                    {
+                        probe = Some(depth)
+                    }
+                    b"EndpointReference" if probe.is_some() && namespace_is(WSA) => {
+                        endpoint = Some(depth)
+                    }
+                    b"Address" if endpoint.is_some() && namespace_is(WSA) => {
+                        current = Some("endpoint")
+                    }
+                    b"Types" if probe.is_some() && is_wsd => current = Some("types"),
+                    b"Scopes" if probe.is_some() && is_wsd => current = Some("scopes"),
+                    b"XAddrs" if probe.is_some() && is_wsd => current = Some("xaddrs"),
                     _ => {}
                 }
             }
@@ -817,13 +844,34 @@ fn soap(
                     if z.len() > 1024 {
                         return Err(PassiveParseError::Metadata);
                     }
+                    if k == "types" {
+                        onvif |= z.split_ascii_whitespace().any(|qname| {
+                            matches!(
+                                r.resolver().resolve_element(QName(qname.as_bytes())).0,
+                                ResolveResult::Bound(Namespace(uri)) if uri == ONVIF
+                            )
+                        });
+                    } else if k == "scopes" {
+                        onvif |= z
+                            .split_ascii_whitespace()
+                            .any(|scope| scope.starts_with("onvif://www.onvif.org/"));
+                    }
                     v.push((k, z, EvidenceFamily::Service, 300));
                     current = None
                 }
             }
-            Ok(Event::End(e)) => {
-                if e.local_name().as_ref() == b"EndpointReference" {
-                    in_ep = false
+            Ok(Event::End(_)) => {
+                if endpoint == Some(depth) {
+                    endpoint = None;
+                }
+                if probe == Some(depth) {
+                    probe = None;
+                }
+                if matches_depth == Some(depth) {
+                    matches_depth = None;
+                }
+                if body == Some(depth) {
+                    body = None;
                 }
                 depth = depth.checked_sub(1).ok_or(PassiveParseError::Metadata)?
             }
@@ -834,16 +882,11 @@ fn soap(
             Ok(_) => {}
             Err(_) => return Err(PassiveParseError::Metadata),
         }
+        buffer.clear();
     }
-    if !envelope || v.is_empty() {
+    if envelope.is_none() || v.is_empty() {
         return Err(PassiveParseError::Metadata);
     }
-    let onvif = v.iter().any(|(k, z, _, _)| {
-        matches!(*k, "types" | "scopes")
-            && (z.contains("NetworkVideoTransmitter")
-                || z.starts_with("onvif://")
-                || z.contains("www.onvif.org"))
-    });
     Ok(observation(
         i,
         t,

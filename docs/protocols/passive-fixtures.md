@@ -10,6 +10,10 @@ DHCP lease, DNS/service-record TTL, and SSDP max-age drive per-fact expiry when
 present; other protocols use a bounded five-minute default. DNS and LLMNR query
 names require the explicit `metadata_enabled` option. The bounded normalizer parses
 namespaced WS-Discovery SOAP and distinguishes ONVIF from decoded Types/Scopes.
+SOAP parsing requires the SOAP 1.2 envelope namespace, WS-Addressing 2005/08,
+and either WS-Discovery 2005/04 or 2009/01 along the validated
+Envelope/Body/ProbeMatch path. ONVIF type classification requires the bound
+ONVIF network-WSDL namespace; ONVIF scope classification uses parsed scope URIs.
 DTD, entity/reference, processing-instruction, oversized, over-deep, and excessive-event
 XML inputs are rejected. Live capture, packet export, persistence, and active probing
 remain out of scope for this fixture milestone.

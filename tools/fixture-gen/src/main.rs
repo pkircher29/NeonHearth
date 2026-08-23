@@ -276,7 +276,7 @@ fn main() {
             udp(1900, 1900, s),
         ),
     );
-    let w=br#"<s:Envelope xmlns:s="urn:soap" xmlns:a="urn:wsa" xmlns:d="urn:wsd"><s:Body><d:ProbeMatch><a:EndpointReference><a:Address>urn:uuid:device-1</a:Address></a:EndpointReference><d:Types>dn:Device</d:Types><d:Scopes>urn:example:lab</d:Scopes><d:XAddrs>http://192.0.2.30/device</d:XAddrs></d:ProbeMatch></s:Body></s:Envelope>"#;
+    let w=br#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="urn:example"><s:Body><d:ProbeMatches><d:ProbeMatch><a:EndpointReference><a:Address>urn:uuid:device-1</a:Address></a:EndpointReference><d:Types>dn:Device</d:Types><d:Scopes>urn:example:lab</d:Scopes><d:XAddrs>http://192.0.2.30/device</d:XAddrs></d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>"#;
     save(
         "ws-discovery",
         v4(
@@ -286,7 +286,7 @@ fn main() {
             udp(3702, 3702, w),
         ),
     );
-    let o=br#"<s:Envelope xmlns:s="urn:soap" xmlns:a="urn:wsa" xmlns:d="urn:wsd" xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><s:Body><d:ProbeMatch><a:EndpointReference><a:Address>urn:uuid:camera-1</a:Address></a:EndpointReference><d:Types>dn:NetworkVideoTransmitter</d:Types><d:Scopes>onvif://www.onvif.org/name/Camera</d:Scopes><d:XAddrs>http://192.0.2.30/onvif/device_service</d:XAddrs></d:ProbeMatch></s:Body></s:Envelope>"#;
+    let o=br#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:d="http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01" xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><s:Body><d:ProbeMatches><d:ProbeMatch><a:EndpointReference><a:Address>urn:uuid:camera-1</a:Address></a:EndpointReference><d:Types>dn:NetworkVideoTransmitter</d:Types><d:Scopes>onvif://www.onvif.org/name/Camera</d:Scopes><d:XAddrs>http://192.0.2.30/onvif/device_service</d:XAddrs></d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>"#;
     save(
         "onvif-discovery",
         v4(

@@ -508,6 +508,50 @@ fn xml_dtd_entities_depth_and_event_budgets_are_rejected() {
 }
 
 #[test]
+fn ws_discovery_requires_standard_namespaces_and_document_scope() {
+    let wrong_all = br#"<s:Envelope xmlns:s="urn:fake-soap" xmlns:a="urn:fake-wsa" xmlns:d="urn:fake-wsd"><s:Body><d:ProbeMatch><a:EndpointReference><a:Address>urn:spoof</a:Address></a:EndpointReference><d:Types>dn:Device</d:Types><d:XAddrs>http://spoof</d:XAddrs></d:ProbeMatch></s:Body></s:Envelope>"#;
+    let outside = br#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:d="http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01"><d:Types>dn:Device</d:Types></s:Envelope>"#;
+    let unbound = br#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><d:ProbeMatch><d:Types>dn:Device</d:Types></d:ProbeMatch></s:Body></s:Envelope>"#;
+    let mixed = br#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="urn:fake-wsa" xmlns:d="urn:fake-wsd"><s:Body><d:ProbeMatch><a:EndpointReference><a:Address>urn:spoof</a:Address></a:EndpointReference><d:Types>dn:NetworkVideoTransmitter</d:Types><d:Scopes>onvif://www.onvif.org/name/Camera</d:Scopes></d:ProbeMatch></s:Body></s:Envelope>"#;
+    for (label, xml) in [
+        ("wrong", wrong_all.as_slice()),
+        ("outside", outside.as_slice()),
+        ("unbound", unbound.as_slice()),
+        ("mixed", mixed.as_slice()),
+    ] {
+        assert!(
+            lattice_sensor::PassiveAdapter::normalize(
+                &OfflinePassiveAdapter,
+                "x",
+                chrono::Utc::now(),
+                &udp_frame(3702, 3702, xml),
+                &PassiveOptions::default()
+            )
+            .is_err(),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn ws_discovery_fixtures_use_supported_standard_namespaces() {
+    for name in ["ws-discovery", "onvif-discovery"] {
+        let bytes = fs::read(fixtures().join(format!("{name}.pcap"))).unwrap();
+        let wire = String::from_utf8_lossy(&bytes);
+        assert!(wire.contains("http://www.w3.org/2003/05/soap-envelope"));
+        assert!(wire.contains("http://www.w3.org/2005/08/addressing"));
+        assert!(wire.contains("discovery/2009/01") || wire.contains("ws/2005/04/discovery"));
+        assert_eq!(
+            OfflinePassiveAdapter
+                .ingest_pcap("x", &bytes, &PassiveOptions::default())
+                .unwrap()[0]
+                .protocol,
+            name
+        );
+    }
+}
+
+#[test]
 fn invalid_utf8_and_oversized_metadata_are_rejected() {
     let oversized = vec![b'x'; 2_049];
     for (label, payload) in [
