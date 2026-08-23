@@ -5,6 +5,7 @@ members = [
     "crates/lattice-store",
     "crates/lattice-event-bus",
     "crates/lattice-sensor",
+    "crates/lattice-intelligence",
     "crates/lattice-service",
     "tools/fixture-gen",
 ]

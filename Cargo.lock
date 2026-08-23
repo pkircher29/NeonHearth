@@ -1199,6 +1199,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-intelligence"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lattice-domain",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "lattice-sensor"
 version = "0.1.0"
 dependencies = [
