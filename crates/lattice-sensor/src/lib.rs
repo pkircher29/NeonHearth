@@ -11,6 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use pnet_datalink::interfaces;
 use thiserror::Error;
 
+pub mod active;
 pub mod passive;
 pub use passive::{
     OfflinePassiveAdapter, PassiveAdapter, PassiveObservation, PassiveOptions, PassiveParseError,
