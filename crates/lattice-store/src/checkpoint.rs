@@ -12,7 +12,16 @@ pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_BATCH: usize = 4096;
 const CURRENT_FORMAT_VERSION: i64 = 1;
 type StoredCheckpointRow = (i64, Vec<u8>, String, i64, String, Vec<u8>);
-type StoredDiscoveryRow = (String, Vec<u8>, String, Vec<u8>, i64, String, Vec<u8>);
+type StoredDiscoveryRow = (
+    String,
+    Vec<u8>,
+    String,
+    Vec<u8>,
+    i64,
+    String,
+    Vec<u8>,
+    Vec<u8>,
+);
 type StoredTransitionRow = (
     String,
     String,
@@ -171,7 +180,7 @@ impl M2StateRepository {
         input_hash: [u8; 32],
     ) -> Result<Option<StoredDiscoveryCommit>, CheckpointError> {
         let row: Option<StoredDiscoveryRow> = sqlx::query_as(
-            "SELECT source,result_summary,committed_at,result_sha256,checkpoint_sequence,source_fingerprint,commit_digest FROM discovery_commits WHERE input_hash=?",
+            "SELECT source,result_summary,committed_at,result_sha256,checkpoint_sequence,source_fingerprint,commit_digest,row_sha256 FROM discovery_commits WHERE input_hash=?",
         )
         .bind(input_hash.to_vec())
         .fetch_optional(&self.pool)
@@ -184,6 +193,7 @@ impl M2StateRepository {
             checkpoint_sequence,
             source_fingerprint,
             commit_digest,
+            row_sha256,
         )) = row
         else {
             return Ok(None);
@@ -194,33 +204,60 @@ impl M2StateRepository {
             "discovery source",
             CheckpointError::Corrupt,
         )?;
+        check_string_with(
+            &source_fingerprint,
+            &self.config,
+            "discovery source fingerprint",
+            CheckpointError::Corrupt,
+        )?;
         if result_summary.len() > self.config.max_discovery_summary_bytes
+            || result_sha256.len() != 32
             || Sha256::digest(&result_summary).as_slice() != result_sha256.as_slice()
             || commit_digest.len() != 32
+            || row_sha256.len() != 32
         {
             return Err(CheckpointError::Corrupt(
                 "discovery commit checksum or bound invalid".into(),
             ));
         }
-        serde_json::from_slice::<serde_json::Value>(&result_summary).map_err(|e| {
-            CheckpointError::Corrupt(format!("discovery result summary is not JSON: {e}"))
-        })?;
+        let committed_at = parse_timestamp(
+            &committed_at,
+            "discovery commit committed_at",
+            CheckpointError::Corrupt,
+        )?;
+        if row_sha256
+            != discovery_row_checksum(
+                input_hash,
+                &source,
+                committed_at,
+                &result_summary,
+                &result_sha256,
+                &commit_digest,
+                checkpoint_sequence,
+                &source_fingerprint,
+            )
+        {
+            return Err(CheckpointError::Corrupt(
+                "discovery commit row checksum mismatch".into(),
+            ));
+        }
+        validate_discovery_summary(
+            &result_summary,
+            checkpoint_sequence,
+            CheckpointError::Corrupt,
+        )?;
         let checkpoint = self.load(&source_fingerprint).await?.ok_or_else(|| {
             CheckpointError::Corrupt("discovery record exists without checkpoint".into())
         })?;
-        if checkpoint.commit_sequence != checkpoint_sequence {
+        if checkpoint.commit_sequence < checkpoint_sequence {
             return Err(CheckpointError::Corrupt(
-                "discovery checkpoint sequence mismatch".into(),
+                "discovery commit names a future checkpoint sequence".into(),
             ));
         }
         Ok(Some(StoredDiscoveryCommit {
             source,
             result_summary,
-            committed_at: parse_timestamp(
-                &committed_at,
-                "discovery commit committed_at",
-                CheckpointError::Corrupt,
-            )?,
+            committed_at,
         }))
     }
     pub fn flow_repository(&self, max_batch: usize) -> Result<FlowRepository, CheckpointError> {
@@ -230,84 +267,7 @@ impl M2StateRepository {
     pub async fn commit(&self, input: CommitInput) -> Result<(), CheckpointError> {
         validate_input(&self.config, &input)?;
         let digest = logical_commit_digest(&input)?;
-        let mut tx = self.pool.begin().await?;
-        if let Some(discovery) = &input.discovery {
-            let old: Option<Vec<u8>> = sqlx::query_scalar(
-                "SELECT commit_digest FROM discovery_commits WHERE input_hash=?",
-            )
-            .bind(discovery.input_hash.to_vec())
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(old) = old {
-                if old == digest {
-                    verify_idempotent_checkpoint(&mut tx, &self.config, &input).await?;
-                    tx.commit().await?;
-                    return Ok(());
-                }
-                return Err(CheckpointError::Conflict(
-                    "input hash already names a different logical commit".into(),
-                ));
-            }
-        }
-        let previous: Option<i64> =
-            sqlx::query_scalar("SELECT commit_sequence FROM state_checkpoints WHERE singleton=1")
-                .fetch_optional(&mut *tx)
-                .await?;
-        let expected = previous.map_or(Ok(1), |value| {
-            value
-                .checked_add(1)
-                .ok_or_else(|| CheckpointError::Conflict("commit sequence is exhausted".into()))
-        })?;
-        if input.checkpoint.commit_sequence != expected {
-            return Err(CheckpointError::Conflict(format!(
-                "stale or out-of-order sequence: expected {expected}, got {}",
-                input.checkpoint.commit_sequence
-            )));
-        }
-        let checksum = checkpoint_checksum(&input.checkpoint);
-        let checkpoint_insert = if let Some(previous) = previous {
-            sqlx::query("UPDATE state_checkpoints SET format_version=?,checkpoint_bytes=?,source_fingerprint=?,commit_sequence=?,written_at=?,sha256=? WHERE singleton=1 AND commit_sequence=?")
-                .bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checksum).bind(previous).execute(&mut *tx).await
-        } else {
-            sqlx::query("INSERT INTO state_checkpoints(singleton,format_version,checkpoint_bytes,source_fingerprint,commit_sequence,written_at,sha256) VALUES(1,?,?,?,?,?,?) ON CONFLICT(singleton) DO NOTHING")
-                .bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checksum).execute(&mut *tx).await
-        };
-        let changed = match checkpoint_insert {
-            Ok(result) => result.rows_affected(),
-            Err(error) => {
-                if error.as_database_error().is_some_and(|db| {
-                    db.is_unique_violation()
-                        || db.code().as_deref() == Some("5")
-                        || db.message().contains("database is locked")
-                }) {
-                    return Err(CheckpointError::Conflict(
-                        "another writer committed this sequence first".into(),
-                    ));
-                }
-                return Err(CheckpointError::Storage(error));
-            }
-        };
-        if changed != 1 {
-            return Err(CheckpointError::Conflict(
-                "another writer advanced the checkpoint first".into(),
-            ));
-        }
-        for device in &input.devices {
-            upsert_device(&mut tx, device).await?;
-        }
-        for evidence in &input.evidence {
-            insert_evidence(&mut tx, evidence).await?;
-        }
-        let mut transitions: Vec<_> = input.transitions.iter().collect();
-        transitions.sort_by_key(|transition| transition.transition_id);
-        for transition in transitions {
-            insert_transition(&mut tx, transition).await?;
-        }
-        if let Some(discovery) = &input.discovery {
-            sqlx::query("INSERT INTO discovery_commits(input_hash,source,committed_at,result_summary,commit_digest,result_sha256,checkpoint_sequence,source_fingerprint) VALUES(?,?,?,?,?,?,?,?)").bind(discovery.input_hash.to_vec()).bind(&discovery.source).bind(discovery.committed_at.to_rfc3339()).bind(&discovery.result_summary).bind(digest).bind(Sha256::digest(&discovery.result_summary).to_vec()).bind(input.checkpoint.commit_sequence).bind(&input.checkpoint.source_fingerprint).execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        Ok(())
+        self.commit_inner(input, digest, None).await
     }
 
     pub async fn commit_with_flow(
@@ -319,6 +279,16 @@ impl M2StateRepository {
     ) -> Result<(), CheckpointError> {
         validate_input(&self.config, &input)?;
         let digest = logical_commit_digest_with_flow(&input, changes)?;
+        self.commit_inner(input, digest, Some((flow, changes, now)))
+            .await
+    }
+
+    async fn commit_inner(
+        &self,
+        input: CommitInput,
+        digest: Vec<u8>,
+        flow: Option<(&FlowRepository, &[RollupChange], DateTime<Utc>)>,
+    ) -> Result<(), CheckpointError> {
         let mut tx = self.pool.begin().await?;
         if let Some(discovery) = &input.discovery {
             let old: Option<Vec<u8>> = sqlx::query_scalar(
@@ -344,7 +314,7 @@ impl M2StateRepository {
                 .await?;
         let expected = previous.map_or(Ok(1), |v| {
             v.checked_add(1)
-                .ok_or_else(|| CheckpointError::Conflict("sequence exhausted".into()))
+                .ok_or_else(|| CheckpointError::Conflict("commit sequence is exhausted".into()))
         })?;
         if input.checkpoint.commit_sequence != expected {
             return Err(CheckpointError::Conflict(format!(
@@ -353,31 +323,44 @@ impl M2StateRepository {
             )));
         }
         let checksum = checkpoint_checksum(&input.checkpoint);
-        let result = if let Some(previous) = previous {
-            sqlx::query("UPDATE state_checkpoints SET format_version=?,checkpoint_bytes=?,source_fingerprint=?,commit_sequence=?,written_at=?,sha256=? WHERE singleton=1 AND commit_sequence=?").bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checksum).bind(previous).execute(&mut *tx).await?
+        let checkpoint_write = if let Some(previous) = previous {
+            sqlx::query("UPDATE state_checkpoints SET format_version=?,checkpoint_bytes=?,source_fingerprint=?,commit_sequence=?,written_at=?,sha256=? WHERE singleton=1 AND commit_sequence=?").bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checksum).bind(previous).execute(&mut *tx).await
         } else {
-            sqlx::query("INSERT INTO state_checkpoints(singleton,format_version,checkpoint_bytes,source_fingerprint,commit_sequence,written_at,sha256) VALUES(1,?,?,?,?,?,?)").bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checksum).execute(&mut *tx).await?
+            sqlx::query("INSERT INTO state_checkpoints(singleton,format_version,checkpoint_bytes,source_fingerprint,commit_sequence,written_at,sha256) VALUES(1,?,?,?,?,?,?) ON CONFLICT(singleton) DO NOTHING").bind(input.checkpoint.format_version).bind(&input.checkpoint.bytes).bind(&input.checkpoint.source_fingerprint).bind(input.checkpoint.commit_sequence).bind(input.checkpoint.written_at.to_rfc3339()).bind(checksum).execute(&mut *tx).await
         };
-        if result.rows_affected() != 1 {
-            return Err(CheckpointError::Conflict("checkpoint CAS failed".into()));
+        let changed = match checkpoint_write {
+            Ok(result) => result.rows_affected(),
+            Err(error) if is_write_conflict(&error) => {
+                return Err(CheckpointError::Conflict(
+                    "another writer committed this sequence first".into(),
+                ));
+            }
+            Err(error) => return Err(CheckpointError::Storage(error)),
+        };
+        if changed != 1 {
+            return Err(CheckpointError::Conflict(
+                "another writer advanced the checkpoint first".into(),
+            ));
         }
-        for d in &input.devices {
-            upsert_device(&mut tx, d).await?;
+        for device in &input.devices {
+            upsert_device(&mut tx, device).await?;
         }
-        for e in &input.evidence {
-            insert_evidence(&mut tx, e).await?;
+        for evidence in &input.evidence {
+            insert_evidence(&mut tx, evidence).await?;
         }
         let mut transitions: Vec<_> = input.transitions.iter().collect();
         transitions.sort_by_key(|transition| transition.transition_id);
-        for t in transitions {
-            insert_transition(&mut tx, t).await?;
+        for transition in transitions {
+            insert_transition(&mut tx, transition).await?;
         }
-        if let Some(d) = &input.discovery {
-            sqlx::query("INSERT INTO discovery_commits(input_hash,source,committed_at,result_summary,commit_digest,result_sha256,checkpoint_sequence,source_fingerprint) VALUES(?,?,?,?,?,?,?,?)").bind(d.input_hash.to_vec()).bind(&d.source).bind(d.committed_at.to_rfc3339()).bind(&d.result_summary).bind(digest).bind(Sha256::digest(&d.result_summary).to_vec()).bind(input.checkpoint.commit_sequence).bind(&input.checkpoint.source_fingerprint).execute(&mut *tx).await?;
+        if let Some(discovery) = &input.discovery {
+            insert_discovery_commit(&mut tx, &input.checkpoint, discovery, &digest).await?;
         }
-        flow.apply_in_transaction(&mut tx, changes, now)
-            .await
-            .map_err(|e| CheckpointError::Invalid(e.to_string()))?;
+        if let Some((flow, changes, now)) = flow {
+            flow.apply_in_transaction(&mut tx, changes, now)
+                .await
+                .map_err(|e| CheckpointError::Invalid(e.to_string()))?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -528,12 +511,131 @@ fn validate_input(config: &M2StateConfig, input: &CommitInput) -> Result<(), Che
                 "discovery result summary too large".into(),
             ));
         }
-        serde_json::from_slice::<serde_json::Value>(&d.result_summary).map_err(|e| {
-            CheckpointError::Invalid(format!("discovery result summary is not JSON: {e}"))
-        })?;
+        validate_discovery_summary(
+            &d.result_summary,
+            input.checkpoint.commit_sequence,
+            CheckpointError::Invalid,
+        )?;
     }
     Ok(())
 }
+
+fn validate_discovery_summary(
+    bytes: &[u8],
+    expected_sequence: i64,
+    error: fn(String) -> CheckpointError,
+) -> Result<(), CheckpointError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|cause| error(format!("discovery result summary is not JSON: {cause}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| error("discovery result summary must be an object".into()))?;
+    if object.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(error(
+            "discovery result summary has an unsupported version".into(),
+        ));
+    }
+    let device_id = object
+        .get("device_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| error("discovery result summary is missing device_id".into()))?;
+    DeviceId::parse(device_id)
+        .map_err(|_| error("discovery result summary has an invalid device_id".into()))?;
+    if object
+        .get("commit_sequence")
+        .and_then(serde_json::Value::as_i64)
+        != Some(expected_sequence)
+    {
+        return Err(error(
+            "discovery result summary commit_sequence mismatch".into(),
+        ));
+    }
+    for field in ["event_count", "presence_transition_count"] {
+        if object
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        {
+            return Err(error(format!(
+                "discovery result summary has an invalid {field}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn insert_discovery_commit(
+    tx: &mut Transaction<'_, Sqlite>,
+    checkpoint: &CheckpointInput,
+    discovery: &DiscoveryCommit,
+    commit_digest: &[u8],
+) -> Result<(), CheckpointError> {
+    let result_sha256 = Sha256::digest(&discovery.result_summary).to_vec();
+    let row_sha256 = discovery_row_checksum(
+        discovery.input_hash,
+        &discovery.source,
+        discovery.committed_at,
+        &discovery.result_summary,
+        &result_sha256,
+        commit_digest,
+        checkpoint.commit_sequence,
+        &checkpoint.source_fingerprint,
+    );
+    let result = sqlx::query(
+        "INSERT INTO discovery_commits(input_hash,source,committed_at,result_summary,commit_digest,result_sha256,checkpoint_sequence,source_fingerprint,row_sha256) VALUES(?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(discovery.input_hash.to_vec())
+    .bind(&discovery.source)
+    .bind(discovery.committed_at.to_rfc3339())
+    .bind(&discovery.result_summary)
+    .bind(commit_digest)
+    .bind(result_sha256)
+    .bind(checkpoint.commit_sequence)
+    .bind(&checkpoint.source_fingerprint)
+    .bind(row_sha256)
+    .execute(&mut **tx)
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if is_write_conflict(&error) => Err(CheckpointError::Conflict(
+            "another writer committed this discovery input first".into(),
+        )),
+        Err(error) => Err(CheckpointError::Storage(error)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // fields are the complete durable replay envelope
+fn discovery_row_checksum(
+    input_hash: [u8; 32],
+    source: &str,
+    committed_at: DateTime<Utc>,
+    result_summary: &[u8],
+    result_sha256: &[u8],
+    commit_digest: &[u8],
+    checkpoint_sequence: i64,
+    source_fingerprint: &str,
+) -> Vec<u8> {
+    let canonical = json!({
+        "checkpoint_sequence": checkpoint_sequence,
+        "commit_digest": commit_digest,
+        "committed_at": committed_at.to_rfc3339(),
+        "input_hash": input_hash,
+        "result_sha256": result_sha256,
+        "result_summary": result_summary,
+        "source": source,
+        "source_fingerprint": source_fingerprint,
+    });
+    Sha256::digest(serde_json::to_vec(&canonical).expect("JSON value serializes")).to_vec()
+}
+
+fn is_write_conflict(error: &sqlx::Error) -> bool {
+    error.as_database_error().is_some_and(|database| {
+        database.is_unique_violation()
+            || database.code().as_deref() == Some("5")
+            || database.message().contains("database is locked")
+    })
+}
+
 #[allow(clippy::too_many_arguments)] // fields mirror one durable checkpoint envelope
 fn validate_checkpoint(
     config: &M2StateConfig,

@@ -19,7 +19,8 @@ CREATE TABLE discovery_commits (
  commit_digest BLOB NOT NULL CHECK(length(commit_digest)=32),
  result_sha256 BLOB NOT NULL CHECK(length(result_sha256)=32),
  checkpoint_sequence INTEGER NOT NULL CHECK(checkpoint_sequence>0),
- source_fingerprint TEXT NOT NULL
+ source_fingerprint TEXT NOT NULL,
+ row_sha256 BLOB NOT NULL CHECK(length(row_sha256)=32)
 );
 CREATE INDEX discovery_commits_time_idx ON discovery_commits(committed_at DESC);
 CREATE UNIQUE INDEX evidence_semantic_identity_idx ON evidence

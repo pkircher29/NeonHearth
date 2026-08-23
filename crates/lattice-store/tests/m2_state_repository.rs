@@ -64,7 +64,14 @@ fn input(sequence: i64, hash: [u8; 32]) -> CommitInput {
         discovery: Some(DiscoveryCommit {
             input_hash: hash,
             source: "mdns".into(),
-            result_summary: br#"{"devices":1}"#.to_vec(),
+            result_summary: serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "device_id": device().to_string(),
+                "commit_sequence": sequence,
+                "event_count": 1,
+                "presence_transition_count": 1,
+            }))
+            .expect("summary serializes"),
             committed_at: at,
         }),
     }
@@ -141,7 +148,13 @@ async fn identical_retry_is_idempotent_but_changed_payload_conflicts() -> anyhow
     repo.commit(original.clone()).await?;
     repo.commit(original.clone()).await?;
     let mut changed = original;
-    changed.discovery.as_mut().unwrap().result_summary = br#"{"devices":2}"#.to_vec();
+    changed.discovery.as_mut().unwrap().result_summary = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "device_id": device().to_string(),
+        "commit_sequence": 1,
+        "event_count": 2,
+        "presence_transition_count": 1,
+    }))?;
     assert!(matches!(
         repo.commit(changed).await,
         Err(CheckpointError::Conflict(_))
@@ -373,6 +386,75 @@ async fn combined_flow_sorts_reversed_corrections() -> anyhow::Result<()> {
             .await?,
         3
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_discovery_lookup_accepts_an_older_commit_on_the_same_lineage() -> anyhow::Result<()>
+{
+    let repo = M2StateRepository::new(lattice_store::connect_memory().await?);
+    repo.commit(input(1, [51; 32])).await?;
+    repo.commit(input(2, [52; 32])).await?;
+
+    let first = repo.discovery_commit([51; 32]).await?.unwrap();
+    assert_eq!(first.source, "mdns");
+    let summary: serde_json::Value = serde_json::from_slice(&first.result_summary)?;
+    assert_eq!(summary["commit_sequence"], 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_discovery_lookup_fails_closed_for_any_corrupt_replay_field() -> anyhow::Result<()>
+{
+    for statement in [
+        "UPDATE discovery_commits SET commit_digest=zeroblob(32)",
+        "UPDATE discovery_commits SET result_sha256=zeroblob(32)",
+        "UPDATE discovery_commits SET row_sha256=zeroblob(32)",
+        "UPDATE discovery_commits SET checkpoint_sequence=99",
+        "UPDATE discovery_commits SET source_fingerprint='other'",
+        "UPDATE discovery_commits SET result_summary=x'7b7d'",
+    ] {
+        let pool = lattice_store::connect_memory().await?;
+        let repo = M2StateRepository::new(pool.clone());
+        repo.commit(input(1, [53; 32])).await?;
+        sqlx::query(statement).execute(&pool).await?;
+        assert!(matches!(
+            repo.discovery_commit([53; 32]).await,
+            Err(CheckpointError::Corrupt(_))
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovery_summary_schema_and_sequence_are_validated_before_mutation() -> anyhow::Result<()>
+{
+    let repo = M2StateRepository::new(lattice_store::connect_memory().await?);
+    for summary in [
+        serde_json::json!({}),
+        serde_json::json!({
+            "version": 1,
+            "device_id": "not-a-device-id",
+            "commit_sequence": 1,
+            "event_count": 1,
+            "presence_transition_count": 1,
+        }),
+        serde_json::json!({
+            "version": 1,
+            "device_id": device().to_string(),
+            "commit_sequence": 2,
+            "event_count": 1,
+            "presence_transition_count": 1,
+        }),
+    ] {
+        let mut invalid = input(1, [54; 32]);
+        invalid.discovery.as_mut().unwrap().result_summary = serde_json::to_vec(&summary)?;
+        assert!(matches!(
+            repo.commit(invalid).await,
+            Err(CheckpointError::Invalid(_))
+        ));
+    }
+    assert!(repo.load("sensor-config-v1").await?.is_none());
     Ok(())
 }
 

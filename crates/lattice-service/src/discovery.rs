@@ -220,6 +220,9 @@ impl PersistentDiscoveryPipeline {
     pub fn commit_sequence(&self) -> i64 {
         self.sequence
     }
+    pub fn presence_state(&self, id: DeviceId) -> Option<lattice_domain::PresenceState> {
+        self.pipeline.presence_state(id)
+    }
     pub async fn observe_with_flow(
         &mut self,
         input: DiscoveryObservation,
