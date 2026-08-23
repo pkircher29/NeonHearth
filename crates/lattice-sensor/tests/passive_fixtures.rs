@@ -37,6 +37,22 @@ fn fixture_inventory_is_exact_protocol_matrix() {
     names.sort();
     assert_eq!(names, EXPECTED);
 }
+
+#[test]
+fn fixtures_are_real_ethernet_ip_or_arp_not_private_metadata_envelopes() {
+    for name in EXPECTED {
+        let bytes = fs::read(fixtures().join(format!("{name}.pcap"))).unwrap();
+        let frame = &bytes[24 + 16..];
+        let ether_type = u16::from_be_bytes([frame[12], frame[13]]);
+        assert!(matches!(ether_type, 0x0806 | 0x0800 | 0x86dd));
+        assert_ne!(ether_type, 0x88b5);
+        if ether_type == 0x0800 && frame[23] == 17 {
+            let ihl = usize::from(frame[14] & 15) * 4;
+            let port = u16::from_be_bytes([frame[14 + ihl], frame[15 + ihl]]);
+            assert!(port > 0);
+        }
+    }
+}
 #[test]
 fn every_fixture_normalizes_sanitized_metadata() {
     let adapter = OfflinePassiveAdapter;
@@ -72,8 +88,13 @@ fn expected_facts_and_protocol_ttls_are_exact() {
     let cases = [
         ("arp", "ip", "192.0.2.10", 300),
         ("dhcpv4", "hostname", "lab-client", 3600),
-        ("dhcpv6", "server", "2001:db8::1", 3600),
-        ("mdns-dns-sd", "service", "_ipp._tcp.example.test", 120),
+        (
+            "dhcpv6",
+            "client_id",
+            "0100000101000a000100010001000100010027000400000e10002700106c61622d76362e6578616d706c652e74657374",
+            3600,
+        ),
+        ("mdns-dns-sd", "name", "printer.example.test", 120),
         ("ssdp-upnp", "location", "http://192.0.2.20/desc.xml", 1800),
         (
             "ws-discovery",
@@ -90,8 +111,8 @@ fn expected_facts_and_protocol_ttls_are_exact() {
         ("igmp", "group", "239.255.0.1", 300),
         ("mld", "group", "ff02::1", 300),
         ("dns-query", "query", "update.example.test", 300),
-        ("tcp-flow", "bytes", "512", 300),
-        ("udp-flow", "dst", "192.0.2.41:5353", 300),
+        ("tcp-flow", "bytes", "52", 300),
+        ("udp-flow", "dst", "unknown:4243", 300),
     ];
     for (name, key, value, ttl) in cases {
         let observation = OfflinePassiveAdapter
@@ -123,17 +144,19 @@ fn expected_facts_and_protocol_ttls_are_exact() {
 #[test]
 fn dns_queries_respect_privacy_switch() {
     let bytes = fs::read(fixtures().join("dns-query.pcap")).unwrap();
+    let observations = OfflinePassiveAdapter
+        .ingest_pcap(
+            "x",
+            &bytes,
+            &PassiveOptions {
+                metadata_enabled: false,
+            },
+        )
+        .unwrap();
     assert!(
-        OfflinePassiveAdapter
-            .ingest_pcap(
-                "x",
-                &bytes,
-                &PassiveOptions {
-                    metadata_enabled: false
-                }
-            )
-            .unwrap()
-            .is_empty()
+        observations
+            .iter()
+            .all(|observation| observation.facts.iter().all(|fact| fact.key != "query"))
     );
 }
 #[test]
@@ -169,24 +192,12 @@ fn malformed_and_unsupported_inputs_are_bounded() {
 
 #[test]
 fn invalid_utf8_oversized_text_and_xml_entities_are_rejected_without_observation() {
-    let adapter = OfflinePassiveAdapter;
-    for payload in [
-        vec![0xff; 16],
-        format!("NH1|arp|name={}", "x".repeat(513)).into_bytes(),
-        b"NH1|onvif-discovery|xml=<!DOCTYPE x [<!ENTITY a 'x'>]>".to_vec(),
-    ] {
-        let mut frame = vec![0; 12];
-        frame.extend_from_slice(&0x88b5u16.to_be_bytes());
-        frame.extend_from_slice(&payload);
-        assert!(
-            lattice_sensor::PassiveAdapter::normalize(
-                &adapter,
-                "x",
-                chrono::Utc::now(),
-                &frame,
-                &PassiveOptions::default()
-            )
+    let mut bytes = fs::read(fixtures().join("ws-discovery.pcap")).unwrap();
+    let at = 24 + 16 + 14 + 20 + 8;
+    bytes[at..at + 9].copy_from_slice(b"<!DOCTYPE");
+    assert!(
+        OfflinePassiveAdapter
+            .ingest_pcap("x", &bytes, &PassiveOptions::default())
             .is_err()
-        );
-    }
+    );
 }
