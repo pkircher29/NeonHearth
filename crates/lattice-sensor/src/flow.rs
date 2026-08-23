@@ -86,7 +86,7 @@ pub enum FlowError {
     #[error("overflow")]
     Overflow,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Rollup {
     pub bucket: DateTime<Utc>,
     pub device_id: DeviceId,
