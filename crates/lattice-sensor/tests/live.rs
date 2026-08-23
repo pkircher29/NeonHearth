@@ -238,3 +238,60 @@ fn absent_and_nonsecond_retire_do_not_cancel_valid_pending_sample() {
     };
     assert_eq!(f.samples[0].delta.upload, 3);
 }
+
+#[test]
+fn emitted_cumulative_replacements_only_report_growth_and_reset_safely() {
+    let mut a = FlowLiveAdapter::new(LiveConfig::default(), 4).unwrap();
+    a.apply(0, &[RollupChange::Upsert(roll(100))]).unwrap();
+    let EventPayload::BandwidthFrame(first) = a.flush_payload(0, t(2)).unwrap().unwrap() else {
+        panic!()
+    };
+    assert_eq!(first.samples[0].delta.upload, 100);
+
+    a.apply(250, &[RollupChange::Correction(roll(150))])
+        .unwrap();
+    let EventPayload::BandwidthFrame(growth) = a.flush_payload(250, t(3)).unwrap().unwrap() else {
+        panic!()
+    };
+    assert_eq!(growth.samples[0].delta.upload, 50);
+
+    a.apply(500, &[RollupChange::Correction(roll(40))]).unwrap();
+    assert!(a.flush_payload(500, t(4)).unwrap().is_none());
+    a.apply(750, &[RollupChange::Correction(roll(70))]).unwrap();
+    let EventPayload::BandwidthFrame(after_reset) = a.flush_payload(750, t(5)).unwrap().unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(after_reset.samples[0].delta.upload, 30);
+}
+
+#[test]
+fn adapter_prunes_superseded_seconds_but_keeps_latest_dimensions() {
+    let mut a = FlowLiveAdapter::new(LiveConfig::default(), 2).unwrap();
+    for second in 1..=8 {
+        let mut tcp = roll(second as u64);
+        tcp.key.bucket = t(second);
+        let mut udp = tcp.clone();
+        udp.key.protocol = Protocol::Udp;
+        udp.bytes.upload = 1;
+        a.apply(
+            (second as u64 - 1) * 250,
+            &[RollupChange::Upsert(tcp), RollupChange::Upsert(udp)],
+        )
+        .unwrap();
+        let EventPayload::BandwidthFrame(frame) = a
+            .flush_payload((second as u64 - 1) * 250, t(second + 1))
+            .unwrap()
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(frame.samples[0].delta.upload, second as u64 + 1);
+        assert_eq!(a.cached_rollups().len(), 2);
+        assert!(
+            a.cached_rollups()
+                .iter()
+                .all(|row| row.key.bucket == t(second))
+        );
+    }
+}

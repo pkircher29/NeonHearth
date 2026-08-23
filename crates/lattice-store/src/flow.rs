@@ -146,14 +146,14 @@ impl FlowRepository {
             .checked_sub_signed(p.minutes)
             .ok_or(FlowStoreError::Overflow)?;
         let mut tx = self.pool.begin().await?;
-        let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM flow_rollups WHERE (resolution='second' AND datetime(bucket,'+60 seconds')<=datetime(?)) OR (resolution='minute' AND datetime(bucket,'+3600 seconds')<=datetime(?))").bind(sec.to_rfc3339()).bind(min.to_rfc3339()).fetch_one(&mut *tx).await?;
+        let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM flow_rollups WHERE (resolution='second' AND unixepoch(bucket)-((unixepoch(bucket)%60+60)%60)+60<=unixepoch(?)) OR (resolution='minute' AND unixepoch(bucket)-((unixepoch(bucket)%3600+3600)%3600)+3600<=unixepoch(?))").bind(sec.to_rfc3339()).bind(min.to_rfc3339()).fetch_one(&mut *tx).await?;
         if usize::try_from(count).map_err(|_| FlowStoreError::Overflow)? > p.max_rows {
             return Err(FlowStoreError::Capacity);
         };
         aggregate(&mut tx, true, &sec, now).await?;
         aggregate(&mut tx, false, &min, now).await?;
-        let a=sqlx::query("DELETE FROM flow_rollups WHERE resolution='second' AND datetime(bucket,'+60 seconds')<=datetime(?)").bind(sec.to_rfc3339()).execute(&mut *tx).await?.rows_affected();
-        let b=sqlx::query("DELETE FROM flow_rollups WHERE resolution='minute' AND datetime(bucket,'+3600 seconds')<=datetime(?)").bind(min.to_rfc3339()).execute(&mut *tx).await?.rows_affected();
+        let a=sqlx::query("DELETE FROM flow_rollups WHERE resolution='second' AND unixepoch(bucket)-((unixepoch(bucket)%60+60)%60)+60<=unixepoch(?)").bind(sec.to_rfc3339()).execute(&mut *tx).await?.rows_affected();
+        let b=sqlx::query("DELETE FROM flow_rollups WHERE resolution='minute' AND unixepoch(bucket)-((unixepoch(bucket)%3600+3600)%3600)+3600<=unixepoch(?)").bind(min.to_rfc3339()).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
         Ok(a + b)
     }
@@ -243,14 +243,14 @@ async fn aggregate(
     now: DateTime<Utc>,
 ) -> Result<(), FlowStoreError> {
     let sql = if seconds_to_minutes {
-        "INSERT INTO flow_rollups(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain,upload,download,coverage,updated_at) SELECT 'minute',strftime('%Y-%m-%dT%H:%M:%SZ',unixepoch(bucket)-((unixepoch(bucket)%60+60)%60),'unixepoch'),device_id,protocol,destination,interface,metadata_ip,metadata_domain,SUM(upload),SUM(download),CASE WHEN MIN(coverage)=MAX(coverage) THEN MIN(coverage) ELSE 'estimated' END,? FROM flow_rollups WHERE resolution='second' AND datetime(bucket,'+60 seconds')<=datetime(?) GROUP BY 2,device_id,protocol,destination,interface,metadata_ip,metadata_domain ON CONFLICT(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain) DO NOTHING"
+        "INSERT INTO flow_rollups(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain,upload,download,coverage,updated_at) SELECT 'minute',strftime('%Y-%m-%dT%H:%M:%SZ',unixepoch(bucket)-((unixepoch(bucket)%60+60)%60),'unixepoch'),device_id,protocol,destination,interface,metadata_ip,metadata_domain,SUM(upload),SUM(download),CASE WHEN MIN(coverage)=MAX(coverage) THEN MIN(coverage) ELSE 'estimated' END,? FROM flow_rollups WHERE resolution='second' AND unixepoch(bucket)-((unixepoch(bucket)%60+60)%60)+60<=unixepoch(?) GROUP BY 2,device_id,protocol,destination,interface,metadata_ip,metadata_domain ON CONFLICT(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain) DO NOTHING"
     } else {
-        "INSERT INTO flow_rollups(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain,upload,download,coverage,updated_at) SELECT 'hour',strftime('%Y-%m-%dT%H:%M:%SZ',unixepoch(bucket)-((unixepoch(bucket)%3600+3600)%3600),'unixepoch'),device_id,protocol,destination,interface,metadata_ip,metadata_domain,SUM(upload),SUM(download),CASE WHEN MIN(coverage)=MAX(coverage) THEN MIN(coverage) ELSE 'estimated' END,? FROM flow_rollups WHERE resolution='minute' AND datetime(bucket,'+3600 seconds')<=datetime(?) GROUP BY 2,device_id,protocol,destination,interface,metadata_ip,metadata_domain ON CONFLICT(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain) DO NOTHING"
+        "INSERT INTO flow_rollups(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain,upload,download,coverage,updated_at) SELECT 'hour',strftime('%Y-%m-%dT%H:%M:%SZ',unixepoch(bucket)-((unixepoch(bucket)%3600+3600)%3600),'unixepoch'),device_id,protocol,destination,interface,metadata_ip,metadata_domain,SUM(upload),SUM(download),CASE WHEN MIN(coverage)=MAX(coverage) THEN MIN(coverage) ELSE 'estimated' END,? FROM flow_rollups WHERE resolution='minute' AND unixepoch(bucket)-((unixepoch(bucket)%3600+3600)%3600)+3600<=unixepoch(?) GROUP BY 2,device_id,protocol,destination,interface,metadata_ip,metadata_domain ON CONFLICT(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain) DO NOTHING"
     };
     let seal_sql = if seconds_to_minutes {
-        "INSERT OR IGNORE INTO flow_compaction_seals(child_resolution,parent_bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain) SELECT 'second',strftime('%Y-%m-%dT%H:%M:%SZ',unixepoch(bucket)-((unixepoch(bucket)%60+60)%60),'unixepoch'),device_id,protocol,destination,interface,metadata_ip,metadata_domain FROM flow_rollups WHERE resolution='second' AND datetime(bucket,'+60 seconds')<=datetime(?) GROUP BY 2,device_id,protocol,destination,interface,metadata_ip,metadata_domain"
+        "INSERT OR IGNORE INTO flow_compaction_seals(child_resolution,parent_bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain) SELECT 'second',strftime('%Y-%m-%dT%H:%M:%SZ',unixepoch(bucket)-((unixepoch(bucket)%60+60)%60),'unixepoch'),device_id,protocol,destination,interface,metadata_ip,metadata_domain FROM flow_rollups WHERE resolution='second' AND unixepoch(bucket)-((unixepoch(bucket)%60+60)%60)+60<=unixepoch(?) GROUP BY 2,device_id,protocol,destination,interface,metadata_ip,metadata_domain"
     } else {
-        "INSERT OR IGNORE INTO flow_compaction_seals(child_resolution,parent_bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain) SELECT 'minute',strftime('%Y-%m-%dT%H:%M:%SZ',unixepoch(bucket)-((unixepoch(bucket)%3600+3600)%3600),'unixepoch'),device_id,protocol,destination,interface,metadata_ip,metadata_domain FROM flow_rollups WHERE resolution='minute' AND datetime(bucket,'+3600 seconds')<=datetime(?) GROUP BY 2,device_id,protocol,destination,interface,metadata_ip,metadata_domain"
+        "INSERT OR IGNORE INTO flow_compaction_seals(child_resolution,parent_bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain) SELECT 'minute',strftime('%Y-%m-%dT%H:%M:%SZ',unixepoch(bucket)-((unixepoch(bucket)%3600+3600)%3600),'unixepoch'),device_id,protocol,destination,interface,metadata_ip,metadata_domain FROM flow_rollups WHERE resolution='minute' AND unixepoch(bucket)-((unixepoch(bucket)%3600+3600)%3600)+3600<=unixepoch(?) GROUP BY 2,device_id,protocol,destination,interface,metadata_ip,metadata_domain"
     };
     sqlx::query(seal_sql)
         .bind(cut.to_rfc3339())

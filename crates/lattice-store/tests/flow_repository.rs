@@ -420,3 +420,108 @@ async fn compaction_preserves_fuller_parent_and_floors_negative_epoch() {
         (1, t(-60), 50)
     );
 }
+
+#[tokio::test]
+async fn bisected_minute_is_not_aggregated_sealed_or_deleted_early() {
+    let pool = connect_memory().await.unwrap();
+    let repo = FlowRepository::new(pool, 20).unwrap();
+    repo.apply(
+        &[
+            RollupChange::Upsert(roll(Resolution::Second, 0, 2, Coverage::Complete)),
+            RollupChange::Upsert(roll(Resolution::Second, 30, 3, Coverage::Complete)),
+        ],
+        t(31),
+    )
+    .await
+    .unwrap();
+    let p = CompactionPolicy {
+        seconds: Duration::seconds(60),
+        minutes: Duration::days(1),
+        hours: None,
+        max_rows: 20,
+    };
+    for _ in 0..2 {
+        assert_eq!(repo.compact(t(90), &p).await.unwrap(), 0);
+    }
+    assert_eq!(
+        repo.range(Resolution::Second, t(0), t(59), 20)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        repo.range(Resolution::Minute, t(0), t(0), 20)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    repo.apply(
+        &[RollupChange::Correction(roll(
+            Resolution::Second,
+            0,
+            4,
+            Coverage::Complete,
+        ))],
+        t(91),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repo.compact(t(120), &p).await.unwrap(), 2);
+    let minute = repo
+        .range(Resolution::Minute, t(0), t(0), 20)
+        .await
+        .unwrap();
+    assert_eq!((minute.len(), minute[0].bytes.upload), (1, 7));
+}
+
+#[tokio::test]
+async fn bisected_hour_is_not_aggregated_sealed_or_deleted_early() {
+    let pool = connect_memory().await.unwrap();
+    let repo = FlowRepository::new(pool, 20).unwrap();
+    repo.apply(
+        &[
+            RollupChange::Upsert(roll(Resolution::Minute, 0, 5, Coverage::Complete)),
+            RollupChange::Upsert(roll(Resolution::Minute, 1800, 7, Coverage::Complete)),
+        ],
+        t(1801),
+    )
+    .await
+    .unwrap();
+    let p = CompactionPolicy {
+        seconds: Duration::seconds(60),
+        minutes: Duration::seconds(120),
+        hours: None,
+        max_rows: 20,
+    };
+    for _ in 0..2 {
+        assert_eq!(repo.compact(t(1920), &p).await.unwrap(), 0);
+    }
+    assert_eq!(
+        repo.range(Resolution::Minute, t(0), t(3599), 20)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        repo.range(Resolution::Hour, t(0), t(0), 20)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    repo.apply(
+        &[RollupChange::Correction(roll(
+            Resolution::Minute,
+            0,
+            6,
+            Coverage::Complete,
+        ))],
+        t(1921),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repo.compact(t(3720), &p).await.unwrap(), 2);
+    let hour = repo.range(Resolution::Hour, t(0), t(0), 20).await.unwrap();
+    assert_eq!((hour.len(), hour[0].bytes.upload), (1, 13));
+}

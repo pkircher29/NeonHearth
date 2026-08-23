@@ -1,10 +1,12 @@
 # Live flow and durable retention
 
-`FlowLiveAdapter` consumes validated current one-second rollup replacements. Upserts and
-corrections replace the same key before per-device aggregation, so corrections do not add bytes
-twice. Cache-only retirements remove their live cache row without becoming traffic. Each device
-uses its own latest bucket. The upstream flow engine has already selected
-one authoritative visibility source for overlapping observations.
+`FlowLiveAdapter` consumes validated cumulative one-second rollup replacements. It retains every
+dimension of each device's latest second and prunes that device's superseded seconds. Emitted
+baselines are keyed by the full rollup key, so a replacement from 100 to 150 bytes reports only
+50 new bytes. A downward correction resets the baseline without underflow or fabricated traffic;
+later growth is measured from that corrected value. Cache-only retirements remove their live
+cache row and pending baseline without becoming traffic. The upstream flow engine has already
+selected one authoritative visibility source for overlapping observations.
 
 `LiveCoalescer` uses caller-supplied monotonic millisecond ticks. It emits one global
 `bandwidth_frame` no faster than every 250 ms, retains the latest pending device replacement
@@ -19,8 +21,9 @@ view over this normalized table.
 
 Compaction defaults are exactly 24 hours for seconds, 90 days for minutes, and no automatic hour
 deletion; a configured hour duration is rejected because owner deletion is a separate future
-operation. Only complete parent intervals at or before the cutoff are aggregated. Minute parents
-are rebuilt from seconds and hour parents from minutes in the same transaction before eligible
-children are deleted. Repeating or restarting compaction is idempotent; a failure rolls back the
-whole bounded batch. Hours require explicit owner deletion, which D14 deliberately does not
+operation. Eligibility is aligned to the parent boundary: a minute is aggregated and sealed only
+when that whole minute ends at or before the seconds cutoff, and an hour only when that whole hour
+ends at or before the minutes cutoff. All children of an eligible parent are aggregated before
+those children are deleted. Repeating or restarting compaction is idempotent; a failure rolls back
+the whole bounded batch. Hours require explicit owner deletion, which D14 deliberately does not
 expose as an automatic operation.
