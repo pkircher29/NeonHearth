@@ -4,7 +4,9 @@ use lattice_intelligence::presence::PresenceEvidenceKind;
 use lattice_sensor::flow::{
     DestinationCategory, Protocol, Resolution, Rollup, RollupChange, RollupKey,
 };
-use lattice_service::discovery::{DiscoveryObservation, DiscoveryPipeline};
+use lattice_service::discovery::{
+    DiscoveryObservation, DiscoveryPipeline, DiscoverySource, DiscoverySources,
+};
 use lattice_store::{FlowIngestor, FlowRepository, connect_memory};
 
 fn id(n: u8) -> DeviceId {
@@ -190,4 +192,30 @@ async fn flow_boundary_emits_honest_local_only_bandwidth() {
         ),
         _ => panic!("unexpected event"),
     }
+}
+
+#[test]
+fn source_provenance_and_router_family_are_rejected_before_mutation() {
+    let sources = DiscoverySources::new(vec![
+        DiscoverySource {
+            id: 1,
+            name: "sensor".into(),
+            families: vec![EvidenceFamily::LinkLayer],
+            presence: true,
+        },
+        DiscoverySource {
+            id: 9,
+            name: "router".into(),
+            families: vec![EvidenceFamily::RouterHint],
+            presence: false,
+        },
+    ])
+    .unwrap();
+    let mut p = DiscoveryPipeline::with_sources([id(1), id(2)].into_iter(), sources).unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+    let mut input = obs(at, PresenceEvidenceKind::Traffic);
+    input.source_id = 9;
+    input.presence_source = "spoof".into();
+    assert!(p.observe(input, at).is_err());
+    assert_eq!(p.presence_state(id(1)), None);
 }
