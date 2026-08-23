@@ -1,0 +1,9 @@
+# Interface and target scope
+
+NeonHearth discovers only adapters that are up and confidently classified as physical wired or Wi-Fi. Loopback, Tailscale, VPN/tunnel, container, virtual-machine, corporate-role, down, and unknown adapters are excluded by default. A homeowner can explicitly enable a private excluded adapter, but loopback can never be enabled. “Corporate” is an owner-set role; the program never guesses it from a weak adapter name.
+
+The service uses the maintained `pnet_datalink` Rust crate to call supported Windows/Linux platform APIs. On Windows it pairs that enumeration with the maintained `windows-sys` binding for `GetIfEntry2`, because adapter flags alone do not express operational state there. It does not parse shell-command output. The inventory boundary returns the OS interface index, name, state, classification, and address prefixes; callers can diff snapshots and react to adapter changes without restarting.
+
+`TargetGuard` is the single authorization point for all future passive and active discovery adapters. It requires an eligible interface and a target inside an address prefix attached to that same interface. Permitted address families are RFC1918 IPv4, IPv4 link-local, IPv6 ULA, and IPv6 link-local. It rejects public, loopback, unspecified, multicast, broadcast, CGNAT (including Tailscale's `100.64.0.0/10`), IPv4-mapped public IPv6, and cross-interface targets. An override never expands that network scope.
+
+This boundary performs no probing and opens no sockets. Prefix authorization is intentionally conservative: it is a safety precondition, not proof that a target device belongs to the owner.

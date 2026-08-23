@@ -4,6 +4,7 @@ members = [
     "crates/lattice-domain",
     "crates/lattice-store",
     "crates/lattice-event-bus",
+    "crates/lattice-sensor",
     "crates/lattice-service",
 ]
 
@@ -33,3 +34,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-axum = "0.2"
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
+pnet_datalink = "0.35"
+windows-sys = "0.61"
