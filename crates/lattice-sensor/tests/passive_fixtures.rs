@@ -96,12 +96,7 @@ fn expected_facts_and_protocol_ttls_are_exact() {
         ),
         ("mdns-dns-sd", "name", "printer.example.test", 120),
         ("ssdp-upnp", "location", "http://192.0.2.20/desc.xml", 1800),
-        (
-            "ws-discovery",
-            "xaddrs",
-            "http://192.0.2.30/onvif/device_service",
-            300,
-        ),
+        ("ws-discovery", "xaddrs", "http://192.0.2.30/device", 300),
         (
             "onvif-discovery",
             "types",

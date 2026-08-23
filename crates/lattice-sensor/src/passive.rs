@@ -452,8 +452,8 @@ fn dns(
     if p == "dns-query" && !o.metadata_enabled {
         return Ok(obs(i, t, m, ip, p, vec![], 300));
     }
-    let ttl = if q.len() > n.1 + 10 && q[n.1] == 192 {
-        u32::from_be_bytes(q[n.1 + 6..n.1 + 10].try_into().unwrap()).min(86400) as i64
+    let ttl = if q.len() > n.1 + 14 && q[n.1 + 4] == 192 {
+        u32::from_be_bytes(q[n.1 + 10..n.1 + 14].try_into().unwrap()).min(86400) as i64
     } else {
         300
     };
@@ -555,9 +555,6 @@ fn soap(
         ("scopes", "Scopes"),
         ("xaddrs", "XAddrs"),
     ] {
-        if let Some(a) = x.find(&format!(">")) {
-            let _ = a;
-        }
         if let Some(s) = x.find(&format!("<{tag}>")) {
             let b = s + tag.len() + 2;
             if let Some(e) = x[b..].find(&format!("</{tag}>")) {
