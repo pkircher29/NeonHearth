@@ -88,6 +88,12 @@ pub struct LoadedCheckpoint {
     pub commit_sequence: i64,
     pub written_at: DateTime<Utc>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredDiscoveryCommit {
+    pub source: String,
+    pub result_summary: Vec<u8>,
+    pub committed_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Error)]
 pub enum CheckpointError {
@@ -158,6 +164,29 @@ impl M2StateRepository {
             commit_sequence: sequence,
             written_at,
         }))
+    }
+    pub async fn discovery_commit(
+        &self,
+        input_hash: [u8; 32],
+    ) -> Result<Option<StoredDiscoveryCommit>, CheckpointError> {
+        let row: Option<(String, Vec<u8>, String)> = sqlx::query_as(
+            "SELECT source,result_summary,committed_at FROM discovery_commits WHERE input_hash=?",
+        )
+        .bind(input_hash.to_vec())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(source, result_summary, committed_at)| {
+            Ok(StoredDiscoveryCommit {
+                source,
+                result_summary,
+                committed_at: parse_timestamp(
+                    &committed_at,
+                    "discovery commit committed_at",
+                    CheckpointError::Corrupt,
+                )?,
+            })
+        })
+        .transpose()
     }
     pub async fn commit(&self, input: CommitInput) -> Result<(), CheckpointError> {
         validate_input(&self.config, &input)?;
@@ -250,7 +279,7 @@ impl M2StateRepository {
         flow: &FlowRepository,
     ) -> Result<(), CheckpointError> {
         validate_input(&self.config, &input)?;
-        let digest = logical_commit_digest(&input)?;
+        let digest = logical_commit_digest_with_flow(&input, changes)?;
         let mut tx = self.pool.begin().await?;
         if let Some(discovery) = &input.discovery {
             let old: Option<Vec<u8>> = sqlx::query_scalar(
@@ -558,6 +587,27 @@ fn checkpoint_checksum_fields(
     Sha256::digest(serde_json::to_vec(&json!({"checkpoint_bytes":bytes,"commit_sequence":sequence,"format_version":version,"source_fingerprint":fingerprint,"written_at":written_at.to_rfc3339()})).expect("JSON value serializes")).to_vec()
 }
 fn logical_commit_digest(input: &CommitInput) -> Result<Vec<u8>, CheckpointError> {
+    logical_commit_digest_extra(input, None)
+}
+fn logical_commit_digest_with_flow(
+    input: &CommitInput,
+    changes: &[RollupChange],
+) -> Result<Vec<u8>, CheckpointError> {
+    let mut flow: Vec<_> = changes
+        .iter()
+        .map(|change| {
+            serde_json::to_value(change).map_err(|e| {
+                CheckpointError::Invalid(format!("flow canonical serialization failed: {e}"))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    sort_json_values(&mut flow);
+    logical_commit_digest_extra(input, Some(flow))
+}
+fn logical_commit_digest_extra(
+    input: &CommitInput,
+    flow: Option<Vec<serde_json::Value>>,
+) -> Result<Vec<u8>, CheckpointError> {
     let mut devices: Vec<_> = input.devices.iter().map(|d| json!({"device_id":d.device_id.to_string(),"first_seen_at":d.first_seen_at.to_rfc3339(),"last_seen_at":d.last_seen_at.to_rfc3339(),"owner_name":d.owner_name,"owner_type":d.owner_type,"owner_confirmed":d.owner_confirmed})).collect();
     let mut evidence: Vec<_> = input.evidence.iter().map(|e| { let f=&e.fact; json!({"device_id":e.device_id.to_string(),"family":evidence_family(f.family),"source":f.source,"key":f.key,"value":f.value,"confidence":f.confidence,"observed_at":f.observed_at.to_rfc3339(),"expires_at":f.expires_at.map(|x|x.to_rfc3339()),"owner_confirmed":f.owner_confirmed}) }).collect();
     let mut transitions: Vec<_> = input.transitions.iter().map(|t| json!({"transition_id":t.transition_id,"device_id":t.device_id.to_string(),"from":presence_state(t.from),"to":presence_state(t.to),"occurred_at":t.occurred_at.to_rfc3339(),"reason":t.reason,"trigger_source":t.trigger_source,"trigger_kind":t.trigger_kind,"evidence_observed_at":t.evidence_observed_at.to_rfc3339(),"evidence_valid_until":t.evidence_valid_until.map(|x|x.to_rfc3339()),"trigger_arrival_at":t.trigger_arrival_at.to_rfc3339(),"correction_of":t.correction_of})).collect();
@@ -565,7 +615,7 @@ fn logical_commit_digest(input: &CommitInput) -> Result<Vec<u8>, CheckpointError
     sort_json_values(&mut evidence);
     sort_json_values(&mut transitions);
     let c = &input.checkpoint;
-    let canonical = json!({"checkpoint":{"format_version":c.format_version,"bytes":c.bytes,"source_fingerprint":c.source_fingerprint,"commit_sequence":c.commit_sequence,"written_at":c.written_at.to_rfc3339()},"devices":devices,"evidence":evidence,"transitions":transitions,"discovery":input.discovery.as_ref().map(|d|json!({"input_hash":d.input_hash,"source":d.source,"result_summary":d.result_summary,"committed_at":d.committed_at.to_rfc3339()}))});
+    let canonical = json!({"checkpoint":{"format_version":c.format_version,"bytes":c.bytes,"source_fingerprint":c.source_fingerprint,"commit_sequence":c.commit_sequence,"written_at":c.written_at.to_rfc3339()},"devices":devices,"evidence":evidence,"transitions":transitions,"discovery":input.discovery.as_ref().map(|d|json!({"input_hash":d.input_hash,"source":d.source,"result_summary":d.result_summary,"committed_at":d.committed_at.to_rfc3339()})),"flow":flow});
     Ok(Sha256::digest(serde_json::to_vec(&canonical).map_err(|e| {
         CheckpointError::Invalid(format!("canonical commit serialization failed: {e}"))
     })?)

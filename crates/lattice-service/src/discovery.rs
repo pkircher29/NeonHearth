@@ -9,7 +9,10 @@ use lattice_intelligence::presence::{
 };
 use lattice_intelligence::{IdentityConfig, IdentityEngine, IdentityError};
 use lattice_sensor::flow::RollupChange;
-use lattice_store::FlowIngestor;
+use lattice_store::{
+    CheckpointError, CheckpointInput, CommitInput, DeviceProjection, DiscoveryCommit,
+    EvidenceProjection, FlowIngestor, FlowRepository, M2StateRepository,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -139,12 +142,185 @@ pub enum DiscoveryError {
     InvalidCheckpoint,
     #[error("flow: {0}")]
     Flow(#[from] lattice_store::FlowStoreError),
+    #[error("live bandwidth: {0}")]
+    Live(#[from] lattice_sensor::live::LiveError),
+    #[error("checkpoint: {0}")]
+    Checkpoint(#[from] CheckpointError),
+    #[error("checkpoint encoding: {0}")]
+    CheckpointEncoding(#[from] serde_json::Error),
 }
 
+#[derive(Clone)]
 pub struct DiscoveryPipeline {
     identity: IdentityEngine,
     presence: PresenceEngine,
     sources: DiscoverySources,
+}
+
+/// Durable, fail-closed discovery boundary. In-memory engines advance only after the same SQLite
+/// transaction has accepted their checkpoint, projections, transitions, and flow rollups.
+pub struct PersistentDiscoveryPipeline {
+    pipeline: DiscoveryPipeline,
+    live: lattice_sensor::live::FlowLiveAdapter,
+    state: M2StateRepository,
+    flow: FlowRepository,
+    sequence: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommittedDiscovery {
+    pub result: DiscoveryResult,
+    pub payload: Option<EventPayload>,
+    pub commit_sequence: i64,
+}
+#[derive(Clone, Debug)]
+pub struct DuplicateDiscovery {
+    pub result_summary: Vec<u8>,
+    pub resnapshot_required: bool,
+}
+#[derive(Clone, Debug)]
+pub enum DiscoveryPipelineOutcome {
+    Committed(Box<CommittedDiscovery>),
+    Duplicate(DuplicateDiscovery),
+}
+
+impl PersistentDiscoveryPipeline {
+    pub async fn open(
+        state: M2StateRepository,
+        flow: FlowRepository,
+        sources: DiscoverySources,
+        remaining_ids: impl Iterator<Item = DeviceId> + Send,
+        live: lattice_sensor::live::LiveConfig,
+        max_live_rows: usize,
+    ) -> Result<Self, DiscoveryError> {
+        let fingerprint = sources.fingerprint();
+        let (pipeline, sequence) = match state.load(&fingerprint).await? {
+            Some(stored) => {
+                let checkpoint: DiscoveryPipelineCheckpoint = serde_json::from_slice(&stored.bytes)
+                    .map_err(|_| DiscoveryError::InvalidCheckpoint)?;
+                (
+                    DiscoveryPipeline::from_checkpoint(sources, checkpoint)?,
+                    stored.commit_sequence,
+                )
+            }
+            None => (DiscoveryPipeline::with_sources(remaining_ids, sources)?, 0),
+        };
+        Ok(Self {
+            pipeline,
+            live: lattice_sensor::live::FlowLiveAdapter::new(live, max_live_rows)?,
+            state,
+            flow,
+            sequence,
+        })
+    }
+    pub fn source_fingerprint(&self) -> String {
+        self.pipeline.sources.fingerprint()
+    }
+    pub fn commit_sequence(&self) -> i64 {
+        self.sequence
+    }
+    pub async fn observe_with_flow(
+        &mut self,
+        input: DiscoveryObservation,
+        changes: &[RollupChange],
+        tick_ms: u64,
+        arrival: DateTime<Utc>,
+    ) -> Result<DiscoveryPipelineOutcome, DiscoveryError> {
+        let input_hash = semantic_input_hash(&input, changes)?;
+        if let Some(existing) = self.state.discovery_commit(input_hash).await? {
+            return Ok(DiscoveryPipelineOutcome::Duplicate(DuplicateDiscovery {
+                result_summary: existing.result_summary,
+                resnapshot_required: true,
+            }));
+        }
+        let facts = input.facts.clone();
+        let mut staged_pipeline = self.pipeline.clone();
+        let result = staged_pipeline.observe(input, arrival)?;
+        if changes.iter().any(|c| match c {
+            RollupChange::Upsert(r) | RollupChange::Correction(r) => {
+                r.key.device_id != result.device_id
+            }
+            RollupChange::Retire(r) => r.key.device_id != result.device_id,
+        }) {
+            return Err(DiscoveryError::InvalidSource);
+        }
+        let (staged_live, payload) = self.live.staged_payload(tick_ms, changes, arrival)?;
+        let next_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(DiscoveryError::InvalidCheckpoint)?;
+        let checkpoint = staged_pipeline.checkpoint();
+        let checkpoint_bytes = serde_json::to_vec(&checkpoint)?;
+        let transitions: Vec<_> = result.presence.iter().map(PresenceChanged::from).collect();
+        let summary = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "device_id": result.device_id.to_string(), "commit_sequence": next_sequence,
+            "event_count": result.events.len(), "presence_transition_count": transitions.len(),
+        }))?;
+        let commit = CommitInput {
+            checkpoint: CheckpointInput {
+                format_version: 1,
+                bytes: checkpoint_bytes,
+                source_fingerprint: checkpoint.source_fingerprint,
+                commit_sequence: next_sequence,
+                written_at: arrival,
+            },
+            devices: vec![DeviceProjection {
+                device_id: result.device_id,
+                first_seen_at: facts.iter().map(|f| f.observed_at).min().unwrap_or(arrival),
+                last_seen_at: arrival,
+                owner_name: None,
+                owner_type: None,
+                owner_confirmed: false,
+            }],
+            evidence: facts
+                .into_iter()
+                .map(|fact| EvidenceProjection {
+                    device_id: result.device_id,
+                    fact,
+                })
+                .collect(),
+            transitions,
+            discovery: Some(DiscoveryCommit {
+                input_hash,
+                source: result.device_id.to_string(),
+                result_summary: summary,
+                committed_at: arrival,
+            }),
+        };
+        self.state
+            .commit_with_flow(commit, changes, arrival, &self.flow)
+            .await?;
+        self.pipeline = staged_pipeline;
+        self.live = staged_live;
+        self.sequence = next_sequence;
+        Ok(DiscoveryPipelineOutcome::Committed(Box::new(
+            CommittedDiscovery {
+                result,
+                payload,
+                commit_sequence: next_sequence,
+            },
+        )))
+    }
+}
+
+fn semantic_input_hash(
+    input: &DiscoveryObservation,
+    changes: &[RollupChange],
+) -> Result<[u8; 32], DiscoveryError> {
+    let mut facts: Vec<_> = input
+        .facts
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()?;
+    facts.sort_by_key(|value| serde_json::to_string(value).expect("JSON value serializes"));
+    let mut flow: Vec<_> = changes
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()?;
+    flow.sort_by_key(|value| serde_json::to_string(value).expect("JSON value serializes"));
+    let canonical = serde_json::json!({"version":1,"source_id":input.source_id,"candidate":input.candidate.map(|id|id.to_string()),"facts":facts,"presence_source":input.presence_source,"presence_kind":input.presence_kind,"observed_at":input.observed_at,"valid_until":input.valid_until,"flow":flow});
+    let hash = Sha256::digest(serde_json::to_vec(&canonical)?);
+    Ok(hash.into())
 }
 
 impl DiscoveryPipeline {

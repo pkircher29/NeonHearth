@@ -31,6 +31,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.29"
 tempfile = "3"
+sqlx.workspace = true
 
 [lib]
 path = "src/lib.rs"

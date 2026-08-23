@@ -1,8 +1,12 @@
 use chrono::{TimeZone, Utc};
+use lattice_domain::{ByteCount, Coverage};
 use lattice_domain::{DeviceId, EvidenceFact, EvidenceFamily, PresenceChanged, PresenceState};
+use lattice_sensor::flow::{
+    DestinationCategory, Protocol, Resolution, Rollup, RollupChange, RollupKey,
+};
 use lattice_store::{
     CheckpointError, CheckpointInput, CommitInput, DeviceProjection, DiscoveryCommit,
-    EvidenceProjection, M2StateRepository, connect_path,
+    EvidenceProjection, FlowRepository, M2StateRepository, connect_path,
 };
 use tempfile::tempdir;
 
@@ -64,6 +68,49 @@ fn input(sequence: i64, hash: [u8; 32]) -> CommitInput {
             committed_at: at,
         }),
     }
+}
+
+#[tokio::test]
+async fn combined_flow_failure_rolls_back_checkpoint_and_projections() -> anyhow::Result<()> {
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool.clone());
+    let flow = FlowRepository::new(pool.clone(), 16)?;
+    let bad = RollupChange::Upsert(Rollup {
+        key: RollupKey {
+            resolution: Resolution::Second,
+            bucket: time(1_700_000_001),
+            device_id: device(),
+            protocol: Protocol::Tcp,
+            destination: DestinationCategory::Internet,
+            interface: 0,
+            metadata: None,
+        },
+        bytes: ByteCount {
+            upload: 1,
+            download: 1,
+        },
+        coverage: Coverage::LocalOnly,
+        metadata: None,
+    });
+    assert!(
+        repo.commit_with_flow(input(1, [88; 32]), &[bad], time(1_700_000_001), &flow)
+            .await
+            .is_err()
+    );
+    assert!(repo.load("sensor-config-v1").await?.is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM devices")
+            .fetch_one(&pool)
+            .await?,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM flow_rollups")
+            .fetch_one(&pool)
+            .await?,
+        0
+    );
+    Ok(())
 }
 
 #[tokio::test]
