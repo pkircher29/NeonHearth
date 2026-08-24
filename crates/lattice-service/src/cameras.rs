@@ -36,7 +36,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, duplex, split},
     net::{TcpListener, TcpSocket, TcpStream},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, watch},
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
 };
@@ -44,6 +44,10 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{AppState, auth::Authorized, vault::Vault};
+
+const CLEANUP_COMPONENT_TIMEOUT: Duration = Duration::from_secs(5);
+const CLEANUP_RETRY_BASE: Duration = Duration::from_millis(25);
+const CLEANUP_RETRY_MAX: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug)]
 pub struct CameraSessionConfig {
@@ -261,6 +265,45 @@ struct ManagedSession {
     _permit: OwnedSemaphorePermit,
 }
 
+struct CleanupResources {
+    process: Option<Box<dyn MediaProcess>>,
+    proxy: Option<LoopbackRtspProxy>,
+    output_dir: Option<PathBuf>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl CleanupResources {
+    fn from_session(value: ManagedSession) -> Self {
+        let _ = (value.camera, value.stream);
+        Self {
+            process: Some(value.process),
+            proxy: Some(value.proxy),
+            output_dir: Some(value.output_dir),
+            _permit: value._permit,
+        }
+    }
+
+    fn transient(
+        process: Option<Box<dyn MediaProcess>>,
+        proxy: Option<LoopbackRtspProxy>,
+        output_dir: PathBuf,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            process,
+            proxy,
+            output_dir: Some(output_dir),
+            _permit: permit,
+        }
+    }
+}
+
+struct PendingCleanup {
+    resources: CleanupResources,
+    attempts: u32,
+    next_retry: Instant,
+}
+
 pub struct CameraSessionManager {
     repository: CameraRepository,
     vault: Arc<dyn Vault>,
@@ -271,6 +314,9 @@ pub struct CameraSessionManager {
     config: CameraSessionConfig,
     capacity: Arc<Semaphore>,
     sessions: Mutex<HashMap<HlsSessionId, ManagedSession>>,
+    pending_cleanup: Mutex<HashMap<HlsSessionId, PendingCleanup>>,
+    lifecycle: RwLock<()>,
+    accepting: AtomicBool,
     reaper_started: AtomicBool,
 }
 
@@ -312,6 +358,9 @@ impl CameraSessionManager {
             config,
             capacity: Arc::new(Semaphore::new(config.max_sessions)),
             sessions: Mutex::new(HashMap::new()),
+            pending_cleanup: Mutex::new(HashMap::new()),
+            lifecycle: RwLock::new(()),
+            accepting: AtomicBool::new(true),
             reaper_started: AtomicBool::new(false),
         })
     }
@@ -346,14 +395,21 @@ impl CameraSessionManager {
         camera: CameraId,
         stream: StreamId,
     ) -> Result<HlsSession, CameraSessionError> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(CameraSessionError::Unavailable);
+        }
         self.reap(true).await;
         self.exact_profile(camera, stream).await?;
+        let (source, binding) = self.resolve_source(camera, stream).await?;
+        let _operation = self.lifecycle.read().await;
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(CameraSessionError::Unavailable);
+        }
         let permit = self
             .capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| CameraSessionError::Capacity)?;
-        let (source, binding) = self.resolve_source(camera, stream).await?;
         let session = HlsSessionId::new();
         let created_at = Utc::now();
         let expires_at = created_at
@@ -362,9 +418,23 @@ impl CameraSessionManager {
         let contract = HlsSession::new(session.clone(), camera, stream, created_at, expires_at)
             .map_err(|_| CameraSessionError::Invalid)?;
         let token = LoopbackSourceToken::new();
-        let output_dir = self
+        let output_dir = match self
             .create_output_dir("session", &session.to_string())
-            .await?;
+            .await
+        {
+            Ok(output_dir) => output_dir,
+            Err(Some(output_dir)) => {
+                let _ = self
+                    .cleanup_or_retain(
+                        session,
+                        CleanupResources::transient(None, None, output_dir, permit),
+                        0,
+                    )
+                    .await;
+                return Err(CameraSessionError::Unavailable);
+            }
+            Err(None) => return Err(CameraSessionError::Unavailable),
+        };
         let proxy_limits = RtspProxyLimits {
             lease_ttl: self.config.total_timeout,
             ..RtspProxyLimits::default()
@@ -381,15 +451,26 @@ impl CameraSessionManager {
         {
             Ok(proxy) => proxy,
             Err(_) => {
-                let _ = tokio::fs::remove_dir_all(&output_dir).await;
+                let _ = self
+                    .cleanup_or_retain(
+                        session.clone(),
+                        CleanupResources::transient(None, None, output_dir, permit),
+                        0,
+                    )
+                    .await;
                 return Err(CameraSessionError::Unavailable);
             }
         };
         let spec = match MediaProcessSpec::hls(proxy.local_addr().port(), &token, &output_dir) {
             Ok(spec) => spec,
             Err(_) => {
-                let _ = proxy.shutdown(&session).await;
-                let _ = tokio::fs::remove_dir_all(&output_dir).await;
+                let _ = self
+                    .cleanup_or_retain(
+                        session.clone(),
+                        CleanupResources::transient(None, Some(proxy), output_dir, permit),
+                        0,
+                    )
+                    .await;
                 return Err(CameraSessionError::Unavailable);
             }
         };
@@ -401,25 +482,42 @@ impl CameraSessionManager {
         {
             Ok(Ok(process)) => process,
             Ok(Err(_)) | Err(_) => {
-                let _ = proxy.shutdown(&session).await;
-                let _ = tokio::fs::remove_dir_all(&output_dir).await;
+                let _ = self
+                    .cleanup_or_retain(
+                        session.clone(),
+                        CleanupResources::transient(None, Some(proxy), output_dir, permit),
+                        0,
+                    )
+                    .await;
                 return Err(CameraSessionError::Unavailable);
             }
         };
         let now = Instant::now();
-        self.sessions.lock().await.insert(
-            session.clone(),
-            ManagedSession {
-                camera,
-                stream,
-                created: now,
-                last_access: now,
-                output_dir,
-                process,
-                proxy,
-                _permit: permit,
-            },
-        );
+        let value = ManagedSession {
+            camera,
+            stream,
+            created: now,
+            last_access: now,
+            output_dir,
+            process,
+            proxy,
+            _permit: permit,
+        };
+        let value = {
+            let mut sessions = self.sessions.lock().await;
+            if self.accepting.load(Ordering::Acquire) {
+                sessions.insert(session.clone(), value);
+                None
+            } else {
+                Some(value)
+            }
+        };
+        if let Some(value) = value {
+            let _ = self
+                .cleanup_or_retain(session.clone(), CleanupResources::from_session(value), 0)
+                .await;
+            return Err(CameraSessionError::Unavailable);
+        }
         Ok(contract)
     }
 
@@ -441,22 +539,37 @@ impl CameraSessionManager {
     }
 
     pub async fn close_session(&self, session: &HlsSessionId) -> Result<(), CameraSessionError> {
-        if let Some(value) = self.sessions.lock().await.remove(session) {
-            self.cleanup(value).await?;
+        let active = { self.sessions.lock().await.remove(session) };
+        if let Some(value) = active {
+            return self
+                .cleanup_or_retain(session.clone(), CleanupResources::from_session(value), 0)
+                .await;
+        }
+        let pending = { self.pending_cleanup.lock().await.remove(session) };
+        if let Some(value) = pending {
+            return self
+                .cleanup_or_retain(session.clone(), value.resources, value.attempts)
+                .await;
         }
         Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<(), CameraSessionError> {
+        self.accepting.store(false, Ordering::Release);
+        let _exclusive = self.lifecycle.write().await;
         let sessions = {
             let mut current = self.sessions.lock().await;
-            current.drain().map(|(_, value)| value).collect::<Vec<_>>()
+            current.drain().collect::<Vec<_>>()
         };
-        let mut failed = false;
-        for value in sessions {
-            failed |= self.cleanup(value).await.is_err();
+        for (session, value) in sessions {
+            let _ = self
+                .cleanup_or_retain(session, CleanupResources::from_session(value), 0)
+                .await;
         }
-        if failed {
+        let _ = self.retry_pending(true).await;
+        if !self.pending_cleanup.lock().await.is_empty()
+            || self.capacity.available_permits() != self.config.max_sessions
+        {
             Err(CameraSessionError::Unavailable)
         } else {
             Ok(())
@@ -468,6 +581,9 @@ impl CameraSessionManager {
         camera: CameraId,
         stream: Option<StreamId>,
     ) -> Result<Vec<u8>, CameraSessionError> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(CameraSessionError::Unavailable);
+        }
         self.reap(true).await;
         let stream = match stream {
             Some(stream) => {
@@ -483,17 +599,32 @@ impl CameraSessionManager {
                 .map(|profile| profile.stream_id())
                 .ok_or(CameraSessionError::NotFound)?,
         };
+        let (source, binding) = self.resolve_source(camera, stream).await?;
+        let _operation = self.lifecycle.read().await;
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(CameraSessionError::Unavailable);
+        }
         let permit = self
             .capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| CameraSessionError::Capacity)?;
-        let (source, binding) = self.resolve_source(camera, stream).await?;
         let owner = HlsSessionId::new();
         let token = LoopbackSourceToken::new();
-        let output_dir = self
-            .create_output_dir("snapshot", &owner.to_string())
-            .await?;
+        let output_dir = match self.create_output_dir("snapshot", &owner.to_string()).await {
+            Ok(output_dir) => output_dir,
+            Err(Some(output_dir)) => {
+                let _ = self
+                    .cleanup_or_retain(
+                        owner,
+                        CleanupResources::transient(None, None, output_dir, permit),
+                        0,
+                    )
+                    .await;
+                return Err(CameraSessionError::Unavailable);
+            }
+            Err(None) => return Err(CameraSessionError::Unavailable),
+        };
         let proxy_limits = RtspProxyLimits {
             lease_ttl: self.config.snapshot_timeout,
             ..RtspProxyLimits::default()
@@ -510,7 +641,13 @@ impl CameraSessionManager {
         {
             Ok(proxy) => proxy,
             Err(_) => {
-                let _ = tokio::fs::remove_dir_all(&output_dir).await;
+                let _ = self
+                    .cleanup_or_retain(
+                        owner.clone(),
+                        CleanupResources::transient(None, None, output_dir, permit),
+                        0,
+                    )
+                    .await;
                 return Err(CameraSessionError::Unavailable);
             }
         };
@@ -518,8 +655,13 @@ impl CameraSessionManager {
         {
             Ok(spec) => spec,
             Err(_) => {
-                let _ = proxy.shutdown(&owner).await;
-                let _ = tokio::fs::remove_dir_all(&output_dir).await;
+                let _ = self
+                    .cleanup_or_retain(
+                        owner.clone(),
+                        CleanupResources::transient(None, Some(proxy), output_dir, permit),
+                        0,
+                    )
+                    .await;
                 return Err(CameraSessionError::Unavailable);
             }
         };
@@ -531,8 +673,13 @@ impl CameraSessionManager {
         {
             Ok(Ok(process)) => process,
             Ok(Err(_)) | Err(_) => {
-                let _ = proxy.shutdown(&owner).await;
-                let _ = tokio::fs::remove_dir_all(&output_dir).await;
+                let _ = self
+                    .cleanup_or_retain(
+                        owner.clone(),
+                        CleanupResources::transient(None, Some(proxy), output_dir, permit),
+                        0,
+                    )
+                    .await;
                 return Err(CameraSessionError::Unavailable);
             }
         };
@@ -553,11 +700,15 @@ impl CameraSessionManager {
             }
             Ok(Ok(_)) | Ok(Err(_)) | Err(_) => Err(CameraSessionError::Unavailable),
         };
-        let cleanup_failed = process.close().await.is_err()
-            | proxy.shutdown(&owner).await.is_err()
-            | remove_output_dir(&output_dir).await.is_err();
-        drop(permit);
-        if cleanup_failed {
+        if self
+            .cleanup_or_retain(
+                owner,
+                CleanupResources::transient(Some(process), Some(proxy), output_dir, permit),
+                0,
+            )
+            .await
+            .is_err()
+        {
             Err(CameraSessionError::Unavailable)
         } else {
             result
@@ -567,6 +718,11 @@ impl CameraSessionManager {
     pub async fn active_count(&self) -> usize {
         self.reap(true).await;
         self.sessions.lock().await.len()
+    }
+
+    #[doc(hidden)]
+    pub async fn pending_cleanup_count(&self) -> usize {
+        self.pending_cleanup.lock().await.len()
     }
 
     #[doc(hidden)]
@@ -645,24 +801,21 @@ impl CameraSessionManager {
         &self,
         prefix: &str,
         opaque: &str,
-    ) -> Result<PathBuf, CameraSessionError> {
+    ) -> Result<PathBuf, Option<PathBuf>> {
         let output = self.output_root.join(format!("{prefix}-{opaque}"));
-        tokio::fs::create_dir(&output)
-            .await
-            .map_err(|_| CameraSessionError::Unavailable)?;
+        tokio::fs::create_dir(&output).await.map_err(|_| None)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             tokio::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700))
                 .await
-                .map_err(|_| CameraSessionError::Unavailable)?;
+                .map_err(|_| Some(output.clone()))?;
         }
         let canonical = tokio::fs::canonicalize(&output)
             .await
-            .map_err(|_| CameraSessionError::Unavailable)?;
+            .map_err(|_| Some(output.clone()))?;
         if canonical.parent() != Some(self.output_root.as_path()) {
-            let _ = tokio::fs::remove_dir_all(&output).await;
-            return Err(CameraSessionError::Unavailable);
+            return Err(Some(output));
         }
         Ok(canonical)
     }
@@ -689,8 +842,11 @@ impl CameraSessionManager {
             (value.output_dir.clone(), crashed)
         };
         if crashed {
-            if let Some(value) = self.sessions.lock().await.remove(session) {
-                let _ = self.cleanup(value).await;
+            let crashed = { self.sessions.lock().await.remove(session) };
+            if let Some(value) = crashed {
+                let _ = self
+                    .cleanup_or_retain(session.clone(), CleanupResources::from_session(value), 0)
+                    .await;
             }
             return Err(CameraSessionError::Unavailable);
         }
@@ -698,6 +854,7 @@ impl CameraSessionManager {
     }
 
     async fn reap(&self, include_crashed: bool) {
+        let _ = self.retry_pending(false).await;
         let now = Instant::now();
         let expired = {
             let mut sessions = self.sessions.lock().await;
@@ -714,25 +871,105 @@ impl CameraSessionManager {
                 })
                 .collect();
             ids.into_iter()
-                .filter_map(|id| sessions.remove(&id))
+                .filter_map(|id| sessions.remove(&id).map(|value| (id, value)))
                 .collect::<Vec<_>>()
         };
-        for value in expired {
-            let _ = self.cleanup(value).await;
+        for (session, value) in expired {
+            let _ = self
+                .cleanup_or_retain(session, CleanupResources::from_session(value), 0)
+                .await;
         }
     }
 
-    async fn cleanup(&self, mut value: ManagedSession) -> Result<(), CameraSessionError> {
-        let _ = (value.camera, value.stream);
-        let failed = value.process.close().await.is_err()
-            | value.proxy.shutdown(&value.proxy.owner).await.is_err()
-            | remove_output_dir(&value.output_dir).await.is_err();
+    async fn cleanup_or_retain(
+        &self,
+        owner: HlsSessionId,
+        mut resources: CleanupResources,
+        previous_attempts: u32,
+    ) -> Result<(), CameraSessionError> {
+        if self.cleanup_attempt(&mut resources).await.is_ok() {
+            return Ok(());
+        }
+        let attempts = previous_attempts.saturating_add(1);
+        let next_retry = Instant::now() + cleanup_retry_delay(attempts);
+        let mut pending = self.pending_cleanup.lock().await;
+        debug_assert!(pending.len() < self.config.max_sessions || pending.contains_key(&owner));
+        pending.insert(
+            owner,
+            PendingCleanup {
+                resources,
+                attempts,
+                next_retry,
+            },
+        );
+        Err(CameraSessionError::Unavailable)
+    }
+
+    async fn retry_pending(&self, force: bool) -> Result<(), CameraSessionError> {
+        let due = {
+            let now = Instant::now();
+            let mut pending = self.pending_cleanup.lock().await;
+            let owners = pending
+                .iter()
+                .filter_map(|(owner, value)| {
+                    (force || value.next_retry <= now).then_some(owner.clone())
+                })
+                .collect::<Vec<_>>();
+            owners
+                .into_iter()
+                .filter_map(|owner| pending.remove(&owner).map(|value| (owner, value)))
+                .collect::<Vec<_>>()
+        };
+        let mut failed = false;
+        for (owner, value) in due {
+            failed |= self
+                .cleanup_or_retain(owner, value.resources, value.attempts)
+                .await
+                .is_err();
+        }
         if failed {
             Err(CameraSessionError::Unavailable)
         } else {
             Ok(())
         }
     }
+
+    async fn cleanup_attempt(
+        &self,
+        resources: &mut CleanupResources,
+    ) -> Result<(), CameraSessionError> {
+        let mut failed = false;
+        if let Some(process) = resources.process.as_mut() {
+            match timeout(CLEANUP_COMPONENT_TIMEOUT, process.close()).await {
+                Ok(Ok(())) => resources.process = None,
+                Ok(Err(_)) | Err(_) => failed = true,
+            }
+        }
+        if let Some(proxy) = resources.proxy.as_ref() {
+            match timeout(CLEANUP_COMPONENT_TIMEOUT, proxy.shutdown(&proxy.owner)).await {
+                Ok(Ok(())) => resources.proxy = None,
+                Ok(Err(_)) | Err(_) => failed = true,
+            }
+        }
+        if let Some(output_dir) = resources.output_dir.as_ref() {
+            match timeout(CLEANUP_COMPONENT_TIMEOUT, remove_output_dir(output_dir)).await {
+                Ok(Ok(())) => resources.output_dir = None,
+                Ok(Err(_)) | Err(_) => failed = true,
+            }
+        }
+        if failed {
+            Err(CameraSessionError::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn cleanup_retry_delay(attempts: u32) -> Duration {
+    let multiplier = 1_u32 << attempts.saturating_sub(1).min(5);
+    CLEANUP_RETRY_BASE
+        .saturating_mul(multiplier)
+        .min(CLEANUP_RETRY_MAX)
 }
 
 async fn remove_output_dir(path: &Path) -> Result<(), CameraSessionError> {
@@ -1343,7 +1580,8 @@ impl LoopbackRtspProxy {
             return Err(RtspProxyError::WrongOwner);
         }
         let _ = self.shutdown.send(true);
-        if let Some(mut task) = self.task.lock().await.take() {
+        let task = { self.task.lock().await.take() };
+        if let Some(mut task) = task {
             match timeout(self.shutdown_timeout, &mut task).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Err(RtspProxyError::Unavailable),
@@ -1836,10 +2074,11 @@ impl ValidatedRequest {
         if (!suffix.is_empty() && !suffix.starts_with('/')) || unsafe_path(path) {
             return Err(RequestRejection::Invalid);
         }
+        let headers = validate_client_headers(method, message.headers)?;
         Ok(Self {
             method: method.to_owned(),
             suffix: suffix.to_owned(),
-            headers: message.headers,
+            headers,
             body: message.body,
         })
     }
@@ -1887,6 +2126,105 @@ impl ValidatedRequest {
         output.extend_from_slice(&self.body);
         Ok(output)
     }
+}
+
+fn validate_client_headers(
+    method: &str,
+    mut headers: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>, RequestRejection> {
+    const FORWARDED: [&str; 7] = [
+        "cseq",
+        "accept",
+        "transport",
+        "session",
+        "range",
+        "user-agent",
+        "content-type",
+    ];
+    for header in FORWARDED {
+        if headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(header))
+            .count()
+            > 1
+        {
+            return Err(RequestRejection::Invalid);
+        }
+    }
+    let cseq = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("cseq"))
+        .map(|(_, value)| value.as_str())
+        .ok_or(RequestRejection::Invalid)?;
+    if cseq.is_empty()
+        || !cseq.bytes().all(|byte| byte.is_ascii_digit())
+        || cseq.parse::<u32>().is_err()
+    {
+        return Err(RequestRejection::Invalid);
+    }
+
+    let transport = headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("transport"));
+    match (method, transport) {
+        ("SETUP", Some((_, value))) => {
+            *value = sanitize_client_transport(value)?;
+        }
+        ("SETUP", None) | (_, Some(_)) => return Err(RequestRejection::Invalid),
+        (_, None) => {}
+    }
+    Ok(headers)
+}
+
+fn sanitize_client_transport(value: &str) -> Result<String, RequestRejection> {
+    let mut parts = value.split(';');
+    let profile = parts.next().ok_or(RequestRejection::Invalid)?;
+    if !profile.eq_ignore_ascii_case("RTP/AVP/TCP") {
+        return Err(RequestRejection::Invalid);
+    }
+    let mut unicast = false;
+    let mut channels = None;
+    for part in parts {
+        if part != part.trim() || part.is_empty() {
+            return Err(RequestRejection::Invalid);
+        }
+        if part.eq_ignore_ascii_case("unicast") {
+            if unicast {
+                return Err(RequestRejection::Invalid);
+            }
+            unicast = true;
+            continue;
+        }
+        let Some(value) = part.strip_prefix("interleaved=") else {
+            return Err(RequestRejection::Invalid);
+        };
+        if channels.is_some() {
+            return Err(RequestRejection::Invalid);
+        }
+        let (first, second) = value.split_once('-').ok_or(RequestRejection::Invalid)?;
+        if first.is_empty()
+            || second.is_empty()
+            || (first.len() > 1 && first.starts_with('0'))
+            || (second.len() > 1 && second.starts_with('0'))
+            || !first.bytes().all(|byte| byte.is_ascii_digit())
+            || !second.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(RequestRejection::Invalid);
+        }
+        let first = first.parse::<u8>().map_err(|_| RequestRejection::Invalid)?;
+        let second = second
+            .parse::<u8>()
+            .map_err(|_| RequestRejection::Invalid)?;
+        if first.checked_add(1) != Some(second) {
+            return Err(RequestRejection::Invalid);
+        }
+        channels = Some((first, second));
+    }
+    let (first, second) = channels.ok_or(RequestRejection::Invalid)?;
+    if !unicast {
+        return Err(RequestRejection::Invalid);
+    }
+    Ok(format!("RTP/AVP/TCP;unicast;interleaved={first}-{second}"))
 }
 
 async fn read_message<R: AsyncRead + Unpin>(
@@ -2115,6 +2453,7 @@ fn rewrite_sdp(
 struct DigestState {
     realm: Option<String>,
     nonce: Option<String>,
+    opaque: Option<String>,
     cnonce: Option<Zeroizing<String>>,
     nonce_count: u32,
 }
@@ -2133,6 +2472,11 @@ impl DigestState {
         let parameters = parse_digest(challenge)?;
         let realm = parameter(&parameters, "realm")?;
         let nonce = parameter(&parameters, "nonce")?;
+        let opaque = parameters
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("opaque"))
+            .map(|(_, value)| quote_value(value))
+            .transpose()?;
         let algorithm = parameters
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("algorithm"))
@@ -2177,6 +2521,7 @@ impl DigestState {
             self.cnonce = Some(random_cnonce()?);
             self.nonce_count = 0;
         }
+        self.opaque = opaque.map(str::to_owned);
         self.nonce_count = self
             .nonce_count
             .checked_add(1)
@@ -2211,6 +2556,9 @@ impl DigestState {
                 ", qop=auth, nc={nc}, cnonce=\"{}\"",
                 cnonce.as_str()
             ));
+        }
+        if let Some(opaque) = &self.opaque {
+            value.push_str(&format!(", opaque=\"{}\"", quote_value(opaque)?));
         }
         Ok(value)
     }
