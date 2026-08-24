@@ -187,7 +187,7 @@ impl ToSchema for BinaryMedia {}
 #[serde(deny_unknown_fields)]
 pub struct CameraQuery {
     pub limit: Option<usize>,
-    pub after: Option<lattice_camera::CameraId>,
+    pub after: Option<String>,
 }
 
 #[utoipa::path(get, path = "/api/v1/cameras", params(("limit" = Option<usize>, Query, minimum = 1, maximum = 256), ("after" = Option<String>, Query, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 200, body = CameraList), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
@@ -201,9 +201,14 @@ pub async fn cameras(
     if !(1..=256).contains(&limit) {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let after = query
+        .after
+        .as_deref()
+        .map(parse_canonical_camera_id)
+        .transpose()?;
     let repo = lattice_store::CameraRepository::new(state.state_repository().pool().clone());
     let (rows, has_more) = repo
-        .list_cameras(limit, query.after)
+        .list_cameras(limit, after)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let items = rows

@@ -251,6 +251,45 @@ async fn camera_query_rejects_unknown_fields_after_authentication() {
 }
 
 #[tokio::test]
+async fn camera_cursor_requires_lowercase_canonical_uuid_after_authentication() {
+    let (router, _) = fixture().await;
+    assert_eq!(
+        response(
+            &router,
+            "/api/v1/cameras?after=00000000-0000-0000-0000-000000000001".into()
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    for cursor in [
+        "ABCDEF01-2345-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000001%20",
+    ] {
+        assert_eq!(
+            response(&router, format!("/api/v1/cameras?after={cursor}"))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/cameras?after=ABCDEF01-2345-0000-0000-000000000001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn camera_list_cursor_is_deterministic_across_more_than_two_pages() {
     let (_router, _) = fixture().await;
     let ids = (2..=7)
