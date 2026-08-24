@@ -151,6 +151,39 @@ describe('reduceLiveMessage', () => {
     expect(result.timeline).toHaveLength(1);
   });
 
+  it('clears snapshot delivery pending when the matching policy event arrives', () => {
+    const id = '0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b';
+    const snapshot = {
+      sequence: 0,
+      devices: [{
+        device_id: id,
+        first_seen_at: '2026-08-23T00:00:00Z',
+        last_seen_at: '2026-08-23T00:00:00Z',
+        owner_name: null,
+        owner_type: null,
+        owner_confirmed: false,
+        presence: { state: 'unknown' as const, observed_at: null, source: null, kind: null },
+        evidence: null,
+        identity: { available: false, classification: null, confidence: null },
+        bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null },
+        policy: {
+          owner_decision: 'quarantined' as const,
+          protection: 'collector' as const,
+          evaluation: { policy_version: 1, reason: 'unknown_deadline_expired' as const, requested_action: 'quarantine' as const, deadline: null, warning: null },
+          enforcement_result: 'verified' as const,
+          undo_available: true,
+          delivery_pending: true
+        }
+      }],
+      next_after: null,
+      service_status: 'ready' as const
+    };
+    const baseline = applySnapshot(initialLiveState, snapshot);
+    expect(baseline.policies[id]?.delivery_pending).toBe(true);
+    const result = reduceLiveMessage(baseline, { type: 'event', data: policy(1) });
+    expect(result.policies[id]?.delivery_pending).toBe(false);
+  });
+
   it('keeps verified policy control authoritative until a verified release', () => {
     const id = '0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b';
     const blocked = reduceLiveMessage(initialLiveState, { type: 'event', data: policy(1) });

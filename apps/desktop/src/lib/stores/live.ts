@@ -95,6 +95,7 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
   if (event.payload.type === 'policy_changed') {
     const policy = event.payload.data;
     const id = policy.device_id;
+    // A typed policy event proves the durable outbox delivered the policy, so clear snapshot pending.
     next.policies = { ...next.policies, [id]: { ...policy, delivery_pending: false } };
     const verifiedBlock = policy.enforcement_result === 'verified'
       && (policy.requested_action === 'quarantine' || policy.requested_action === 'permanent_ban');

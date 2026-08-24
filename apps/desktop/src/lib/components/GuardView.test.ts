@@ -37,4 +37,26 @@ describe('GuardView', () => {
     expect(view.container.querySelector('.action-quarantine.enforcement-verified')).toBeTruthy();
     expect(screen.getByText('Available')).toBeTruthy();
   });
+
+  it('replaces the card when a policy lifecycle changes without changing its version', async () => {
+    const device_id = '018f47a0-9b5c-7a22-8a33-112233445599';
+    const policy = {
+      device_id,
+      evaluation: { policy_version: 1 as const, reason: 'unknown_deadline_expired' as const, requested_action: 'quarantine' as const, deadline: null, warning: null },
+      requested_action: 'quarantine' as const,
+      enforcement_result: 'verified' as const,
+      undo_available: true,
+      delivery_pending: false
+    };
+    const view = render(GuardView, { state: { ...initialLiveState, policies: { [device_id]: policy } } });
+    const first = view.container.querySelector('.policy-card');
+    const firstKey = first?.getAttribute('data-lifecycle-key');
+
+    await view.rerender({ state: { ...initialLiveState, policies: { [device_id]: { ...policy, undo_available: false } } } });
+
+    const second = view.container.querySelector('.policy-card');
+    expect(second).not.toBe(first);
+    expect(second?.getAttribute('data-lifecycle-key')).not.toBe(firstKey);
+    expect(second?.getAttribute('aria-live')).toBeNull();
+  });
 });

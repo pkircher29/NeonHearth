@@ -30,6 +30,9 @@
     if (!policy.evaluation.deadline) return 'No active deadline';
     return `Due ${new Date(policy.evaluation.deadline.due_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}`;
   }
+  function lifecycleKey(policy: GuardPolicy): string {
+    return [policy.device_id, policy.evaluation.policy_version, policy.requested_action, policy.enforcement_result, policy.evaluation.reason, policy.evaluation.deadline?.due_at ?? '', policy.evaluation.warning ?? '', policy.undo_available, policy.delivery_pending].join('|');
+  }
 </script>
 
 <section class="guard-view" aria-labelledby="guard-heading">
@@ -55,8 +58,8 @@
     </div>
   {:else}
     <div class="policy-grid" aria-live="polite">
-      {#each policies as policy (policy.device_id)}
-        <article class="policy-card action-{policy.requested_action} enforcement-{policy.enforcement_result}">
+      {#each policies as policy (lifecycleKey(policy))}
+        <article class="policy-card action-{policy.requested_action} enforcement-{policy.enforcement_result}" data-lifecycle-key={lifecycleKey(policy)}>
           <div class="policy-head">
             <span class="policy-signal" aria-hidden="true"></span>
             <div><p class="kicker">{action(policy)}</p><h2>{title(policy)}</h2></div>
