@@ -1,7 +1,8 @@
 //! Service-owned boundary joining source-stamped evidence, identity, presence, and flow facts.
 //! Sensors submit facts; this module is the only place that correlates them into app events.
 
-use chrono::{DateTime, Utc};
+use crate::{AppState, ServiceRuntimeStatus};
+use chrono::{DateTime, TimeZone, Utc};
 use lattice_domain::{DeviceId, EventPayload, EvidenceFact, PresenceChanged};
 use lattice_intelligence::presence::{
     PresenceConfig, PresenceEngine, PresenceError, PresenceEvidence, PresenceEvidenceKind,
@@ -16,7 +17,6 @@ use lattice_store::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::future::Future;
 use thiserror::Error;
 
 /// Service-owned policy for translating neighbor snapshots into durable presence facts.
@@ -44,25 +44,114 @@ pub enum NeighborCoordinatorError {
     Discovery(#[from] DiscoveryError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct NeighborInterfaceBinding {
+    interface: lattice_sensor::InterfaceId,
+    source_id: u64,
+}
+impl NeighborInterfaceBinding {
+    pub fn new(interface: lattice_sensor::InterfaceId, source_id: u64) -> Self {
+        Self {
+            interface,
+            source_id,
+        }
+    }
+    pub fn interface(self) -> lattice_sensor::InterfaceId {
+        self.interface
+    }
+    pub fn source_id(self) -> u64 {
+        self.source_id
+    }
+    pub fn safe_name(self) -> String {
+        format!("neighbor-interface-{}", self.interface.get())
+    }
+}
+
+/// Produces the sole deterministic mapping from configured network interfaces to discovery
+/// sources. Wiring must use this helper rather than inventing independently named sources.
+pub fn neighbor_discovery_sources(
+    bindings: &[NeighborInterfaceBinding],
+) -> Result<DiscoverySources, DiscoveryError> {
+    validate_neighbor_bindings(bindings).map_err(|_| DiscoveryError::InvalidSource)?;
+    let mut ordered = bindings.to_vec();
+    ordered.sort();
+    DiscoverySources::new(
+        ordered
+            .into_iter()
+            .map(|binding| DiscoverySource {
+                id: binding.source_id(),
+                name: binding.safe_name(),
+                families: vec![lattice_domain::EvidenceFamily::LinkLayer],
+                presence: true,
+            })
+            .collect(),
+    )
+}
+
+fn validate_neighbor_bindings(
+    bindings: &[NeighborInterfaceBinding],
+) -> Result<(), NeighborCoordinatorError> {
+    if bindings.is_empty()
+        || bindings
+            .iter()
+            .any(|b| b.interface().get() == 0 || b.source_id() == 0)
+        || bindings
+            .iter()
+            .map(|b| b.interface())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != bindings.len()
+        || bindings
+            .iter()
+            .map(|b| b.source_id())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != bindings.len()
+    {
+        return Err(NeighborCoordinatorError::Snapshot(
+            lattice_sensor::neighbor::NeighborError::InvalidConfig,
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct NeighborCycle {
+    outcomes: Vec<DiscoveryPipelineOutcome>,
+    commit_sequence: i64,
+}
+impl NeighborCycle {
+    pub fn outcomes(&self) -> &[DiscoveryPipelineOutcome] {
+        &self.outcomes
+    }
+    pub fn commit_sequence(&self) -> i64 {
+        self.commit_sequence
+    }
+}
+
 /// Coordinates one injected snapshot source. Failed snapshots are deliberately inert.
 pub struct NeighborCoordinator<S> {
     source: S,
     bindings: BTreeMap<lattice_sensor::InterfaceId, u64>,
     config: NeighborCoordinatorConfig,
     tracker: lattice_sensor::neighbor::NeighborTracker,
+    pipeline: PersistentDiscoveryPipeline,
+    state: AppState,
 }
 impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S> {
     pub fn new<I>(
         source: S,
+        pipeline: PersistentDiscoveryPipeline,
+        state: AppState,
         bindings: I,
         config: NeighborCoordinatorConfig,
     ) -> Result<Self, NeighborCoordinatorError>
     where
-        I: IntoIterator<Item = (lattice_sensor::InterfaceId, u64)>,
+        I: IntoIterator<Item = NeighborInterfaceBinding>,
     {
-        let bindings = bindings.into_iter().collect::<BTreeMap<_, _>>();
-        if bindings.is_empty()
-            || config.poll_interval <= chrono::Duration::zero()
+        let bindings: Vec<_> = bindings.into_iter().collect();
+        validate_neighbor_bindings(&bindings)?;
+        if config.poll_interval <= chrono::Duration::zero()
             || config.support_ttl <= chrono::Duration::zero()
             || config.support_ttl >= config.poll_interval
         {
@@ -70,21 +159,16 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
                 lattice_sensor::neighbor::NeighborError::InvalidConfig,
             ));
         }
-        if bindings.values().any(|id| *id == 0)
-            || bindings.len()
-                != bindings
-                    .values()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-        {
-            return Err(NeighborCoordinatorError::Snapshot(
-                lattice_sensor::neighbor::NeighborError::InvalidConfig,
-            ));
-        }
+        let bindings = bindings
+            .into_iter()
+            .map(|binding| (binding.interface(), binding.source_id()))
+            .collect::<BTreeMap<_, _>>();
         Ok(Self {
             source,
             bindings,
             tracker: lattice_sensor::neighbor::NeighborTracker::new(config.tracker.clone())?,
+            pipeline,
+            state,
             config,
         })
     }
@@ -95,15 +179,28 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
         self.config.support_ttl
     }
     fn floor_second(t: DateTime<Utc>) -> DateTime<Utc> {
-        t - chrono::Duration::nanoseconds(i64::from(t.timestamp_subsec_nanos()))
+        Utc.timestamp_opt(t.timestamp(), 0)
+            .single()
+            .expect("UTC seconds are representable")
     }
-    pub async fn poll(
+    pub fn commit_sequence(&self) -> i64 {
+        self.pipeline.commit_sequence()
+    }
+    pub async fn cycle(
         &mut self,
         now: DateTime<Utc>,
-    ) -> Option<Result<Vec<LinkPresenceObservation>, NeighborCoordinatorError>> {
+    ) -> Result<NeighborCycle, NeighborCoordinatorError> {
         let rows = match self.source.snapshot().await {
             Ok(rows) => rows,
-            Err(_) => return None,
+            Err(error) => {
+                self.state
+                    .transition_service_status(
+                        ServiceRuntimeStatus::Degraded,
+                        Self::floor_second(now),
+                    )
+                    .await;
+                return Err(error.into());
+            }
         };
         let observed_at = Self::floor_second(now);
         let rows = rows
@@ -112,7 +209,12 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
             .collect();
         let events = match self.tracker.observe(rows, observed_at) {
             Ok(events) => events,
-            Err(error) => return Some(Err(error.into())),
+            Err(error) => {
+                self.state
+                    .transition_service_status(ServiceRuntimeStatus::Degraded, observed_at)
+                    .await;
+                return Err(error.into());
+            }
         };
         let mut out = Vec::new();
         for event in events {
@@ -139,40 +241,54 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
                 kind,
             });
         }
-        Some(Ok(out))
-    }
-    pub async fn poll_and_publish<F, Fut>(
-        &mut self,
-        pipeline: &mut PersistentDiscoveryPipeline,
-        now: DateTime<Utc>,
-        mut publish: F,
-    ) -> Result<Vec<DiscoveryPipelineOutcome>, NeighborCoordinatorError>
-    where
-        F: FnMut(EventPayload) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        let Some(observations) = self.poll(now).await else {
-            return Ok(Vec::new());
-        };
-        let observations = observations?;
         let mut outcomes = Vec::new();
-        for observation in observations {
-            let outcome = pipeline
+        for observation in out {
+            let outcome = match self
+                .pipeline
                 .observe_link_presence_with_flow(observation, &[], 0, observation.observed_at)
-                .await?;
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.state
+                        .transition_service_status(ServiceRuntimeStatus::Degraded, observed_at)
+                        .await;
+                    return Err(error.into());
+                }
+            };
             // The pipeline returns only after the SQLite transaction commits; publishing here
             // therefore enforces durable-commit-before-event-publish.
             if let DiscoveryPipelineOutcome::Committed(ref committed) = outcome {
                 for payload in &committed.result.events {
-                    publish(payload.clone()).await;
+                    self.state
+                        .events()
+                        .publish(payload_occurred_at(payload, observed_at), payload.clone())
+                        .await;
                 }
                 if let Some(payload) = committed.payload.clone() {
-                    publish(payload).await;
+                    self.state
+                        .events()
+                        .publish(payload_occurred_at(&payload, observed_at), payload)
+                        .await;
                 }
             }
             outcomes.push(outcome);
         }
-        Ok(outcomes)
+        self.state
+            .transition_service_status(ServiceRuntimeStatus::Ready, observed_at)
+            .await;
+        Ok(NeighborCycle {
+            outcomes,
+            commit_sequence: self.pipeline.commit_sequence(),
+        })
+    }
+}
+
+fn payload_occurred_at(payload: &EventPayload, fallback: DateTime<Utc>) -> DateTime<Utc> {
+    match payload {
+        EventPayload::PresenceChanged(change) => change.occurred_at,
+        EventPayload::BandwidthFrame(frame) => frame.emitted_at,
+        EventPayload::ServiceStatus(_) => fallback,
     }
 }
 

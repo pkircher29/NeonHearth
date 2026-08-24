@@ -13,7 +13,7 @@ use axum::{
 };
 pub use platform::{Platform, PlatformPaths, platform_paths};
 use serde::Deserialize;
-pub use state::{AppState, InvalidServiceToken};
+pub use state::{AppState, InvalidServiceToken, ServiceRuntimeStatus};
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(api::health))

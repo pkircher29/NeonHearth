@@ -6,7 +6,7 @@ use axum::{
 use chrono::Utc;
 use http_body_util::BodyExt;
 use lattice_domain::{EventPayload, ServiceStatus};
-use lattice_service::{AppState, app};
+use lattice_service::{AppState, ServiceRuntimeStatus, app};
 use lattice_store::{M2StateRepository, connect_memory};
 use tower::ServiceExt;
 const TOKEN: &str = "owner-token-0123456789abcdefghijkl";
@@ -123,6 +123,20 @@ async fn snapshot_uses_current_event_watermark() {
         .await
         .unwrap();
     assert_eq!(body(response).await["sequence"], 1);
+}
+
+#[tokio::test]
+async fn state_exposes_runtime_degraded_status() {
+    let state = test_state().await;
+    state
+        .transition_service_status(ServiceRuntimeStatus::Degraded, Utc::now())
+        .await;
+    let response = app(state)
+        .oneshot(authorized_state("/api/v1/state"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await["service_status"], "degraded");
 }
 
 #[tokio::test]

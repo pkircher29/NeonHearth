@@ -11,6 +11,26 @@ use tokio::{
 };
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceRuntimeStatus {
+    Ready,
+    Degraded,
+}
+impl ServiceRuntimeStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Degraded => "degraded",
+        }
+    }
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Ready => "neighbor discovery recovered",
+            Self::Degraded => "neighbor discovery unavailable",
+        }
+    }
+}
+
 pub(crate) const EVENT_TICKET_TTL: Duration = Duration::from_secs(30);
 pub(crate) const MAX_OUTSTANDING_EVENT_TICKETS: usize = 64;
 
@@ -30,7 +50,9 @@ pub struct AppState {
     events: EventBus,
     state_repository: M2StateRepository,
     event_tickets: Arc<Mutex<HashMap<String, Instant>>>,
-    service_status: Arc<Mutex<String>>,
+    // This lock spans both the state transition and event publication.  No observer can
+    // observe a changed status without its corresponding transition event being queued.
+    service_status: Arc<Mutex<ServiceRuntimeStatus>>,
 }
 impl AppState {
     pub fn new(
@@ -50,33 +72,31 @@ impl AppState {
             events: EventBus::new(4096, 1024),
             state_repository,
             event_tickets: Arc::new(Mutex::new(HashMap::new())),
-            service_status: Arc::new(Mutex::new("ready".into())),
+            service_status: Arc::new(Mutex::new(ServiceRuntimeStatus::Ready)),
         })
     }
     pub fn events(&self) -> &EventBus {
         &self.events
     }
     pub async fn service_status(&self) -> String {
-        self.service_status.lock().await.clone()
+        self.service_status.lock().await.as_str().to_owned()
     }
-    pub async fn set_service_status(
+    pub async fn transition_service_status(
         &self,
-        status: &str,
-        detail: &str,
+        status: ServiceRuntimeStatus,
         occurred_at: chrono::DateTime<Utc>,
     ) {
         let mut current = self.service_status.lock().await;
         if *current == status {
             return;
         }
-        *current = status.to_owned();
-        drop(current);
+        *current = status;
         self.events
             .publish(
                 occurred_at,
                 EventPayload::ServiceStatus(ServiceStatus {
-                    state: status.to_owned(),
-                    detail: detail.to_owned(),
+                    state: status.as_str().to_owned(),
+                    detail: status.detail().to_owned(),
                 }),
             )
             .await;
