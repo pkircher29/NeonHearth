@@ -1,5 +1,11 @@
 use anyhow::{Context, Result, bail};
-use std::{env, fs, path::PathBuf};
+use std::{
+    env,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 fn main() {
     if let Err(e) = run() {
@@ -27,13 +33,53 @@ fn run() -> Result<()> {
     let input: PathBuf = val("--input")?.into();
     let output: PathBuf = val("--output")?.into();
     let fp = val("--fingerprint")?;
-    let bytes = fs::read(&input).context("cannot read input trace")?;
+    let bytes = read_bounded(&input)?;
     let result = w6_fixture_recorder::record(&bytes, &fp, true)?;
-    if output.exists() {
-        bail!("refusing to overwrite existing output")
-    };
-    let tmp = output.with_extension("tmp");
-    fs::write(&tmp, &result).context("cannot write output")?;
-    fs::rename(tmp, output).context("cannot finalize output")?;
+    write_new_atomic(&output, &result)?;
     Ok(())
+}
+
+fn read_bounded(path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(path).context("cannot read input trace")?;
+    let mut bytes = Vec::new();
+    file.take((w6_fixture_recorder::MAX_INPUT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .context("cannot read input trace")?;
+    if bytes.len() > w6_fixture_recorder::MAX_INPUT {
+        bail!("input exceeds safety limit");
+    }
+    Ok(bytes)
+}
+
+fn write_new_atomic(output: &Path, result: &[u8]) -> Result<()> {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fixture");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = parent.join(format!(".{stem}.tmp-{}-{nonce}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .context("cannot create temporary output")?;
+    if let Err(error) = file.write_all(result).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error).context("cannot write output");
+    }
+    drop(file);
+    let linked = fs::hard_link(&tmp, output).map_err(|error| {
+        let _ = fs::remove_file(&tmp);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!("refusing to overwrite existing output")
+        } else {
+            error.into()
+        }
+    });
+    let _ = fs::remove_file(&tmp);
+    linked.context("cannot finalize output")
 }

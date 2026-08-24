@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-const MAX_INPUT: usize = 16 * 1024 * 1024;
+pub const MAX_INPUT: usize = 16 * 1024 * 1024;
 const MAX_ENTRIES: usize = 256;
 const MAX_DEPTH: usize = 16;
 const MAX_KEYS: usize = 128;
@@ -32,8 +33,9 @@ pub fn record(input: &[u8], fingerprint: &str, authorized: bool) -> Result<Vec<u
         bail!("trace has too many entries");
     }
     let mut out = Vec::new();
+    let baseline = entries.iter().filter_map(entry_time).min();
     for e in entries {
-        out.push(sanitize_entry(e)?);
+        out.push(sanitize_entry(e, baseline)?);
     }
     serde_json::to_vec_pretty(&json!({"schema":"w6-compat-fixture-v1","fingerprint": fingerprint_hash(fingerprint),"entries":out})).map_err(Into::into)
 }
@@ -43,7 +45,7 @@ fn fingerprint_hash(s: &str) -> String {
     h.update(s.as_bytes());
     format!("sha256:{:x}", h.finalize())
 }
-fn sanitize_entry(e: &Value) -> Result<Value> {
+fn sanitize_entry(e: &Value, baseline: Option<DateTime<Utc>>) -> Result<Value> {
     let req = e.get("request").context("entry missing request")?;
     let res = e.get("response").context("entry missing response")?;
     let method = req.get("method").and_then(Value::as_str).unwrap_or("GET");
@@ -66,9 +68,16 @@ fn sanitize_entry(e: &Value) -> Result<Value> {
         .and_then(|s| serde_json::from_str(s).ok())
         .map(|v| shape(&v, 0))
         .unwrap_or(Value::Null);
+    let relative_start_ms = entry_time(e)
+        .zip(baseline)
+        .map(|(time, baseline)| (time - baseline).num_milliseconds().max(0))
+        .unwrap_or(0);
     Ok(
-        json!({"method":method,"path":path,"status":status,"content_type":ct,"response_shape":shape}),
+        json!({"method":method,"path":path,"status":status,"content_type":ct,"relative_start_ms":relative_start_ms,"response_shape":shape}),
     )
+}
+fn entry_time(e: &Value) -> Option<DateTime<Utc>> {
+    e.get("startedDateTime")?.as_str()?.parse().ok()
 }
 fn normalized_path(url: &str) -> String {
     let p = url
@@ -146,6 +155,9 @@ fn sensitive(k: &str) -> bool {
         "password",
         "username",
         "secret",
+        "device_name",
+        "serial_number",
+        "mac_address",
     ]
     .iter()
     .any(|x| k.contains(x))
@@ -171,5 +183,27 @@ mod tests {
         let s = String::from_utf8(a).unwrap();
         assert!(!s.contains("CANARY"));
         assert!(!s.contains("192.168.1.8"));
+    }
+
+    #[test]
+    fn preserves_relative_entry_timing_without_absolute_dates() {
+        let h = br#"{"log":{"entries":[
+          {"startedDateTime":"2026-01-01T00:00:01.000Z","request":{"url":"http://router/api/status"},"response":{}},
+          {"startedDateTime":"2026-01-01T00:00:01.250Z","request":{"url":"http://router/api/info"},"response":{}}
+        ]}}"#;
+        let output = String::from_utf8(record(h, "fw", true).unwrap()).unwrap();
+        assert!(output.contains("\"relative_start_ms\": 0"));
+        assert!(output.contains("\"relative_start_ms\": 250"));
+        assert!(!output.contains("2026-01-01"));
+    }
+
+    #[test]
+    fn removes_structural_identity_keys() {
+        let h = br#"{"log":{"entries":[{"request":{"url":"http://router/api/status"},"response":{"content":{"text":"{\"device_name\":\"CANARY\",\"serial_number\":\"CANARY\",\"mac_address\":\"CANARY\",\"safe\":true}"}}}]}}"#;
+        let output = String::from_utf8(record(h, "fw", true).unwrap()).unwrap();
+        assert!(!output.contains("device_name"));
+        assert!(!output.contains("serial_number"));
+        assert!(!output.contains("mac_address"));
+        assert!(output.contains("safe"));
     }
 }
