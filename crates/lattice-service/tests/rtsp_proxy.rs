@@ -1,9 +1,13 @@
 use async_trait::async_trait;
 use lattice_camera::{HlsSessionId, LoopbackSourceToken};
-use lattice_sensor::{AuthorizedBinding, InterfaceClass, SystemInterfaceManager};
+use lattice_sensor::AuthorizedBinding;
+#[cfg(target_os = "linux")]
+use lattice_sensor::{InterfaceClass, SystemInterfaceManager};
+#[cfg(target_os = "linux")]
+use lattice_service::cameras::SystemAuthorizedRtspConnector;
 use lattice_service::cameras::{
     ApprovedRtspTarget, AuthorizedRtspConnector, FakeAuthorizedRtspConnector, LoopbackRtspProxy,
-    RtspConnection, RtspProxyError, RtspProxyLimits, SystemAuthorizedRtspConnector,
+    RtspConnection, RtspProxyError, RtspProxyLimits,
 };
 use md5_digest::{Digest, Md5};
 use secrecy::SecretString;
@@ -15,9 +19,11 @@ use std::{
     },
     time::Duration,
 };
+#[cfg(target_os = "linux")]
+use tokio::net::TcpListener;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     time::Instant,
 };
 

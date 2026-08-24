@@ -487,7 +487,9 @@ async fn fixture_pipeline_projects_only_sanitized_camera_data_and_reaps_idle_med
         assert!(input.starts_with("rtsp://127.0.0.1:"));
         assert!(input.contains("/source/"));
         let output = std::path::Path::new(spec.args().last().unwrap());
-        assert!(output.starts_with(dir.path()));
+        // The session manager canonicalizes its output root (a \?\ path on
+        // Windows), so the fixture dir must be canonicalized the same way.
+        assert!(output.starts_with(dir.path().canonicalize().unwrap()));
     }
     assert_clean(format!("{:?}", onvif), &source_ref_label);
     let export = lattice_service::api::serialize_camera_inventory_for_support_export(
