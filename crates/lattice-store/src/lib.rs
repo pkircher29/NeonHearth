@@ -1,22 +1,26 @@
 //! Persistence interfaces and implementations for NeonHearth.
 
 mod advisory;
+mod audit_log;
 mod camera;
 mod checkpoint;
 mod flow;
 mod home;
 mod install;
+mod maintenance_db;
 mod policy;
 mod w6;
 
 pub use advisory::*;
 use anyhow::Context;
+pub use audit_log::*;
 pub use camera::*;
 pub use checkpoint::*;
 pub use flow::{CompactionPolicy, FlowIngestor, FlowRepository, FlowStoreError};
 use fs2::FileExt;
 pub use home::*;
 pub use install::{InstallRepository, InstallState};
+pub use maintenance_db::*;
 pub use policy::{ActuationAttempt, ActuationReservation, PendingDecision, PolicyRepository};
 use sqlx::{
     SqlitePool,

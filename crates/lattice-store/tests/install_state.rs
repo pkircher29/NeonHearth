@@ -36,7 +36,7 @@ async fn concurrent_connects_serialize_first_migration() -> anyhow::Result<()> {
         let sequences: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_sequence")
             .fetch_one(pool)
             .await?;
-        assert_eq!(migrations.0, 19);
+        assert_eq!(migrations.0, 20);
         assert_eq!(sequences.0, 1);
     }
     Ok(())
