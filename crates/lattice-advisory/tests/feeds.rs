@@ -46,6 +46,17 @@ fn nvd_requests_have_canonical_url_encoded_incremental_query_and_bounded_window(
     assert!(FeedRequest::nvd(0, 1, at(2), at(1)).is_err());
 }
 
+#[test]
+fn nvd_request_validation_rejects_url_and_typed_field_drift() {
+    let mut request = FeedRequest::nvd(4, 1000, at(0), at(1)).unwrap();
+    request.url.push_str("&startIndex=5");
+    assert_eq!(request.validate(), Err(TransportError::UnsafeUrl));
+
+    let mut request = FeedRequest::nvd(4, 1000, at(0), at(1)).unwrap();
+    request.start_index = 5;
+    assert_eq!(request.validate(), Err(TransportError::UnsafeUrl));
+}
+
 #[tokio::test]
 async fn nvd_retries_oversized_page_with_halved_size_and_negotiates_following_pages() {
     let transport = FixtureTransport::queued([

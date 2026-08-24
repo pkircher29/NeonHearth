@@ -323,6 +323,54 @@ async fn provenance_stale_is_never_promoted_by_a_future_cache_expiry() -> anyhow
     Ok(())
 }
 
+#[tokio::test]
+async fn persisted_stale_is_monotonic_and_impossible_future_state_is_corrupt() -> anyhow::Result<()>
+{
+    let pool = connect_memory().await?;
+    enroll(&pool, device_id()).await;
+    let repository = AdvisoryRepository::new(pool.clone());
+    let value = advisory("CVE-2026-8899");
+    let id = repository.upsert_advisory(&value).await?;
+    repository
+        .record_match(
+            id,
+            device_id(),
+            &match_advisory(None, &value)?,
+            RiskDimensions {
+                severity: Severity::High,
+                exploitability: Exploitability::Unknown,
+                exposure: Exposure::Unknown,
+                confidence: Confidence::Low,
+                remediation: Remediation::Unknown,
+            },
+        )
+        .await?;
+    sqlx::query("UPDATE advisories SET effective_freshness='stale' WHERE advisory_id=?")
+        .bind(id.to_string())
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        repository
+            .list_device_advisories(device_id(), at(150))
+            .await?[0]
+            .freshness,
+        Freshness::Stale
+    );
+
+    sqlx::query("UPDATE advisories SET effective_freshness='future_dated' WHERE advisory_id=?")
+        .bind(id.to_string())
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        repository
+            .list_device_advisories(device_id(), at(150))
+            .await
+            .unwrap_err(),
+        AdvisoryStoreError::Corrupt
+    );
+    Ok(())
+}
+
 async fn enroll(pool: &sqlx::SqlitePool, device: DeviceId) {
     sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at) VALUES (?, ?, ?)")
         .bind(device.to_string())
