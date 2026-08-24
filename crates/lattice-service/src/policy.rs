@@ -72,14 +72,22 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
         if connector.discovery_status() != DiscoveryStatus::Trusted {
             return EnforcementResult::ManualRequired;
         }
-        match connector.quarantine(request).await {
+        let prepared = match connector.prepare_quarantine(request).await {
+            Ok(prepared) => prepared,
+            Err(W6Error::Transport | W6Error::Authentication | W6Error::SessionExpired) => {
+                return EnforcementResult::Failed;
+            }
+            Err(_) => return EnforcementResult::ManualRequired,
+        };
+        if let Some(durable) = &self.durable {
+            if durable.save(_device, &prepared.previous).await.is_err() {
+                return EnforcementResult::Failed;
+            }
+        }
+        match connector.apply_prepared(prepared).await {
             Ok(report) if report.verification == Verification::Verified => {
-                if let Some(previous) = report.previous {
-                    if let Some(durable) = &self.durable {
-                        if durable.save(_device, &previous).await.is_err() {
-                            return EnforcementResult::Failed;
-                        }
-                    } else {
+                if self.durable.is_none() {
+                    if let Some(previous) = report.previous {
                         self.previous.lock().await.insert(_device, previous);
                     }
                 }

@@ -86,6 +86,12 @@ pub struct MutationReport {
     pub remaining: Option<u32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedMutation {
+    pub capability: Capability,
+    pub previous: DeviceState,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FilterCapacity {
     pub used: u32,
@@ -150,6 +156,70 @@ impl<T> fmt::Debug for Connector<T> {
 }
 
 impl<T: Transport> Connector<T> {
+    pub async fn prepare_quarantine(
+        &mut self,
+        request: RequestedQuarantine,
+    ) -> Result<PreparedMutation, Error> {
+        self.require_trusted()?;
+        let capability = request.capability();
+        let profile = self.profile.clone().ok_or(Error::UnknownProfile)?;
+        if !profile.advertises(capability) {
+            return Err(Error::CapabilityUnavailable);
+        }
+        let mut renewed = false;
+        let previous = self.call_state(&mut renewed).await?;
+        if capability == Capability::PersistentFilter {
+            let capacity = profile.filter_capacity.ok_or(Error::InvalidCapacity)?;
+            if capacity == 0 || capacity > W6_PERSISTENT_FILTER_LIMIT {
+                return Err(Error::InvalidCapacity);
+            }
+            if previous.filter_entries >= capacity {
+                return Err(Error::CapacityExhausted);
+            }
+        }
+        Ok(PreparedMutation {
+            capability,
+            previous,
+        })
+    }
+
+    pub async fn apply_prepared(
+        &mut self,
+        prepared: PreparedMutation,
+    ) -> Result<MutationReport, Error> {
+        self.require_trusted()?;
+        let profile = self.profile.clone().ok_or(Error::UnknownProfile)?;
+        let mut renewed = false;
+        let current = self.call_state(&mut renewed).await?;
+        if current != prepared.previous {
+            return Err(Error::VerificationFailed);
+        }
+        self.apply_with_budget(prepared.capability, &mut renewed)
+            .await?;
+        let after = self.call_state(&mut renewed).await?;
+        let matches = if prepared.capability == Capability::PersistentFilter {
+            after.persistent_filter
+                && prepared.previous.filter_entries.checked_add(1) == Some(after.filter_entries)
+                && profile
+                    .filter_capacity
+                    .is_some_and(|capacity| after.filter_entries <= capacity)
+                && after.filter_entries <= W6_PERSISTENT_FILTER_LIMIT
+        } else {
+            after.enabled(prepared.capability)
+        };
+        if !matches {
+            return Err(Error::VerificationFailed);
+        }
+        Ok(MutationReport {
+            verification: Verification::Verified,
+            capability: prepared.capability,
+            previous: Some(prepared.previous),
+            used: after.filter_entries,
+            remaining: profile
+                .filter_capacity
+                .map(|c| c.saturating_sub(after.filter_entries)),
+        })
+    }
     pub fn new(transport: T) -> Self {
         // The fixture transport's documented profile. Production integrations must
         // construct this allowlist from owner configuration; no HTTP assumptions live here.
