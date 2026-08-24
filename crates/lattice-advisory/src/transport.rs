@@ -4,7 +4,10 @@ use url::Url;
 pub const NVD_URL: &str = "https://services.nvd.nist.gov/rest/json/cves/2.0";
 pub const KEV_URL: &str =
     "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
-pub const MAX_RESPONSE_BYTES: usize = 1_048_576;
+pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_RESULTS_PER_PAGE: usize = 2_000;
+pub const MAX_PAGES: usize = 128;
+pub const MAX_AGGREGATE_RECORDS: usize = 256_000;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TransportError {
@@ -64,6 +67,76 @@ pub struct FeedResponse {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub source_url: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProductionTransport {
+    client: reqwest::Client,
+}
+impl ProductionTransport {
+    pub fn new() -> Result<Self, TransportError> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| TransportError::Unavailable)?;
+        Ok(Self { client })
+    }
+}
+impl FeedTransport for ProductionTransport {
+    async fn get(&self, request: FeedRequest) -> Result<FeedResponse, TransportError> {
+        validate_url(&request.url)?;
+        let mut builder = self.client.get(&request.url);
+        if let Some(etag) = request.etag {
+            builder = builder.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(last) = request.last_modified {
+            builder = builder.header(reqwest::header::IF_MODIFIED_SINCE, last);
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        let status = response.status().as_u16();
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let last_modified = response
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        if status == 304 {
+            return Ok(FeedResponse {
+                status,
+                body: String::new(),
+                retrieved_at: Utc::now(),
+                etag,
+                last_modified,
+                source_url: request.url,
+            });
+        }
+        if !(200..300).contains(&status) {
+            return Err(TransportError::Unavailable);
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(TransportError::Oversized);
+        }
+        let body = String::from_utf8(bytes.to_vec()).map_err(|_| TransportError::Unavailable)?;
+        Ok(FeedResponse {
+            status,
+            body,
+            retrieved_at: Utc::now(),
+            etag,
+            last_modified,
+            source_url: request.url,
+        })
+    }
 }
 pub trait FeedTransport {
     fn get(
