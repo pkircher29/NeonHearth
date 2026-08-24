@@ -532,6 +532,30 @@ impl PolicyRepository {
             .await
     }
 
+    /// Atomically records an owner-approved release intent and the recovery
+    /// reservation that must survive any external undo attempt.
+    pub async fn set_owner_decision_and_schedule_release_retry(
+        &self,
+        device_id: DeviceId,
+        value: OwnerDecision,
+        action: RequestedAction,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE device_policy SET owner_decision_json=?, release_retry_action_json=?, release_retry_at=?, updated_at=? WHERE device_id=?",
+        )
+        .bind(encode(&value)?)
+        .bind(encode(&action)?)
+        .bind((now + Duration::minutes(1)).to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(device_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn set_risk(&self, device_id: DeviceId, value: RiskSignal) -> anyhow::Result<()> {
         self.update_json(device_id, "risk_json", &value).await
     }

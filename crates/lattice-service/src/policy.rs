@@ -1,3 +1,4 @@
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lattice_domain::{
@@ -396,6 +397,7 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             && let Some(attempt) = self.repo.actuation_attempt(p.device_id).await?
             && attempt.policy_version == last.policy_version
             && attempt.action == last.requested_action
+            && attempt.decision.as_ref() == Some(last)
         {
             self.repo
                 .clear_actuation_attempt(p.device_id, attempt.policy_version, attempt.action)
@@ -416,13 +418,27 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                         .await;
                 }
             } else {
+                // A crash may happen after the durable control-plane unblock
+                // but before the retry row is cleared.  That durable fact is
+                // the idempotency fence for restoration: never issue a second
+                // undo just to complete cleanup.
+                if let Some(presence) = &self.presence
+                    && !presence.verified_control_blocked(p.device_id).await?
+                {
+                    self.repo.clear_release_retry(p.device_id).await?;
+                    return self
+                        .finish(p, evaluation, EnforcementResult::Verified, false, now)
+                        .await;
+                }
                 let undo = self.actuator.undo(p.device_id, action).await;
                 let available = self.actuator.undo_available(p.device_id, action).await;
                 if undo == EnforcementResult::Verified {
-                    self.repo.clear_release_retry(p.device_id).await?;
                     if let Some(presence) = &self.presence {
                         presence.record_verified_unblock(p.device_id, now).await?;
                     }
+                    // Retire retry state only after the durable unblock. If
+                    // the control write fails, the next sweep must retry.
+                    self.repo.clear_release_retry(p.device_id).await?;
                 } else {
                     self.repo
                         .schedule_release_retry(p.device_id, action, now)
@@ -446,7 +462,13 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 }
                 ActuationReconciliation::VerifiedApplied => {
                     if let Some(ref event) = old.decision {
-                        self.publish_exact(event, Some(&old), now).await?;
+                        let mut recovered = event.clone();
+                        recovered.undo_available =
+                            matches!(
+                                old.action,
+                                RequestedAction::Quarantine | RequestedAction::PermanentBan
+                            ) && self.actuator.undo_available(p.device_id, old.action).await;
+                        self.publish_exact(&recovered, Some(&old), now).await?;
                         // PermanentBan is stronger than Quarantine.  Never
                         // claim a downgrade merely by applying the weaker
                         // control over it: first drive the durable restore
@@ -690,6 +712,7 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                     .filter(|attempt| {
                         attempt.policy_version == event.policy_version
                             && attempt.action == event.requested_action
+                            && attempt.decision.as_ref() == Some(event)
                     })
             } else {
                 None
@@ -711,10 +734,6 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
         let prior = self.repo.published_decision(d).await?;
-        self.repo
-            .set_owner_decision(d, OwnerDecision::Approved)
-            .await?;
-        let p = self.repo.load(d).await?.unwrap();
         if let Some(prior) = prior
             && prior.enforcement_result == EnforcementResult::Verified
             && matches!(
@@ -722,6 +741,15 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 RequestedAction::Quarantine | RequestedAction::PermanentBan
             )
         {
+            self.repo
+                .set_owner_decision_and_schedule_release_retry(
+                    d,
+                    OwnerDecision::Approved,
+                    prior.requested_action,
+                    now,
+                )
+                .await?;
+            let p = self.repo.load(d).await?.context("policy disappeared")?;
             let can_undo = self
                 .actuator
                 .undo_available(d, prior.requested_action)
@@ -732,10 +760,10 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 EnforcementResult::ManualRequired
             };
             if undo == EnforcementResult::Verified {
-                self.repo.clear_release_retry(d).await?;
                 if let Some(presence) = &self.presence {
                     presence.record_verified_unblock(d, now).await?;
                 }
+                self.repo.clear_release_retry(d).await?;
             } else {
                 self.repo
                     .schedule_release_retry(d, prior.requested_action, now)
@@ -751,23 +779,73 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 )
                 .await;
         }
+        self.repo
+            .set_owner_decision(d, OwnerDecision::Approved)
+            .await?;
+        let p = self.repo.load(d).await?.context("policy disappeared")?;
         self.evaluate(p, now).await
     }
     pub async fn reject(&self, d: DeviceId, now: DateTime<Utc>) -> anyhow::Result<AuditedDecision> {
-        self.repo
-            .set_owner_decision(d, OwnerDecision::Rejected)
-            .await?;
-        self.evaluate(self.repo.load(d).await?.unwrap(), now).await
+        self.set_owner_decision_after_release_guard(d, OwnerDecision::Rejected, now)
+            .await
     }
     pub async fn quarantine(
         &self,
         d: DeviceId,
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
-        self.repo
-            .set_owner_decision(d, OwnerDecision::Quarantined)
-            .await?;
-        self.evaluate(self.repo.load(d).await?.unwrap(), now).await
+        self.set_owner_decision_after_release_guard(d, OwnerDecision::Quarantined, now)
+            .await
+    }
+    /// A queued restoration encodes a previous owner intent. Reconcile or
+    /// cancel it before recording a newer intent so it cannot later undo the
+    /// newer block. Re-applying the same action is read-only when reconciliation
+    /// proves it remains active; stronger/different actions return to the
+    /// ordinary journaled enforcement path after cancellation.
+    async fn set_owner_decision_after_release_guard(
+        &self,
+        d: DeviceId,
+        owner: OwnerDecision,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<AuditedDecision> {
+        let current = self.repo.load(d).await?.context("unknown policy device")?;
+        let mut intended = current.clone();
+        intended.owner_decision = owner;
+        let evaluation = evaluate_policy(&intended, now);
+        if let Some(release_action) = self.repo.release_retry_action(d).await? {
+            if evaluation.requested_action == release_action {
+                match self.actuator.reconcile(d, release_action).await {
+                    ActuationReconciliation::VerifiedApplied => {
+                        self.repo.clear_release_retry(d).await?;
+                        self.repo.set_owner_decision(d, owner).await?;
+                        let p = self.repo.load(d).await?.context("policy disappeared")?;
+                        let undo_available = self.actuator.undo_available(d, release_action).await;
+                        return self
+                            .finish(
+                                p,
+                                evaluate_policy(&intended, now),
+                                EnforcementResult::Verified,
+                                undo_available,
+                                now,
+                            )
+                            .await;
+                    }
+                    ActuationReconciliation::ProvenNotApplied => {
+                        self.repo.clear_release_retry(d).await?;
+                    }
+                    ActuationReconciliation::Indeterminate
+                    | ActuationReconciliation::ManualRequired
+                    | ActuationReconciliation::Failed => anyhow::bail!(
+                        "cannot replace a pending release until its control state is reconciled"
+                    ),
+                }
+            } else {
+                self.repo.clear_release_retry(d).await?;
+            }
+        }
+        self.repo.set_owner_decision(d, owner).await?;
+        self.evaluate(self.repo.load(d).await?.context("policy disappeared")?, now)
+            .await
     }
     pub async fn extend_once(
         &self,
