@@ -118,7 +118,11 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
                         Ok(after) => after,
                         Err(_) => return EnforcementResult::Failed,
                     };
-                    if durable.mark_verified(_device, &after).await.is_err() {
+                    if durable
+                        .mark_verified(_device, action, &after)
+                        .await
+                        .is_err()
+                    {
                         return EnforcementResult::Failed;
                     }
                 }

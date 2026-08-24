@@ -38,8 +38,13 @@ impl W6PriorStateRepository {
             .bind(device.to_string()).bind(&state).bind(action).bind(&state).execute(&self.pool).await?;
         Ok(())
     }
-    pub async fn mark_verified(&self, device: DeviceId, after: &DeviceState) -> Result<()> {
-        let result=sqlx::query("UPDATE w6_policy_prior_state SET verified_after_json=? WHERE device_id=? AND action_json IS NOT NULL AND prepared_before_json IS NOT NULL").bind(serde_json::to_string(after)?).bind(device.to_string()).execute(&self.pool).await?;
+    pub async fn mark_verified(
+        &self,
+        device: DeviceId,
+        action: RequestedAction,
+        after: &DeviceState,
+    ) -> Result<()> {
+        let result=sqlx::query("UPDATE w6_policy_prior_state SET verified_after_json=? WHERE device_id=? AND action_json=? AND prepared_before_json IS NOT NULL").bind(serde_json::to_string(after)?).bind(device.to_string()).bind(serde_json::to_string(&action)?).execute(&self.pool).await?;
         anyhow::ensure!(result.rows_affected() == 1, "missing W6 actuation attempt");
         Ok(())
     }
