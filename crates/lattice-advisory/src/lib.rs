@@ -358,3 +358,5 @@ fn validate_version(v: &VersionConstraint) -> Result<(), AdvisoryError> {
         Err(AdvisoryError::InvalidVersion)
     }
 }
+pub mod feed;
+pub mod transport;
