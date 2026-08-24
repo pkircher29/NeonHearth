@@ -490,6 +490,7 @@ async fn camera_openapi_schema_has_all_boundary_constraints() {
     .unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let uuid_pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+    let session_pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
     for path in [
         "/api/v1/cameras",
         "/api/v1/cameras/{id}",
@@ -512,7 +513,12 @@ async fn camera_openapi_schema_has_all_boundary_constraints() {
                 || parameter["name"] == "after"
                 || parameter["name"] == "stream_id"
             {
-                assert_eq!(schema["pattern"], uuid_pattern);
+                let expected = if path.contains("camera-sessions") && parameter["name"] == "id" {
+                    session_pattern
+                } else {
+                    uuid_pattern
+                };
+                assert_eq!(schema["pattern"], expected);
                 assert_eq!(schema["minLength"], 36);
                 assert_eq!(schema["maxLength"], 36);
             }
@@ -541,6 +547,13 @@ async fn camera_openapi_schema_has_all_boundary_constraints() {
         schemas["CameraInventoryProjection"]["properties"]["capabilities"]["maxItems"],
         32
     );
+    let items = &schemas["CameraInventoryProjection"]["properties"]["capabilities"]["items"];
+    let item_schema = items["$ref"]
+        .as_str()
+        .and_then(|reference| reference.rsplit('/').next())
+        .map(|name| &schemas[name])
+        .unwrap_or(items);
+    assert_eq!(item_schema["maxLength"], 128);
     assert!(
         schemas["CameraSummary"]["properties"]["classification"]["pattern"]
             .as_str()

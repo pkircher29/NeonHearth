@@ -73,11 +73,22 @@ pub struct CameraInventoryProjection {
     pub firmware: Option<String>,
     #[schema(max_length = 128)]
     pub serial: Option<String>,
-    #[schema(max_items = 32, value_type = Vec<String>)]
+    #[schema(max_items = 32, value_type = Vec<BoundedCapability>)]
     pub capabilities: Vec<String>,
     #[schema(pattern = "^(healthy|degraded)$")]
     pub health: String,
 }
+
+pub struct BoundedCapability;
+impl PartialSchema for BoundedCapability {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .max_length(Some(128))
+            .into()
+    }
+}
+impl ToSchema for BoundedCapability {}
 
 /// A deliberately serial-free representation for exports and structured logs.
 /// The owner UI receives [`CameraInventoryProjection`] only after authentication.
@@ -149,7 +160,7 @@ impl From<lattice_store::CameraInventoryRecord> for CameraInventoryProjection {
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraSessionResponse {
-    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
+    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
     pub session_id: String,
 }
 #[derive(Deserialize, ToSchema)]
