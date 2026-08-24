@@ -46,7 +46,8 @@ async fn main() -> Result<()> {
     let terminate = ();
     let listener = TcpListener::bind("127.0.0.1:58120").await?;
     let server = axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal(terminate, shutdown_tx.clone()));
+        .with_graceful_shutdown(shutdown_signal(terminate, shutdown_tx.clone()))
+        .into_future();
     match startup {
         StartupResult::Worker(worker) => {
             let mut worker = tokio::spawn(worker.run(shutdown_rx));
