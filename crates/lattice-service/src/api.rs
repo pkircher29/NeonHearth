@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::fmt;
 use tokio::time::Instant;
+use url::Url;
 use utoipa::{Modify, OpenApi, PartialSchema, ToSchema};
 
 fn parse_canonical_camera_id(value: &str) -> Result<lattice_camera::CameraId, StatusCode> {
@@ -97,37 +98,75 @@ pub struct AdvisoryList {
 }
 #[derive(Serialize, ToSchema)]
 pub struct AdvisoryProjection {
-    #[schema(max_length = 36)]
+    #[schema(
+        max_length = 36,
+        min_length = 36,
+        pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    )]
     pub advisory_id: String,
-    #[schema(max_length = 32)]
+    #[schema(max_length = 32, pattern = "^(nvd|cisa_kev|vendor)$")]
     pub source: String,
     #[schema(max_length = 512)]
     pub source_id: String,
     #[schema(max_length = 64)]
     pub provenance_sha256: String,
-    #[schema(max_length = 512)]
+    #[schema(max_length = 512, pattern = "^https://")]
     pub source_url: String,
     #[schema(max_length = 512)]
     pub title: String,
+    #[schema(max_length = 128)]
+    pub vendor: String,
+    #[schema(max_length = 128)]
+    pub model: Option<String>,
+    #[schema(max_length = 128)]
+    pub firmware: Option<String>,
     #[schema(max_length = 32)]
+    #[schema(pattern = "^(fresh|stale|future_dated)$")]
     pub freshness: String,
+    #[schema(pattern = "^(official_api|verified_signature|registered_https|invalid)$")]
     pub source_trust: String,
     pub retrieved_at: DateTime<Utc>,
     pub cache_expires_at: DateTime<Utc>,
+    #[schema(pattern = "^(exact|possible|contradicted|unknown)$")]
     pub label: String,
     #[schema(max_items = 8)]
     pub matched_fields: Vec<String>,
     #[schema(max_length = 512)]
     pub explanation: String,
+    #[schema(pattern = "^(low|medium|high)$")]
     pub confidence: String,
     pub risk: AdvisoryRisk,
 }
+
+fn sanitized_source_url(raw: &str) -> String {
+    Url::parse(raw)
+        .map(|mut url| {
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_else(|_| String::new())
+}
+
+fn firmware_projection(value: &lattice_advisory::VersionConstraint) -> Option<String> {
+    match value {
+        lattice_advisory::VersionConstraint::Any => None,
+        lattice_advisory::VersionConstraint::Exact(value) => Some(value.clone()),
+        lattice_advisory::VersionConstraint::LessThan(value) => Some(format!("<{value}")),
+        lattice_advisory::VersionConstraint::Range { min, max } => Some(format!("{min}..{max}")),
+    }
+}
 #[derive(Serialize, ToSchema)]
 pub struct AdvisoryRisk {
+    #[schema(pattern = "^(none|low|medium|high|critical|unknown)$")]
     pub severity: String,
+    #[schema(pattern = "^(none|proof_of_concept|active_known_exploitation|unknown)$")]
     pub exploitability: String,
+    #[schema(pattern = "^(not_exposed|potentially_exposed|exposed|unknown)$")]
     pub exposure: String,
+    #[schema(pattern = "^(low|medium|high)$")]
     pub confidence: String,
+    #[schema(pattern = "^(upgrade|mitigate|monitor|none|unknown)$")]
     pub remediation: String,
 }
 fn advisory_source(v: AdvisorySource) -> String {
@@ -218,7 +257,7 @@ pub struct AdvisoryQuery {
     pub limit: Option<usize>,
 }
 
-#[utoipa::path(get, path = "/api/v1/devices/{device_id}/advisories", params(("device_id" = String, Path, format = Uuid), ("limit" = Option<usize>, Query, minimum = 1, maximum = 128)), responses((status = 200, body = AdvisoryList), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/devices/{device_id}/advisories", params(("device_id" = String, Path, format = Uuid), ("limit" = Option<usize>, Query, minimum = 1, maximum = 128)), responses((status = 200, body = AdvisoryList), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub async fn device_advisories(
     _: Authorized,
     State(state): State<AppState>,
@@ -260,8 +299,11 @@ pub async fn device_advisories(
                 source: advisory_source(input.source),
                 source_id: input.source_id.clone(),
                 provenance_sha256: row.advisory.provenance_sha256().to_owned(),
-                source_url: input.source_url.clone(),
+                source_url: sanitized_source_url(&input.source_url),
                 title: input.title.clone(),
+                vendor: input.vendor.clone(),
+                model: input.model.clone(),
+                firmware: firmware_projection(&input.firmware),
                 freshness: freshness_name(row.freshness),
                 source_trust: source_trust_name(input.source_trust),
                 retrieved_at: input.retrieved_at,

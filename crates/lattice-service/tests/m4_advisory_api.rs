@@ -113,6 +113,9 @@ async fn authorized_listing_is_device_scoped_and_has_independent_sanitized_risk(
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["matches"][0]["label"], "exact");
+    assert_eq!(json["matches"][0]["vendor"], "Acme");
+    assert_eq!(json["matches"][0]["model"], "Cam-1");
+    assert_eq!(json["matches"][0]["firmware"], "1.2");
     for field in [
         "severity",
         "exploitability",
@@ -125,7 +128,11 @@ async fn authorized_listing_is_device_scoped_and_has_independent_sanitized_risk(
             "missing {field}"
         );
     }
-    assert!(json.to_string().contains("services.nvd.nist.gov"));
+    assert_eq!(
+        json["matches"][0]["source_url"],
+        "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    );
+    assert!(!json.to_string().contains("cveId=CVE-1"));
     assert!(!json.to_string().contains("192.168.") && !json.to_string().contains("AA:BB"));
 }
 #[tokio::test]
@@ -186,4 +193,5 @@ async fn openapi_documents_advisory_route_and_security() {
             .iter()
             .any(|p| p["name"] == "limit")
     );
+    assert!(operation["responses"]["404"].is_object());
 }
