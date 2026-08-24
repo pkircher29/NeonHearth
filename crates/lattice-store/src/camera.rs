@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use lattice_camera::{CameraId, Confidence, StreamId};
+use lattice_camera::{CameraId, Confidence, StreamId, StreamSourceRef};
 use sqlx::SqlitePool;
 use thiserror::Error;
 use uuid::Uuid;
@@ -116,20 +116,12 @@ impl CameraRepository {
         &self,
         id: CameraId,
         stream: StreamId,
-        source_ref: &str,
+        source_ref: StreamSourceRef,
     ) -> Result<(), CameraStoreError> {
-        if source_ref.is_empty()
-            || source_ref.len() > 128
-            || !source_ref
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return Err(CameraStoreError::Invalid);
-        }
         sqlx::query("INSERT INTO camera_stream_refs(camera_id,stream_id,source_ref) VALUES(?,?,?)")
             .bind(id.to_string())
             .bind(stream.to_string())
-            .bind(source_ref)
+            .bind(source_ref.as_str())
             .execute(&self.pool)
             .await?;
         Ok(())

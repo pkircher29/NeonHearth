@@ -13,7 +13,7 @@ pub use detection::{
     DetectionError, classify_candidate,
 };
 pub use onvif::{
-    BoundedSerial, CameraInventory, InventoryLimits, OnvifAction, OnvifCredential, OnvifError,
+    BoundedSerial, CameraHealth as OnvifHealth, CameraInventory, InventoryLimits, OnvifAction, OnvifCredential, OnvifError,
     OnvifTransport, StreamId, StreamSecretSink, StreamSourceRef, TargetAddress, inventory,
 };
 

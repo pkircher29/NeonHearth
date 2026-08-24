@@ -29,7 +29,7 @@ impl TargetAddress {
         path: impl Into<String>,
     ) -> Result<Self, OnvifError> {
         let path = path.into();
-        if port == 0 || !path.starts_with('/') || path.contains(['?', '#', '@']) || path.len() > 128
+        if port == 0 || !path.starts_with('/') || path.starts_with("//") || path.contains(['?', '#', '@', '\\']) || path.len() > 128 || path.bytes().any(|b| b.is_ascii_control()) || path.split('/').any(|p| p=="." || p=="..")
         {
             return Err(OnvifError::InvalidTarget);
         }
@@ -61,7 +61,7 @@ pub struct OnvifCredential {
 impl OnvifCredential {
     pub fn new(username: impl Into<String>, password: SecretString) -> Result<Self, OnvifError> {
         let username = username.into();
-        if username.is_empty() || username.len() > 128 {
+        if username.is_empty() || username.len() > 128 || !username.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.'|b'_'|b'-')) {
             return Err(OnvifError::InvalidCredential);
         }
         Ok(Self { username, password })
@@ -129,6 +129,7 @@ impl StreamSourceRef {
         }
         Ok(Self(value))
     }
+    pub fn as_str(&self) -> &str { &self.0 }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BoundedSerial(String);
@@ -147,27 +148,35 @@ impl BoundedSerial {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct CameraInventory {
-    pub manufacturer: Option<String>,
-    pub model: Option<String>,
-    pub firmware: Option<String>,
+    pub manufacturer: Option<BoundedSerial>,
+    pub model: Option<BoundedSerial>,
+    pub firmware: Option<BoundedSerial>,
     pub serial: Option<BoundedSerial>,
     pub profiles: Vec<StreamId>,
-    pub capabilities: Vec<String>,
-    pub health: String,
+    pub capabilities: Vec<BoundedSerial>,
+    pub health: CameraHealth,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all="snake_case")]
+pub enum CameraHealth { Healthy, Degraded }
 #[derive(Clone, Debug)]
 pub struct InventoryLimits {
+    pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub max_xml_depth: usize,
     pub max_facts: usize,
+    pub max_events: usize,
+    pub max_profiles: usize,
+    pub max_field_bytes: usize,
+    pub max_uri_bytes: usize,
     pub timeout: Duration,
 }
 impl Default for InventoryLimits {
     fn default() -> Self {
         Self {
-            max_response_bytes: 64 * 1024,
+            max_request_bytes: 16 * 1024, max_response_bytes: 64 * 1024,
             max_xml_depth: 32,
-            max_facts: 16,
+            max_facts: 16, max_events: 1024, max_profiles: 16, max_field_bytes: 128, max_uri_bytes: 2048,
             timeout: Duration::from_secs(5),
         }
     }
@@ -192,6 +201,8 @@ pub enum OnvifError {
     ResponseTooLarge,
     #[error("invalid ONVIF response")]
     InvalidResponse,
+    #[error("invalid inventory limits")]
+    InvalidLimits,
     #[error("stream sink failed")]
     Sink,
 }
@@ -203,6 +214,7 @@ pub async fn inventory<T: OnvifTransport, S: StreamSecretSink>(
     credential: Option<&OnvifCredential>,
     limits: InventoryLimits,
 ) -> Result<CameraInventory, OnvifError> {
+    if limits.max_request_bytes==0 || limits.max_response_bytes==0 || limits.max_xml_depth==0 || limits.max_facts==0 || limits.max_events==0 || limits.max_profiles==0 || limits.max_field_bytes==0 || limits.max_uri_bytes==0 || limits.timeout.is_zero() { return Err(OnvifError::InvalidLimits); }
     let device = transport
         .request(
             &target,
@@ -247,16 +259,15 @@ pub async fn inventory<T: OnvifTransport, S: StreamSecretSink>(
         streams.push(id);
     }
     Ok(CameraInventory {
-        manufacturer: facts.get("Manufacturer").cloned(),
-        model: facts.get("Model").cloned(),
-        firmware: facts.get("FirmwareVersion").cloned(),
+        manufacturer: facts.get("Manufacturer").and_then(BoundedSerial::new),
+        model: facts.get("Model").and_then(BoundedSerial::new),
+        firmware: facts.get("FirmwareVersion").and_then(BoundedSerial::new),
         serial: facts.get("SerialNumber").and_then(BoundedSerial::new),
         profiles: streams,
-        capabilities: capfacts
-            .get("Media")
-            .map(|_| vec!["media".to_owned()])
+        capabilities: capfacts.get("Media").and_then(BoundedSerial::new)
+            .map(|_| vec![BoundedSerial::new("media").unwrap()])
             .unwrap_or_default(),
-        health: "healthy".to_owned(),
+        health: CameraHealth::Healthy,
     })
 }
 fn parse(
@@ -313,7 +324,7 @@ fn parse_uri(input: &str, limits: &InventoryLimits) -> Result<String, OnvifError
         .into_iter()
         .find(|(n, ns, v)| n == "Uri" && ns == SCHEMA && !v.is_empty())
         .map(|(_, _, v)| v)
-        .filter(|v| v.len() <= 2048 && v.starts_with("rtsp://"))
+        .filter(|v| v.len() <= limits.max_uri_bytes && v.starts_with("rtsp://"))
         .ok_or(OnvifError::InvalidResponse)
 }
 fn xml(input: &str, limits: &InventoryLimits) -> Result<Vec<(String, String, String)>, OnvifError> {
@@ -332,7 +343,8 @@ fn xml(input: &str, limits: &InventoryLimits) -> Result<Vec<(String, String, Str
     let mut buf = Vec::new();
     let mut stack: Vec<(String, String)> = Vec::new();
     let mut out = Vec::new();
-    loop {
+    let mut events=0usize; loop {
+        events+=1; if events>limits.max_events { return Err(OnvifError::InvalidResponse); }
         match r
             .read_event_into(&mut buf)
             .map_err(|_| OnvifError::InvalidResponse)?

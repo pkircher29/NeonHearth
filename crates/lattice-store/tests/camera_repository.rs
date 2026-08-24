@@ -1,5 +1,5 @@
 use chrono::Utc;
-use lattice_camera::{CameraId, Confidence, StreamId};
+use lattice_camera::{CameraId, Confidence, StreamId, StreamSourceRef};
 use lattice_store::{
     CameraInventoryRecord, CameraRepository, CameraStoreError, NewCamera, connect_memory,
 };
@@ -29,13 +29,13 @@ async fn camera_repository_persists_only_bounded_non_secret_records() -> anyhow:
     )
     .await?;
     let stream = StreamId::new();
-    repo.add_stream_ref(id, stream, "opaque-ref").await?;
+    repo.add_stream_ref(id, stream, StreamSourceRef::new("opaque-ref").unwrap()).await?;
     assert_eq!(repo.stream_refs(id).await?.len(), 1);
     assert!(
         repo.add_stream_ref(
             CameraId::from_uuid(Uuid::now_v7()),
             StreamId::new(),
-            "opaque-ref"
+            StreamSourceRef::new("opaque-ref").unwrap()
         )
         .await
         .is_err()

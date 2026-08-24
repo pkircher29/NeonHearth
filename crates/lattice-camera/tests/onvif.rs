@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use lattice_camera::{
-    InventoryLimits, OnvifAction, OnvifCredential, OnvifError, OnvifTransport, StreamId,
+    BoundedSerial, InventoryLimits, OnvifAction, OnvifCredential, OnvifError, OnvifTransport, StreamId,
     StreamSecretSink, TargetAddress, inventory,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -88,7 +88,7 @@ async fn inventory_is_schema_valid_and_hands_stream_only_to_sink() {
     )
     .await
     .unwrap();
-    assert_eq!(value.manufacturer.as_deref(), Some("Acme"));
+    assert_eq!(value.manufacturer.as_ref().map(BoundedSerial::as_str), Some("Acme"));
     assert_eq!(value.serial.as_ref().unwrap().as_str(), "SN-42");
     assert_eq!(value.profiles.len(), 1);
     assert_eq!(
