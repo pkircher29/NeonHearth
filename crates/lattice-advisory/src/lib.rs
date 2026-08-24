@@ -359,4 +359,6 @@ fn validate_version(v: &VersionConstraint) -> Result<(), AdvisoryError> {
     }
 }
 pub mod feed;
+pub mod kev;
+pub mod nvd;
 pub mod transport;
