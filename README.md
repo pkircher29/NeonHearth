@@ -12,5 +12,12 @@ NeonHearth is for private networks the owner administers. It does not scan publi
 
 ## Current status
 
-Implementation follows the approved M1–M7 build checklist in the parent workspace. The first deliverable is the loopback-only service foundation and unprivileged UI shell.
+Implementation follows the approved M1–M7 build checklist in the parent
+workspace. M1 is complete, the automated M2 discovery/identity/presence work is
+complete with real departure/rejoin acceptance still pending, and the simulated
+M3 live UI, approval policy, and W6 enforcement gate is complete.
 
+The W6 adapter is fixture-verified but intentionally not enabled in the main
+runtime until an owner-authorized, sanitized compatibility capture identifies
+the real interface. Cameras/security assessment, Home Twin, Network Doctor,
+Tailscale access, and production installers follow in M4–M7.
