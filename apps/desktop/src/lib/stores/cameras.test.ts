@@ -49,4 +49,21 @@ describe('createCameraStore', () => {
     expect(store.state.session).toBeNull();
     expect(client.closeCameraSession).toHaveBeenCalledWith(sessionId);
   });
+
+  it('closes the prior live session and revokes its still before selecting another camera', async () => {
+    const other = '018f47a0-9b5c-7a22-8a33-112233445588'; const revoke = vi.fn(); const client = clientStub();
+    const store = createCameraStore(client, { createObjectURL: vi.fn(() => 'blob:still'), revokeObjectURL: revoke });
+    await store.load(); await store.snapshot(cameraId); await store.startSession(cameraId, streamId);
+    await store.select(other);
+    expect(store.state.selected).toBe(other);
+    expect(store.state.session).toBeNull(); expect(store.state.snapshotUrl).toBeNull();
+    expect(revoke).toHaveBeenCalledWith('blob:still'); expect(client.closeCameraSession).toHaveBeenCalledWith(sessionId);
+  });
+
+  it('keeps cleanup idempotent when session closing fails', async () => {
+    const client = clientStub({ closeCameraSession: vi.fn(async () => { throw new Error('Request failed with status 503'); }) });
+    const store = createCameraStore(client); await store.load(); await store.startSession(cameraId, streamId);
+    await store.closeSession(); await store.closeSession(); await store.dispose();
+    expect(store.state.session).toBeNull(); expect(client.closeCameraSession).toHaveBeenCalledTimes(1);
+  });
 });

@@ -27,7 +27,14 @@ export function createCameraStore(client: ApiClient, urls: ObjectUrlApi = URL) {
   return {
     get state() { return state; },
     subscribe(listener: (next: CamerasState) => void) { listeners.add(listener); listener(state); return () => listeners.delete(listener); },
-    select(cameraId: string | null) { request += 1; update({ selected: cameraId, error: null }); },
+    async select(cameraId: string | null) {
+      request += 1;
+      const priorSession = state.session;
+      const snapshotUrl = state.snapshotUrl;
+      update({ selected: cameraId, session: null, snapshotUrl: null, error: null });
+      if (snapshotUrl) urls.revokeObjectURL(snapshotUrl);
+      await close(priorSession);
+    },
     async load() {
       const token = ++request; update({ loading: true, error: null });
       try {
