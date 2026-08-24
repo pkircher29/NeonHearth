@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use lattice_camera::{
-    BoundedMetadata, BoundedOnvifResponse, BoundedSerial, CameraProfile, InventoryLimits,
-    OnvifAction, OnvifCredential, OnvifError, OnvifRequest, OnvifTransport, StreamId,
-    StreamSecretSink, StreamSourceRef, TargetAddress, inventory,
+    BoundedMetadata, BoundedSerial, CameraProfile, InventoryLimits, OnvifAction, OnvifCredential,
+    OnvifError, OnvifRequest, OnvifResponseWriter, OnvifTransport, StreamId, StreamSecretSink,
+    StreamSourceRef, TargetAddress, inventory,
 };
 use secrecy::{ExposeSecret, SecretString};
 use std::{
@@ -21,6 +21,11 @@ const DEVICE: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA: &str = "http://www.onvif.org/ver10/media/wsdl";
 const SCHEMA: &str = "http://www.onvif.org/ver10/schema";
 const URI_SENTINEL: &str = "rtsp://uri-secret.invalid/live";
+const CREDENTIAL_PASSWORD_SENTINEL: &str = "digest-secret";
+const DEVICE_INFORMATION_ACTION: &str =
+    "http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation";
+const DEVICE_INFORMATION_RESPONSE_ACTION: &str =
+    "http://www.onvif.org/ver10/device/wsdl/GetDeviceInformationResponse";
 
 #[derive(Clone, Copy, Debug)]
 enum Mutation {
@@ -48,6 +53,8 @@ enum Mutation {
     TokenTooLong,
     UriTooLong,
     EscapedFieldTooLong,
+    EscapedTextWireTooLong,
+    EscapedAttributeWireTooLong,
     InvalidUtf8,
     EmptyHealth,
     WrongHealthNamespace,
@@ -64,9 +71,12 @@ struct FixtureTransport {
     credential_digest: AtomicU64,
     failure: Option<OnvifError>,
     profile_token: &'static str,
+    required_credential: Option<(&'static str, &'static str)>,
 }
 
 struct SlowTransport(FixtureTransport);
+
+struct OverflowingTransport;
 
 #[async_trait]
 impl OnvifTransport for SlowTransport {
@@ -75,9 +85,28 @@ impl OnvifTransport for SlowTransport {
         target: &TargetAddress,
         request: &OnvifRequest,
         credential: Option<&OnvifCredential>,
-    ) -> Result<BoundedOnvifResponse, OnvifError> {
+        response: &mut OnvifResponseWriter,
+    ) -> Result<(), OnvifError> {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        self.0.request(target, request, credential).await
+        self.0.request(target, request, credential, response).await
+    }
+}
+
+#[async_trait]
+impl OnvifTransport for OverflowingTransport {
+    async fn request(
+        &self,
+        _: &TargetAddress,
+        _: &OnvifRequest,
+        _: Option<&OnvifCredential>,
+        response: &mut OnvifResponseWriter,
+    ) -> Result<(), OnvifError> {
+        response.append_chunk(b"1234")?;
+        assert_eq!(
+            response.append_chunk(b"56789"),
+            Err(OnvifError::ResponseTooLarge)
+        );
+        Ok(())
     }
 }
 
@@ -90,6 +119,7 @@ impl FixtureTransport {
             credential_digest: AtomicU64::new(0),
             failure: None,
             profile_token: "main-profile",
+            required_credential: None,
         }
     }
 
@@ -113,6 +143,13 @@ impl FixtureTransport {
             ..Self::valid()
         }
     }
+
+    fn requiring_credential() -> Self {
+        Self {
+            required_credential: Some(("admin", CREDENTIAL_PASSWORD_SENTINEL)),
+            ..Self::valid()
+        }
+    }
 }
 
 #[async_trait]
@@ -122,8 +159,18 @@ impl OnvifTransport for FixtureTransport {
         _: &TargetAddress,
         request: &OnvifRequest,
         credential: Option<&OnvifCredential>,
-    ) -> Result<BoundedOnvifResponse, OnvifError> {
+        response: &mut OnvifResponseWriter,
+    ) -> Result<(), OnvifError> {
         self.calls.lock().unwrap().push(request.action().clone());
+        if let Some((expected_username, expected_password)) = self.required_credential {
+            let accepted = credential.is_some_and(|credential| {
+                credential.username() == expected_username
+                    && credential.password().expose_secret() == expected_password
+            });
+            if !accepted {
+                return Err(OnvifError::Authentication);
+            }
+        }
         if let Some(credential) = credential {
             self.credential_seen.store(true, Ordering::SeqCst);
             let mut hasher = DefaultHasher::new();
@@ -160,6 +207,12 @@ impl OnvifTransport for FixtureTransport {
             Mutation::TokenTooLong if matches!(request.action(), OnvifAction::GetProfiles) => body = body.replace("token=\"main-profile\"", "token=\"profile-token-too-long\""),
             Mutation::UriTooLong if matches!(request.action(), OnvifAction::GetStreamUri { .. }) => body = body.replace(URI_SENTINEL, "rtsp://uri-secret.invalid/this-is-too-long"),
             Mutation::EscapedFieldTooLong if matches!(request.action(), OnvifAction::GetDeviceInformation) => body = body.replace("Acme", "A&amp;B&amp;C"),
+            Mutation::EscapedTextWireTooLong if matches!(request.action(), OnvifAction::GetDeviceInformation) => {
+                body = body.replace("Acme", &"&#65;".repeat(60));
+            }
+            Mutation::EscapedAttributeWireTooLong if matches!(request.action(), OnvifAction::GetProfiles) => {
+                body = body.replace("main-profile", &"&#65;".repeat(60));
+            }
             Mutation::EmptyHealth if matches!(request.action(), OnvifAction::GetSystemDateAndTime) => {
                 body = "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime/></tds:GetSystemDateAndTimeResponse>".into();
             }
@@ -228,7 +281,7 @@ impl OnvifTransport for FixtureTransport {
             declaration.extend(bytes);
             bytes = declaration;
         }
-        request.bind_response(bytes)
+        response.append_chunk(&bytes)
     }
 }
 
@@ -285,7 +338,7 @@ fn target_path(path: &str) -> TargetAddress {
     TargetAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4)), 8899, true, path).unwrap()
 }
 fn credential() -> OnvifCredential {
-    OnvifCredential::new("admin", SecretString::from("digest-secret")).unwrap()
+    OnvifCredential::new("admin", SecretString::from(CREDENTIAL_PASSWORD_SENTINEL)).unwrap()
 }
 
 #[tokio::test]
@@ -317,17 +370,66 @@ async fn inherited_namespaces_correlation_token_health_and_opaque_stream_are_enf
     assert_ne!(sink.digest.load(Ordering::SeqCst), 0);
     assert!(transport.credential_seen.load(Ordering::SeqCst));
     assert_ne!(transport.credential_digest.load(Ordering::SeqCst), 0);
-    let calls = transport.calls.lock().unwrap();
-    assert!(matches!(calls[0], OnvifAction::GetDeviceInformation));
-    assert!(matches!(calls[1], OnvifAction::GetCapabilities));
-    assert!(matches!(calls[2], OnvifAction::GetProfiles));
-    assert!(
-        matches!(calls[3], OnvifAction::GetStreamUri { ref profile_token } if profile_token.as_str() == "main-profile")
-    );
-    assert!(matches!(calls[4], OnvifAction::GetSystemDateAndTime));
+    {
+        let calls = transport.calls.lock().unwrap();
+        assert!(matches!(calls[0], OnvifAction::GetDeviceInformation));
+        assert!(matches!(calls[1], OnvifAction::GetCapabilities));
+        assert!(matches!(calls[2], OnvifAction::GetProfiles));
+        assert!(
+            matches!(calls[3], OnvifAction::GetStreamUri { ref profile_token } if profile_token.as_str() == "main-profile")
+        );
+        assert!(matches!(calls[4], OnvifAction::GetSystemDateAndTime));
+    }
     let json = serde_json::to_string(&value).unwrap();
     let debug = format!("{value:?}");
-    assert!(!json.contains("rtsp://"));
+    let error = inventory(
+        &FixtureTransport::requiring_credential(),
+        &Sink::default(),
+        target(),
+        None,
+        InventoryLimits::default(),
+    )
+    .await
+    .unwrap_err();
+    let failed_sink = Sink::default();
+    failed_sink.fail.store(true, Ordering::SeqCst);
+    let sink_error = inventory(
+        &FixtureTransport::valid(),
+        &failed_sink,
+        target(),
+        Some(&credential()),
+        InventoryLimits::default(),
+    )
+    .await
+    .unwrap_err();
+    let error_debug = format!("{error:?}");
+    let error_display = error.to_string();
+    let sink_error_debug = format!("{sink_error:?}");
+    let sink_error_display = sink_error.to_string();
+    for normalized in [
+        &json,
+        &debug,
+        &error_debug,
+        &error_display,
+        &sink_error_debug,
+        &sink_error_display,
+    ] {
+        for forbidden in [
+            CREDENTIAL_PASSWORD_SENTINEL,
+            URI_SENTINEL,
+            "rtsp://",
+            SOAP,
+            "<s:Envelope",
+            "GetDeviceInformationResponse",
+            DEVICE_INFORMATION_ACTION,
+            DEVICE_INFORMATION_RESPONSE_ACTION,
+        ] {
+            assert!(
+                !normalized.contains(forbidden),
+                "normalized output retained {forbidden:?}: {normalized}"
+            );
+        }
+    }
     assert!(!json.contains("SN-42"));
     assert!(!json.contains("\"serial\""));
     assert!(!debug.contains("uri-secret"));
@@ -394,6 +496,41 @@ async fn digest_absent_tls_timeout_and_sink_failures_are_typed_and_redacted() {
     assert_eq!(error, OnvifError::Sink);
     assert!(!sink.called.load(Ordering::SeqCst));
     assert!(!format!("{error:?}").contains("uri-secret"));
+}
+
+#[tokio::test]
+async fn digest_auth_fixture_requires_the_exact_typed_credential() {
+    for supplied in [
+        None,
+        Some(
+            OnvifCredential::new("viewer", SecretString::from(CREDENTIAL_PASSWORD_SENTINEL))
+                .unwrap(),
+        ),
+        Some(OnvifCredential::new("admin", SecretString::from("wrong-digest-secret")).unwrap()),
+    ] {
+        let error = inventory(
+            &FixtureTransport::requiring_credential(),
+            &Sink::default(),
+            target(),
+            supplied.as_ref(),
+            InventoryLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, OnvifError::Authentication);
+        assert!(!format!("{error:?} {error}").contains(CREDENTIAL_PASSWORD_SENTINEL));
+    }
+
+    let inventory = inventory(
+        &FixtureTransport::requiring_credential(),
+        &Sink::default(),
+        target(),
+        Some(&credential()),
+        InventoryLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(inventory.profiles.len(), 1);
 }
 
 #[tokio::test]
@@ -617,6 +754,32 @@ async fn depth_event_fact_profile_capability_field_token_uri_and_escaped_caps_ap
 }
 
 #[tokio::test]
+async fn oversized_raw_escaped_text_and_attributes_are_rejected_before_decode() {
+    let limits = InventoryLimits {
+        max_uri_bytes: 32,
+        ..InventoryLimits::default()
+    };
+    for mutation in [
+        Mutation::EscapedTextWireTooLong,
+        Mutation::EscapedAttributeWireTooLong,
+    ] {
+        assert_eq!(
+            inventory(
+                &FixtureTransport::mutated(mutation),
+                &Sink::default(),
+                target(),
+                None,
+                limits.clone(),
+            )
+            .await
+            .unwrap_err(),
+            OnvifError::InvalidResponse,
+            "{mutation:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn response_request_target_and_limit_bounds_are_enforced_before_retention() {
     let transport = FixtureTransport::valid();
     let sink = Sink::default();
@@ -656,6 +819,26 @@ async fn response_request_target_and_limit_bounds_are_enforced_before_retention(
     assert!(TargetAddress::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, false, "/x").is_err());
     assert!(OnvifCredential::new("bad user", SecretString::from("x")).is_err());
     assert!(StreamSourceRef::new("not opaque/ref").is_err());
+}
+
+#[tokio::test]
+async fn response_writer_rejects_a_chunk_before_extending_past_the_inventory_cap() {
+    let limits = InventoryLimits {
+        max_response_bytes: 8,
+        ..InventoryLimits::default()
+    };
+    assert_eq!(
+        inventory(
+            &OverflowingTransport,
+            &Sink::default(),
+            target(),
+            None,
+            limits,
+        )
+        .await
+        .unwrap_err(),
+        OnvifError::ResponseTooLarge
+    );
 }
 
 #[test]

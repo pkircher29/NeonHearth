@@ -266,15 +266,6 @@ impl OnvifRequest {
     pub const fn timeout(&self) -> Duration {
         self.timeout
     }
-
-    pub fn bind_response(&self, bytes: Vec<u8>) -> Result<BoundedOnvifResponse, OnvifError> {
-        if bytes.len() > self.max_response_bytes {
-            return Err(OnvifError::ResponseTooLarge);
-        }
-        Ok(BoundedOnvifResponse {
-            bytes: bytes.into_boxed_slice(),
-        })
-    }
 }
 
 impl fmt::Debug for OnvifRequest {
@@ -290,7 +281,7 @@ impl fmt::Debug for OnvifRequest {
     }
 }
 
-pub struct BoundedOnvifResponse {
+struct BoundedOnvifResponse {
     bytes: Box<[u8]>,
 }
 
@@ -309,6 +300,64 @@ impl fmt::Debug for BoundedOnvifResponse {
     }
 }
 
+/// Inventory-owned bounded collector supplied to an ONVIF transport.
+///
+/// A rejected chunk poisons the collector, so a transport cannot ignore a
+/// bounds error and return a truncated response as though it were complete.
+pub struct OnvifResponseWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    rejected: bool,
+}
+
+impl OnvifResponseWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            rejected: false,
+        }
+    }
+
+    /// Appends one transport chunk after proving the resulting response stays
+    /// within the request's response limit.
+    pub fn append_chunk(&mut self, chunk: &[u8]) -> Result<(), OnvifError> {
+        if self.rejected {
+            return Err(OnvifError::ResponseTooLarge);
+        }
+        let Some(next_len) = self.bytes.len().checked_add(chunk.len()) else {
+            self.rejected = true;
+            return Err(OnvifError::ResponseTooLarge);
+        };
+        if next_len > self.max_bytes {
+            self.rejected = true;
+            return Err(OnvifError::ResponseTooLarge);
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<BoundedOnvifResponse, OnvifError> {
+        if self.rejected {
+            return Err(OnvifError::ResponseTooLarge);
+        }
+        Ok(BoundedOnvifResponse {
+            bytes: self.bytes.into_boxed_slice(),
+        })
+    }
+}
+
+impl fmt::Debug for OnvifResponseWriter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OnvifResponseWriter")
+            .field("bytes", &self.bytes.len())
+            .field("max_bytes", &self.max_bytes)
+            .field("rejected", &self.rejected)
+            .finish()
+    }
+}
+
 #[async_trait]
 pub trait OnvifTransport: Send + Sync {
     async fn request(
@@ -316,7 +365,8 @@ pub trait OnvifTransport: Send + Sync {
         target: &TargetAddress,
         request: &OnvifRequest,
         credential: Option<&OnvifCredential>,
-    ) -> Result<BoundedOnvifResponse, OnvifError>;
+        response: &mut OnvifResponseWriter,
+    ) -> Result<(), OnvifError>;
 }
 
 pub trait StreamSecretSink: Send + Sync {
@@ -703,10 +753,14 @@ async fn exchange<T: OnvifTransport>(
     action: OnvifAction,
 ) -> Result<ParsedEnvelope, OnvifError> {
     let request = OnvifRequest::new(action, target, limits)?;
-    let response =
-        tokio::time::timeout_at(deadline, transport.request(target, &request, credential))
-            .await
-            .map_err(|_| OnvifError::Timeout)??;
+    let mut writer = OnvifResponseWriter::new(request.max_response_bytes());
+    tokio::time::timeout_at(
+        deadline,
+        transport.request(target, &request, credential, &mut writer),
+    )
+    .await
+    .map_err(|_| OnvifError::Timeout)??;
+    let response = writer.finish()?;
     parse_envelope(response.as_bytes(), &request, limits)
 }
 
@@ -827,6 +881,9 @@ fn parse_xml(bytes: &[u8], limits: &InventoryLimits) -> Result<XmlNode, OnvifErr
                 attach_node(&mut stack, &mut root, node)?;
             }
             Event::Text(text) => {
+                if text.as_ref().len() > max_retained {
+                    return Err(OnvifError::InvalidResponse);
+                }
                 let decoded = text.decode().map_err(|_| OnvifError::InvalidResponse)?;
                 let decoded = unescape(&decoded).map_err(|_| OnvifError::InvalidResponse)?;
                 if decoded.len() > max_retained {
@@ -902,6 +959,9 @@ fn node_from_start(
     let mut attributes = Vec::new();
     for attribute in start.attributes() {
         let attribute = attribute.map_err(|_| OnvifError::InvalidResponse)?;
+        if attribute.value.as_ref().len() > max_retained {
+            return Err(OnvifError::InvalidResponse);
+        }
         let raw_name = attribute.key.as_ref();
         if raw_name == b"xmlns" || raw_name.starts_with(b"xmlns:") {
             let value = attribute

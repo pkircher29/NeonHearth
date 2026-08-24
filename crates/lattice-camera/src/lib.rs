@@ -13,10 +13,10 @@ pub use detection::{
     DetectionError, classify_candidate,
 };
 pub use onvif::{
-    BoundedMetadata, BoundedOnvifResponse, BoundedSerial, CameraHealth as OnvifHealth,
-    CameraInventory, CameraProfile, InventoryLimits, OnvifAction, OnvifCredential, OnvifError,
-    OnvifRequest, OnvifTransport, ProfileToken, StreamId, StreamSecretSink, StreamSourceRef,
-    TargetAddress, inventory,
+    BoundedMetadata, BoundedSerial, CameraHealth as OnvifHealth, CameraInventory, CameraProfile,
+    InventoryLimits, OnvifAction, OnvifCredential, OnvifError, OnvifRequest, OnvifResponseWriter,
+    OnvifTransport, ProfileToken, StreamId, StreamSecretSink, StreamSourceRef, TargetAddress,
+    inventory,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
