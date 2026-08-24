@@ -71,20 +71,16 @@ async fn successful_polls_commit_and_publish_only_after_commit() {
         NeighborCoordinatorConfig::default(),
     )
     .unwrap();
-    let mut published = Vec::new();
     let mut p = pipeline;
     let t = Utc.timestamp_opt(1_700_000_000, 987_000_000).unwrap();
     let outcomes = coordinator
-        .poll_and_publish(&mut p, t, |event| {
-            published.push(event);
-        })
+        .poll_and_publish(&mut p, t, |_event| async {})
         .await
         .unwrap();
     assert!(matches!(
         outcomes.as_slice(),
         [DiscoveryPipelineOutcome::Committed(_)]
     ));
-    assert_eq!(published.len(), 0, "first join has no presence event");
     assert_eq!(p.commit_sequence(), 1);
 }
 

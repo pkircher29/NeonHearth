@@ -1,3 +1,5 @@
+use chrono::Utc;
+use lattice_domain::{EventPayload, ServiceStatus};
 use lattice_event_bus::EventBus;
 use lattice_store::M2StateRepository;
 use secrecy::{ExposeSecret, SecretString};
@@ -28,6 +30,7 @@ pub struct AppState {
     events: EventBus,
     state_repository: M2StateRepository,
     event_tickets: Arc<Mutex<HashMap<String, Instant>>>,
+    service_status: Arc<Mutex<String>>,
 }
 impl AppState {
     pub fn new(
@@ -47,10 +50,36 @@ impl AppState {
             events: EventBus::new(4096, 1024),
             state_repository,
             event_tickets: Arc::new(Mutex::new(HashMap::new())),
+            service_status: Arc::new(Mutex::new("ready".into())),
         })
     }
     pub fn events(&self) -> &EventBus {
         &self.events
+    }
+    pub async fn service_status(&self) -> String {
+        self.service_status.lock().await.clone()
+    }
+    pub async fn set_service_status(
+        &self,
+        status: &str,
+        detail: &str,
+        occurred_at: chrono::DateTime<Utc>,
+    ) {
+        let mut current = self.service_status.lock().await;
+        if *current == status {
+            return;
+        }
+        *current = status.to_owned();
+        drop(current);
+        self.events
+            .publish(
+                occurred_at,
+                EventPayload::ServiceStatus(ServiceStatus {
+                    state: status.to_owned(),
+                    detail: detail.to_owned(),
+                }),
+            )
+            .await;
     }
     pub(crate) fn state_repository(&self) -> &M2StateRepository {
         &self.state_repository

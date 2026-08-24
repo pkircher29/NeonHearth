@@ -16,6 +16,7 @@ use lattice_store::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::future::Future;
 use thiserror::Error;
 
 /// Service-owned policy for translating neighbor snapshots into durable presence facts.
@@ -63,6 +64,18 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
         if bindings.is_empty()
             || config.poll_interval <= chrono::Duration::zero()
             || config.support_ttl <= chrono::Duration::zero()
+            || config.support_ttl >= config.poll_interval
+        {
+            return Err(NeighborCoordinatorError::Snapshot(
+                lattice_sensor::neighbor::NeighborError::InvalidConfig,
+            ));
+        }
+        if bindings.values().any(|id| *id == 0)
+            || bindings.len()
+                != bindings
+                    .values()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
         {
             return Err(NeighborCoordinatorError::Snapshot(
                 lattice_sensor::neighbor::NeighborError::InvalidConfig,
@@ -93,6 +106,10 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
             Err(_) => return None,
         };
         let observed_at = Self::floor_second(now);
+        let rows = rows
+            .into_iter()
+            .filter(|row| self.bindings.contains_key(&row.interface()))
+            .collect();
         let events = match self.tracker.observe(rows, observed_at) {
             Ok(events) => events,
             Err(error) => return Some(Err(error.into())),
@@ -124,14 +141,15 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
         }
         Some(Ok(out))
     }
-    pub async fn poll_and_publish<F>(
+    pub async fn poll_and_publish<F, Fut>(
         &mut self,
         pipeline: &mut PersistentDiscoveryPipeline,
         now: DateTime<Utc>,
         mut publish: F,
     ) -> Result<Vec<DiscoveryPipelineOutcome>, NeighborCoordinatorError>
     where
-        F: FnMut(EventPayload),
+        F: FnMut(EventPayload) -> Fut,
+        Fut: Future<Output = ()>,
     {
         let Some(observations) = self.poll(now).await else {
             return Ok(Vec::new());
@@ -144,10 +162,13 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
                 .await?;
             // The pipeline returns only after the SQLite transaction commits; publishing here
             // therefore enforces durable-commit-before-event-publish.
-            if let DiscoveryPipelineOutcome::Committed(ref committed) = outcome
-                && let Some(payload) = committed.payload.clone()
-            {
-                publish(payload);
+            if let DiscoveryPipelineOutcome::Committed(ref committed) = outcome {
+                for payload in &committed.result.events {
+                    publish(payload.clone()).await;
+                }
+                if let Some(payload) = committed.payload.clone() {
+                    publish(payload).await;
+                }
             }
             outcomes.push(outcome);
         }

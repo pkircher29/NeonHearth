@@ -21,7 +21,7 @@ pub struct Snapshot {
     pub sequence: u64,
     pub devices: Vec<DeviceSnapshot>,
     pub next_after: Option<DeviceId>,
-    pub service_status: &'static str,
+    pub service_status: String,
 }
 #[derive(Serialize, ToSchema)]
 pub struct DeviceSnapshot {
@@ -116,7 +116,7 @@ pub async fn state(
         sequence,
         devices: devices.into_iter().map(map_device).collect(),
         next_after,
-        service_status: "ready",
+        service_status: state.service_status().await,
     }))
 }
 
