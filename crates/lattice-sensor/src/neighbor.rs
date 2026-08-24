@@ -682,6 +682,7 @@ struct State {
     device: NeighborDevice,
     missed: usize,
 }
+#[derive(Clone)]
 pub struct NeighborTracker {
     cfg: NeighborTrackerConfig,
     states: BTreeMap<(InterfaceId, LinkAddress), State>,

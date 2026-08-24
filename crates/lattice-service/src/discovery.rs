@@ -50,11 +50,22 @@ pub struct NeighborInterfaceBinding {
     source_id: u64,
 }
 impl NeighborInterfaceBinding {
-    pub fn new(interface: lattice_sensor::InterfaceId, source_id: u64) -> Self {
-        Self {
-            interface,
-            source_id,
+    const SOURCE_NAMESPACE: u64 = 0x4e45_4947;
+
+    /// Creates the only supported neighbor-source binding for an interface.
+    /// The source ID is namespaced and derived solely from the nonzero interface ID.
+    pub fn for_interface(
+        interface: lattice_sensor::InterfaceId,
+    ) -> Result<Self, NeighborCoordinatorError> {
+        if interface.get() == 0 {
+            return Err(NeighborCoordinatorError::Snapshot(
+                lattice_sensor::neighbor::NeighborError::InvalidConfig,
+            ));
         }
+        Ok(Self {
+            interface,
+            source_id: (Self::SOURCE_NAMESPACE << 32) | u64::from(interface.get()),
+        })
     }
     pub fn interface(self) -> lattice_sensor::InterfaceId {
         self.interface
@@ -151,6 +162,12 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
     {
         let bindings: Vec<_> = bindings.into_iter().collect();
         validate_neighbor_bindings(&bindings)?;
+        let expected_sources = neighbor_discovery_sources(&bindings)?;
+        if pipeline.source_fingerprint() != expected_sources.fingerprint() {
+            return Err(NeighborCoordinatorError::Discovery(
+                DiscoveryError::InvalidSource,
+            ));
+        }
         if config.poll_interval <= chrono::Duration::zero()
             || config.support_ttl <= chrono::Duration::zero()
             || config.support_ttl >= config.poll_interval
@@ -207,7 +224,11 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
             .into_iter()
             .filter(|row| self.bindings.contains_key(&row.interface()))
             .collect();
-        let events = match self.tracker.observe(rows, observed_at) {
+        // A cycle may durably commit a prefix before a later observation fails. Keep the
+        // tracker staged until every generated observation and its event publication succeeds;
+        // then a retry starts from the pre-cycle snapshot and safely reconciles that prefix.
+        let mut staged_tracker = self.tracker.clone();
+        let events = match staged_tracker.observe(rows, observed_at) {
             Ok(events) => events,
             Err(error) => {
                 self.state
@@ -274,6 +295,7 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
             }
             outcomes.push(outcome);
         }
+        self.tracker = staged_tracker;
         self.state
             .transition_service_status(ServiceRuntimeStatus::Ready, observed_at)
             .await;
