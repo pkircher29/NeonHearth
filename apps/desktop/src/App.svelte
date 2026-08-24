@@ -1,8 +1,44 @@
 <script lang="ts">
-  import { onMount } from 'svelte'; import { createApiClient } from './lib/api/client'; import CollectorStatus, { type CollectorState } from './lib/components/CollectorStatus.svelte'; import PulseView from './lib/components/PulseView.svelte'; import DevicesView from './lib/components/DevicesView.svelte';
-  let collectorState: CollectorState = $state('connecting'); let view = $state('pulse');
-  const nav = [['pulse','Pulse','◒'],['devices','Devices','◌'],['guard','Guard','⌁'],['cameras','Cameras','□'],['home','Home','⌂'],['doctor','Doctor','✚'],['history','History','↺'],['settings','Settings','⚙']];
-  onMount(() => { const client = createApiClient({ baseUrl: window.location.origin, serviceToken: '' }); void client.health().then(() => collectorState = 'ready', () => collectorState = 'offline'); });
+  import { onMount } from 'svelte';
+  import { createApiClient } from './lib/api/client';
+  import { applySnapshot, initialLiveState, reduceLiveMessage, type LiveState } from './lib/stores/live';
+  import CollectorStatus, { type CollectorState } from './lib/components/CollectorStatus.svelte';
+  import PulseView from './lib/components/PulseView.svelte';
+  import DevicesView from './lib/components/DevicesView.svelte';
+
+  type Destination = 'pulse' | 'devices' | 'guard' | 'cameras' | 'home' | 'doctor' | 'history' | 'settings';
+  const nav: Array<[Destination, string, string]> = [['pulse', 'Pulse', '◒'], ['devices', 'Devices', '◌'], ['guard', 'Guard', '⌁'], ['cameras', 'Cameras', '□'], ['home', 'Home', '⌂'], ['doctor', 'Doctor', '✚'], ['history', 'History', '↺'], ['settings', 'Settings', '⚙']];
+  let collectorState: CollectorState = $state('connecting'); let view: Destination = $state('pulse'); let liveState: LiveState = $state(initialLiveState); let moreOpen = $state(false);
+  function eventDetail(event: LiveState['timeline'][number]): string {
+    if (event.type === 'resync_required') return 'Waiting for safe recovery';
+    if (event.data.payload.type === 'service_status') return event.data.payload.data.detail;
+    if (event.data.payload.type === 'presence_changed') return event.data.payload.data.reason;
+    return `${event.data.payload.data.samples.length} samples received`;
+  }
+  onMount(() => {
+    let socket: WebSocket | undefined; let active = true;
+    const client = createApiClient({ baseUrl: window.location.origin, serviceToken: '' });
+    async function connect() {
+      try {
+        await client.health(); if (!active) return; collectorState = 'ready';
+        const snapshot = await client.snapshotAll(); if (!active) return;
+        liveState = applySnapshot(initialLiveState, snapshot);
+        try { socket = await client.openEvents(snapshot.sequence, (message) => { if (active) liveState = reduceLiveMessage(liveState, message); }, (state) => { if (active && state === 'error') collectorState = 'offline'; }); } catch { /* Unpaired builds can still show the honest snapshot state. */ }
+      } catch { if (active) collectorState = 'offline'; }
+    }
+    void connect(); return () => { active = false; socket?.close(); };
+  });
 </script>
-<svelte:head><title>NeonHearth — Pulse</title></svelte:head>
-<div class="app-shell"><aside class="rail"><div class="brand"><span class="brand-mark">✦</span><span>NEON<br/>HEARTH</span></div><nav aria-label="Primary">{#each nav as item}<button class:active={view === item[0]} on:click={() => view = item[0]}><span class="nav-icon">{item[2]}</span><span>{item[1]}</span></button>{/each}</nav><div class="rail-foot"><span class="secure-icon">⌾</span><span>LOCAL<br/>ONLY</span></div></aside><header class="mobile-head"><div class="brand"><span class="brand-mark">✦</span><span>NEONHEARTH</span></div><span class="kicker">{view.toUpperCase()}</span></header><main>{#if view === 'pulse'}<PulseView/>{:else if view === 'devices'}<DevicesView/>{:else}<section class="not-ready"><span class="not-ready-mark">⌁</span><p class="kicker">{view.toUpperCase()}</p><h1>This room is still being wired.</h1><p class="muted">This view will arrive in a future build. Your secure pairing and private network data remain untouched.</p></section>{/if}</main><aside class="events-rail"><div class="section-title"><h2>Live thread</h2><span class="live-pill">● QUIET</span></div><div class="event-quiet"><span>⌁</span><strong>Nothing needs attention</strong><p class="muted">Events will appear here as your home changes.</p></div><CollectorStatus state={collectorState}/></aside><nav class="mobile-nav" aria-label="Mobile navigation">{#each nav.slice(0,5) as item}<button class:active={view === item[0]} on:click={() => view = item[0]}><span>{item[2]}</span>{item[1]}</button>{/each}</nav></div>
+<svelte:head><title>NeonHearth — {view}</title></svelte:head>
+<div class="app-shell"><aside class="rail"><div class="brand"><span class="brand-mark">✦</span><span>NEON<br/>HEARTH</span></div><nav aria-label="Primary">{#each nav as item}<button class:active={view === item[0]} type="button" onclick={() => { view = item[0]; moreOpen = false; }}><span class="nav-icon">{item[2]}</span><span>{item[1]}</span></button>{/each}</nav><div class="rail-foot"><span class="secure-icon">⌾</span><span>LOCAL<br/>ONLY</span></div></aside><header class="mobile-head"><div class="brand"><span class="brand-mark">✦</span><span>NEONHEARTH</span></div><span class="kicker">{view.toUpperCase()}</span></header><main>{#if view === 'pulse'}<PulseView state={liveState}/>{:else if view === 'devices'}<DevicesView liveState={liveState}/>{:else}<section class="not-ready"><span class="not-ready-mark">⌁</span><p class="kicker">{view.toUpperCase()}</p><h1>This room is still being wired.</h1><p class="muted">This view is not available in this build yet. Your secure pairing and private network data remain untouched.</p></section>{/if}</main><aside class="events-rail"><div class="section-title"><h2>Live thread</h2><span class="live-pill">● {liveState.timeline.length ? 'ACTIVE' : 'QUIET'}</span></div>{#if liveState.timeline.length}<div class="event-list" aria-label="Live events">{#each liveState.timeline.slice(-5).reverse() as event}<div class="event-row"><span class="event-kind info" aria-hidden="true">·</span><span><strong>{event.type === 'resync_required' ? 'Stream resync requested' : event.data.payload.type === 'service_status' ? `Collector ${event.data.payload.data.state}` : event.data.payload.type === 'presence_changed' ? `Presence: ${event.data.payload.data.to}` : 'Bandwidth updated'}</strong><small>{eventDetail(event)}</small></span><time>{event.type === 'event' ? new Date(event.data.occurred_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'now'}</time></div>{/each}</div>{:else}<div class="event-quiet"><span>⌁</span><strong>Nothing needs attention</strong><p class="muted">Events will appear here as your home changes.</p></div>{/if}<CollectorStatus state={collectorState}/></aside><nav class="mobile-nav" aria-label="Mobile navigation">{#each nav.slice(0, 2) as item}<button class:active={view === item[0]} type="button" onclick={() => { view = item[0]; moreOpen = false; }}><span>{item[2]}</span>{item[1]}</button>{/each}<button class:active={moreOpen} type="button" aria-expanded={moreOpen} aria-controls="mobile-drawer" onclick={() => moreOpen = !moreOpen}><span>⋯</span>More</button></nav>{#if moreOpen}<div class="mobile-drawer" id="mobile-drawer" aria-label="More destinations">{#each nav.slice(2) as item}<button class:active={view === item[0]} type="button" onclick={() => { view = item[0]; moreOpen = false; }}><span>{item[2]}</span>{item[1]}</button>{/each}</div>{/if}</div>
+<style>
+  :global(button:focus-visible), :global(input:focus-visible) { outline: 3px solid #ffcd66; outline-offset: 3px; }
+  .events-rail .event-list { border-top: 1px solid #17323d; }
+  .events-rail .event-row { min-height: 57px; border-bottom: 1px solid #17323d; display: grid; grid-template-columns: 25px 1fr auto; align-items: center; gap: 10px; }
+  .events-rail .event-row strong, .events-rail .event-row small { display: block; }
+  .events-rail .event-row small { margin-top: 4px; color: #77959d; font-size: 11px; }
+  .events-rail .event-row time { color: #64838b; font: 10px monospace; }
+  .events-rail .event-kind { display: inline-grid; place-items: center; width: 21px; height: 21px; border: 1px solid #548cff; border-radius: 4px; color: #548cff; font: 11px monospace; }
+  .mobile-drawer { display: none; }
+  @media (max-width: 850px) { .mobile-drawer { position: fixed; z-index: 6; right: 8px; bottom: 73px; display: grid; grid-template-columns: 1fr 1fr; gap: 5px; padding: 8px; background: #0b1c26; border: 1px solid #28505a; border-radius: 8px; box-shadow: 0 8px 30px #0008; }.mobile-drawer button { min-height: 44px; padding: 9px 12px; border: 0; border-radius: 5px; color: #9bb7bb; background: #102a35; font: 600 12px Arial; text-align: left; }.mobile-drawer button.active { color: #e9fbfc; outline: 1px solid #63f3f0; }.mobile-drawer button span { display: inline-block; width: 22px; color: #63f3f0; } }
+</style>
