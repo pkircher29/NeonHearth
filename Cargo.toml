@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/lattice-domain",
+    "crates/lattice-camera",
     "crates/lattice-store",
     "crates/lattice-event-bus",
     "crates/lattice-sensor",

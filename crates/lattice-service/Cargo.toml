@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+lattice-camera = { path = "../lattice-camera" }
 futures-util.workspace = true
 chrono.workspace = true
 lattice-event-bus = { path = "../lattice-event-bus" }
