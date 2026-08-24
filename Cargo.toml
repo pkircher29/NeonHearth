@@ -10,6 +10,7 @@ members = [
     "crates/lattice-service",
     "crates/lattice-w6",
     "tools/fixture-gen",
+    "tools/w6-fixture-recorder",
 ]
 
 [workspace.package]
