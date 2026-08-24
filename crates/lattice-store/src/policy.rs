@@ -2,7 +2,7 @@ use anyhow::{Context, ensure};
 use chrono::{DateTime, Duration, Utc};
 use lattice_domain::{
     AUTOMATIC_IDENTITY_THRESHOLD_BPS, AUTOMATIC_POLICY_DEADLINE_HOURS, DeviceId, DevicePolicy,
-    Identification, OwnerDecision, PolicyChanged, Protection, RiskSignal,
+    Identification, OwnerDecision, PolicyChanged, Protection, RequestedAction, RiskSignal,
     UNKNOWN_POLICY_DEADLINE_HOURS,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -316,6 +316,53 @@ impl PolicyRepository {
             .bind(device_id.to_string())
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    pub async fn release_retry_action(
+        &self,
+        device_id: DeviceId,
+    ) -> anyhow::Result<Option<RequestedAction>> {
+        let value: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT release_retry_action_json FROM device_policy WHERE device_id=?",
+        )
+        .bind(device_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        value
+            .flatten()
+            .map(|v| decode(&v, "release retry action"))
+            .transpose()
+    }
+    pub async fn release_retry_due(
+        &self,
+        device_id: DeviceId,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let value: Option<Option<String>> =
+            sqlx::query_scalar("SELECT release_retry_at FROM device_policy WHERE device_id=?")
+                .bind(device_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(value
+            .flatten()
+            .as_deref()
+            .map(|v| parse_time(v, "release retry timestamp"))
+            .transpose()?
+            .map(|v| v <= now)
+            .unwrap_or(false))
+    }
+    pub async fn schedule_release_retry(
+        &self,
+        device_id: DeviceId,
+        action: RequestedAction,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE device_policy SET release_retry_action_json=?, release_retry_at=? WHERE device_id=?").bind(encode(&action)?).bind((now + Duration::minutes(1)).to_rfc3339()).bind(device_id.to_string()).execute(&self.pool).await?;
+        Ok(())
+    }
+    pub async fn clear_release_retry(&self, device_id: DeviceId) -> anyhow::Result<()> {
+        sqlx::query("UPDATE device_policy SET release_retry_action_json=NULL, release_retry_at=NULL WHERE device_id=?").bind(device_id.to_string()).execute(&self.pool).await?;
         Ok(())
     }
 

@@ -68,6 +68,29 @@ impl PolicyActuator for CountingOutcomeActuator {
     }
 }
 
+#[derive(Clone)]
+struct RetryUndoActuator {
+    undo_attempts: Arc<AtomicUsize>,
+    outcome: Arc<Mutex<VecDeque<EnforcementResult>>>,
+}
+#[async_trait]
+impl PolicyActuator for RetryUndoActuator {
+    async fn enforce(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult {
+        EnforcementResult::Verified
+    }
+    async fn undo(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult {
+        self.undo_attempts.fetch_add(1, Ordering::SeqCst);
+        self.outcome
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(EnforcementResult::Verified)
+    }
+    async fn undo_available(&self, _: DeviceId, _: RequestedAction) -> bool {
+        true
+    }
+}
+
 struct QueuedSource(Mutex<VecDeque<Result<Vec<NeighborRow>, NeighborError>>>);
 #[async_trait]
 impl NeighborSnapshotSource for QueuedSource {
@@ -657,6 +680,82 @@ async fn owner_approval_records_unblock_only_after_verified_undo() -> anyhow::Re
             .to_state,
         lattice_domain::PresenceState::Blocked
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_owner_release_is_durable_and_retries_only_when_due_after_restart()
+-> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let actuator = RetryUndoActuator {
+        undo_attempts: attempts.clone(),
+        outcome: Arc::new(Mutex::new(VecDeque::from([
+            EnforcementResult::ManualRequired,
+            EnforcementResult::Verified,
+        ]))),
+    };
+    let state = M2StateRepository::new(pool.clone());
+    let coordinator = PolicyCoordinator::with_actuator_and_state(
+        repo.clone(),
+        Some(EventBus::new(8, 8)),
+        actuator.clone(),
+        state.clone(),
+    );
+    coordinator.enroll_and_evaluate(device, at(108)).await?;
+    assert_eq!(
+        repo.published_decision(device)
+            .await?
+            .unwrap()
+            .enforcement_result,
+        EnforcementResult::Verified
+    );
+    let failed = coordinator.approve(device, at(108)).await?;
+    assert_eq!(failed.enforcement, EnforcementResult::ManualRequired);
+    assert!(failed.undo_available);
+    assert_eq!(
+        state.list_device_snapshots(8, None).await?[0]
+            .presence
+            .as_ref()
+            .unwrap()
+            .to_state,
+        lattice_domain::PresenceState::Blocked
+    );
+    coordinator.sweep(at(108)).await?;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        repo.published_decision(device)
+            .await?
+            .unwrap()
+            .enforcement_result,
+        EnforcementResult::ManualRequired
+    );
+    let restarted = PolicyCoordinator::with_actuator_and_state(
+        repo.clone(),
+        Some(EventBus::new(8, 8)),
+        actuator,
+        state.clone(),
+    );
+    restarted.sweep(at(108)).await?;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    restarted.sweep(at(109)).await?;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        repo.published_decision(device)
+            .await?
+            .unwrap()
+            .enforcement_result,
+        EnforcementResult::Verified
+    );
+    assert!(!restarted.control_blocks(device).await?);
     Ok(())
 }
 

@@ -293,6 +293,36 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
     ) -> anyhow::Result<AuditedDecision> {
         let evaluation = evaluate_policy(&p, now);
         let previously_published = self.repo.published_decision(p.device_id).await?;
+        let release_action = self.repo.release_retry_action(p.device_id).await?;
+        if let Some(action) = release_action {
+            if !self.repo.release_retry_due(p.device_id, now).await? {
+                if let Some(last) = previously_published {
+                    return self
+                        .finish(
+                            p,
+                            evaluation,
+                            last.enforcement_result,
+                            last.undo_available,
+                            now,
+                        )
+                        .await;
+                }
+            } else {
+                let undo = self.actuator.undo(p.device_id, action).await;
+                let available = self.actuator.undo_available(p.device_id, action).await;
+                if undo == EnforcementResult::Verified {
+                    self.repo.clear_release_retry(p.device_id).await?;
+                    if let Some(presence) = &self.presence {
+                        presence.record_verified_unblock(p.device_id, now).await?;
+                    }
+                } else {
+                    self.repo
+                        .schedule_release_retry(p.device_id, action, now)
+                        .await?;
+                }
+                return self.finish(p, evaluation, undo, available, now).await;
+            }
+        }
         let prior_matches = |result: EnforcementResult| {
             previously_published.as_ref().is_some_and(|last| {
                 last.evaluation == evaluation
@@ -425,10 +455,15 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             } else {
                 EnforcementResult::ManualRequired
             };
-            if undo == EnforcementResult::Verified
-                && let Some(presence) = &self.presence
-            {
-                presence.record_verified_unblock(d, now).await?;
+            if undo == EnforcementResult::Verified {
+                self.repo.clear_release_retry(d).await?;
+                if let Some(presence) = &self.presence {
+                    presence.record_verified_unblock(d, now).await?;
+                }
+            } else {
+                self.repo
+                    .schedule_release_retry(d, prior.requested_action, now)
+                    .await?;
             }
             return self
                 .finish(
