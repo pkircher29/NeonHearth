@@ -77,6 +77,9 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         let policy = self.repo.enroll(device).await?;
         self.evaluate(policy, now).await
     }
+    pub async fn enabled(&self) -> anyhow::Result<bool> {
+        Ok(self.repo.baseline_started_at().await?.is_some())
+    }
     pub async fn evaluate(
         &self,
         p: DevicePolicy,

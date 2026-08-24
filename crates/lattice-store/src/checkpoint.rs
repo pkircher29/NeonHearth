@@ -173,6 +173,9 @@ impl M2StateRepository {
             config: M2StateConfig::default(),
         }
     }
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
     pub fn with_config(pool: SqlitePool, config: M2StateConfig) -> Result<Self, CheckpointError> {
         if config.max_checkpoint_bytes == 0
             || config.max_discovery_summary_bytes == 0

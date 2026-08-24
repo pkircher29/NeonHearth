@@ -148,6 +148,7 @@ pub struct NeighborCoordinator<S> {
     tracker: lattice_sensor::neighbor::NeighborTracker,
     pipeline: PersistentDiscoveryPipeline,
     state: AppState,
+    policy: crate::policy::PolicyCoordinator,
 }
 impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S> {
     pub fn new<I>(
@@ -180,12 +181,15 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
             .into_iter()
             .map(|binding| (binding.interface(), binding.source_id()))
             .collect::<BTreeMap<_, _>>();
+        let policy_repo = lattice_store::PolicyRepository::new(pipeline.state.pool().clone());
+        let policy_events = state.events().clone();
         Ok(Self {
             source,
             bindings,
             tracker: lattice_sensor::neighbor::NeighborTracker::new(config.tracker.clone())?,
             pipeline,
             state,
+            policy: crate::policy::PolicyCoordinator::new(policy_repo, Some(policy_events)),
             config,
         })
     }
@@ -280,6 +284,19 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
             // The pipeline returns only after the SQLite transaction commits; publishing here
             // therefore enforces durable-commit-before-event-publish.
             if let DiscoveryPipelineOutcome::Committed(ref committed) = outcome {
+                if self.policy.enabled().await.unwrap_or(false)
+                    && let Err(error) = self
+                        .policy
+                        .enroll_and_evaluate(committed.result.device_id, observed_at)
+                        .await
+                {
+                    tracing::warn!(
+                        "policy evaluation degraded after durable discovery commit: {error}"
+                    );
+                    self.state
+                        .transition_service_status(ServiceRuntimeStatus::Degraded, observed_at)
+                        .await;
+                }
                 for payload in &committed.result.events {
                     self.state
                         .events()
