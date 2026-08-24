@@ -3,11 +3,13 @@ use secrecy::{ExposeSecret, SecretString};
 
 struct Fixture {
     profile: Profile,
+    profile_on_read: Vec<Profile>,
     state: DeviceState,
     expired: bool,
     mismatch: bool,
     renewals: u32,
     expire_on: Vec<&'static str>,
+    persistent_entries_to_add: u32,
 }
 #[async_trait]
 impl Transport for Fixture {
@@ -24,6 +26,9 @@ impl Transport for Fixture {
         Ok(())
     }
     async fn profile(&mut self) -> Result<Profile, Error> {
+        if !self.profile_on_read.is_empty() {
+            return Ok(self.profile_on_read.remove(0));
+        }
         Ok(self.profile.clone())
     }
     async fn state(&mut self) -> Result<DeviceState, Error> {
@@ -49,7 +54,7 @@ impl Transport for Fixture {
             return Ok(());
         };
         if c == Capability::PersistentFilter {
-            self.state.filter_entries += 1;
+            self.state.filter_entries += self.persistent_entries_to_add;
             self.state.persistent_filter = true;
         } else {
             match c {
@@ -70,6 +75,7 @@ fn fixture(c: Vec<Capability>, used: u32) -> Fixture {
             capabilities: c,
             filter_capacity: Some(32),
         },
+        profile_on_read: Vec::new(),
         state: DeviceState {
             filter_entries: used,
             disconnect_now: false,
@@ -82,6 +88,7 @@ fn fixture(c: Vec<Capability>, used: u32) -> Fixture {
         mismatch: false,
         renewals: 0,
         expire_on: Vec::new(),
+        persistent_entries_to_add: 1,
     }
 }
 
@@ -140,6 +147,33 @@ async fn mismatch_fails_without_success_claim() {
 }
 
 #[tokio::test]
+async fn persistent_filter_requires_a_new_entry_even_when_already_enabled() {
+    let mut f = fixture(vec![Capability::PersistentFilter], 4);
+    f.state.persistent_filter = true;
+    f.mismatch = true;
+    let mut c = trusted(f);
+    c.login("u", SecretString::from("x")).await.unwrap();
+
+    assert_eq!(
+        c.quarantine(RequestedQuarantine::PersistentFilter).await,
+        Err(Error::VerificationFailed)
+    );
+}
+
+#[tokio::test]
+async fn persistent_filter_readback_rejects_an_oversized_result() {
+    let mut f = fixture(vec![Capability::PersistentFilter], 31);
+    f.persistent_entries_to_add = 2;
+    let mut c = trusted(f);
+    c.login("u", SecretString::from("x")).await.unwrap();
+
+    assert_eq!(
+        c.quarantine(RequestedQuarantine::PersistentFilter).await,
+        Err(Error::VerificationFailed)
+    );
+}
+
+#[tokio::test]
 async fn prior_internet_denial_does_not_verify_wifi_or_lan() {
     let mut f = fixture(
         vec![Capability::DenyWifiAssociation, Capability::DenyLan],
@@ -185,6 +219,76 @@ async fn unknown_fingerprint_is_manual_required_and_drift_is_read_only() {
         Err(Error::ReadOnly)
     );
     assert_eq!(c.discovery_status(), DiscoveryStatus::ReadOnly);
+}
+
+#[tokio::test]
+async fn a_new_login_clears_trust_when_the_profile_drifts() {
+    let mut f = fixture(vec![Capability::DenyInternet], 0);
+    f.profile_on_read = vec![
+        f.profile.clone(),
+        Profile {
+            fingerprint: "fw-1".into(),
+            capabilities: vec![Capability::DenyLan],
+            filter_capacity: Some(32),
+        },
+    ];
+    let mut c = trusted(f);
+    c.login("u", SecretString::from("x")).await.unwrap();
+    assert_eq!(c.discovery_status(), DiscoveryStatus::Trusted);
+    assert_eq!(
+        c.login("u", SecretString::from("x")).await,
+        Err(Error::ReadOnly)
+    );
+    assert_eq!(c.discovery_status(), DiscoveryStatus::ReadOnly);
+    assert_eq!(
+        c.quarantine(RequestedQuarantine::DenyInternet).await,
+        Err(Error::ReadOnly)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_new_login_clears_prior_trust_before_authentication() {
+    let mut c = trusted(fixture(vec![Capability::DenyInternet], 0));
+    c.login("u", SecretString::from("x")).await.unwrap();
+
+    assert_eq!(
+        c.login("u", SecretString::from("bad")).await,
+        Err(Error::Authentication)
+    );
+    assert_eq!(c.discovery_status(), DiscoveryStatus::ManualRequired);
+    assert_eq!(
+        c.quarantine(RequestedQuarantine::DenyInternet).await,
+        Err(Error::ManualRequired)
+    );
+}
+
+#[tokio::test]
+async fn mutations_require_current_trusted_discovery_status() {
+    let mut c = trusted(fixture(vec![Capability::DenyInternet], 0));
+    c.login("u", SecretString::from("x")).await.unwrap();
+    c.status = DiscoveryStatus::ManualRequired;
+
+    assert_eq!(
+        c.quarantine(RequestedQuarantine::DenyInternet).await,
+        Err(Error::ManualRequired)
+    );
+}
+
+#[tokio::test]
+async fn empty_capabilities_and_none_capacity_are_not_allowlist_wildcards() {
+    let known = Profile {
+        fingerprint: "fw-1".into(),
+        capabilities: vec![],
+        filter_capacity: None,
+    };
+    let mut f = fixture(vec![Capability::DenyInternet], 0);
+    f.profile.filter_capacity = Some(32);
+    let mut c = Connector::with_profiles(f, vec![known]);
+
+    assert_eq!(
+        c.login("u", SecretString::from("x")).await,
+        Err(Error::ReadOnly)
+    );
 }
 
 #[tokio::test]

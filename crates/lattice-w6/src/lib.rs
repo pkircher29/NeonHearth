@@ -10,7 +10,7 @@ use thiserror::Error;
 /// Maximum number of persistent filter entries supported by the W6 contract.
 pub const W6_PERSISTENT_FILTER_LIMIT: u32 = 32;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum Capability {
     DisconnectNow,
     DenyWifiAssociation,
@@ -174,6 +174,10 @@ impl<T: Transport> Connector<T> {
         username: &str,
         password: SecretString,
     ) -> Result<Profile, Error> {
+        // A fresh login invalidates every fact learned from the prior session.
+        self.profile = None;
+        self.logged_in = false;
+        self.status = DiscoveryStatus::ManualRequired;
         self.transport.login(username, &password).await?;
         self.logged_in = true;
         let p = self.transport.profile().await?;
@@ -189,8 +193,8 @@ impl<T: Transport> Connector<T> {
             self.status = DiscoveryStatus::ManualRequired;
             return Err(Error::ManualRequired);
         };
-        if (!known.capabilities.is_empty() && known.capabilities != p.capabilities)
-            || known.filter_capacity.is_some() && known.filter_capacity != p.filter_capacity
+        if !same_capability_set(&known.capabilities, &p.capabilities)
+            || known.filter_capacity != p.filter_capacity
         {
             self.status = DiscoveryStatus::ReadOnly;
             return Err(Error::ReadOnly);
@@ -222,6 +226,7 @@ impl<T: Transport> Connector<T> {
         &mut self,
         request: RequestedQuarantine,
     ) -> Result<MutationReport, Error> {
+        self.require_trusted()?;
         let capability = request.capability();
         let profile = self.profile.clone().ok_or(Error::UnknownProfile)?;
         if !profile.advertises(capability) {
@@ -243,7 +248,13 @@ impl<T: Transport> Connector<T> {
         }
         self.apply_with_budget(capability, &mut renewed).await?;
         let after = self.call_state(&mut renewed).await?;
-        let matches = after.enabled(capability);
+        let matches = if capability == Capability::PersistentFilter {
+            after.persistent_filter
+                && before.filter_entries.checked_add(1) == Some(after.filter_entries)
+                && after.filter_entries <= W6_PERSISTENT_FILTER_LIMIT
+        } else {
+            after.enabled(capability)
+        };
         if !matches {
             return Err(Error::VerificationFailed);
         }
@@ -270,6 +281,13 @@ impl<T: Transport> Connector<T> {
             x => x,
         }
     }
+    fn require_trusted(&self) -> Result<(), Error> {
+        match self.status {
+            DiscoveryStatus::Trusted => Ok(()),
+            DiscoveryStatus::ReadOnly => Err(Error::ReadOnly),
+            DiscoveryStatus::ManualRequired => Err(Error::ManualRequired),
+        }
+    }
     async fn apply_with_budget(
         &mut self,
         capability: Capability,
@@ -290,6 +308,16 @@ impl<T: Transport> Connector<T> {
     pub fn into_transport(self) -> T {
         self.transport
     }
+}
+
+fn same_capability_set(left: &[Capability], right: &[Capability]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    right.sort_unstable();
+    left.dedup();
+    right.dedup();
+    left == right
 }
 
 impl DeviceState {
