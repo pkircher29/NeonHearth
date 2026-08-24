@@ -372,6 +372,27 @@ impl<
                         .await;
                 }
                 for payload in &committed.result.events {
+                    if let EventPayload::PresenceChanged(change) = payload {
+                        match self.policy.control_blocks(change.device_id).await {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(error) => {
+                                policy_degraded = true;
+                                tracing::warn!(
+                                    "policy control-state lookup degraded before presence publication: {error}"
+                                );
+                                self.state
+                                    .transition_service_status(
+                                        ServiceRuntimeStatus::Degraded,
+                                        observed_at,
+                                    )
+                                    .await;
+                                // Fail closed: do not publish a discovery state
+                                // that might contradict an active control block.
+                                continue;
+                            }
+                        }
+                    }
                     self.state
                         .events()
                         .publish(payload_occurred_at(payload, observed_at), payload.clone())

@@ -136,15 +136,18 @@ async fn verified_undo_restores_the_saved_pre_enforcement_state() -> Result<(), 
         .login("owner", SecretString::new("fixture".into()))
         .await?;
     let actuator = W6PolicyActuator::new(connector);
+    assert!(!actuator.undo_available(device, RequestedAction::Quarantine));
     assert_eq!(
         actuator.enforce(device, RequestedAction::Quarantine).await,
         EnforcementResult::Verified
     );
+    assert!(actuator.undo_available(device, RequestedAction::Quarantine));
     assert_eq!(
         actuator.undo(device, RequestedAction::Quarantine).await,
         EnforcementResult::Verified
     );
     assert!(!state.lock().unwrap().deny_internet);
+    assert!(!actuator.undo_available(device, RequestedAction::Quarantine));
     Ok(())
 }
 

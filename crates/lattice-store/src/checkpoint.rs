@@ -176,6 +176,22 @@ impl M2StateRepository {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+    /// Returns whether the most recent verified control-plane transition keeps
+    /// the device blocked. Discovery evidence cannot override this state.
+    pub async fn verified_control_blocked(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<bool, CheckpointError> {
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT to_state FROM presence_transitions
+             WHERE device_id=? AND trigger_kind IN ('enforcement_blocked','enforcement_unblocked')
+             ORDER BY occurred_at DESC, transition_id ASC LIMIT 1",
+        )
+        .bind(device_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(state.as_deref() == Some("blocked"))
+    }
     /// Persist an enforcement control fact only after the caller has verified
     /// that the requested network action succeeded.  The next identifier is
     /// allocated inside the transaction so it cannot collide with discovery
@@ -187,7 +203,11 @@ impl M2StateRepository {
     ) -> Result<(), CheckpointError> {
         let mut tx = self.pool.begin().await?;
         let current: Option<String> = sqlx::query_scalar(
-            "SELECT to_state FROM presence_transitions WHERE device_id=? ORDER BY occurred_at DESC, transition_id DESC LIMIT 1",
+            "SELECT to_state FROM presence_transitions WHERE device_id=?
+             ORDER BY CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN 1 ELSE 0 END DESC,
+                      occurred_at DESC,
+                      CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN transition_id END ASC,
+                      transition_id DESC LIMIT 1",
         ).bind(device_id.to_string()).fetch_optional(&mut *tx).await?;
         if current.as_deref() == Some("blocked") {
             tx.commit().await?;
@@ -481,7 +501,7 @@ impl M2StateRepository {
                     "owner string exceeds configured bound".into(),
                 ));
             }
-            let presence_row = sqlx::query("SELECT to_state,occurred_at,trigger_source,trigger_kind FROM presence_transitions WHERE device_id=? ORDER BY CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN 1 ELSE 0 END DESC, occurred_at DESC, transition_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
+            let presence_row = sqlx::query("SELECT to_state,occurred_at,trigger_source,trigger_kind FROM presence_transitions WHERE device_id=? ORDER BY CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN 1 ELSE 0 END DESC, occurred_at DESC, CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN transition_id END ASC, transition_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
             let presence = if let Some(r) = presence_row {
                 Some(StoredPresenceSummary {
                     to_state: parse_presence_state(&corrupt_get!(r, String, "to_state"))?,

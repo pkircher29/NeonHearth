@@ -9,6 +9,7 @@ export interface GuardPolicy {
   requested_action: RequestedAction;
   enforcement_result: EnforcementStatus;
   undo_available: boolean;
+  delivery_pending: boolean;
 }
 export interface LiveState {
   sequence: number;
@@ -45,7 +46,8 @@ export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
       evaluation: device.policy.evaluation,
       requested_action: device.policy.evaluation.requested_action,
       enforcement_result: device.policy.enforcement_result,
-      undo_available: device.policy.undo_available
+      undo_available: device.policy.undo_available,
+      delivery_pending: device.policy.delivery_pending
     };
   }
   // A snapshot is a trustworthy baseline, but it is not evidence that the
@@ -69,7 +71,11 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
     const id = event.payload.data.device_id;
     const current = next.devices[id] ?? placeholder(id, event.occurred_at);
     if (!(id in next.devices)) next.deviceOrder = [...next.deviceOrder, id];
-    next.devices = { ...next.devices, [id]: { ...current, last_seen_at: event.occurred_at, presence: { state: event.payload.data.to, observed_at: event.payload.data.occurred_at, source: event.payload.data.trigger_source, kind: event.payload.data.trigger_kind } } };
+    // Discovery cannot lift a verified control-plane block. Only a verified
+    // policy release below changes the effective state away from blocked.
+    if (current.presence.state !== 'blocked') {
+      next.devices = { ...next.devices, [id]: { ...current, last_seen_at: event.occurred_at, presence: { state: event.payload.data.to, observed_at: event.payload.data.occurred_at, source: event.payload.data.trigger_source, kind: event.payload.data.trigger_kind } } };
+    }
   }
   if (event.payload.type === 'bandwidth_frame') {
     next.devices = { ...next.devices };
@@ -87,7 +93,26 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
     next.protocolMix = null;
   }
   if (event.payload.type === 'policy_changed') {
-    next.policies = { ...next.policies, [event.payload.data.device_id]: event.payload.data };
+    const policy = event.payload.data;
+    const id = policy.device_id;
+    next.policies = { ...next.policies, [id]: { ...policy, delivery_pending: false } };
+    const verifiedBlock = policy.enforcement_result === 'verified'
+      && (policy.requested_action === 'quarantine' || policy.requested_action === 'permanent_ban');
+    const verifiedRelease = policy.enforcement_result === 'verified'
+      && policy.requested_action === 'none' && policy.evaluation.reason === 'owner_approved';
+    if (verifiedBlock || verifiedRelease) {
+      const current = next.devices[id] ?? placeholder(id, event.occurred_at);
+      if (!(id in next.devices)) next.deviceOrder = [...next.deviceOrder, id];
+      next.devices = { ...next.devices, [id]: {
+        ...current,
+        presence: {
+          state: verifiedBlock ? 'blocked' : 'unknown',
+          observed_at: event.occurred_at,
+          source: 'policy',
+          kind: verifiedBlock ? 'enforcement_blocked' : 'enforcement_unblocked'
+        }
+      } };
+    }
   }
   return summarize(next);
 }

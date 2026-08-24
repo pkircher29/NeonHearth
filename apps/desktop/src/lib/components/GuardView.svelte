@@ -60,7 +60,7 @@
           <div class="policy-head">
             <span class="policy-signal" aria-hidden="true"></span>
             <div><p class="kicker">{action(policy)}</p><h2>{title(policy)}</h2></div>
-            <span class="enforcement"><span aria-hidden="true">{policy.enforcement_result === 'verified' ? '✓' : policy.enforcement_result === 'failed' ? '!' : '◇'}</span> {policy.enforcement_result.replaceAll('_', ' ')}</span>
+            <span class="enforcement"><span aria-hidden="true">{policy.enforcement_result === 'verified' ? '✓' : policy.enforcement_result === 'failed' ? '!' : '◇'}</span> {policy.delivery_pending ? 'delivery pending' : policy.enforcement_result.replaceAll('_', ' ')}</span>
           </div>
           <div class="policy-path" aria-label="Policy lifecycle">
             <span class="done">Seen</span><i></i><span class="done">Evaluated</span><i></i><span class:done={policy.enforcement_result === 'verified'}>{policy.enforcement_result === 'verified' ? 'Verified' : 'Awaiting proof'}</span>

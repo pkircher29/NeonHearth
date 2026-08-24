@@ -151,6 +151,35 @@ describe('reduceLiveMessage', () => {
     expect(result.timeline).toHaveLength(1);
   });
 
+  it('keeps verified policy control authoritative until a verified release', () => {
+    const id = '0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b';
+    const blocked = reduceLiveMessage(initialLiveState, { type: 'event', data: policy(1) });
+    expect(blocked.devices[id]?.presence.state).toBe('blocked');
+
+    const contradictory = reduceLiveMessage(blocked, { type: 'event', data: presence(2) });
+    expect(contradictory.devices[id]?.presence.state).toBe('blocked');
+
+    const release: EventEnvelope = {
+      sequence: 3,
+      occurred_at: '2026-08-23T00:02:00Z',
+      payload: {
+        type: 'policy_changed',
+        data: {
+          device_id: id,
+          policy_version: 1,
+          evaluation: { policy_version: 1, reason: 'owner_approved', requested_action: 'none', deadline: null, warning: null },
+          requested_action: 'none',
+          evidence_summary: 'policy facts evaluated',
+          enforcement_result: 'verified',
+          undo_available: false
+        }
+      }
+    };
+    const released = reduceLiveMessage(contradictory, { type: 'event', data: release });
+    expect(released.devices[id]?.presence.state).toBe('unknown');
+    expect(reduceLiveMessage(released, { type: 'event', data: presence(4) }).devices[id]?.presence.state).toBe('online');
+  });
+
   it('hydrates durable policy state from a resync snapshot', () => {
     const device = {
       ...resultDevice('018f47a0-9b5c-7a22-8a33-112233445599'),
@@ -159,7 +188,8 @@ describe('reduceLiveMessage', () => {
         protection: 'none' as const,
         evaluation: { policy_version: 1, reason: 'owner_quarantined' as const, requested_action: 'quarantine' as const, deadline: null, warning: null },
         enforcement_result: 'verified' as const,
-        undo_available: true
+        undo_available: true,
+        delivery_pending: false
       }
     };
 

@@ -644,7 +644,7 @@ async fn owner_approval_records_unblock_only_after_verified_undo() -> anyhow::Re
         lattice_domain::PresenceState::Blocked
     );
     assert_eq!(
-        coordinator.approve(device, at(109)).await?.enforcement,
+        coordinator.approve(device, at(108)).await?.enforcement,
         EnforcementResult::Verified
     );
     assert_ne!(
@@ -836,5 +836,80 @@ async fn baseline_read_failure_keeps_a_committed_cycle_degraded() -> anyhow::Res
 
     assert_eq!(cycle.outcomes().len(), 1);
     assert_eq!(state.service_status().await, "degraded");
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_verified_block_suppresses_later_discovery_presence_events() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let policy_repo = PolicyRepository::new(pool.clone());
+    policy_repo.mark_successful_service_start(at(0)).await?;
+    let state_repo = M2StateRepository::new(pool.clone());
+    let state = AppState::new("owner-token-0123456789abcdefghijkl", state_repo.clone())?;
+    let binding = NeighborInterfaceBinding::for_interface(InterfaceId::new(7))?;
+    let pipeline = PersistentDiscoveryPipeline::open(
+        state_repo.clone(),
+        neighbor_discovery_sources(&[binding])?,
+        [DeviceId::new()].into_iter(),
+        Default::default(),
+        16,
+        16,
+    )
+    .await?;
+    let policy = PolicyCoordinator::with_actuator_and_state(
+        policy_repo,
+        Some(state.events().clone()),
+        FakeActuator::default(),
+        state_repo,
+    );
+    let mut coordinator = NeighborCoordinator::with_policy(
+        QueuedSource(Mutex::new(VecDeque::from([
+            Ok(vec![neighbor_row(1)]),
+            Ok(vec![]),
+            Ok(vec![neighbor_row(1)]),
+        ]))),
+        pipeline,
+        state.clone(),
+        [binding],
+        NeighborCoordinatorConfig {
+            poll_interval: Duration::seconds(5),
+            support_ttl: Duration::seconds(4),
+            tracker: NeighborTrackerConfig::default(),
+        },
+        policy,
+    )?;
+
+    coordinator.cycle(at(60)).await?;
+    let before_block = state.events().current_sequence().await;
+    coordinator.cycle(at(108)).await?;
+    coordinator.cycle(at(109)).await?;
+
+    let lattice_event_bus::Resume::Events(events) = state.events().resume_after(before_block).await
+    else {
+        panic!("bounded event history should remain resumable");
+    };
+    assert!(events.iter().any(|event| matches!(
+        event.payload,
+        lattice_domain::EventPayload::PolicyChanged(ref change)
+            if change.enforcement_result == EnforcementResult::Verified
+                && change.requested_action == RequestedAction::Quarantine
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event.payload,
+        lattice_domain::EventPayload::PresenceChanged(_)
+    )));
+    assert_eq!(
+        M2StateRepository::new(pool)
+            .list_device_snapshots(8, None)
+            .await?[0]
+            .presence
+            .as_ref()
+            .unwrap()
+            .to_state,
+        lattice_domain::PresenceState::Blocked
+    );
     Ok(())
 }

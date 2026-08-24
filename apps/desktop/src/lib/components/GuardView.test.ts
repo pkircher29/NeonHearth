@@ -23,7 +23,8 @@ describe('GuardView', () => {
           },
           requested_action: 'quarantine',
           enforcement_result: 'verified',
-          undo_available: true
+          undo_available: true,
+          delivery_pending: false
         }
       }
     };

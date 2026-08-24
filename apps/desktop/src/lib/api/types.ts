@@ -59,6 +59,7 @@ export interface PolicyProjection {
   evaluation: PolicyEvaluation;
   enforcement_result: EnforcementStatus;
   undo_available: boolean;
+  delivery_pending: boolean;
 }
 
 // Bandwidth frames are emitted by the collector at a bounded cadence.

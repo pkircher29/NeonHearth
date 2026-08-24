@@ -143,7 +143,7 @@ function isPolicyProjection(value: unknown): value is PolicyProjection {
     && typeof value.protection === 'string' && protections.has(value.protection)
     && isPolicyEvaluation(value.evaluation)
     && typeof value.enforcement_result === 'string' && enforcementStatuses.has(value.enforcement_result)
-    && typeof value.undo_available === 'boolean';
+    && typeof value.undo_available === 'boolean' && typeof value.delivery_pending === 'boolean';
 }
 function isPolicyChanged(value: unknown): value is PolicyChanged {
   return isRecord(value) && isDeviceId(value.device_id) && isPolicyVersion(value.policy_version)

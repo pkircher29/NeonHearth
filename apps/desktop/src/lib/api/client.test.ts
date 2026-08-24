@@ -48,7 +48,7 @@ describe('createApiClient', () => {
     const policy = {
       owner_decision: 'quarantined', protection: 'none',
       evaluation: { policy_version: 1, reason: 'owner_quarantined', requested_action: 'quarantine', deadline: null, warning: null },
-      enforcement_result: 'verified', undo_available: true
+      enforcement_result: 'verified', undo_available: true, delivery_pending: false
     };
     const snapshot = { sequence: 1, devices: [{ ...validDevice, policy }], next_after: null, service_status: 'ready' };
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200 }));
@@ -58,7 +58,8 @@ describe('createApiClient', () => {
       { ...policy, owner_decision: 'invented' },
       { ...policy, protection: 'administrator_laptop' },
       { ...policy, evaluation: { ...policy.evaluation, requested_action: 'permanent_ban', reason: 'owner_quarantined' } },
-      { ...policy, enforcement_result: 'success' }
+      { ...policy, enforcement_result: 'success' },
+      { ...policy, delivery_pending: 'yes' }
     ]) {
       const malformed = { ...snapshot, devices: [{ ...validDevice, policy: malformedPolicy }] };
       const badFetch = vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 }));

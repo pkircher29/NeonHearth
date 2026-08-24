@@ -99,7 +99,10 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
         };
         let mut connector = self.connector.lock().await;
         match connector.restore(previous).await {
-            Ok(Verification::Verified) => EnforcementResult::Verified,
+            Ok(Verification::Verified) => {
+                self.previous.lock().await.remove(&device);
+                EnforcementResult::Verified
+            }
             Ok(Verification::Unverified) | Err(W6Error::VerificationFailed) => {
                 EnforcementResult::Failed
             }
@@ -220,6 +223,14 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
     pub async fn enabled(&self) -> anyhow::Result<bool> {
         Ok(self.repo.baseline_started_at().await?.is_some())
     }
+    /// Durable control state is authoritative over contradictory discovery
+    /// presence until the router has verified a release.
+    pub async fn control_blocks(&self, device: DeviceId) -> anyhow::Result<bool> {
+        match &self.presence {
+            Some(state) => Ok(state.verified_control_blocked(device).await?),
+            None => Ok(false),
+        }
+    }
     /// Evaluate every persisted policy on a runtime tick.  Deadlines advance
     /// with wall clock time even when no neighbor observations arrive.
     pub async fn sweep(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<AuditedDecision>> {
@@ -285,10 +296,14 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         {
             presence.record_verified_block(p.device_id, now).await?;
         }
-        let undo_available = matches!(
-            p.owner_decision,
-            OwnerDecision::Approved | OwnerDecision::Quarantined
-        );
+        let undo_available = enforcement == EnforcementResult::Verified
+            && matches!(
+                evaluation.requested_action,
+                RequestedAction::Quarantine | RequestedAction::PermanentBan
+            )
+            && self
+                .actuator
+                .undo_available(p.device_id, evaluation.requested_action);
         self.finish(p, evaluation, enforcement, undo_available, now)
             .await
     }
