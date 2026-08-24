@@ -60,7 +60,10 @@ pub fn parse_nvd(
         let mut seen = BTreeSet::new();
         let mut node_count = 0;
         let mut emitted = false;
-        if let Some(configurations) = cve.get("configurations").and_then(Value::as_array) {
+        if let Some(configurations_value) = cve.get("configurations") {
+            let configurations = configurations_value
+                .as_array()
+                .ok_or(NvdParseError::Malformed)?;
             for configuration in configurations {
                 visit_nodes_iterative(
                     configuration.get("nodes"),
@@ -268,6 +271,11 @@ fn cpe(value: &Value) -> Result<Option<Selector>, NvdParseError> {
     let start_excluding = bound(value, "versionStartExcluding")?;
     let end_including = bound(value, "versionEndIncluding")?;
     let end_excluding = bound(value, "versionEndExcluding")?;
+    if (start_including.is_some() && start_excluding.is_some())
+        || (end_including.is_some() && end_excluding.is_some())
+    {
+        return Err(NvdParseError::Malformed);
+    }
     let firmware = match (
         start_including.as_deref().or(start_excluding.as_deref()),
         end_including.as_deref().or(end_excluding.as_deref()),

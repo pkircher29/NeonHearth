@@ -142,6 +142,50 @@ fn nvd_retains_generic_cves_and_distinguishes_full_cpe_selectors() {
 }
 
 #[test]
+fn nvd_requires_configurations_to_be_an_array_when_present() {
+    let bare = r#"{"vulnerabilities":[{"cve":{"id":"CVE-2026-0012","published":"1970-01-01T00:00:00Z","lastModified":"1970-01-01T00:00:00Z","descriptions":[{"lang":"en","value":"title"}]}}]}"#;
+    assert!(parse_nvd(bare, at(1), at(2)).is_ok());
+    assert!(
+        parse_nvd(
+            &bare.replace("}}]}", ",\"configurations\":null}}]}"),
+            at(1),
+            at(2)
+        )
+        .is_err()
+    );
+    assert!(
+        parse_nvd(
+            &bare.replace("}}]}", ",\"configurations\":{}}}]}"),
+            at(1),
+            at(2)
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn nvd_rejects_conflicting_version_bound_sides_but_accepts_one_side() {
+    let criteria = "cpe:2.3:a:acme:camera:*:*:*:*:*:*:*:*";
+    let both_start = nvd_with_nodes(
+        serde_json::json!([{"cpeMatch":[{"criteria":criteria,"versionStartIncluding":"1","versionStartExcluding":"2"}]}]),
+    );
+    let both_end = nvd_with_nodes(
+        serde_json::json!([{"cpeMatch":[{"criteria":criteria,"versionEndIncluding":"2","versionEndExcluding":"3"}]}]),
+    );
+    assert!(parse_nvd(&both_start, at(1), at(2)).is_err());
+    assert!(parse_nvd(&both_end, at(1), at(2)).is_err());
+    let single = nvd_with_nodes(
+        serde_json::json!([{"cpeMatch":[{"criteria":criteria,"versionStartExcluding":"1","versionEndIncluding":"2"}]}]),
+    );
+    assert!(matches!(
+        parse_nvd(&single, at(1), at(2)).unwrap()[0]
+            .input()
+            .firmware,
+        VersionConstraint::Range { .. }
+    ));
+}
+
+#[test]
 fn kev_includes_every_catalog_item_and_requires_documented_fields() {
     let body = r#"{"vulnerabilities":[{"cveID":"CVE-2026-0001","vendorProject":"Acme","product":"Camera","vulnerabilityName":"Acme Camera RCE","dateAdded":"1970-01-01","shortDescription":"desc","requiredAction":"Update","dueDate":"1970-01-02","knownRansomwareCampaignUse":"Unknown"}]}"#;
     let result = parse_kev(body, at(3), at(4)).unwrap();
