@@ -27,9 +27,110 @@ pub struct PolicyRepository {
     pool: SqlitePool,
 }
 
+/// The crash journal entry which fences a real-world policy mutation.  This is
+/// deliberately separate from the event outbox: publication may be retried,
+/// but a mutation must first be reconciled with the appliance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActuationAttempt {
+    pub policy_version: u32,
+    pub action: RequestedAction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActuationReservation {
+    Reserved,
+    Existing,
+}
+
 impl PolicyRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    pub async fn actuation_attempt(
+        &self,
+        device_id: DeviceId,
+    ) -> anyhow::Result<Option<ActuationAttempt>> {
+        let row: Option<(i64, String)> = sqlx::query_as(
+            "SELECT policy_version, action_json FROM policy_actuation_journal WHERE device_id=?",
+        )
+        .bind(device_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(policy_version, action_json)| {
+            Ok(ActuationAttempt {
+                policy_version: u32::try_from(policy_version)
+                    .context("invalid journal policy version")?,
+                action: decode(&action_json, "journal action")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Reserve an exact policy mutation before an actuator can be called.
+    /// A different pending mutation is an error, never an implicit overwrite.
+    pub async fn reserve_actuation(
+        &self,
+        device_id: DeviceId,
+        policy_version: u32,
+        action: RequestedAction,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<ActuationReservation> {
+        let encoded = encode(&action)?;
+        let mut tx = self.pool.begin().await?;
+        if let Some(existing) = self.actuation_attempt_in(&mut tx, device_id).await? {
+            ensure!(
+                existing.policy_version == policy_version && existing.action == action,
+                "superseded actuation attempt requires explicit reconciliation"
+            );
+            tx.commit().await?;
+            return Ok(ActuationReservation::Existing);
+        }
+        sqlx::query("INSERT INTO policy_actuation_journal(device_id, policy_version, action_json, reserved_at) VALUES(?,?,?,?)")
+            .bind(device_id.to_string())
+            .bind(i64::from(policy_version))
+            .bind(encoded)
+            .bind(now.to_rfc3339())
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(ActuationReservation::Reserved)
+    }
+
+    pub async fn clear_actuation_attempt(
+        &self,
+        device_id: DeviceId,
+        policy_version: u32,
+        action: RequestedAction,
+    ) -> anyhow::Result<()> {
+        let result = sqlx::query("DELETE FROM policy_actuation_journal WHERE device_id=? AND policy_version=? AND action_json=?")
+            .bind(device_id.to_string()).bind(i64::from(policy_version)).bind(encode(&action)?)
+            .execute(&self.pool).await?;
+        ensure!(
+            result.rows_affected() == 1,
+            "actuation journal entry changed before acknowledgement"
+        );
+        Ok(())
+    }
+
+    async fn actuation_attempt_in(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        device_id: DeviceId,
+    ) -> anyhow::Result<Option<ActuationAttempt>> {
+        let row: Option<(i64, String)> = sqlx::query_as(
+            "SELECT policy_version, action_json FROM policy_actuation_journal WHERE device_id=?",
+        )
+        .bind(device_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await?;
+        row.map(|(policy_version, action_json)| {
+            Ok(ActuationAttempt {
+                policy_version: u32::try_from(policy_version)
+                    .context("invalid journal policy version")?,
+                action: decode(&action_json, "journal action")?,
+            })
+        })
+        .transpose()
     }
 
     /// Persists the first point at which the service has successfully bound

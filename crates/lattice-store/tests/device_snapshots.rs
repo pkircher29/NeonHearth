@@ -314,7 +314,7 @@ async fn snapshot_corrupt_base_rows_and_migration_indexes_are_detected() -> anyh
         sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?,
-        10
+        13
     );
     for index in ["presence_transitions_snapshot_idx", "evidence_snapshot_idx"] {
         assert!(

@@ -298,6 +298,13 @@ impl<T: Transport> Connector<T> {
             limit,
         })
     }
+    /// Trusted, read-only appliance state used to reconcile an interrupted
+    /// policy mutation.  Callers cannot infer this from an apply response.
+    pub async fn read_state(&mut self) -> Result<DeviceState, Error> {
+        self.require_trusted()?;
+        let mut renewed = false;
+        self.call_state(&mut renewed).await
+    }
     pub async fn quarantine(
         &mut self,
         request: RequestedQuarantine,

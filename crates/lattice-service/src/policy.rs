@@ -5,7 +5,9 @@ use lattice_domain::{
     PolicyReason, Protection, RequestedAction, RiskSignal,
 };
 use lattice_event_bus::EventBus;
-use lattice_store::{M2StateRepository, PolicyRepository, W6PriorStateRepository};
+use lattice_store::{
+    ActuationReservation, M2StateRepository, PolicyRepository, W6PriorStateRepository,
+};
 use lattice_w6::{
     Connector, DiscoveryStatus, Error as W6Error, RequestedQuarantine, Transport, Verification,
 };
@@ -19,11 +21,33 @@ pub enum ConnectorOutcome {
     Failed,
 }
 
+/// Result of a read-only restart reconciliation.  Only `ProvenNotApplied`
+/// authorizes another call to `enforce`; every other non-applied result fails
+/// closed so an irreversible action cannot be replayed on uncertainty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActuationReconciliation {
+    VerifiedApplied,
+    ProvenNotApplied,
+    Indeterminate,
+    ManualRequired,
+    Failed,
+}
+
 pub use lattice_domain::EnforcementStatus as EnforcementResult;
 
 #[async_trait]
 pub trait PolicyActuator: Send + Sync {
     async fn enforce(&self, device: DeviceId, action: RequestedAction) -> EnforcementResult;
+    async fn reconcile(
+        &self,
+        _device: DeviceId,
+        _action: RequestedAction,
+    ) -> ActuationReconciliation {
+        // The default actuator is deliberately non-mutating.  Real actuators
+        // must override this with trusted readback; test-only non-mutating
+        // actuators retain the historic bounded retry behaviour.
+        ActuationReconciliation::ProvenNotApplied
+    }
     async fn undo_available(&self, _device: DeviceId, _action: RequestedAction) -> bool {
         false
     }
@@ -112,6 +136,56 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
                 | W6Error::VerificationFailed,
             ) => EnforcementResult::Failed,
         }
+    }
+    async fn reconcile(
+        &self,
+        device: DeviceId,
+        action: RequestedAction,
+    ) -> ActuationReconciliation {
+        let request = match action {
+            RequestedAction::Quarantine => RequestedQuarantine::DenyInternet,
+            RequestedAction::PermanentBan => RequestedQuarantine::PersistentFilter,
+            _ => return ActuationReconciliation::ManualRequired,
+        };
+        let previous = if let Some(durable) = &self.durable {
+            match durable.load(device).await {
+                Ok(state) => state,
+                Err(_) => return ActuationReconciliation::Indeterminate,
+            }
+        } else {
+            self.previous.lock().await.get(&device).cloned()
+        };
+        // No captured pre-mutation state proves this actuator never reached its
+        // mutation preparation point (the coordinator journal is written first).
+        let Some(previous) = previous else {
+            return ActuationReconciliation::ProvenNotApplied;
+        };
+        let mut connector = self.connector.lock().await;
+        if connector.discovery_status() != DiscoveryStatus::Trusted {
+            return ActuationReconciliation::ManualRequired;
+        }
+        let current = match connector.read_state().await {
+            Ok(state) => state,
+            Err(W6Error::Transport | W6Error::Authentication | W6Error::SessionExpired) => {
+                return ActuationReconciliation::Failed;
+            }
+            Err(_) => return ActuationReconciliation::ManualRequired,
+        };
+        let applied = match request {
+            RequestedQuarantine::DenyInternet => current.deny_internet && !previous.deny_internet,
+            RequestedQuarantine::PersistentFilter => {
+                current.persistent_filter
+                    && previous.filter_entries.checked_add(1) == Some(current.filter_entries)
+            }
+            _ => false,
+        };
+        if applied {
+            return ActuationReconciliation::VerifiedApplied;
+        }
+        if current == previous {
+            return ActuationReconciliation::ProvenNotApplied;
+        }
+        ActuationReconciliation::Indeterminate
     }
     async fn undo(&self, device: DeviceId, action: RequestedAction) -> EnforcementResult {
         if !matches!(
@@ -349,9 +423,58 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         {
             EnforcementResult::Failed
         } else {
-            self.actuator
-                .enforce(p.device_id, evaluation.requested_action)
-                .await
+            // This durable reservation is the idempotency boundary for the
+            // physical mutation, not merely for its event publication.
+            match self
+                .repo
+                .reserve_actuation(
+                    p.device_id,
+                    evaluation.policy_version,
+                    evaluation.requested_action,
+                    now,
+                )
+                .await?
+            {
+                ActuationReservation::Reserved => {
+                    self.actuator
+                        .enforce(p.device_id, evaluation.requested_action)
+                        .await
+                }
+                ActuationReservation::Existing => match self
+                    .actuator
+                    .reconcile(p.device_id, evaluation.requested_action)
+                    .await
+                {
+                    ActuationReconciliation::VerifiedApplied => EnforcementResult::Verified,
+                    ActuationReconciliation::ProvenNotApplied => {
+                        // Readback proved the prior reservation did not reach
+                        // the appliance.  Re-reserve before the one permitted
+                        // retry; failed/manual results remain rate limited by
+                        // the existing enforcement retry schedule.
+                        self.repo
+                            .clear_actuation_attempt(
+                                p.device_id,
+                                evaluation.policy_version,
+                                evaluation.requested_action,
+                            )
+                            .await?;
+                        self.repo
+                            .reserve_actuation(
+                                p.device_id,
+                                evaluation.policy_version,
+                                evaluation.requested_action,
+                                now,
+                            )
+                            .await?;
+                        self.actuator
+                            .enforce(p.device_id, evaluation.requested_action)
+                            .await
+                    }
+                    ActuationReconciliation::Indeterminate
+                    | ActuationReconciliation::ManualRequired => EnforcementResult::ManualRequired,
+                    ActuationReconciliation::Failed => EnforcementResult::Failed,
+                },
+            }
         };
         match enforcement {
             EnforcementResult::ManualRequired | EnforcementResult::Failed => {
@@ -398,11 +521,10 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             enforcement,
             undo_available,
         ))?;
-        if let Some(bus) = &self.events
-            && self
-                .repo
-                .prepare_decision_publication(p.device_id, &fingerprint)
-                .await?
+        if self
+            .repo
+            .prepare_decision_publication(p.device_id, &fingerprint)
+            .await?
         {
             let event = PolicyChanged {
                 device_id: p.device_id,
@@ -413,11 +535,38 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 enforcement_result: enforcement,
                 undo_available,
             };
-            bus.publish(now, EventPayload::PolicyChanged(event.clone()))
-                .await;
+            if let Some(bus) = &self.events {
+                bus.publish(now, EventPayload::PolicyChanged(event.clone()))
+                    .await;
+            }
             self.repo
                 .mark_decision_published(p.device_id, &fingerprint, &event)
                 .await?;
+            // The journal may be removed only after the verified decision has
+            // a durable acknowledgement.  A crash at any earlier point keeps
+            // it for read-only reconciliation on restart.
+            if enforcement == EnforcementResult::Verified
+                && matches!(
+                    evaluation.requested_action,
+                    RequestedAction::Quarantine | RequestedAction::PermanentBan
+                )
+                && self
+                    .repo
+                    .actuation_attempt(p.device_id)
+                    .await?
+                    .is_some_and(|attempt| {
+                        attempt.policy_version == evaluation.policy_version
+                            && attempt.action == evaluation.requested_action
+                    })
+            {
+                self.repo
+                    .clear_actuation_attempt(
+                        p.device_id,
+                        evaluation.policy_version,
+                        evaluation.requested_action,
+                    )
+                    .await?;
+            }
         }
         Ok(AuditedDecision {
             evaluation,
