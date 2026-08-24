@@ -31,6 +31,45 @@ describe('createApiClient', () => {
     expect(fetchImpl).toHaveBeenCalledWith(`https://collector.example/api/v1/cameras/${id}/health`, { method: 'GET', headers: { Authorization: 'Bearer secret' } });
   });
 
+  it('uses only bounded opaque camera URLs and exact media/session contracts', async () => {
+    const id = '018f47a0-9b5c-7a22-8a33-112233445599';
+    const stream = '018f47a0-9b5c-7a22-8a33-112233445598';
+    const inventory = { manufacturer: null, model: null, firmware: null, serial: null, capabilities: [], health: 'healthy' };
+    const summary = { camera_id: id, classification: 'camera', confidence: 0.5, health: 'healthy', observed_at: '2026-01-01T00:00:00Z' };
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/snapshot')) return new Response(new Uint8Array([1, 2]), { status: 200, headers: { 'content-type': 'image/jpeg' } });
+      if (init?.method === 'DELETE') return new Response(null, { status: 204 });
+      if (init?.method === 'POST') return new Response(JSON.stringify({ session_id: stream }), { status: 201 });
+      if (url.endsWith('/inventory')) return new Response(JSON.stringify(inventory), { status: 200 });
+      if (url.endsWith('/health')) return new Response(JSON.stringify({ health: 'healthy', confidence: 0.5 }), { status: 200 });
+      if (url.includes('/cameras?')) return new Response(JSON.stringify({ items: [summary], next_after: null }), { status: 200 });
+      if (url.endsWith(id)) return new Response(JSON.stringify({ ...summary, inventory }), { status: 200 });
+      return new Response(JSON.stringify({ items: [summary], next_after: null }), { status: 200 });
+    });
+    const client = createApiClient({ baseUrl: 'https://collector.example/base', serviceToken: 'secret', fetchImpl });
+    await expect(client.cameras({ limit: 1, after: id })).resolves.toMatchObject({ items: [summary] });
+    await expect(client.camera(id)).resolves.toMatchObject({ inventory });
+    await expect(client.cameraHealth(id)).resolves.toEqual({ health: 'healthy', confidence: 0.5 });
+    await expect(client.cameraInventory(id)).resolves.toEqual(inventory);
+    await expect(client.cameraSnapshot(id, stream)).resolves.toBeInstanceOf(Blob);
+    await expect(client.startCameraSession(id, stream)).resolves.toEqual({ session_id: stream });
+    await expect(client.closeCameraSession(stream)).resolves.toBeUndefined();
+    expect(fetchImpl.mock.calls[0][0]).toContain(`limit=1&after=${id}`);
+    expect(fetchImpl.mock.calls.some(([, init]) => init?.body === JSON.stringify({ stream_id: stream }))).toBe(true);
+    for (const invalid of ['not-opaque', '018F47A0-9B5C-7A22-8A33-112233445599']) await expect(client.camera(invalid)).rejects.toThrow('Invalid camera id');
+  });
+
+  it('rejects unsafe camera fields, bounds violations, media types, and error statuses', async () => {
+    const id = '018f47a0-9b5c-7a22-8a33-112233445599';
+    const base = { camera_id: id, classification: 'camera', confidence: 0.5, health: 'healthy', observed_at: '2026-01-01T00:00:00Z', inventory: null };
+    for (const malformed of [{ ...base, endpoint: 'rtsp://unsafe' }, { ...base, confidence: 2 }, { ...base, classification: 'invented' }]) {
+      await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 })) }).camera(id)).rejects.toThrow('Invalid camera response');
+    }
+    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(new Uint8Array(1), { status: 200, headers: { 'content-type': 'image/png' } })) }).cameraSnapshot(id)).rejects.toThrow('media type');
+    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(null, { status: 503 })) }).closeCameraSession(id)).rejects.toThrow('503');
+  });
+
   it('accepts a fully typed snapshot and rejects malformed nested projections', async () => {
     const snapshot = { sequence: 1, devices: [validDevice], next_after: null, service_status: 'ready' };
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200 }));

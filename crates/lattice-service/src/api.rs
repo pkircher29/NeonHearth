@@ -9,6 +9,7 @@ use lattice_domain::{Coverage, DeviceId, EvidenceFamily, OwnerDecision, Presence
 use lattice_store::{PendingDecision, PolicyRepository, StoredDeviceSnapshot};
 use serde::Deserialize;
 use serde::Serialize;
+use std::fmt;
 use tokio::time::Instant;
 use utoipa::{Modify, OpenApi, ToSchema};
 #[derive(Serialize, ToSchema)]
@@ -51,6 +52,44 @@ pub struct CameraInventoryProjection {
     pub serial: Option<String>,
     pub capabilities: Vec<String>,
     pub health: String,
+}
+
+/// A deliberately serial-free representation for exports and structured logs.
+/// The owner UI receives [`CameraInventoryProjection`] only after authentication.
+#[derive(Serialize)]
+pub struct CameraInventoryExportProjection {
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub firmware: Option<String>,
+    pub capabilities: Vec<String>,
+    pub health: String,
+}
+
+impl CameraInventoryProjection {
+    #[must_use]
+    pub fn redacted_for_export(&self) -> CameraInventoryExportProjection {
+        CameraInventoryExportProjection {
+            manufacturer: self.manufacturer.clone(),
+            model: self.model.clone(),
+            firmware: self.firmware.clone(),
+            capabilities: self.capabilities.clone(),
+            health: self.health.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for CameraInventoryProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CameraInventoryProjection")
+            .field("manufacturer", &self.manufacturer)
+            .field("model", &self.model)
+            .field("firmware", &self.firmware)
+            .field("serial", &"[redacted]")
+            .field("capabilities", &self.capabilities)
+            .field("health", &self.health)
+            .finish()
+    }
 }
 
 impl From<lattice_store::CameraInventoryRecord> for CameraInventoryProjection {

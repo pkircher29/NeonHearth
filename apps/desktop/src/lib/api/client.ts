@@ -84,6 +84,9 @@ const deadlineKinds = new Set(['unknown48_hours', 'automatic7_days']);
 const deadlineWarnings = new Set(['hours24', 'hours6', 'hour1']);
 const ownerDecisions = new Set(['pending', 'approved', 'rejected', 'quarantined']);
 const protections = new Set(['none', 'router', 'collector', 'administrator_phone', 'safety_device']);
+const cameraClassifications = new Set(['camera', 'possible_camera', 'unknown']);
+const cameraHealths = new Set(['healthy', 'degraded', 'unknown']);
+const inventoryHealths = new Set(['healthy', 'degraded']);
 const actionForReason = new Map([
   ['pending_confirmation', 'none'], ['baseline_exempt', 'none'], ['high_confidence_danger', 'quarantine'],
   ['unknown_deadline_expired', 'quarantine'], ['automatic_deadline_expired', 'quarantine'],
@@ -177,11 +180,11 @@ function isSnapshot(value: unknown): value is Snapshot {
     && value.devices.every(isDeviceSnapshot) && (value.next_after === null || isDeviceId(value.next_after))
     && typeof value.service_status === 'string';
 }
-function isCameraSummary(value: unknown): value is import('./types').CameraSummary { return isRecord(value) && exact(value,['camera_id','classification','confidence','health','observed_at']) && isOpaqueId(value.camera_id) && typeof value.classification === 'string' && value.classification.length <= 64 && isConfidence(value.confidence) && typeof value.health === 'string' && value.health.length <= 64 && isDate(value.observed_at); }
+function isCameraSummary(value: unknown): value is import('./types').CameraSummary { return isRecord(value) && exact(value,['camera_id','classification','confidence','health','observed_at']) && isOpaqueId(value.camera_id) && typeof value.classification === 'string' && cameraClassifications.has(value.classification) && isConfidence(value.confidence) && typeof value.health === 'string' && cameraHealths.has(value.health) && isDate(value.observed_at); }
 function isCameraList(value: unknown): value is CameraList { return isRecord(value) && exact(value,['items','next_after']) && Array.isArray(value.items) && value.items.length <= 256 && value.items.every(isCameraSummary) && (value.next_after === null || isOpaqueId(value.next_after)); }
-function isInventory(value: unknown): value is CameraInventoryProjection { return isRecord(value) && exact(value,['manufacturer','model','firmware','serial','capabilities','health']) && ['manufacturer','model','firmware','serial'].every(k => value[k] === null || (typeof value[k] === 'string' && value[k].length <= 256)) && Array.isArray(value.capabilities) && value.capabilities.length <= 32 && value.capabilities.every(v => typeof v === 'string' && v.length <= 256) && typeof value.health === 'string'; }
-function isCameraDetail(value: unknown): value is CameraDetail { return isRecord(value) && exact(value,['camera_id','classification','confidence','health','observed_at','inventory']) && isOpaqueId(value.camera_id) && typeof value.classification === 'string' && value.classification.length <= 64 && isConfidence(value.confidence) && typeof value.health === 'string' && value.health.length <= 64 && isDate(value.observed_at) && (value.inventory === null || isInventory(value.inventory)); }
-function isCameraHealth(value: unknown): value is CameraHealth { return isRecord(value) && exact(value,['health','confidence']) && typeof value.health === 'string' && isConfidence(value.confidence); }
+function isInventory(value: unknown): value is CameraInventoryProjection { return isRecord(value) && exact(value,['manufacturer','model','firmware','serial','capabilities','health']) && ['manufacturer','model','firmware','serial'].every(k => value[k] === null || (typeof value[k] === 'string' && value[k].length > 0 && value[k].length <= 256)) && Array.isArray(value.capabilities) && value.capabilities.length <= 32 && value.capabilities.every(v => typeof v === 'string' && v.length > 0 && v.length <= 256) && typeof value.health === 'string' && inventoryHealths.has(value.health); }
+function isCameraDetail(value: unknown): value is CameraDetail { return isRecord(value) && exact(value, ['camera_id', 'classification', 'confidence', 'health', 'observed_at', 'inventory']) && isCameraSummary({ camera_id: value.camera_id, classification: value.classification, confidence: value.confidence, health: value.health, observed_at: value.observed_at }) && (value.inventory === null || isInventory(value.inventory)); }
+function isCameraHealth(value: unknown): value is CameraHealth { return isRecord(value) && exact(value,['health','confidence']) && typeof value.health === 'string' && cameraHealths.has(value.health) && isConfidence(value.confidence); }
 function isSession(value: unknown): value is CameraSessionResponse { return isRecord(value) && exact(value,['session_id']) && isOpaqueId(value.session_id); }
 
 function isEventTicket(value: unknown): value is EventTicket {

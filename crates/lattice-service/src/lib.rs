@@ -1,4 +1,4 @@
-mod api;
+pub mod api;
 mod auth;
 pub mod cameras;
 pub mod discovery;
