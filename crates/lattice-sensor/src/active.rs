@@ -1082,7 +1082,7 @@ fn verify_local_binding(local: SocketAddr, expected: IpAddr) -> Result<(), Activ
 }
 
 #[cfg(target_os = "linux")]
-fn pin_socket_to_interface<S: std::os::fd::AsFd>(
+pub fn pin_socket_to_interface<S: std::os::fd::AsFd>(
     socket: &S,
     binding: AuthorizedBinding,
 ) -> Result<(), ActiveError> {
@@ -1119,7 +1119,7 @@ fn pin_socket_to_interface<S: std::os::fd::AsFd>(
 }
 
 #[cfg(windows)]
-fn pin_socket_to_interface<S: std::os::windows::io::AsRawSocket>(
+pub fn pin_socket_to_interface<S: std::os::windows::io::AsRawSocket>(
     socket: &S,
     binding: AuthorizedBinding,
 ) -> Result<(), ActiveError> {
@@ -1163,7 +1163,7 @@ fn pin_socket_to_interface<S: std::os::windows::io::AsRawSocket>(
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn pin_socket_to_interface<S>(_: &S, _: AuthorizedBinding) -> Result<(), ActiveError> {
+pub fn pin_socket_to_interface<S>(_: &S, _: AuthorizedBinding) -> Result<(), ActiveError> {
     Err(ActiveError::Unavailable)
 }
 

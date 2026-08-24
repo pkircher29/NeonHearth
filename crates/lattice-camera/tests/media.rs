@@ -1,9 +1,13 @@
+use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use lattice_camera::{
-    FakeMediaProcessFactory, HlsSessionId, LoopbackSourceToken, MediaError, MediaJob,
-    MediaProcessFactory, MediaProcessSpec, ProductionMediaProcessFactory, SnapshotRequest,
-    ffmpeg_executable, hls_args, snapshot_args,
+    CameraId, FakeMediaProcessFactory, HlsSession, HlsSessionId, LoopbackSourceToken, MediaError,
+    MediaJob, MediaProcess, MediaProcessExit, MediaProcessFactory, MediaProcessSpec,
+    ProductionMediaProcessFactory, SnapshotRequest, StreamId, ffmpeg_executable, hls_args,
+    snapshot_args,
 };
-use std::{ffi::OsString, path::Path};
+use std::{ffi::OsString, future::pending, path::Path, time::Duration};
+use uuid::Uuid;
 
 const CAMERA: &str = "192.168.4.22";
 const USERNAME: &str = "camera-user";
@@ -34,6 +38,67 @@ fn opaque_media_ids_have_canonical_serde_and_redacted_debug() {
         assert!(serde_json::from_str::<LoopbackSourceToken>(invalid).is_err());
         assert!(serde_json::from_str::<HlsSessionId>(invalid).is_err());
     }
+}
+
+#[test]
+fn hls_session_contract_is_bounded_opaque_and_round_trips() {
+    let id = HlsSessionId::from_canonical("0190c6d1-1234-7abc-8def-0123456789ac").unwrap();
+    let camera = CameraId::from_uuid(Uuid::from_u128(1));
+    let stream = StreamId::from_uuid(Uuid::from_u128(2));
+    let created = Utc.with_ymd_and_hms(2026, 8, 24, 12, 0, 0).unwrap();
+    let expires = created + ChronoDuration::minutes(10);
+    let session = HlsSession::new(id.clone(), camera, stream, created, expires).unwrap();
+    assert_eq!(session.id(), &id);
+    assert_eq!(session.camera(), camera);
+    assert_eq!(session.stream(), stream);
+    assert_eq!(session.created_at(), created);
+    assert_eq!(session.expires_at(), expires);
+    assert_eq!(format!("{session:?}"), "HlsSession([opaque])");
+
+    let encoded = serde_json::to_string(&session).unwrap();
+    let decoded: HlsSession = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, session);
+    let object = serde_json::from_str::<serde_json::Value>(&encoded).unwrap();
+    assert_eq!(
+        object
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            "camera_id",
+            "created_at",
+            "expires_at",
+            "session_id",
+            "stream_id"
+        ]
+    );
+    for forbidden in [
+        "source_token",
+        "output_path",
+        "rtsp",
+        "credential_ref",
+        "endpoint",
+        "camera-password-leak-sentinel",
+    ] {
+        assert!(!encoded.contains(forbidden));
+    }
+    assert!(
+        HlsSession::new(
+            id.clone(),
+            camera,
+            stream,
+            created,
+            created + ChronoDuration::minutes(10) + ChronoDuration::milliseconds(1),
+        )
+        .is_err()
+    );
+    assert!(HlsSession::new(id, camera, stream, created, created).is_err());
+
+    let mut unknown = object;
+    unknown["endpoint"] = serde_json::Value::String("rtsp://camera/private".into());
+    assert!(serde_json::from_value::<HlsSession>(unknown).is_err());
 }
 
 #[test]
@@ -152,6 +217,30 @@ async fn fake_process_records_only_the_spec_and_close_kills_then_awaits() {
     assert_eq!(observations.len(), 1);
     assert!(observations[0].kill_requested);
     assert!(observations[0].awaited);
+}
+
+struct UncooperativeMediaProcess;
+
+#[async_trait]
+impl MediaProcess for UncooperativeMediaProcess {
+    async fn kill(&mut self) -> Result<(), MediaError> {
+        Ok(())
+    }
+
+    async fn wait(&mut self) -> Result<MediaProcessExit, MediaError> {
+        pending().await
+    }
+
+    fn try_wait(&mut self) -> Result<Option<MediaProcessExit>, MediaError> {
+        Ok(None)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn media_close_bounds_an_uncooperative_process_wait() {
+    let mut process = UncooperativeMediaProcess;
+    let result = tokio::time::timeout(Duration::from_secs(6), process.close()).await;
+    assert_eq!(result.unwrap(), Err(MediaError::ProcessFailed));
 }
 
 #[tokio::test]

@@ -1566,6 +1566,7 @@ dependencies = [
  "base64",
  "chrono",
  "futures-util",
+ "getrandom 0.3.4",
  "http-body-util",
  "keyring",
  "lattice-camera",
@@ -1576,6 +1577,7 @@ dependencies = [
  "lattice-sensor",
  "lattice-store",
  "lattice-w6",
+ "libc",
  "md-5 0.10.6",
  "percent-encoding",
  "secrecy",
@@ -1594,6 +1596,7 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

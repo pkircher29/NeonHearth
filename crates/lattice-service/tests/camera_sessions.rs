@@ -288,6 +288,24 @@ async fn session_response_is_opaque_and_hls_files_have_strict_types_and_cache_po
 }
 
 #[tokio::test]
+async fn manager_returns_the_bounded_public_session_contract() {
+    let fixture = fixture(config()).await;
+    let session = fixture
+        .manager
+        .start_session(fixture.camera, fixture.stream)
+        .await
+        .unwrap();
+    assert_eq!(session.camera(), fixture.camera);
+    assert_eq!(session.stream(), fixture.stream);
+    assert!(session.expires_at() > session.created_at());
+    let encoded = serde_json::to_string(&session).unwrap();
+    for forbidden in [PASSWORD, "source_token", "output_path", "rtsp", "endpoint"] {
+        assert!(!encoded.contains(forbidden));
+    }
+    fixture.manager.close_session(session.id()).await.unwrap();
+}
+
+#[tokio::test]
 async fn exact_repository_vault_and_target_failures_are_sanitized() {
     let fixture = fixture(config()).await;
     let missing_camera = fixture
@@ -448,6 +466,26 @@ async fn playlist_and_segment_reject_traversal_wrong_names_symlinks_and_oversize
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+}
+
+#[tokio::test]
+async fn unicode_segment_name_is_rejected_without_panicking() {
+    let fixture = fixture(config()).await;
+    let (_, value) = start(&fixture).await;
+    let session = value["session_id"].as_str().unwrap();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            authorized(Request::get(format!(
+                "/api/v1/camera-sessions/{session}/segments/segment-0000%C3%A9.ts"
+            )))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .expect("Unicode segment name must not panic the route");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

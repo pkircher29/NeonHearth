@@ -6,6 +6,7 @@
 //! process diagnostics.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
 use std::{
     ffi::{OsStr, OsString},
@@ -23,7 +24,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::{CameraId, StreamId};
+
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+const MEDIA_PROCESS_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 macro_rules! opaque_uuid_v7 {
     ($name:ident) => {
@@ -97,6 +101,89 @@ macro_rules! opaque_uuid_v7 {
 
 opaque_uuid_v7!(LoopbackSourceToken);
 opaque_uuid_v7!(HlsSessionId);
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct HlsSession {
+    #[serde(rename = "session_id")]
+    id: HlsSessionId,
+    #[serde(rename = "camera_id")]
+    camera: CameraId,
+    #[serde(rename = "stream_id")]
+    stream: StreamId,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+impl HlsSession {
+    pub fn new(
+        id: HlsSessionId,
+        camera: CameraId,
+        stream: StreamId,
+        created_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Self, MediaError> {
+        let lease = expires_at.signed_duration_since(created_at);
+        if lease <= ChronoDuration::zero() || lease > ChronoDuration::minutes(10) {
+            return Err(MediaError::InvalidSession);
+        }
+        Ok(Self {
+            id,
+            camera,
+            stream,
+            created_at,
+            expires_at,
+        })
+    }
+
+    pub const fn id(&self) -> &HlsSessionId {
+        &self.id
+    }
+
+    pub const fn camera(&self) -> CameraId {
+        self.camera
+    }
+
+    pub const fn stream(&self) -> StreamId {
+        self.stream
+    }
+
+    pub const fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+
+    pub const fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+}
+
+impl fmt::Debug for HlsSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HlsSession([opaque])")
+    }
+}
+
+impl<'de> Deserialize<'de> for HlsSession {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            session_id: HlsSessionId,
+            camera_id: CameraId,
+            stream_id: StreamId,
+            created_at: DateTime<Utc>,
+            expires_at: DateTime<Utc>,
+        }
+        let value = Wire::deserialize(deserializer)?;
+        HlsSession::new(
+            value.session_id,
+            value.camera_id,
+            value.stream_id,
+            value.created_at,
+            value.expires_at,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaJob {
@@ -184,6 +271,8 @@ impl MediaProcessSpec {
 pub enum MediaError {
     #[error("invalid opaque media identifier")]
     InvalidOpaqueId,
+    #[error("invalid bounded media session")]
+    InvalidSession,
     #[error("invalid loopback media source")]
     InvalidSource,
     #[error("invalid media output location")]
@@ -315,11 +404,18 @@ pub trait MediaProcess: Send {
     fn try_wait(&mut self) -> Result<Option<MediaProcessExit>, MediaError>;
 
     async fn close(&mut self) -> Result<(), MediaError> {
-        let kill = self.kill().await;
-        let wait = self.wait().await;
-        match (kill, wait) {
-            (Ok(()), Ok(_)) => Ok(()),
-            _ => Err(MediaError::ProcessFailed),
+        match tokio::time::timeout(MEDIA_PROCESS_CLOSE_TIMEOUT, async {
+            let kill = self.kill().await;
+            let wait = self.wait().await;
+            match (kill, wait) {
+                (Ok(()), Ok(_)) => Ok(()),
+                _ => Err(MediaError::ProcessFailed),
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(MediaError::ProcessFailed),
         }
     }
 }

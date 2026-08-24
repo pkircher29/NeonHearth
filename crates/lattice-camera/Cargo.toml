@@ -16,3 +16,4 @@ tokio = { workspace = true, features = ["fs", "io-util", "process"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

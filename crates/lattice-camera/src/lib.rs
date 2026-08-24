@@ -13,8 +13,8 @@ pub use detection::{
     DetectionError, classify_candidate,
 };
 pub use media::{
-    FakeMediaProcessFactory, HlsSessionId, LoopbackSourceToken, MediaError, MediaJob, MediaProcess,
-    MediaProcessExit, MediaProcessFactory, MediaProcessObservation, MediaProcessSpec,
+    FakeMediaProcessFactory, HlsSession, HlsSessionId, LoopbackSourceToken, MediaError, MediaJob,
+    MediaProcess, MediaProcessExit, MediaProcessFactory, MediaProcessObservation, MediaProcessSpec,
     ProductionMediaProcessFactory, SnapshotRequest, ffmpeg_executable, hls_args, snapshot_args,
 };
 pub use onvif::{

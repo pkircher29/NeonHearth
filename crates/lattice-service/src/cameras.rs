@@ -9,11 +9,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use chrono::{Duration as ChronoDuration, Utc};
 use lattice_camera::{
-    CameraId, HlsSessionId, LoopbackSourceToken, MediaProcess, MediaProcessFactory,
+    CameraId, HlsSession, HlsSessionId, LoopbackSourceToken, MediaProcess, MediaProcessFactory,
     MediaProcessSpec, StreamId,
 };
-use lattice_sensor::{AuthorizedBinding, InterfaceId, TargetGuard};
+use lattice_sensor::{
+    AuthorizedBinding, InterfaceId, TargetGuard, active::pin_socket_to_interface,
+};
 use lattice_store::CameraRepository;
 use md5_digest::{Digest, Md5};
 use percent_encoding::percent_decode_str;
@@ -38,6 +41,7 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::{AppState, auth::Authorized, vault::Vault};
 
@@ -341,7 +345,7 @@ impl CameraSessionManager {
         &self,
         camera: CameraId,
         stream: StreamId,
-    ) -> Result<HlsSessionId, CameraSessionError> {
+    ) -> Result<HlsSession, CameraSessionError> {
         self.reap(true).await;
         self.exact_profile(camera, stream).await?;
         let permit = self
@@ -351,6 +355,12 @@ impl CameraSessionManager {
             .map_err(|_| CameraSessionError::Capacity)?;
         let (source, binding) = self.resolve_source(camera, stream).await?;
         let session = HlsSessionId::new();
+        let created_at = Utc::now();
+        let expires_at = created_at
+            + ChronoDuration::from_std(self.config.total_timeout)
+                .map_err(|_| CameraSessionError::Invalid)?;
+        let contract = HlsSession::new(session.clone(), camera, stream, created_at, expires_at)
+            .map_err(|_| CameraSessionError::Invalid)?;
         let token = LoopbackSourceToken::new();
         let output_dir = self
             .create_output_dir("session", &session.to_string())
@@ -410,7 +420,7 @@ impl CameraSessionManager {
                 _permit: permit,
             },
         );
-        Ok(session)
+        Ok(contract)
     }
 
     pub async fn playlist(&self, session: &HlsSessionId) -> Result<Vec<u8>, CameraSessionError> {
@@ -734,10 +744,11 @@ async fn remove_output_dir(path: &Path) -> Result<(), CameraSessionError> {
 }
 
 fn valid_segment_name(value: &str) -> bool {
-    value.len() == "segment-000000.ts".len()
-        && value.starts_with("segment-")
-        && value.ends_with(".ts")
-        && value[8..14].bytes().all(|byte| byte.is_ascii_digit())
+    let value = value.as_bytes();
+    value.len() == b"segment-000000.ts".len()
+        && value.get(..8) == Some(b"segment-")
+        && value.get(14..) == Some(b".ts")
+        && value[8..14].iter().all(u8::is_ascii_digit)
 }
 
 async fn read_bounded_file(
@@ -748,22 +759,8 @@ async fn read_bounded_file(
     if name.contains('/') || name.contains('\\') || matches!(name, "." | "..") {
         return Err(CameraSessionError::Invalid);
     }
-    let path = directory.join(name);
-    let link_metadata = tokio::fs::symlink_metadata(&path)
-        .await
-        .map_err(|_| CameraSessionError::NotFound)?;
-    if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
-        return Err(CameraSessionError::NotFound);
-    }
-    let canonical = tokio::fs::canonicalize(&path)
-        .await
-        .map_err(|_| CameraSessionError::NotFound)?;
-    if canonical.parent() != Some(directory) {
-        return Err(CameraSessionError::NotFound);
-    }
-    let file = tokio::fs::File::open(&canonical)
-        .await
-        .map_err(|_| CameraSessionError::NotFound)?;
+    let file = open_session_file(directory.to_path_buf(), name.to_owned()).await?;
+    let file = tokio::fs::File::from_std(file);
     let metadata = file
         .metadata()
         .await
@@ -780,6 +777,198 @@ async fn read_bounded_file(
         Err(CameraSessionError::PayloadTooLarge)
     } else {
         Ok(output)
+    }
+}
+
+async fn open_session_file(
+    directory: PathBuf,
+    name: String,
+) -> Result<std::fs::File, CameraSessionError> {
+    tokio::task::spawn_blocking(move || open_session_file_sync(&directory, &name))
+        .await
+        .map_err(|_| CameraSessionError::Unavailable)?
+        .map_err(|_| CameraSessionError::NotFound)
+}
+
+#[cfg(target_os = "linux")]
+fn open_session_file_sync(directory: &Path, name: &str) -> io::Result<std::fs::File> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::fs::OpenOptionsExt,
+        },
+    };
+
+    let directory_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(directory)?;
+    #[cfg(test)]
+    run_file_open_hook(directory);
+    let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory_file.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_session_file_sync(directory: &Path, name: &str) -> io::Result<std::fs::File> {
+    use std::os::windows::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawHandle,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
+    let shared = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    let directory_file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(shared)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(directory)?;
+    let directory_metadata = directory_file.metadata()?;
+    if !directory_metadata.is_dir()
+        || directory_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    #[cfg(test)]
+    run_file_open_hook(directory);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(shared)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(directory.join(name))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    let directory_path = windows_final_path(
+        directory_file.as_raw_handle(),
+        GetFinalPathNameByHandleW,
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+    )?;
+    let file_path = windows_final_path(
+        file.as_raw_handle(),
+        GetFinalPathNameByHandleW,
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+    )?;
+    if !windows_paths_equal(file_path.parent(), Some(directory_path.as_path())) {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_final_path(
+    handle: std::os::windows::io::RawHandle,
+    get_path: unsafe extern "system" fn(*mut std::ffi::c_void, *mut u16, u32, u32) -> u32,
+    flags: u32,
+) -> io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let handle = handle.cast();
+    let required = unsafe { get_path(handle, std::ptr::null_mut(), 0, flags) };
+    if required == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut value = vec![0_u16; required as usize + 1];
+    let written = unsafe { get_path(handle, value.as_mut_ptr(), value.len() as u32, flags) };
+    if written == 0 || written as usize >= value.len() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(
+        &value[..written as usize],
+    )))
+}
+
+#[cfg(windows)]
+fn windows_paths_equal(left: Option<&Path>, right: Option<&Path>) -> bool {
+    let Some((left, right)) = left.zip(right) else {
+        return false;
+    };
+    let normalize = |path: &Path| {
+        path.components()
+            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+    };
+    normalize(left) == normalize(right)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn open_session_file_sync(_: &Path, _: &str) -> io::Result<std::fs::File> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+#[cfg(test)]
+struct FileOpenHook {
+    directory: PathBuf,
+    action: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(test)]
+static FILE_OPEN_HOOK: std::sync::Mutex<Option<FileOpenHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_file_open_hook(directory: &Path) {
+    let action = {
+        let mut hook = FILE_OPEN_HOOK.lock().expect("file hook lock");
+        hook.as_mut()
+            .filter(|hook| hook.directory == directory)
+            .and_then(|hook| hook.action.take())
+    };
+    if let Some(action) = action {
+        action();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod safe_file_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn directory_swap_never_serves_a_file_outside_the_pinned_session_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("session");
+        let held = root.path().join("held-session");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&session).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(session.join("segment-000001.ts"), b"inside").unwrap();
+        std::fs::write(outside.join("segment-000001.ts"), b"outside-secret").unwrap();
+        *FILE_OPEN_HOOK.lock().unwrap() = Some(FileOpenHook {
+            directory: session.clone(),
+            action: Some(Box::new({
+                let session = session.clone();
+                let held = held.clone();
+                let outside = outside.clone();
+                move || {
+                    std::fs::rename(&session, &held).unwrap();
+                    std::os::unix::fs::symlink(&outside, &session).unwrap();
+                }
+            })),
+        });
+
+        let result = read_bounded_file(&session, "segment-000001.ts", 1024).await;
+        assert!(
+            matches!(result.as_deref(), Ok(b"inside")) || result.is_err(),
+            "outside bytes were served after an ancestor directory swap"
+        );
     }
 }
 
@@ -817,9 +1006,11 @@ pub(crate) async fn start_session_route(
         return StatusCode::BAD_REQUEST.into_response();
     };
     match manager.start_session(camera, stream).await {
-        Ok(session_id) => (
+        Ok(session) => (
             StatusCode::CREATED,
-            Json(StartSessionResponse { session_id }),
+            Json(StartSessionResponse {
+                session_id: session.id().clone(),
+            }),
         )
             .into_response(),
         Err(error) => status(error).into_response(),
@@ -1049,10 +1240,27 @@ impl AuthorizedRtspConnector for SystemAuthorizedRtspConnector {
         socket
             .bind(binding.source_socket())
             .map_err(|_| RtspProxyError::Unavailable)?;
+        if socket
+            .local_addr()
+            .map_err(|_| RtspProxyError::Unavailable)?
+            .ip()
+            != binding.source
+        {
+            return Err(RtspProxyError::Unavailable);
+        }
+        pin_socket_to_interface(&socket, binding).map_err(|_| RtspProxyError::Unavailable)?;
         let stream = socket
             .connect(binding.target_socket(port))
             .await
             .map_err(|_| RtspProxyError::Unavailable)?;
+        if stream
+            .local_addr()
+            .map_err(|_| RtspProxyError::Unavailable)?
+            .ip()
+            != binding.source
+        {
+            return Err(RtspProxyError::Unavailable);
+        }
         Ok(Box::new(stream))
     }
 }
@@ -1062,6 +1270,7 @@ pub struct LoopbackRtspProxy {
     token: LoopbackSourceToken,
     local_addr: SocketAddr,
     shutdown: watch::Sender<bool>,
+    shutdown_timeout: Duration,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -1110,6 +1319,7 @@ impl LoopbackRtspProxy {
             token,
             local_addr,
             shutdown,
+            shutdown_timeout: limits.io_timeout,
             task: Mutex::new(Some(task)),
         })
     }
@@ -1133,8 +1343,15 @@ impl LoopbackRtspProxy {
             return Err(RtspProxyError::WrongOwner);
         }
         let _ = self.shutdown.send(true);
-        if let Some(task) = self.task.lock().await.take() {
-            task.await.map_err(|_| RtspProxyError::Unavailable)?;
+        if let Some(mut task) = self.task.lock().await.take() {
+            match timeout(self.shutdown_timeout, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(RtspProxyError::Unavailable),
+                Err(_) => {
+                    task.abort();
+                    return Err(RtspProxyError::Timeout);
+                }
+            }
         }
         Ok(())
     }
@@ -1216,13 +1433,12 @@ impl Upstream {
         })
     }
 
-    fn basic_header(&self) -> Option<String> {
+    fn basic_header(&self) -> Option<Zeroizing<String>> {
         let username = self.username.as_ref()?;
         let password = self.password.as_ref()?;
-        Some(format!(
-            "Basic {}",
-            BASE64.encode(format!("{username}:{}", password.expose_secret()))
-        ))
+        let credential = Zeroizing::new(format!("{username}:{}", password.expose_secret()));
+        let encoded = Zeroizing::new(BASE64.encode(credential.as_bytes()));
+        Some(Zeroizing::new(format!("Basic {}", encoded.as_str())))
     }
 }
 
@@ -1290,6 +1506,7 @@ async fn serve_connection(
     let (mut client_read, mut client_write) = split(client);
     let mut upstream_io: Option<tokio::io::ReadHalf<Box<dyn RtspConnection>>> = None;
     let mut upstream_write: Option<tokio::io::WriteHalf<Box<dyn RtspConnection>>> = None;
+    let mut digest_state = DigestState::default();
     loop {
         enum Incoming {
             Client(Option<u8>),
@@ -1356,8 +1573,10 @@ async fn serve_connection(
             upstream_write = Some(write);
         }
         let upstream_uri = upstream_target(upstream.uri.expose_secret(), &validated.suffix)?;
-        let mut outbound =
-            validated.to_upstream(&upstream_uri, upstream.basic_header().as_deref())?;
+        let basic = upstream.basic_header();
+        let mut outbound = Zeroizing::new(
+            validated.to_upstream(&upstream_uri, basic.as_ref().map(|value| value.as_str()))?,
+        );
         let writer = upstream_write.as_mut().ok_or(RtspProxyError::Unavailable)?;
         write_all(writer, &outbound, limits.io_timeout, expires).await?;
         let reader = upstream_io.as_mut().ok_or(RtspProxyError::Unavailable)?;
@@ -1370,14 +1589,14 @@ async fn serve_connection(
                 .to_ascii_lowercase()
                 .starts_with("digest ")
         {
-            let digest = digest_header(
+            let digest = digest_state.header(
                 challenge,
                 &validated.method,
                 &upstream_uri,
                 upstream.username.as_deref(),
                 upstream.password.as_ref(),
             )?;
-            outbound = validated.to_upstream(&upstream_uri, Some(&digest))?;
+            outbound = Zeroizing::new(validated.to_upstream(&upstream_uri, Some(&digest))?);
             write_all(writer, &outbound, limits.io_timeout, expires).await?;
             response = read_upstream_response(reader, &mut client_write, limits, expires).await?;
         }
@@ -1454,7 +1673,8 @@ impl RtspMessage {
         let mut body = self.body.clone();
         if self
             .header("content-type")
-            .is_some_and(|value| value.eq_ignore_ascii_case("application/sdp"))
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/sdp"))
         {
             body = rewrite_sdp(&body, upstream, local, max_body)?;
         }
@@ -1871,50 +2091,119 @@ fn rewrite_sdp(
     Ok(output.into_bytes())
 }
 
-fn digest_header(
-    challenge: &str,
-    method: &str,
-    uri: &str,
-    username: Option<&str>,
-    password: Option<&SecretString>,
-) -> Result<String, RtspProxyError> {
-    let username = username.ok_or(RtspProxyError::Protocol)?;
-    let password = password.ok_or(RtspProxyError::Protocol)?.expose_secret();
-    let parameters = parse_digest(challenge)?;
-    let realm = parameter(&parameters, "realm")?;
-    let nonce = parameter(&parameters, "nonce")?;
-    let algorithm = parameters
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("algorithm"))
-        .map(|(_, value)| value.as_str())
-        .unwrap_or("MD5");
-    if !algorithm.eq_ignore_ascii_case("MD5") {
-        return Err(RtspProxyError::Protocol);
+#[derive(Default)]
+struct DigestState {
+    realm: Option<String>,
+    nonce: Option<String>,
+    cnonce: Option<Zeroizing<String>>,
+    nonce_count: u32,
+}
+
+impl DigestState {
+    fn header(
+        &mut self,
+        challenge: &str,
+        method: &str,
+        uri: &str,
+        username: Option<&str>,
+        password: Option<&SecretString>,
+    ) -> Result<Zeroizing<String>, RtspProxyError> {
+        let username = username.ok_or(RtspProxyError::Protocol)?;
+        let password = password.ok_or(RtspProxyError::Protocol)?.expose_secret();
+        let parameters = parse_digest(challenge)?;
+        let realm = parameter(&parameters, "realm")?;
+        let nonce = parameter(&parameters, "nonce")?;
+        let algorithm = parameters
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("algorithm"))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("MD5");
+        if !algorithm.eq_ignore_ascii_case("MD5") {
+            return Err(RtspProxyError::Protocol);
+        }
+        let qop = parameters
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("qop"))
+            .map(|(_, value)| value.as_str());
+        let uses_qop = match qop {
+            Some(value) => {
+                if !value
+                    .split(',')
+                    .any(|item| item.trim().eq_ignore_ascii_case("auth"))
+                {
+                    return Err(RtspProxyError::Protocol);
+                }
+                true
+            }
+            None => false,
+        };
+        let stale = parameters
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("stale"))
+            .map(|(_, value)| {
+                if value.eq_ignore_ascii_case("true") {
+                    Ok(true)
+                } else if value.eq_ignore_ascii_case("false") {
+                    Ok(false)
+                } else {
+                    Err(RtspProxyError::Protocol)
+                }
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if stale || self.nonce.as_deref() != Some(nonce) || self.realm.as_deref() != Some(realm) {
+            self.realm = Some(realm.to_owned());
+            self.nonce = Some(nonce.to_owned());
+            self.cnonce = Some(random_cnonce()?);
+            self.nonce_count = 0;
+        }
+        self.nonce_count = self
+            .nonce_count
+            .checked_add(1)
+            .ok_or(RtspProxyError::Limit)?;
+        let nc = format!("{:08x}", self.nonce_count);
+        let cnonce = self.cnonce.as_ref().ok_or(RtspProxyError::Protocol)?;
+        let a1 = Zeroizing::new(format!("{username}:{realm}:{password}"));
+        let ha1 = Zeroizing::new(md5_hex(a1.as_bytes()));
+        let a2 = Zeroizing::new(format!("{method}:{uri}"));
+        let ha2 = Zeroizing::new(md5_hex(a2.as_bytes()));
+        let response_input = if uses_qop {
+            Zeroizing::new(format!(
+                "{}:{nonce}:{nc}:{}:auth:{}",
+                ha1.as_str(),
+                cnonce.as_str(),
+                ha2.as_str()
+            ))
+        } else {
+            Zeroizing::new(format!("{}:{nonce}:{}", ha1.as_str(), ha2.as_str()))
+        };
+        let response = Zeroizing::new(md5_hex(response_input.as_bytes()));
+        let mut value = Zeroizing::new(format!(
+            "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\", algorithm=MD5",
+            quote_value(username)?,
+            quote_value(realm)?,
+            quote_value(nonce)?,
+            quote_value(uri)?,
+            response.as_str()
+        ));
+        if uses_qop {
+            value.push_str(&format!(
+                ", qop=auth, nc={nc}, cnonce=\"{}\"",
+                cnonce.as_str()
+            ));
+        }
+        Ok(value)
     }
-    let qop = parameters
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("qop"))
-        .map(|(_, value)| value.as_str());
-    if qop.is_some_and(|value| !value.split(',').any(|item| item.trim() == "auth")) {
-        return Err(RtspProxyError::Protocol);
-    }
-    let ha1 = md5_hex(format!("{username}:{realm}:{password}").as_bytes());
-    let ha2 = md5_hex(format!("{method}:{uri}").as_bytes());
-    let response = if qop.is_some() {
-        md5_hex(format!("{ha1}:{nonce}:00000001:neonhearth:auth:{ha2}").as_bytes())
-    } else {
-        md5_hex(format!("{ha1}:{nonce}:{ha2}").as_bytes())
-    };
-    let mut value = format!(
-        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\", algorithm=MD5",
-        quote_value(username)?,
-        quote_value(realm)?,
-        quote_value(nonce)?,
-        quote_value(uri)?,
-        response
-    );
-    if qop.is_some() {
-        value.push_str(", qop=auth, nc=00000001, cnonce=\"neonhearth\"");
+}
+
+fn random_cnonce() -> Result<Zeroizing<String>, RtspProxyError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = Zeroizing::new([0_u8; 16]);
+    getrandom::fill(bytes.as_mut()).map_err(|_| RtspProxyError::Unavailable)?;
+    let mut value = Zeroizing::new(String::with_capacity(bytes.len() * 2));
+    for byte in bytes.iter().copied() {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
     }
     Ok(value)
 }

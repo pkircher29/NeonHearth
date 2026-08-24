@@ -1,23 +1,80 @@
 use async_trait::async_trait;
 use lattice_camera::{HlsSessionId, LoopbackSourceToken};
-use lattice_sensor::AuthorizedBinding;
+use lattice_sensor::{AuthorizedBinding, InterfaceClass, SystemInterfaceManager};
 use lattice_service::cameras::{
     ApprovedRtspTarget, AuthorizedRtspConnector, FakeAuthorizedRtspConnector, LoopbackRtspProxy,
-    RtspConnection, RtspProxyError, RtspProxyLimits,
+    RtspConnection, RtspProxyError, RtspProxyLimits, SystemAuthorizedRtspConnector,
 };
 use secrecy::SecretString;
 use std::{
     net::{IpAddr, Ipv4Addr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     time::Instant,
 };
 
 const PASSWORD: &str = "proxy-password-leak-sentinel";
+
+#[cfg(target_os = "linux")]
+fn loopback_binding(interface_index: u32) -> AuthorizedBinding {
+    AuthorizedBinding {
+        source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        interface_index,
+        target: IpAddr::V4(Ipv4Addr::LOCALHOST),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn loopback_interface_index() -> u32 {
+    SystemInterfaceManager
+        .snapshot()
+        .unwrap()
+        .interfaces()
+        .find(|interface| interface.class == InterfaceClass::Loopback)
+        .expect("loopback interface")
+        .id
+        .get()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn system_connector_accepts_an_os_verified_interface_pin() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+    let connection = SystemAuthorizedRtspConnector
+        .connect(loopback_binding(loopback_interface_index()), port)
+        .await
+        .unwrap();
+    drop(connection);
+    accept.await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn system_connector_rejects_an_invalid_interface_before_connecting() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let result = SystemAuthorizedRtspConnector
+        .connect(loopback_binding(u32::MAX), port)
+        .await;
+    assert!(matches!(result, Err(RtspProxyError::Unavailable)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "invalid interface must be rejected before any upstream connection"
+    );
+}
 
 fn binding(target: [u8; 4]) -> AuthorizedBinding {
     AuthorizedBinding {
@@ -51,6 +108,33 @@ async fn request(port: u16, value: &[u8]) -> Vec<u8> {
     let mut response = Vec::new();
     client.read_to_end(&mut response).await.unwrap();
     response
+}
+
+async fn read_rtsp_head(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte).await.unwrap();
+        response.push(byte[0]);
+    }
+    response
+}
+
+fn authorization(request: &[u8]) -> &str {
+    std::str::from_utf8(request)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Authorization: "))
+        .expect("authorization header")
+}
+
+fn quoted_parameter<'a>(header: &'a str, name: &str) -> &'a str {
+    let prefix = format!("{name}=\"");
+    let value = header
+        .split(", ")
+        .find_map(|part| part.strip_prefix(&prefix))
+        .expect("quoted digest parameter");
+    value.strip_suffix('"').expect("closing quote")
 }
 
 #[tokio::test]
@@ -179,6 +263,64 @@ impl AuthorizedRtspConnector for DelayedFrameConnector {
     }
 }
 
+struct NonCooperativeConnector {
+    entered: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl AuthorizedRtspConnector for NonCooperativeConnector {
+    async fn connect(
+        &self,
+        _binding: AuthorizedBinding,
+        _port: u16,
+    ) -> Result<Box<dyn RtspConnection>, RtspProxyError> {
+        self.entered.store(true, Ordering::Release);
+        while !self.stop.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        Err(RtspProxyError::Unavailable)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_shutdown_is_bounded_when_a_connection_task_will_not_yield() {
+    let owner = HlsSessionId::new();
+    let entered = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut bounded = limits();
+    bounded.io_timeout = Duration::from_millis(20);
+    let proxy = LoopbackRtspProxy::start(
+        owner.clone(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        Arc::new(NonCooperativeConnector {
+            entered: entered.clone(),
+            stop: stop.clone(),
+        }),
+        bounded,
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    client
+        .write_all(format!("OPTIONS {} RTSP/1.0\r\nCSeq: 1\r\n\r\n", proxy.endpoint()).as_bytes())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while !entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_millis(200), proxy.shutdown(&owner)).await;
+    stop.store(true, Ordering::Release);
+    assert!(matches!(result, Ok(Err(RtspProxyError::Timeout))));
+}
+
 #[tokio::test]
 async fn delayed_interleaved_frames_flow_without_another_client_request() {
     let owner = HlsSessionId::new();
@@ -250,6 +392,38 @@ async fn basic_auth_is_injected_and_sdp_and_location_are_rewritten_to_the_lease(
 }
 
 #[tokio::test]
+async fn parameterized_mixed_case_sdp_media_type_is_rewritten() {
+    let sdp = b"v=0\r\na=control:rtsp://192.168.4.22:8554/live/trackID=1\r\n";
+    let response = format!(
+        "RTSP/1.0 200 OK\r\nCSeq: 8\r\nContent-Type: Application/SDP; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+        sdp.len()
+    )
+    .into_bytes()
+    .into_iter()
+    .chain(sdp.iter().copied())
+    .collect();
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![response]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector,
+        limits(),
+    )
+    .await
+    .unwrap();
+    let response = request(
+        proxy.local_addr().port(),
+        format!("DESCRIBE {} RTSP/1.0\r\nCSeq: 8\r\n\r\n", proxy.endpoint()).as_bytes(),
+    )
+    .await;
+    let text = String::from_utf8(response).unwrap();
+    assert!(text.contains(&format!("a=control:{}/trackID=1", proxy.endpoint())));
+    assert!(!text.contains("192.168.4.22"));
+}
+
+#[tokio::test]
 async fn digest_challenge_is_answered_internally_and_never_forwarded() {
     let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
         b"RTSP/1.0 401 Unauthorized\r\nCSeq: 9\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"abc123\", algorithm=MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n".to_vec(),
@@ -280,6 +454,140 @@ async fn digest_challenge_is_answered_internally_and_never_forwarded() {
     assert!(second.contains("nonce=\"abc123\""));
     assert!(second.contains("qop=auth"));
     assert!(!second.contains(PASSWORD));
+}
+
+#[tokio::test]
+async fn repeated_digest_nonce_increments_nc_and_changes_authorization() {
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
+        b"RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"same-nonce\", algorithm=MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        b"RTSP/1.0 401 Unauthorized\r\nCSeq: 2\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"same-nonce\", algorithm=MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: 0\r\n\r\n".to_vec(),
+    ]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    for cseq in [1, 2] {
+        client
+            .write_all(
+                format!(
+                    "DESCRIBE {} RTSP/1.0\r\nCSeq: {cseq}\r\n\r\n",
+                    proxy.endpoint()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_rtsp_head(&mut client)
+                .await
+                .starts_with(b"RTSP/1.0 200")
+        );
+    }
+    let requests = connector.requests().await;
+    assert_eq!(requests.len(), 4);
+    let first = authorization(&requests[1]);
+    let second = authorization(&requests[3]);
+    assert!(first.contains("nc=00000001"));
+    assert!(second.contains("nc=00000002"));
+    assert_ne!(first, second);
+    let cnonce = quoted_parameter(first, "cnonce");
+    assert_eq!(cnonce.len(), 32);
+    assert!(cnonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(quoted_parameter(second, "cnonce"), cnonce);
+    assert_ne!(cnonce, "neonhearth");
+}
+
+#[tokio::test]
+async fn digest_new_and_stale_nonces_reset_count_and_rotate_cnonce() {
+    let challenge = |cseq: u8, nonce: &str, stale: bool| {
+        format!(
+            "RTSP/1.0 401 Unauthorized\r\nCSeq: {cseq}\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"{nonce}\", algorithm=MD5, qop=\"AUTH\"{}\r\nContent-Length: 0\r\n\r\n",
+            if stale { ", stale=TRUE" } else { "" }
+        )
+        .into_bytes()
+    };
+    let ok = |cseq: u8| {
+        format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n").into_bytes()
+    };
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
+        challenge(1, "nonce-one", false),
+        ok(1),
+        challenge(2, "nonce-two", false),
+        ok(2),
+        challenge(3, "nonce-two", true),
+        ok(3),
+    ]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    for cseq in [1, 2, 3] {
+        client
+            .write_all(
+                format!(
+                    "OPTIONS {} RTSP/1.0\r\nCSeq: {cseq}\r\n\r\n",
+                    proxy.endpoint()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_rtsp_head(&mut client)
+                .await
+                .starts_with(b"RTSP/1.0 200")
+        );
+    }
+    let requests = connector.requests().await;
+    let headers = [
+        authorization(&requests[1]),
+        authorization(&requests[3]),
+        authorization(&requests[5]),
+    ];
+    assert!(headers.iter().all(|header| header.contains("nc=00000001")));
+    let cnonces = headers.map(|header| quoted_parameter(header, "cnonce"));
+    assert_ne!(cnonces[0], cnonces[1]);
+    assert_ne!(cnonces[1], cnonces[2]);
+}
+
+#[tokio::test]
+async fn digest_rejects_unsupported_qop_without_forwarding_credentials() {
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
+        b"RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"abc\", algorithm=MD5, qop=\"auth-int\"\r\nContent-Length: 0\r\n\r\n".to_vec(),
+    ]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+    )
+    .await
+    .unwrap();
+    let response = request(
+        proxy.local_addr().port(),
+        format!("DESCRIBE {} RTSP/1.0\r\nCSeq: 1\r\n\r\n", proxy.endpoint()).as_bytes(),
+    )
+    .await;
+    assert!(response.is_empty());
+    assert_eq!(connector.requests().await.len(), 1);
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ async-trait.workspace = true
 axum.workspace = true
 lattice-camera = { path = "../lattice-camera" }
 futures-util.workspace = true
+getrandom.workspace = true
 chrono.workspace = true
 lattice-event-bus = { path = "../lattice-event-bus" }
 lattice-domain = { path = "../lattice-domain" }
@@ -38,6 +39,12 @@ url = "2.5"
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 keyring.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 async-trait.workspace = true
