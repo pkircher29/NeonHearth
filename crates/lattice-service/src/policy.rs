@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use lattice_domain::{
-    DeviceId, DevicePolicy, Evaluation, EventPayload, Identification, OwnerDecision, PolicyChanged,
-    PolicyReason, Protection, RequestedAction, RiskSignal,
+    DeviceId, DevicePolicy, Evaluation, EventPayload, OwnerDecision, PolicyChanged, PolicyReason,
+    Protection, RequestedAction, RiskSignal,
 };
 use lattice_event_bus::EventBus;
 use lattice_store::PolicyRepository;
@@ -162,45 +162,9 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
 }
 
 fn evaluate_policy(p: &DevicePolicy, now: DateTime<Utc>) -> Evaluation {
-    if p.baseline_exempt {
-        return Evaluation::visible(PolicyReason::BaselineExempt);
-    }
-    if matches!(p.risk, RiskSignal::HighConfidenceDanger { .. }) {
-        return if p.protection == Protection::None {
-            Evaluation::ban(PolicyReason::HighConfidenceDanger)
-        } else {
-            Evaluation::owner_attention()
-        };
-    }
-    match p.owner_decision {
-        OwnerDecision::Approved => return Evaluation::visible(PolicyReason::OwnerApproved),
-        OwnerDecision::Rejected => return Evaluation::ban(PolicyReason::OwnerRejected),
-        OwnerDecision::Quarantined => {
-            return if p.protection == Protection::None {
-                Evaluation::quarantine(PolicyReason::OwnerQuarantined)
-            } else {
-                Evaluation::owner_attention()
-            };
-        }
-        OwnerDecision::Pending => {}
-    }
-    let automatic = matches!(p.identification, Identification::Automatic { confidence_basis_points: 8500.., ref evidence_families } if evidence_families.len() >= 2);
-    let due = p
-        .extension_until
-        .unwrap_or(p.first_seen_at + Duration::hours(if automatic { 168 } else { 48 }));
-    if now >= due {
-        if p.protection == Protection::None {
-            if automatic {
-                Evaluation::ban(PolicyReason::AutomaticDeadlineExpired)
-            } else {
-                Evaluation::quarantine(PolicyReason::UnknownDeadlineExpired)
-            }
-        } else {
-            Evaluation::owner_attention()
-        }
-    } else {
-        Evaluation::visible(PolicyReason::PendingConfirmation)
-    }
+    // Cohort membership is persisted on the policy row; the engine's baseline timestamp is
+    // intentionally irrelevant to evaluation after enrollment.
+    lattice_policy::PolicyEngine::new(p.first_seen_at).evaluate(p, now)
 }
 fn evidence_summary(p: &DevicePolicy) -> String {
     match p.risk {

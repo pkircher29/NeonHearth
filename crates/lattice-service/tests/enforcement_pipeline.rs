@@ -1,0 +1,98 @@
+use async_trait::async_trait;
+use chrono::{Duration, TimeZone, Utc};
+use lattice_domain::{DeviceId, EvidenceFact, EvidenceFamily, RequestedAction};
+use lattice_intelligence::presence::PresenceEvidenceKind;
+use lattice_service::{
+    discovery::{
+        DiscoveryObservation, DiscoveryPipelineOutcome, DiscoverySources,
+        PersistentDiscoveryPipeline,
+    },
+    policy::{EnforcementResult, PolicyActuator, PolicyCoordinator},
+};
+use lattice_store::{InstallRepository, M2StateRepository, PolicyRepository, connect_path};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use tempfile::tempdir;
+
+fn at(hour: i64) -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 8, 23, 0, 0, 0).unwrap() + Duration::hours(hour)
+}
+
+#[derive(Clone, Default)]
+struct FakeActuator(Arc<AtomicUsize>);
+#[async_trait]
+impl PolicyActuator for FakeActuator {
+    async fn enforce(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        EnforcementResult::Verified
+    }
+}
+
+fn observation(t: chrono::DateTime<Utc>) -> DiscoveryObservation {
+    DiscoveryObservation {
+        source_id: 7,
+        candidate: None,
+        facts: vec![EvidenceFact {
+            family: EvidenceFamily::LinkLayer,
+            source: "sensor".into(),
+            key: "mac".into(),
+            value: "00:11:22:33:44:55".into(),
+            confidence: 0.9,
+            observed_at: t,
+            expires_at: None,
+            owner_confirmed: false,
+        }],
+        presence_source: "sensor".into(),
+        presence_kind: PresenceEvidenceKind::Traffic,
+        observed_at: t,
+        valid_until: Some(t + Duration::seconds(30)),
+    }
+}
+
+#[tokio::test]
+async fn committed_discovery_enrollment_is_post_commit_and_unknown_expires_after_48_hours()
+-> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let pool = connect_path(&dir.path().join("policy.db")).await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let sources = DiscoverySources::sensor(7, "sensor", vec![EvidenceFamily::LinkLayer])?;
+    let mut pipeline = PersistentDiscoveryPipeline::open(
+        M2StateRepository::new(pool.clone()),
+        sources,
+        [DeviceId::new()].into_iter(),
+        Default::default(),
+        8,
+        8,
+    )
+    .await?;
+    let committed = match pipeline
+        .observe_with_flow(observation(at(60)), &[], 0, at(60))
+        .await?
+    {
+        DiscoveryPipelineOutcome::Committed(value) => value,
+        _ => unreachable!(),
+    };
+    let actuator = FakeActuator::default();
+    let coordinator = PolicyCoordinator::with_actuator(repo.clone(), None, actuator.clone());
+    let pending = coordinator
+        .enroll_and_evaluate(committed.result.device_id, at(84))
+        .await?;
+    assert_eq!(pending.requested_action, RequestedAction::None);
+    assert_eq!(
+        pending.evaluation.warning,
+        Some(lattice_domain::DeadlineWarning::Hours24)
+    );
+    let expired = coordinator
+        .enroll_and_evaluate(committed.result.device_id, at(108))
+        .await?;
+    assert_eq!(expired.requested_action, RequestedAction::Quarantine);
+    assert_eq!(expired.enforcement, EnforcementResult::Verified);
+    assert_eq!(actuator.0.load(Ordering::SeqCst), 1);
+    Ok(())
+}

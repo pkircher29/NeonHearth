@@ -1264,6 +1264,7 @@ dependencies = [
  "lattice-domain",
  "lattice-event-bus",
  "lattice-intelligence",
+ "lattice-policy",
  "lattice-sensor",
  "lattice-store",
  "secrecy",
