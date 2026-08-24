@@ -89,3 +89,21 @@ fn camera_contracts_round_trip_through_json() {
         evidence
     );
 }
+
+#[test]
+fn camera_contracts_reject_oversized_json_text_before_retaining_it() {
+    let source = "x".repeat(10_000);
+    let escaped = "\\u0078".repeat(10_000);
+    for value in [source, escaped] {
+        let json =
+            format!(r#"{{"kind":"onvif","source":"{value}","fact":"camera","confidence":0.9}}"#);
+        assert!(serde_json::from_str::<EvidenceInput>(&json).is_err());
+    }
+    let fact = "x".repeat(10_000);
+    let escaped = "\\u0063".repeat(10_000);
+    for value in [fact, escaped] {
+        let json =
+            format!(r#"{{"kind":"onvif","source":"source","fact":"{value}","confidence":0.9}}"#);
+        assert!(serde_json::from_str::<EvidenceInput>(&json).is_err());
+    }
+}

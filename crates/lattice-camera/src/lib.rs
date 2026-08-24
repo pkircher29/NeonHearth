@@ -1,3 +1,4 @@
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use thiserror::Error;
@@ -118,20 +119,97 @@ impl EvidenceInput {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 struct EvidenceInputWire {
     kind: CameraKind,
-    source: String,
-    fact: String,
+    source: BoundedText<128>,
+    fact: BoundedText<256>,
     confidence: Confidence,
+}
+
+impl Serialize for EvidenceInputWire {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("EvidenceInput", 4)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("source", &self.source)?;
+        state.serialize_field("fact", &self.fact)?;
+        state.serialize_field("confidence", &self.confidence)?;
+        state.end()
+    }
+}
+
+struct BoundedText<const MAX: usize>(String);
+
+impl<const MAX: usize> BoundedText<MAX> {
+    fn validate(value: &str) -> Result<(), CameraError> {
+        if value.trim().is_empty() || value.len() > MAX {
+            Err(CameraError::InvalidEvidence("text"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<const MAX: usize> Serialize for BoundedText<MAX> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de, const MAX: usize> Deserialize<'de> for BoundedText<MAX> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BoundedTextVisitor<const MAX: usize>;
+        impl<'de, const MAX: usize> Visitor<'de> for BoundedTextVisitor<MAX> {
+            type Value = BoundedText<MAX>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a bounded non-empty string")
+            }
+            fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+                Self::check(value)
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Self::check(value)
+            }
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                BoundedText::<MAX>::validate(&value).map_err(E::custom)?;
+                Ok(BoundedText(value))
+            }
+        }
+        impl<const MAX: usize> BoundedTextVisitor<MAX> {
+            fn check<E: de::Error>(value: &str) -> Result<BoundedText<MAX>, E> {
+                BoundedText::<MAX>::validate(value).map_err(E::custom)?;
+                Ok(BoundedText(value.to_owned()))
+            }
+        }
+        deserializer.deserialize_string(BoundedTextVisitor::<MAX>)
+    }
+}
+
+impl<'de> Deserialize<'de> for EvidenceInputWire {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            kind: CameraKind,
+            source: BoundedText<128>,
+            fact: BoundedText<256>,
+            confidence: Confidence,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            kind: wire.kind,
+            source: wire.source,
+            fact: wire.fact,
+            confidence: wire.confidence,
+        })
+    }
 }
 
 impl Serialize for EvidenceInput {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         EvidenceInputWire {
             kind: self.kind,
-            source: self.source.clone(),
-            fact: self.fact.clone(),
+            source: BoundedText(self.source.clone()),
+            fact: BoundedText(self.fact.clone()),
             confidence: self.confidence,
         }
         .serialize(serializer)
@@ -141,7 +219,7 @@ impl Serialize for EvidenceInput {
 impl<'de> Deserialize<'de> for EvidenceInput {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = EvidenceInputWire::deserialize(deserializer)?;
-        Self::new(wire.kind, wire.source, wire.fact, wire.confidence)
+        Self::new(wire.kind, wire.source.0, wire.fact.0, wire.confidence)
             .map_err(serde::de::Error::custom)
     }
 }
