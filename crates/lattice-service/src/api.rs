@@ -12,6 +12,16 @@ use serde::Serialize;
 use std::fmt;
 use tokio::time::Instant;
 use utoipa::{Modify, OpenApi, PartialSchema, ToSchema};
+
+fn parse_canonical_camera_id(value: &str) -> Result<lattice_camera::CameraId, StatusCode> {
+    if value.len() != 36 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let uuid = uuid::Uuid::parse_str(value).map_err(|_| StatusCode::BAD_REQUEST)?;
+    (uuid.hyphenated().to_string() == value)
+        .then(|| lattice_camera::CameraId::from_uuid(uuid))
+        .ok_or(StatusCode::BAD_REQUEST)
+}
 #[derive(Serialize, ToSchema)]
 pub struct Health {
     pub status: &'static str,
@@ -208,9 +218,7 @@ pub async fn camera(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<CameraDetail>, StatusCode> {
-    let id = uuid::Uuid::parse_str(&id)
-        .map(lattice_camera::CameraId::from_uuid)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id = parse_canonical_camera_id(&id)?;
     let repo = lattice_store::CameraRepository::new(state.state_repository().pool().clone());
     let r = repo
         .load_camera(id)
@@ -236,9 +244,7 @@ pub async fn camera_health(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<CameraHealth>, StatusCode> {
-    let id = uuid::Uuid::parse_str(&id)
-        .map(lattice_camera::CameraId::from_uuid)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id = parse_canonical_camera_id(&id)?;
     let repo = lattice_store::CameraRepository::new(state.state_repository().pool().clone());
     let r = repo
         .load_camera(id)
@@ -256,9 +262,7 @@ pub async fn camera_inventory(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Option<CameraInventoryProjection>>, StatusCode> {
-    let id = uuid::Uuid::parse_str(&id)
-        .map(lattice_camera::CameraId::from_uuid)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id = parse_canonical_camera_id(&id)?;
     let repo = lattice_store::CameraRepository::new(state.state_repository().pool().clone());
     if repo
         .load_camera(id)

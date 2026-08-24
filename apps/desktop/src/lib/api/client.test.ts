@@ -70,6 +70,33 @@ describe('createApiClient', () => {
     await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(null, { status: 503 })) }).closeCameraSession(id)).rejects.toThrow('503');
   });
 
+  it('enforces lowercase canonical opaque IDs, confidence/enums, and 128-byte inventory bounds', async () => {
+    const id = 'abcdef01-2345-0000-0000-000000000001';
+    const inventory = (size: number) => ({ manufacturer: 'x'.repeat(size), model: null, firmware: null, serial: null, capabilities: ['x'.repeat(size)], health: 'healthy' });
+    const summary = { camera_id: id, classification: 'camera', confidence: 0, health: 'healthy', observed_at: '2026-01-01T00:00:00Z' };
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/inventory')) return new Response(JSON.stringify(inventory(128)), { status: 200 });
+      return new Response(JSON.stringify({ ...summary, inventory: inventory(128) }), { status: 200 });
+    });
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+    await expect(client.camera(id)).resolves.toMatchObject({ camera_id: id });
+    await expect(client.cameraInventory(id)).resolves.toEqual(inventory(128));
+    for (const invalid of [id.toUpperCase(), '00000000-0000-0000-0000-00000000001', 'not-an-id']) {
+      await expect(client.camera(invalid)).rejects.toThrow('Invalid camera id');
+    }
+    for (const malformed of [
+      { ...summary, confidence: -0.01, inventory: inventory(128) },
+      { ...summary, confidence: 1.01, inventory: inventory(128) },
+      { ...summary, classification: 'invented', inventory: inventory(128) },
+      { ...summary, health: 'invented', inventory: inventory(128) },
+      { ...summary, inventory: inventory(129) },
+    ]) {
+      const bad = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 })) });
+      await expect(bad.camera(id)).rejects.toThrow('Invalid camera response');
+    }
+  });
+
   it('accepts a fully typed snapshot and rejects malformed nested projections', async () => {
     const snapshot = { sequence: 1, devices: [validDevice], next_after: null, service_status: 'ready' };
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200 }));

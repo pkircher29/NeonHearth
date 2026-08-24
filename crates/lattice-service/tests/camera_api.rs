@@ -445,3 +445,106 @@ async fn authenticated_camera_projection_is_sanitized_and_bounded() {
         assert!(!text.contains(secret));
     }
 }
+
+#[tokio::test]
+async fn canonical_version_zero_ids_are_accepted_but_noncanonical_ids_are_rejected() {
+    let (router, id) = fixture().await;
+    assert_eq!(id.to_string(), "00000000-0000-0000-0000-000000000001");
+    for uri in [
+        format!("/api/v1/cameras/{id}"),
+        format!("/api/v1/cameras/{id}/health"),
+        format!("/api/v1/cameras/{id}/inventory"),
+        format!("/api/v1/cameras/{id}/snapshot?stream_id={id}"),
+    ] {
+        assert_ne!(
+            response(&router, uri).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let uppercase = "ABCDEF01-2345-0000-0000-000000000001";
+    for value in [
+        "not-a-uuid",                              // malformed
+        "00000000-0000-0000-0000-000000000001%20", // trailing space
+        uppercase.as_str(),
+    ] {
+        assert_eq!(
+            response(&router, format!("/api/v1/cameras/{value}"))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "{value}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn camera_openapi_schema_has_all_boundary_constraints() {
+    let (router, _) = fixture().await;
+    let body = axum::body::to_bytes(
+        response(&router, "/api/v1/openapi.json".into())
+            .await
+            .into_body(),
+        512 * 1024,
+    )
+    .await
+    .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let uuid_pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+    for path in [
+        "/api/v1/cameras",
+        "/api/v1/cameras/{id}",
+        "/api/v1/cameras/{id}/health",
+        "/api/v1/cameras/{id}/inventory",
+        "/api/v1/cameras/{id}/snapshot",
+        "/api/v1/cameras/{id}/sessions",
+        "/api/v1/camera-sessions/{id}",
+        "/api/v1/camera-sessions/{id}/playlist.m3u8",
+        "/api/v1/camera-sessions/{id}/segments/{segment}",
+    ] {
+        let operation = doc["paths"][path]
+            .get("get")
+            .or_else(|| doc["paths"][path].get("post"))
+            .or_else(|| doc["paths"][path].get("delete"))
+            .unwrap();
+        for parameter in operation["parameters"].as_array().unwrap_or(&vec![]) {
+            let schema = &parameter["schema"];
+            if parameter["name"] == "id"
+                || parameter["name"] == "after"
+                || parameter["name"] == "stream_id"
+            {
+                assert_eq!(schema["pattern"], uuid_pattern);
+                assert_eq!(schema["minLength"], 36);
+                assert_eq!(schema["maxLength"], 36);
+            }
+        }
+    }
+    let schemas = &doc["components"]["schemas"];
+    for name in ["CameraSummary", "CameraDetail"] {
+        assert_eq!(schemas[name]["properties"]["confidence"]["minimum"], 0.0);
+        assert_eq!(schemas[name]["properties"]["confidence"]["maximum"], 1.0);
+    }
+    assert_eq!(
+        schemas["CameraHealth"]["properties"]["confidence"]["minimum"],
+        0.0
+    );
+    assert_eq!(
+        schemas["CameraHealth"]["properties"]["confidence"]["maximum"],
+        1.0
+    );
+    for field in ["manufacturer", "model", "firmware", "serial"] {
+        assert_eq!(
+            schemas["CameraInventoryProjection"]["properties"][field]["maxLength"],
+            128
+        );
+    }
+    assert_eq!(
+        schemas["CameraInventoryProjection"]["properties"]["capabilities"]["maxItems"],
+        32
+    );
+    assert!(
+        schemas["CameraSummary"]["properties"]["classification"]["pattern"]
+            .as_str()
+            .unwrap()
+            .contains("possible_camera")
+    );
+}
