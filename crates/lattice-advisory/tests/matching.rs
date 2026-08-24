@@ -194,15 +194,26 @@ fn compose_risk_rejects_mixed_source_ids() {
 fn absent_optional_identity_fields_never_contradict_or_match_exactly() {
     let d = DeviceIdentity::new("Acme", None, None).unwrap();
     let a = advisory("Acme", Some("Cam-1"), exact("unknown"));
-    assert_eq!(
-        match_advisory(&d, &a).unwrap().label(),
-        MatchLabel::Possible
-    );
+    let matched = match_advisory(&d, &a).unwrap();
+    assert_eq!(matched.label(), MatchLabel::Possible);
+    assert_eq!(matched.matched_fields(), &[MatchedField::Vendor]);
     let generic = advisory("unknown", None, VersionConstraint::Any);
     assert_eq!(
         match_advisory(&d, &generic).unwrap().label(),
         MatchLabel::Unknown
     );
+}
+
+#[test]
+fn advisory_match_serializes_as_output_contract() {
+    let matched = match_advisory(
+        &device("Acme", "Cam-1", "1.2"),
+        &advisory("Acme", Some("Cam-1"), exact("1.2")),
+    )
+    .unwrap();
+    let json = serde_json::to_value(&matched).unwrap();
+    assert_eq!(json["label"], "Exact");
+    assert!(json["matched_fields"].is_array());
 }
 
 #[test]

@@ -101,7 +101,7 @@ pub enum MatchedField {
     Model,
     Firmware,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AdvisoryMatch {
     label: MatchLabel,
     matched_fields: Vec<MatchedField>,
@@ -232,13 +232,16 @@ pub fn match_advisory<D: DeviceInput>(
         ));
     }
     let mut fields = Vec::new();
-    if !input.vendor.eq_ignore_ascii_case("unknown") {
+    if !input.vendor.eq_ignore_ascii_case("unknown") && vendor_match {
         fields.push(MatchedField::Vendor);
     }
-    if input.model.is_some() {
+    if input.model.is_some() && device.model().is_some() && model_match {
         fields.push(MatchedField::Model);
     }
-    if matches!(input.firmware, VersionConstraint::Exact(_)) {
+    if matches!(input.firmware, VersionConstraint::Exact(_))
+        && device.firmware().is_some()
+        && firmware_match
+    {
         fields.push(MatchedField::Firmware);
     }
     let exact_allowed = !input.vendor.eq_ignore_ascii_case("unknown")
