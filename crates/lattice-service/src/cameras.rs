@@ -1211,26 +1211,16 @@ mod safe_file_tests {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StartSessionRequest {
-    stream_id: String,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct StartSessionResponse {
-    session_id: HlsSessionId,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotQuery {
     stream_id: Option<String>,
 }
 
+#[utoipa::path(post, path = "/api/v1/cameras/{id}/sessions", request_body = crate::api::CameraSessionRequest, responses((status = 201, body = crate::api::CameraSessionResponse), (status = 400), (status = 401), (status = 404), (status = 429), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn start_session_route(
     _: Authorized,
     State(state): State<AppState>,
     path: Result<AxumPath<String>, axum::extract::rejection::PathRejection>,
-    body: Result<Json<StartSessionRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<crate::api::CameraSessionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -1245,8 +1235,8 @@ pub(crate) async fn start_session_route(
     match manager.start_session(camera, stream).await {
         Ok(session) => (
             StatusCode::CREATED,
-            Json(StartSessionResponse {
-                session_id: session.id().clone(),
+            Json(crate::api::CameraSessionResponse {
+                session_id: session.id().to_string(),
             }),
         )
             .into_response(),
@@ -1254,6 +1244,7 @@ pub(crate) async fn start_session_route(
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/camera-sessions/{id}/playlist.m3u8", responses((status = 200, content_type = "application/vnd.apple.mpegurl", body = String), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn playlist_route(
     _: Authorized,
     State(state): State<AppState>,
@@ -1262,6 +1253,7 @@ pub(crate) async fn playlist_route(
     file_route(state, path, None).await
 }
 
+#[utoipa::path(get, path = "/api/v1/camera-sessions/{id}/segments/{segment}", responses((status = 200, content_type = "video/mp2t", body = String), (status = 400), (status = 401), (status = 404), (status = 413), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn segment_route(
     _: Authorized,
     State(state): State<AppState>,
@@ -1302,6 +1294,7 @@ async fn file_route(
     }
 }
 
+#[utoipa::path(delete, path = "/api/v1/camera-sessions/{id}", responses((status = 204), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn close_session_route(
     _: Authorized,
     State(state): State<AppState>,
@@ -1322,6 +1315,7 @@ pub(crate) async fn close_session_route(
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/cameras/{id}/snapshot", params(("stream_id" = Option<String>, Query)), responses((status = 200, content_type = "image/jpeg", body = String), (status = 400), (status = 401), (status = 404), (status = 413), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn snapshot_route(
     _: Authorized,
     State(state): State<AppState>,

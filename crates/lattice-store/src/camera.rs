@@ -124,9 +124,15 @@ impl CameraRepository {
         if !(1..=256).contains(&limit) {
             return Err(CameraStoreError::Invalid);
         }
-        let mut query = sqlx::query_as::<_, (String, String, f64, String, String)>("SELECT camera_id, classification, confidence, health, observed_at FROM cameras WHERE (? IS NULL OR camera_id > ?) ORDER BY camera_id LIMIT ?");
-        query = query.bind(after.map(|id| id.to_string())).bind(after.map(|id| id.to_string())).bind(i64::try_from(limit + 1).map_err(|_| CameraStoreError::Invalid)?);
-        let rows: Vec<(String, String, f64, String, String)> = query.fetch_all(&self.pool).await.map_err(map_sqlx)?;
+        let mut query = sqlx::query_as::<_, (String, String, f64, String, String)>(
+            "SELECT camera_id, classification, confidence, health, observed_at FROM cameras WHERE (? IS NULL OR camera_id > ?) ORDER BY camera_id LIMIT ?",
+        );
+        query = query
+            .bind(after.map(|id| id.to_string()))
+            .bind(after.map(|id| id.to_string()))
+            .bind(i64::try_from(limit + 1).map_err(|_| CameraStoreError::Invalid)?);
+        let rows: Vec<(String, String, f64, String, String)> =
+            query.fetch_all(&self.pool).await.map_err(map_sqlx)?;
         let has_more = rows.len() > limit;
         let mut out = Vec::new();
         for (raw_id, classification, confidence, health, observed_at) in rows {

@@ -25,6 +25,11 @@ pub struct CameraSummary {
     pub observed_at: DateTime<Utc>,
 }
 #[derive(Serialize, ToSchema)]
+pub struct CameraList {
+    pub items: Vec<CameraSummary>,
+    pub next_after: Option<String>,
+}
+#[derive(Serialize, ToSchema)]
 pub struct CameraDetail {
     pub camera_id: String,
     pub classification: String,
@@ -47,9 +52,31 @@ pub struct CameraInventoryProjection {
     pub capabilities: Vec<String>,
     pub health: String,
 }
+
+impl From<lattice_store::CameraInventoryRecord> for CameraInventoryProjection {
+    fn from(value: lattice_store::CameraInventoryRecord) -> Self {
+        Self {
+            manufacturer: value.manufacturer.map(|value| value.as_str().to_owned()),
+            model: value.model.map(|value| value.as_str().to_owned()),
+            firmware: value.firmware.map(|value| value.as_str().to_owned()),
+            serial: value.serial.map(|value| value.as_str().to_owned()),
+            capabilities: value
+                .capabilities
+                .into_iter()
+                .map(|value| value.as_str().to_owned())
+                .collect(),
+            health: format!("{:?}", value.health).to_lowercase(),
+        }
+    }
+}
 #[derive(Serialize, ToSchema)]
 pub struct CameraSessionResponse {
     pub session_id: String,
+}
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CameraSessionRequest {
+    pub stream_id: String,
 }
 #[derive(Deserialize)]
 pub struct CameraQuery {
@@ -57,12 +84,12 @@ pub struct CameraQuery {
     pub after: Option<lattice_camera::CameraId>,
 }
 
-#[utoipa::path(get, path = "/api/v1/cameras", responses((status = 200, body = serde_json::Value), (status = 401), (status = 400)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras", params(("limit" = Option<usize>, Query), ("after" = Option<String>, Query)), responses((status = 200, body = CameraList), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
 pub async fn cameras(
     _: Authorized,
     State(state): State<AppState>,
     query: Result<Query<CameraQuery>, axum::extract::rejection::QueryRejection>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<CameraList>, StatusCode> {
     let Query(query) = query.map_err(|_| StatusCode::BAD_REQUEST)?;
     let limit = query.limit.unwrap_or(128);
     if !(1..=256).contains(&limit) {
@@ -83,9 +110,14 @@ pub async fn cameras(
             observed_at: r.observed_at,
         })
         .collect::<Vec<_>>();
-    Ok(Json(serde_json::json!({"items": items, "next_after": has_more.then(|| items.last().map(|x| x.camera_id.clone())).flatten()})))
+    Ok(Json(CameraList {
+        next_after: has_more
+            .then(|| items.last().map(|item| item.camera_id.clone()))
+            .flatten(),
+        items,
+    }))
 }
-#[utoipa::path(get, path = "/api/v1/cameras/{id}", responses((status = 200, body = CameraDetail), (status = 401), (status = 404)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras/{id}", responses((status = 200, body = CameraDetail), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub async fn camera(
     _: Authorized,
     State(state): State<AppState>,
@@ -106,10 +138,14 @@ pub async fn camera(
         confidence: r.confidence.get(),
         health: format!("{:?}", r.health).to_lowercase(),
         observed_at: r.observed_at,
-        inventory: None,
+        inventory: repo
+            .load_inventory(id)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .map(CameraInventoryProjection::from),
     }))
 }
-#[utoipa::path(get, path = "/api/v1/cameras/{id}/health", responses((status = 200, body = CameraHealth), (status = 401), (status = 404)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras/{id}/health", responses((status = 200, body = CameraHealth), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub async fn camera_health(
     _: Authorized,
     State(state): State<AppState>,
@@ -129,7 +165,7 @@ pub async fn camera_health(
         confidence: r.confidence.get(),
     }))
 }
-#[utoipa::path(get, path = "/api/v1/cameras/{id}/inventory", responses((status = 200, body = CameraInventoryProjection), (status = 401), (status = 404)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras/{id}/inventory", responses((status = 200, body = Option<CameraInventoryProjection>), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub async fn camera_inventory(
     _: Authorized,
     State(state): State<AppState>,
@@ -139,24 +175,19 @@ pub async fn camera_inventory(
         .map(lattice_camera::CameraId::from_uuid)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let repo = lattice_store::CameraRepository::new(state.state_repository().pool().clone());
+    if repo
+        .load_camera(id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .is_none()
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let r = repo
         .load_inventory(id)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok(Json(r.map(|x| {
-        CameraInventoryProjection {
-            manufacturer: x.manufacturer.map(|v| v.as_str().to_owned()),
-            model: x.model.map(|v| v.as_str().to_owned()),
-            firmware: x.firmware.map(|v| v.as_str().to_owned()),
-            serial: x.serial.map(|v| v.as_str().to_owned()),
-            capabilities: x
-                .capabilities
-                .into_iter()
-                .map(|v| v.as_str().to_owned())
-                .collect(),
-            health: format!("{:?}", x.health).to_lowercase(),
-        }
-    })))
+    Ok(Json(r.map(CameraInventoryProjection::from)))
 }
 #[derive(Serialize, ToSchema)]
 pub struct Snapshot {
@@ -482,7 +513,7 @@ pub async fn event_ticket(
     }))
 }
 #[derive(OpenApi)]
-#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction, CameraSummary, CameraDetail, CameraHealth, CameraInventoryProjection, CameraSessionResponse)), modifiers(&SecurityAddon))]
+#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse)), modifiers(&SecurityAddon))]
 pub struct ApiDoc;
 struct SecurityAddon;
 impl Modify for SecurityAddon {

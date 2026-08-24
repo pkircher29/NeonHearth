@@ -12,6 +12,25 @@ describe('createApiClient', () => {
     policy: null
   };
 
+  it('rejects a camera detail with an extra field or without inventory', async () => {
+    const camera = {
+      camera_id: '018f47a0-9b5c-7a22-8a33-112233445599', classification: 'camera', confidence: 0.9,
+      health: 'healthy', observed_at: '2026-01-01T00:00:00Z'
+    };
+    for (const malformed of [camera, { ...camera, inventory: null, endpoint: 'rtsp://unsafe.invalid' }]) {
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 }));
+      await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl }).camera(camera.camera_id)).rejects.toThrow('Invalid camera response');
+    }
+  });
+
+  it('requests and strictly validates camera health', async () => {
+    const id = '018f47a0-9b5c-7a22-8a33-112233445599';
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ health: 'healthy', confidence: 0.9 }), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+    await expect(client.cameraHealth(id)).resolves.toEqual({ health: 'healthy', confidence: 0.9 });
+    expect(fetchImpl).toHaveBeenCalledWith(`https://collector.example/api/v1/cameras/${id}/health`, { method: 'GET', headers: { Authorization: 'Bearer secret' } });
+  });
+
   it('accepts a fully typed snapshot and rejects malformed nested projections', async () => {
     const snapshot = { sequence: 1, devices: [validDevice], next_after: null, service_status: 'ready' };
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200 }));
