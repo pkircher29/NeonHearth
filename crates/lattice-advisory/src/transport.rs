@@ -141,7 +141,20 @@ impl FeedRequest {
             if start > end || end - start > Duration::days(120) {
                 return Err(TransportError::InvalidWindow);
             }
-            if Self::nvd(self.start_index, self.results_per_page, start, end)?.url != self.url {
+            let mut canonical = Url::parse(NVD_URL).expect("constant NVD URL is valid");
+            canonical
+                .query_pairs_mut()
+                .append_pair(
+                    "lastModStartDate",
+                    &start.to_rfc3339_opts(SecondsFormat::Millis, true),
+                )
+                .append_pair(
+                    "lastModEndDate",
+                    &end.to_rfc3339_opts(SecondsFormat::Millis, true),
+                )
+                .append_pair("startIndex", &self.start_index.to_string())
+                .append_pair("resultsPerPage", &self.results_per_page.to_string());
+            if canonical.as_str() != self.url {
                 return Err(TransportError::UnsafeUrl);
             }
         }

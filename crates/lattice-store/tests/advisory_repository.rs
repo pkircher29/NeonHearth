@@ -210,6 +210,41 @@ async fn failed_fetches_are_stale_and_url_contract_is_strict() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn official_feed_urls_accept_only_canonical_transport_shapes() -> anyhow::Result<()> {
+    let start =
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000Z")?.with_timezone(&Utc);
+    let end = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00.000Z")?.with_timezone(&Utc);
+    let canonical = lattice_advisory::transport::FeedRequest::nvd(0, 1000, start, end)?.url;
+    assert!(FeedFetch::new(AdvisorySource::Nvd, canonical, at(10), at(20)).is_ok());
+    for bad in [
+        "https://services.nvd.nist.gov:443/rest/json/cves/2.0",
+        "https://services.nvd.nist.gov/rest/json/cves/2.0?startIndex=0",
+        "https://services.nvd.nist.gov/rest/json/cves/2.0?startIndex=0&startIndex=1&resultsPerPage=1000&lastModStartDate=2026-01-01T00%3A00%3A00.000Z&lastModEndDate=2026-01-02T00%3A00%3A00.000Z",
+        "https://services.nvd.nist.gov/rest/json/cves/2.0?startIndex=0&resultsPerPage=999999&lastModStartDate=2026-01-01T00%3A00%3A00.000Z&lastModEndDate=2026-01-02T00%3A00%3A00.000Z",
+        "https://services.nvd.nist.gov/rest/json/cves/2.0?startIndex=x&resultsPerPage=1000&lastModStartDate=garbage&lastModEndDate=garbage",
+    ] {
+        assert_eq!(
+            FeedFetch::new(AdvisorySource::Nvd, bad.into(), at(10), at(20)).unwrap_err(),
+            AdvisoryStoreError::Invalid
+        );
+    }
+    let cisa =
+        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
+    assert!(FeedFetch::new(AdvisorySource::CisaKev, cisa.into(), at(10), at(20)).is_ok());
+    for bad in [
+        format!("{cisa}?x=1"),
+        "https://www.cisa.gov:443/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+            .into(),
+    ] {
+        assert_eq!(
+            FeedFetch::new(AdvisorySource::CisaKev, bad, at(10), at(20)).unwrap_err(),
+            AdvisoryStoreError::Invalid
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn conflict_returns_the_persisted_id_and_content_hash_tampering_fails_closed()
 -> anyhow::Result<()> {
     let pool = connect_memory().await?;
