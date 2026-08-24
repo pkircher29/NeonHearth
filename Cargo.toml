@@ -10,6 +10,7 @@ members = [
     "crates/lattice-policy",
     "crates/lattice-service",
     "crates/lattice-advisory",
+    "crates/lattice-audit-wasm",
     "crates/lattice-w6",
     "tools/fixture-gen",
     "tools/w6-fixture-recorder",
@@ -53,6 +54,7 @@ surge-ping = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 sha2 = "0.10"
+ed25519-dalek = { version = "3.0.0", default-features = false }
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 x509-parser = "0.18"
