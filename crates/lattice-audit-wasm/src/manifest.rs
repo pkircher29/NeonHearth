@@ -85,6 +85,18 @@ pub enum AuditError {
     UnsafeSideEffects(SideEffectProfile),
     #[error("manifest exceeds maximum wasm size")]
     WasmTooLarge,
+    #[error("forbidden wasm import: {0}")]
+    ForbiddenImport(String),
+    #[error("wasm fuel exhausted")]
+    FuelExhausted,
+    #[error("wasm execution timed out")]
+    TimedOut,
+    #[error("wasm memory limit exceeded")]
+    MemoryLimitExceeded,
+    #[error("wasm output limit exceeded")]
+    OutputLimitExceeded,
+    #[error("wasm trap")]
+    Trap,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -507,6 +519,7 @@ impl AuditManifest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedManifest {
     inner: AuditManifest,
+    wasm: Vec<u8>,
 }
 impl VerifiedManifest {
     pub fn module_id(&self) -> &str {
@@ -520,6 +533,9 @@ impl VerifiedManifest {
     }
     pub fn manifest(&self) -> &AuditManifest {
         &self.inner
+    }
+    pub(crate) fn wasm(&self) -> &[u8] {
+        &self.wasm
     }
 }
 pub fn verify_manifest(
@@ -556,6 +572,7 @@ pub fn verify_manifest(
         .map_err(|_| AuditError::InvalidSignature)?;
     Ok(VerifiedManifest {
         inner: manifest.clone(),
+        wasm: wasm.to_vec(),
     })
 }
 fn put_str(out: &mut Vec<u8>, s: &str) {
