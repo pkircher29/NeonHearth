@@ -1,4 +1,4 @@
-import type { Bandwidth, DeviceSnapshot, Evidence, EventTicket, Health, Identity, Presence, ServerMessage, Snapshot } from './types';
+import type { Bandwidth, BandwidthFrame, DeviceSnapshot, Evidence, EventTicket, Health, Identity, Presence, ServerMessage, Snapshot } from './types';
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
@@ -46,11 +46,18 @@ function isServerMessage(value: unknown): value is ServerMessage {
   if (!isSequence(event.sequence) || !isDate(event.occurred_at) || !isRecord(event.payload)) return false;
   const payload = event.payload;
   if (payload.type === 'service_status') return isRecord(payload.data) && typeof payload.data.state === 'string' && typeof payload.data.detail === 'string';
+  if (payload.type === 'bandwidth_frame') return isBandwidthFrame(payload.data);
   return payload.type === 'presence_changed' && isRecord(payload.data)
+    && isSequence(payload.data.transition_id)
     && typeof payload.data.device_id === 'string'
     && typeof payload.data.from === 'string'
     && typeof payload.data.to === 'string'
-    && typeof payload.data.reason === 'string';
+    && typeof payload.data.reason === 'string'
+    && isDate(payload.data.occurred_at) && typeof payload.data.trigger_source === 'string'
+    && typeof payload.data.trigger_kind === 'string' && isDate(payload.data.evidence_observed_at)
+    && (payload.data.evidence_valid_until === null || isDate(payload.data.evidence_valid_until))
+    && isDate(payload.data.trigger_arrival_at)
+    && (payload.data.correction_of === null || isSequence(payload.data.correction_of));
 }
 
 function isHealth(value: unknown): value is Health {
@@ -95,6 +102,12 @@ function isBandwidth(value: unknown): value is Bandwidth {
   if (!value.available) return fields.every((field) => field === null);
   return isBytes(value.upload) && isBytes(value.download) && typeof value.coverage === 'string'
     && coverages.has(value.coverage) && isDate(value.observed_at);
+}
+function isBandwidthFrame(value: unknown): value is BandwidthFrame {
+  if (!isRecord(value) || !isSequence(value.interval_ms) || value.interval_ms < 1 || !isDate(value.observed_at) || !isDate(value.emitted_at) || !Array.isArray(value.samples) || value.samples.length > 4096) return false;
+  return value.samples.every((sample) => isRecord(sample) && isDeviceId(sample.device_id) && isRecord(sample.delta)
+    && isBytes(sample.delta.upload) && isBytes(sample.delta.download) && isBytes(sample.upload_bytes_per_second)
+    && isBytes(sample.download_bytes_per_second) && typeof sample.coverage === 'string' && coverages.has(sample.coverage));
 }
 function isDeviceSnapshot(value: unknown): value is DeviceSnapshot {
   return isRecord(value) && isDeviceId(value.device_id) && isDate(value.first_seen_at) && isDate(value.last_seen_at)

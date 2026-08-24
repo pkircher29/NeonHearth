@@ -1,45 +1,9 @@
-import type { ServerMessage, Snapshot } from '../api/types';
-
-export interface LiveState {
-  sequence: number;
-  connected: boolean;
-  needsResync: boolean;
-  serviceStatus: string;
-}
-
-export const initialLiveState: LiveState = {
-  sequence: 0,
-  connected: false,
-  needsResync: false,
-  serviceStatus: 'unknown'
-};
-
-export function reduceLiveMessage(state: LiveState, message: ServerMessage): LiveState {
-  if (state.needsResync) return state;
-
-  if (message.type === 'resync_required') {
-    return { ...state, connected: false, needsResync: true };
-  }
-
-  const { data } = message;
-  if (data.sequence <= state.sequence) return state;
-  if (data.sequence > state.sequence + 1) {
-    return { ...state, connected: false, needsResync: true };
-  }
-
-  return {
-    sequence: data.sequence,
-    connected: true,
-    needsResync: false,
-    serviceStatus: data.payload.type === 'service_status' ? data.payload.data.state : state.serviceStatus
-  };
-}
-
-export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
-  return {
-    sequence: snapshot.sequence,
-    connected: true,
-    needsResync: false,
-    serviceStatus: snapshot.service_status
-  };
-}
+import type { DeviceSnapshot, ServerMessage, Snapshot, Coverage } from '../api/types';
+export interface ThroughputPoint { at:string; upload:number; download:number }
+export interface LiveState { sequence:number; connected:boolean; needsResync:boolean; serviceStatus:string; devices:Record<string,DeviceSnapshot>; deviceOrder:string[]; throughput:ThroughputPoint[]; timeline:ServerMessage[]; coverage:Coverage|'unavailable'|'mixed'; aggregate:{upload:number;download:number}; protocolMix:null }
+export const initialLiveState:LiveState={sequence:0,connected:false,needsResync:false,serviceStatus:'unknown'} as LiveState;
+const sum=(s:LiveState):LiveState=>{const v=Object.values(s.devices).map(d=>d.bandwidth).filter(b=>b.available),c=new Set(v.map(b=>b.coverage));return {...s,aggregate:{upload:v.reduce((n,b)=>n+(b.upload??0),0),download:v.reduce((n,b)=>n+(b.download??0),0)},coverage:c.size===0?'unavailable':c.size===1?[...c][0]! as Coverage:'mixed'};};
+export function applySnapshot(_:LiveState,x:Snapshot):LiveState{if(x.devices.length===0)return {sequence:x.sequence,connected:true,needsResync:false,serviceStatus:x.service_status} as LiveState;const devices:Record<string,DeviceSnapshot>={},order:string[]=[];for(const d of x.devices){if(!devices[d.device_id])order.push(d.device_id);devices[d.device_id]=d;}return sum({...initialLiveState,sequence:x.sequence,connected:true,serviceStatus:x.service_status,devices,deviceOrder:order,throughput:[],timeline:[],coverage:'unavailable',aggregate:{upload:0,download:0},protocolMix:null});}
+export function reduceLiveMessage(s:LiveState,m:ServerMessage):LiveState{if(s.needsResync)return s;if(m.type==='resync_required')return {...s,connected:false,needsResync:true};const e=m.data;if(e.sequence<=s.sequence)return s;if(e.sequence>s.sequence+1)return {...s,connected:false,needsResync:true};if(!('devices' in s))return {...s,sequence:e.sequence,connected:true,needsResync:false,serviceStatus:e.payload.type==='service_status'?e.payload.data.state:s.serviceStatus};let n={...s,sequence:e.sequence,connected:true,timeline:[...s.timeline,m].slice(-120)};if(e.payload.type==='service_status')n.serviceStatus=e.payload.data.state;if(e.payload.type==='presence_changed'){const d=n.devices[e.payload.data.device_id];if(d)n.devices={...n.devices,[d.device_id]:{...d,presence:{...d.presence,state:e.payload.data.to,observed_at:e.payload.data.occurred_at,source:e.payload.data.trigger_source,kind:e.payload.data.trigger_kind}}};}if(e.payload.type==='bandwidth_frame'){n.devices={...n.devices};for(const x of e.payload.data.samples){const d=n.devices[x.device_id];if(d)n.devices[x.device_id]={...d,bandwidth:{available:true,upload:x.upload_bytes_per_second,download:x.download_bytes_per_second,coverage:x.coverage,observed_at:e.payload.data.observed_at}};}const a=e.payload.data.samples.reduce((z,x)=>({upload:z.upload+x.upload_bytes_per_second,download:z.download+x.download_bytes_per_second}),{upload:0,download:0});n.throughput=[...n.throughput,{at:e.occurred_at,...a}].slice(-240);}return sum(n);}
+export function bandwidthTier(b:number):'blue'|'cyan'|'gold'|'pink'{const m=b/1_000_000;return m<=5?'blue':m<=15?'cyan':m<=30?'gold':'pink';}
+export function topDevices(s:LiveState,limit=5){return s.deviceOrder.map(id=>s.devices[id]).filter(Boolean).sort((a,b)=>(b.bandwidth.upload??0)+(b.bandwidth.download??0)-(a.bandwidth.upload??0)-(a.bandwidth.download??0)).slice(0,limit);}
