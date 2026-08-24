@@ -124,6 +124,160 @@ async fn corrupt_persisted_values_are_sanitized_as_corrupt() -> anyhow::Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn failed_fetches_are_stale_and_url_contract_is_strict() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    let repository = AdvisoryRepository::new(pool.clone());
+    let failed = FeedFetch::new(
+        AdvisorySource::Nvd,
+        "https://services.nvd.nist.gov/rest/json/cves/2.0".into(),
+        at(10),
+        at(20),
+    )?
+    .with_response_metadata(
+        Some(503),
+        None,
+        None,
+        Some(lattice_store::FeedFailureClass::Network),
+    )?;
+    repository.record_feed_fetch(&failed).await?;
+    let state: String =
+        sqlx::query_scalar("SELECT effective_freshness FROM advisory_source_fetches")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(state, "stale");
+    let redirect = FeedFetch::new(
+        AdvisorySource::Nvd,
+        "https://services.nvd.nist.gov/rest/json/cves/2.0".into(),
+        at(10),
+        at(20),
+    )?
+    .with_response_metadata(Some(302), None, None, None)?;
+    repository.record_feed_fetch(&redirect).await?;
+    let states: Vec<String> = sqlx::query_scalar(
+        "SELECT effective_freshness FROM advisory_source_fetches ORDER BY rowid",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(states, ["stale", "stale"]);
+    assert_eq!(repository.expire_sources(at(20)).await?, 0);
+    let state: String =
+        sqlx::query_scalar("SELECT effective_freshness FROM advisory_source_fetches")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(state, "stale");
+    for bad in [
+        "https://user@services.nvd.nist.gov/rest/json/cves/2.0",
+        "https://services.nvd.nist.gov/rest/json/cves/2.0#x",
+        "https://services.nvd.nist.gov/rest/json/cves/2.0 x",
+        "https://example.test/vendor#x",
+    ] {
+        assert_eq!(
+            FeedFetch::new(AdvisorySource::Nvd, bad.into(), at(10), at(20)).unwrap_err(),
+            AdvisoryStoreError::Invalid
+        );
+    }
+    assert_eq!(
+        FeedFetch::new(
+            AdvisorySource::Vendor,
+            "https://user@vendor.example.test/security".into(),
+            at(10),
+            at(20)
+        )
+        .unwrap_err(),
+        AdvisoryStoreError::Invalid
+    );
+    assert!(
+        FeedFetch::new(
+            AdvisorySource::Vendor,
+            "https://vendor.example.test/security/advisories".into(),
+            at(10),
+            at(20)
+        )
+        .is_ok()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn conflict_returns_the_persisted_id_and_content_hash_tampering_fails_closed()
+-> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    enroll(&pool, device_id()).await;
+    let repository = AdvisoryRepository::new(pool.clone());
+    let value = advisory("CVE-2026-7777");
+    let left = repository.upsert_advisory(&value).await?;
+    let right = AdvisoryRepository::new(pool.clone())
+        .upsert_advisory(&value)
+        .await?;
+    assert_eq!(left, right);
+    let matching = match_advisory(None, &value)?;
+    repository
+        .record_match(
+            right,
+            device_id(),
+            &matching,
+            RiskDimensions {
+                severity: Severity::High,
+                exploitability: Exploitability::Unknown,
+                exposure: Exposure::Unknown,
+                confidence: Confidence::Low,
+                remediation: Remediation::Unknown,
+            },
+        )
+        .await?;
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE advisories SET content_revision_sha256=? WHERE advisory_id=?")
+        .bind("0".repeat(64))
+        .bind(left.to_string())
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        repository
+            .list_device_advisories(device_id(), at(12))
+            .await
+            .unwrap_err(),
+        AdvisoryStoreError::Corrupt
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn provenance_stale_is_never_promoted_by_a_future_cache_expiry() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    enroll(&pool, device_id()).await;
+    let repository = AdvisoryRepository::new(pool);
+    let mut input = advisory("CVE-2026-8888").input().clone();
+    input.freshness = Freshness::Stale;
+    input.cache_expires_at = at(300);
+    let stale = NormalizedAdvisory::new(input)?;
+    let id = repository.upsert_advisory(&stale).await?;
+    repository
+        .record_match(
+            id,
+            device_id(),
+            &match_advisory(None, &stale)?,
+            RiskDimensions {
+                severity: Severity::High,
+                exploitability: Exploitability::Unknown,
+                exposure: Exposure::Unknown,
+                confidence: Confidence::Low,
+                remediation: Remediation::Unknown,
+            },
+        )
+        .await?;
+    assert_eq!(
+        repository
+            .list_device_advisories(device_id(), at(200))
+            .await?[0]
+            .freshness,
+        Freshness::Stale
+    );
+    Ok(())
+}
+
 async fn enroll(pool: &sqlx::SqlitePool, device: DeviceId) {
     sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at) VALUES (?, ?, ?)")
         .bind(device.to_string())

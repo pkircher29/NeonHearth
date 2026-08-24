@@ -176,7 +176,7 @@ impl AdvisoryRepository {
         value.validate()?;
         sqlx::query("INSERT INTO advisory_source_fetches(fetch_id,source,source_url,http_status,retrieved_at,cache_expires_at,effective_freshness,etag,last_modified,failure_class) VALUES(?,?,?,?,?,?,?,?,?,?)")
             .bind(Uuid::now_v7().to_string()).bind(source(value.source)).bind(&value.source_url).bind(value.http_status.map(i64::from)).bind(time(value.retrieved_at)?).bind(time(value.cache_expires_at)?)
-            .bind(freshness(if value.failure_class.is_some() || value.http_status.is_some_and(|status| status >= 400) { Freshness::Stale } else { Freshness::Fresh })).bind(&value.etag).bind(&value.last_modified).bind(value.failure_class.map(failure))
+            .bind(freshness(if value.failure_class.is_none() && value.http_status.is_none_or(|status| (200..300).contains(&status) || status == 304) { Freshness::Fresh } else { Freshness::Stale })).bind(&value.etag).bind(&value.last_modified).bind(value.failure_class.map(failure))
             .execute(&self.pool).await.map_err(map_sqlx)?;
         Ok(())
     }
@@ -297,7 +297,7 @@ fn decode_row(r: SqliteRow, now: &str) -> Result<DeviceAdvisory, AdvisoryStoreEr
     .map_err(|_| AdvisoryStoreError::Corrupt)?;
     let freshness = if advisory.input().freshness == Freshness::FutureDated {
         Freshness::FutureDated
-    } else if expires.as_str() <= now {
+    } else if advisory.input().freshness == Freshness::Stale || expires.as_str() <= now {
         Freshness::Stale
     } else {
         Freshness::Fresh

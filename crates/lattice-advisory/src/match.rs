@@ -123,6 +123,14 @@ impl AdvisoryMatch {
             || matched_fields
                 .windows(2)
                 .any(|pair| pair[0] as u8 >= pair[1] as u8)
+            || (label == MatchLabel::Exact
+                && (confidence != Confidence::High
+                    || matched_fields
+                        != [
+                            MatchedField::Vendor,
+                            MatchedField::Model,
+                            MatchedField::Firmware,
+                        ]))
         {
             return Err(MatchError::InvalidStoredMatch);
         }
