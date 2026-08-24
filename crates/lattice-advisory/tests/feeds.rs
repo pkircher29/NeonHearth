@@ -82,6 +82,26 @@ async fn nvd_minimum_size_oversized_is_typed_unavailable_without_looping() {
 }
 
 #[tokio::test]
+async fn nvd_size_reduction_budget_is_sync_wide_across_page_starts() {
+    let mut replies = vec![
+        Err(TransportError::Oversized),
+        Ok(FixtureReply::json(nvd_page(0, 2, 1))),
+    ];
+    replies.extend(std::iter::repeat_n(Err(TransportError::Oversized), 9));
+    let transport = FixtureTransport::queued(replies);
+    let feed = NvdFeed::new(transport.clone());
+    assert!(matches!(
+        feed.sync(ModifiedWindow::new(at(0), at(1)).unwrap()).await,
+        Err(FeedError::Unavailable(TransportError::Oversized))
+    ));
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 11);
+    assert!(requests.len() <= MAX_PAGE_SIZE_REDUCTIONS + 2);
+    assert!(requests[2].url.contains("startIndex=1&resultsPerPage=500"));
+    assert!(requests.last().unwrap().url.contains("resultsPerPage=1"));
+}
+
+#[tokio::test]
 async fn nvd_paginates_and_records_each_deterministic_request() {
     let transport = FixtureTransport::queued([
         Ok(FixtureReply::json(nvd_page(0, 3, 2))),

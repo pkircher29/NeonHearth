@@ -89,8 +89,8 @@ impl<T: FeedTransport> NvdFeed<T> {
         let mut first_response = None;
         let mut first_expiry = None;
         let mut results_per_page = DEFAULT_NVD_RESULTS_PER_PAGE;
+        let mut reductions = 0;
         for page in 0..MAX_PAGES {
-            let mut reductions = 0;
             let (key, response) = loop {
                 let uncached = FeedRequest::nvd(start, results_per_page, window.start, window.end)
                     .map_err(FeedError::Transport)?;
