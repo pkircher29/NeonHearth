@@ -202,7 +202,7 @@ pub async fn cameras(
         items,
     }))
 }
-#[utoipa::path(get, path = "/api/v1/cameras/{id}", responses((status = 200, body = CameraDetail), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras/{id}", params(("id" = String, Path, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 200, body = CameraDetail), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub async fn camera(
     _: Authorized,
     State(state): State<AppState>,
@@ -230,7 +230,7 @@ pub async fn camera(
             .map(CameraInventoryProjection::from),
     }))
 }
-#[utoipa::path(get, path = "/api/v1/cameras/{id}/health", responses((status = 200, body = CameraHealth), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras/{id}/health", params(("id" = String, Path, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 200, body = CameraHealth), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub async fn camera_health(
     _: Authorized,
     State(state): State<AppState>,
@@ -250,7 +250,7 @@ pub async fn camera_health(
         confidence: r.confidence.get(),
     }))
 }
-#[utoipa::path(get, path = "/api/v1/cameras/{id}/inventory", responses((status = 200, body = Option<CameraInventoryProjection>), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras/{id}/inventory", params(("id" = String, Path, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 200, body = Option<CameraInventoryProjection>), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub async fn camera_inventory(
     _: Authorized,
     State(state): State<AppState>,

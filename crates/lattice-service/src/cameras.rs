@@ -1215,7 +1215,7 @@ pub(crate) struct SnapshotQuery {
     stream_id: Option<String>,
 }
 
-#[utoipa::path(post, path = "/api/v1/cameras/{id}/sessions", request_body = crate::api::CameraSessionRequest, responses((status = 201, body = crate::api::CameraSessionResponse), (status = 400), (status = 401), (status = 404), (status = 429), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(post, path = "/api/v1/cameras/{id}/sessions", params(("id" = String, Path, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), request_body = crate::api::CameraSessionRequest, responses((status = 201, body = crate::api::CameraSessionResponse), (status = 400), (status = 401), (status = 404), (status = 429), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn start_session_route(
     _: Authorized,
     State(state): State<AppState>,
@@ -1244,7 +1244,7 @@ pub(crate) async fn start_session_route(
     }
 }
 
-#[utoipa::path(get, path = "/api/v1/camera-sessions/{id}/playlist.m3u8", responses((status = 200, content_type = "application/vnd.apple.mpegurl", body = String), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/camera-sessions/{id}/playlist.m3u8", params(("id" = String, Path, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 200, content_type = "application/vnd.apple.mpegurl", body = String), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn playlist_route(
     _: Authorized,
     State(state): State<AppState>,
@@ -1253,7 +1253,7 @@ pub(crate) async fn playlist_route(
     file_route(state, path, None).await
 }
 
-#[utoipa::path(get, path = "/api/v1/camera-sessions/{id}/segments/{segment}", responses((status = 200, content_type = "video/mp2t", body = crate::api::BinaryMedia), (status = 400), (status = 401), (status = 404), (status = 413), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/camera-sessions/{id}/segments/{segment}", params(("id" = String, Path, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"), ("segment" = String, Path, max_length = 255, pattern = "^[A-Za-z0-9_.-]+$")), responses((status = 200, content_type = "video/mp2t", body = crate::api::BinaryMedia), (status = 400), (status = 401), (status = 404), (status = 413), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn segment_route(
     _: Authorized,
     State(state): State<AppState>,
@@ -1294,7 +1294,7 @@ async fn file_route(
     }
 }
 
-#[utoipa::path(delete, path = "/api/v1/camera-sessions/{id}", responses((status = 204), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(delete, path = "/api/v1/camera-sessions/{id}", params(("id" = String, Path, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 204), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn close_session_route(
     _: Authorized,
     State(state): State<AppState>,
@@ -1315,7 +1315,7 @@ pub(crate) async fn close_session_route(
     }
 }
 
-#[utoipa::path(get, path = "/api/v1/cameras/{id}/snapshot", params(("stream_id" = Option<String>, Query, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 200, content_type = "image/jpeg", body = crate::api::BinaryMedia), (status = 400), (status = 401), (status = 404), (status = 413), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras/{id}/snapshot", params(("id" = String, Path, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"), ("stream_id" = Option<String>, Query, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 200, content_type = "image/jpeg", body = crate::api::BinaryMedia), (status = 400), (status = 401), (status = 404), (status = 413), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn snapshot_route(
     _: Authorized,
     State(state): State<AppState>,
