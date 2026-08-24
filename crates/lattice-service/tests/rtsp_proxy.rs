@@ -424,6 +424,94 @@ async fn parameterized_mixed_case_sdp_media_type_is_rewritten() {
 }
 
 #[tokio::test]
+async fn setup_transport_is_single_copy_stripped_and_tcp_only() {
+    let response = b"RTSP/1.0 200 OK\r\nCSeq: 10\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1;source=192.168.4.22;destination=192.168.4.5\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        Arc::new(FakeAuthorizedRtspConnector::new(vec![response])),
+        limits(),
+    )
+    .await
+    .unwrap();
+    let response = request(
+        proxy.local_addr().port(),
+        format!(
+            "SETUP {}/trackID=1 RTSP/1.0\r\nCSeq: 10\r\n\r\n",
+            proxy.endpoint()
+        )
+        .as_bytes(),
+    )
+    .await;
+    let text = String::from_utf8(response).unwrap();
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("Transport:"))
+            .collect::<Vec<_>>(),
+        ["Transport: RTP/AVP/TCP;unicast;interleaved=0-1"]
+    );
+    assert!(!text.to_ascii_lowercase().contains("source="));
+    assert!(!text.to_ascii_lowercase().contains("destination="));
+
+    for transport in [
+        "RTP/AVP;unicast;client_port=8000-8001",
+        "RTP/AVP/TCP;;interleaved=0-1",
+    ] {
+        let response = format!(
+            "RTSP/1.0 200 OK\r\nCSeq: 11\r\nTransport: {transport}\r\nContent-Length: 0\r\n\r\n"
+        )
+        .into_bytes();
+        let proxy = LoopbackRtspProxy::start(
+            HlsSessionId::new(),
+            LoopbackSourceToken::new(),
+            SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+            approved([192, 168, 4, 22]),
+            Arc::new(FakeAuthorizedRtspConnector::new(vec![response])),
+            limits(),
+        )
+        .await
+        .unwrap();
+        let response = request(
+            proxy.local_addr().port(),
+            format!(
+                "SETUP {}/trackID=1 RTSP/1.0\r\nCSeq: 11\r\n\r\n",
+                proxy.endpoint()
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(response.is_empty(), "unsafe Transport was forwarded");
+    }
+}
+
+#[tokio::test]
+async fn rtp_info_rejects_a_residual_external_rtsp_url_after_expected_rewrite() {
+    let response = b"RTSP/1.0 200 OK\r\nCSeq: 12\r\nRTP-Info: url=rtsp://192.168.4.22:8554/live/trackID=1;seq=1,url=rtsp://evil.example/private;seq=2\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        Arc::new(FakeAuthorizedRtspConnector::new(vec![response])),
+        limits(),
+    )
+    .await
+    .unwrap();
+    let response = request(
+        proxy.local_addr().port(),
+        format!("PLAY {} RTSP/1.0\r\nCSeq: 12\r\n\r\n", proxy.endpoint()).as_bytes(),
+    )
+    .await;
+    assert!(
+        response.is_empty(),
+        "mixed RTP-Info leaked a residual external RTSP URL: {}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+#[tokio::test]
 async fn digest_challenge_is_answered_internally_and_never_forwarded() {
     let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
         b"RTSP/1.0 401 Unauthorized\r\nCSeq: 9\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"abc123\", algorithm=MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n".to_vec(),

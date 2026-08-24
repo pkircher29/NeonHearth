@@ -1702,8 +1702,7 @@ impl RtspMessage {
             } else if name.eq_ignore_ascii_case("rtp-info") {
                 let rewritten =
                     value.replace(upstream.trim_end_matches('/'), local.trim_end_matches('/'));
-                if rewritten.to_ascii_lowercase().contains("rtsp://") && !rewritten.contains(local)
-                {
+                if !all_rtsp_urls_are_local(&rewritten, local) {
                     return Err(RtspProxyError::Protocol);
                 }
                 push_header(&mut output, name, &rewritten)?;
@@ -1729,6 +1728,27 @@ impl RtspMessage {
         output.extend_from_slice(&body);
         Ok(output)
     }
+}
+
+fn all_rtsp_urls_are_local(value: &str, local: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    let local = local.trim_end_matches('/').to_ascii_lowercase();
+    let mut remaining = value.as_str();
+    while let Some(offset) = remaining.find("rtsp://") {
+        let url = &remaining[offset..];
+        let Some(tail) = url.strip_prefix(&local) else {
+            return false;
+        };
+        if tail
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| !matches!(byte, b'/' | b';' | b',' | b' ' | b'\t'))
+        {
+            return false;
+        }
+        remaining = tail;
+    }
+    true
 }
 
 fn sanitize_transport(value: &str) -> Result<String, RtspProxyError> {
