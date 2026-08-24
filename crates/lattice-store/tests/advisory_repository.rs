@@ -330,10 +330,17 @@ async fn persists_idempotent_advisories_matches_and_effective_freshness() -> any
             .list_device_advisories(device_id(), at(200))
             .await?[0]
             .freshness,
+        Freshness::Fresh
+    );
+    assert_eq!(
+        repository
+            .list_device_advisories(device_id(), at(201))
+            .await?[0]
+            .freshness,
         Freshness::Stale
     );
-    assert_eq!(repository.expire_sources(at(200)).await?, 1);
-    assert_eq!(repository.expire_sources(at(200)).await?, 0);
+    assert_eq!(repository.expire_sources(at(201)).await?, 1);
+    assert_eq!(repository.expire_sources(at(201)).await?, 0);
     Ok(())
 }
 

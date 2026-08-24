@@ -204,7 +204,7 @@ impl AdvisoryRepository {
         now: DateTime<Utc>,
     ) -> Result<Vec<DeviceAdvisory>, AdvisoryStoreError> {
         let now = time(now)?;
-        let rows: Vec<SqliteRow> = sqlx::query("SELECT a.advisory_id,a.source,a.source_id,a.provenance_sha256,a.source_url,a.title,a.vendor,a.model,a.firmware_kind,a.firmware_min,a.firmware_max,a.published_at,a.modified_at,a.retrieved_at,a.cache_expires_at,a.provenance_freshness,a.source_trust,a.severity,a.exploitability,a.exposure,a.confidence,a.remediation,m.match_label,m.matched_fields_json,m.explanation,m.match_confidence,m.severity,m.exploitability,m.exposure,m.confidence,m.remediation,a.content_revision_sha256 FROM advisory_matches m JOIN advisories a ON a.advisory_id=m.advisory_id WHERE m.device_id=? ORDER BY a.modified_at DESC,a.source,a.source_id,a.advisory_id LIMIT ?")
+        let rows: Vec<SqliteRow> = sqlx::query("SELECT a.advisory_id,a.source,a.source_id,a.provenance_sha256,a.source_url,a.title,a.vendor,a.model,a.firmware_kind,a.firmware_min,a.firmware_max,a.published_at,a.modified_at,a.retrieved_at,a.cache_expires_at,a.provenance_freshness,a.source_trust,a.severity,a.exploitability,a.exposure,a.confidence,a.remediation,m.match_label,m.matched_fields_json,m.explanation,m.match_confidence,m.severity,m.exploitability,m.exposure,m.confidence,m.remediation,a.content_revision_sha256,a.effective_freshness FROM advisory_matches m JOIN advisories a ON a.advisory_id=m.advisory_id WHERE m.device_id=? ORDER BY a.modified_at DESC,a.source,a.source_id,a.advisory_id LIMIT ?")
             .bind(device_id.to_string()).bind(i64::try_from(MAX_ROWS + 1).map_err(|_| AdvisoryStoreError::Capacity)?).fetch_all(&self.pool).await.map_err(map_sqlx)?;
         if rows.len() > MAX_ROWS {
             return Err(AdvisoryStoreError::Corrupt);
@@ -214,9 +214,9 @@ impl AdvisoryRepository {
     pub async fn expire_sources(&self, now: DateTime<Utc>) -> Result<u64, AdvisoryStoreError> {
         let now = time(now)?;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        let advisories = sqlx::query("UPDATE advisories SET effective_freshness='stale' WHERE effective_freshness='fresh' AND cache_expires_at <= ?")
+        let advisories = sqlx::query("UPDATE advisories SET effective_freshness='stale' WHERE effective_freshness='fresh' AND cache_expires_at < ?")
             .bind(&now).execute(&mut *tx).await.map_err(map_sqlx)?.rows_affected();
-        let fetches = sqlx::query("UPDATE advisory_source_fetches SET effective_freshness='stale' WHERE effective_freshness='fresh' AND cache_expires_at <= ?")
+        let fetches = sqlx::query("UPDATE advisory_source_fetches SET effective_freshness='stale' WHERE effective_freshness='fresh' AND cache_expires_at < ?")
             .bind(now).execute(&mut *tx).await.map_err(map_sqlx)?.rows_affected();
         tx.commit().await.map_err(map_sqlx)?;
         Ok(advisories + fetches)
@@ -260,6 +260,7 @@ fn decode_row(r: SqliteRow, now: &str) -> Result<DeviceAdvisory, AdvisoryStoreEr
     let confidence_v: String = v!(29);
     let remediation_v: String = v!(30);
     let stored_content: String = v!(31);
+    let effective: String = v!(32);
     let input = AdvisoryInput {
         source: decode_source(&src)?,
         source_id,
@@ -287,6 +288,10 @@ fn decode_row(r: SqliteRow, now: &str) -> Result<DeviceAdvisory, AdvisoryStoreEr
     if content_revision(advisory.input())? != stored_content {
         return Err(AdvisoryStoreError::Corrupt);
     }
+    let effective = decode_freshness(&effective)?;
+    if advisory.input().freshness != Freshness::Fresh && effective == Freshness::Fresh {
+        return Err(AdvisoryStoreError::Corrupt);
+    }
     let matching = AdvisoryMatch::from_persisted(
         decode_label(&label_v)?,
         serde_json::from_str::<Vec<MatchedField>>(&fields)
@@ -297,7 +302,7 @@ fn decode_row(r: SqliteRow, now: &str) -> Result<DeviceAdvisory, AdvisoryStoreEr
     .map_err(|_| AdvisoryStoreError::Corrupt)?;
     let freshness = if advisory.input().freshness == Freshness::FutureDated {
         Freshness::FutureDated
-    } else if advisory.input().freshness == Freshness::Stale || expires.as_str() <= now {
+    } else if advisory.input().freshness == Freshness::Stale || expires.as_str() < now {
         Freshness::Stale
     } else {
         Freshness::Fresh
