@@ -5,7 +5,7 @@ use lattice_domain::{
     PolicyReason, Protection, RequestedAction, RiskSignal,
 };
 use lattice_event_bus::EventBus;
-use lattice_store::{M2StateRepository, PolicyRepository};
+use lattice_store::{M2StateRepository, PolicyRepository, W6PriorStateRepository};
 use lattice_w6::{
     Connector, DiscoveryStatus, Error as W6Error, RequestedQuarantine, Transport, Verification,
 };
@@ -40,6 +40,7 @@ pub trait PolicyActuator: Send + Sync {
 pub struct W6PolicyActuator<T> {
     connector: Mutex<Connector<T>>,
     previous: Mutex<HashMap<DeviceId, lattice_w6::DeviceState>>,
+    durable: Option<W6PriorStateRepository>,
 }
 
 impl<T: Transport> W6PolicyActuator<T> {
@@ -47,6 +48,14 @@ impl<T: Transport> W6PolicyActuator<T> {
         Self {
             connector: Mutex::new(connector),
             previous: Mutex::new(HashMap::new()),
+            durable: None,
+        }
+    }
+    pub fn with_sqlite(connector: Connector<T>, pool: sqlx::SqlitePool) -> Self {
+        Self {
+            connector: Mutex::new(connector),
+            previous: Mutex::new(HashMap::new()),
+            durable: Some(W6PriorStateRepository::new(pool)),
         }
     }
 }
@@ -66,7 +75,13 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
         match connector.quarantine(request).await {
             Ok(report) if report.verification == Verification::Verified => {
                 if let Some(previous) = report.previous {
-                    self.previous.lock().await.insert(_device, previous);
+                    if let Some(durable) = &self.durable {
+                        if durable.save(_device, &previous).await.is_err() {
+                            return EnforcementResult::Failed;
+                        }
+                    } else {
+                        self.previous.lock().await.insert(_device, previous);
+                    }
                 }
                 EnforcementResult::Verified
             }
@@ -94,13 +109,27 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
         ) {
             return EnforcementResult::ManualRequired;
         }
-        let Some(previous) = self.previous.lock().await.get(&device).cloned() else {
+        let previous = if let Some(durable) = &self.durable {
+            match durable.load(device).await {
+                Ok(Some(state)) => Some(state),
+                Ok(None) | Err(_) => None,
+            }
+        } else {
+            self.previous.lock().await.get(&device).cloned()
+        };
+        let Some(previous) = previous else {
             return EnforcementResult::ManualRequired;
         };
         let mut connector = self.connector.lock().await;
         match connector.restore(previous).await {
             Ok(Verification::Verified) => {
-                self.previous.lock().await.remove(&device);
+                if let Some(durable) = &self.durable {
+                    if durable.remove(device).await.is_err() {
+                        return EnforcementResult::Failed;
+                    }
+                } else {
+                    self.previous.lock().await.remove(&device);
+                }
                 EnforcementResult::Verified
             }
             Ok(Verification::Unverified) | Err(W6Error::VerificationFailed) => {
@@ -113,10 +142,11 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
         matches!(
             action,
             RequestedAction::Quarantine | RequestedAction::PermanentBan
-        ) && self
-            .previous
-            .try_lock()
-            .is_ok_and(|saved| saved.contains_key(&device))
+        ) && (self.durable.is_some()
+            || self
+                .previous
+                .try_lock()
+                .is_ok_and(|saved| saved.contains_key(&device)))
     }
 }
 

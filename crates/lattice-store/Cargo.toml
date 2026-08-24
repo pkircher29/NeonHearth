@@ -11,6 +11,7 @@ chrono.workspace = true
 fs2.workspace = true
 lattice-domain = { path = "../lattice-domain" }
 lattice-sensor = { path = "../lattice-sensor" }
+lattice-w6 = { path = "../lattice-w6" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
