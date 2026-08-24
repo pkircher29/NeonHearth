@@ -53,6 +53,7 @@ pub struct AppState {
     // This lock spans both the state transition and event publication.  No observer can
     // observe a changed status without its corresponding transition event being queued.
     service_status: Arc<Mutex<ServiceRuntimeStatus>>,
+    camera_sessions: Option<Arc<crate::cameras::CameraSessionManager>>,
 }
 impl AppState {
     pub fn new(
@@ -73,7 +74,20 @@ impl AppState {
             state_repository,
             event_tickets: Arc::new(Mutex::new(HashMap::new())),
             service_status: Arc::new(Mutex::new(ServiceRuntimeStatus::Ready)),
+            camera_sessions: None,
         })
+    }
+    #[must_use]
+    pub fn with_camera_sessions(
+        mut self,
+        camera_sessions: Arc<crate::cameras::CameraSessionManager>,
+    ) -> Self {
+        camera_sessions.start_background_reaper();
+        self.camera_sessions = Some(camera_sessions);
+        self
+    }
+    pub(crate) fn camera_sessions(&self) -> Option<&Arc<crate::cameras::CameraSessionManager>> {
+        self.camera_sessions.as_ref()
     }
     pub fn events(&self) -> &EventBus {
         &self.events

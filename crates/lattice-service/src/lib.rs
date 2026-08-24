@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+pub mod cameras;
 pub mod discovery;
 pub mod platform;
 pub mod policy;
@@ -12,7 +13,7 @@ use axum::{
     extract::{Query, State, WebSocketUpgrade, rejection::QueryRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 pub use platform::{Platform, PlatformPaths, platform_paths};
 use serde::Deserialize;
@@ -25,6 +26,26 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/policy/action", post(api::policy_action))
         .route("/api/v1/events/ticket", post(api::event_ticket))
         .route("/api/v1/events", get(events_socket))
+        .route(
+            "/api/v1/cameras/{id}/sessions",
+            post(cameras::start_session_route),
+        )
+        .route(
+            "/api/v1/cameras/{id}/snapshot",
+            get(cameras::snapshot_route),
+        )
+        .route(
+            "/api/v1/camera-sessions/{id}/playlist.m3u8",
+            get(cameras::playlist_route),
+        )
+        .route(
+            "/api/v1/camera-sessions/{id}/segments/{segment}",
+            get(cameras::segment_route),
+        )
+        .route(
+            "/api/v1/camera-sessions/{id}",
+            delete(cameras::close_session_route),
+        )
         .route("/api/v1/openapi.json", get(api::openapi))
         .with_state(state)
 }

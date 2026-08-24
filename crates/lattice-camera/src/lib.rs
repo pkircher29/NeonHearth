@@ -12,6 +12,11 @@ pub use detection::{
     CameraCandidate, CameraClassification, CameraEvidence, CameraEvidenceFamily, CameraHealth,
     DetectionError, classify_candidate,
 };
+pub use media::{
+    FakeMediaProcessFactory, HlsSessionId, LoopbackSourceToken, MediaError, MediaJob, MediaProcess,
+    MediaProcessExit, MediaProcessFactory, MediaProcessObservation, MediaProcessSpec,
+    ProductionMediaProcessFactory, SnapshotRequest, ffmpeg_executable, hls_args, snapshot_args,
+};
 pub use onvif::{
     BoundedMetadata, BoundedSerial, CameraHealth as OnvifHealth, CameraInventory, CameraProfile,
     InventoryLimits, OnvifAction, OnvifCredential, OnvifError, OnvifRequest, OnvifResponseWriter,
