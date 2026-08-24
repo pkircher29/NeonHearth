@@ -273,11 +273,20 @@ impl<
         };
         let observed_at = Self::floor_second(now);
         let mut policy_degraded = false;
+        let policy_enabled = match self.policy.enabled().await {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                policy_degraded = true;
+                tracing::warn!("policy enabled-state lookup degraded: {error}");
+                self.state
+                    .transition_service_status(ServiceRuntimeStatus::Degraded, observed_at)
+                    .await;
+                false
+            }
+        };
         // A quiet network still needs policy progress: deadline warnings and
         // expiry actions are driven by the durable clock, not new sightings.
-        if self.policy.enabled().await.unwrap_or(false)
-            && let Err(error) = self.policy.sweep(observed_at).await
-        {
+        if policy_enabled && let Err(error) = self.policy.sweep(observed_at).await {
             policy_degraded = true;
             tracing::warn!("policy runtime sweep degraded: {error}");
             self.state
@@ -344,7 +353,7 @@ impl<
             // The pipeline returns only after the SQLite transaction commits; publishing here
             // therefore enforces durable-commit-before-event-publish.
             if let DiscoveryPipelineOutcome::Committed(ref committed) = outcome {
-                if self.policy.enabled().await.unwrap_or(false)
+                if policy_enabled
                     && let Err(error) = self
                         .policy
                         .enroll_identification_and_evaluate(

@@ -44,6 +44,7 @@ pub struct PolicyProjection {
     pub evaluation: lattice_domain::Evaluation,
     pub enforcement_result: lattice_domain::EnforcementStatus,
     pub undo_available: bool,
+    pub delivery_pending: bool,
 }
 #[derive(Serialize, ToSchema)]
 pub struct Presence {
@@ -127,11 +128,15 @@ pub async fn state(
         let policy_projection = match (
             policy.load(device.device_id).await,
             policy.published_decision(device.device_id).await,
+            policy.pending_decision(device.device_id).await,
         ) {
-            (Ok(Some(policy_row)), Ok(Some(value))) => {
+            (Ok(Some(policy_row)), Ok(Some(value)), Ok(_)) => {
                 Some(PolicyProjection::from((policy_row, value)))
             }
-            (Ok(_), Ok(None)) => None,
+            (Ok(Some(policy_row)), Ok(None), Ok(true)) => {
+                Some(PolicyProjection::pending(policy_row))
+            }
+            (Ok(_), Ok(None), Ok(false)) => None,
             _ => return Err(StatusCode::SERVICE_UNAVAILABLE),
         };
         mapped.push(map_device(device, policy_projection));
@@ -185,6 +190,24 @@ impl From<(lattice_domain::DevicePolicy, lattice_domain::PolicyChanged)> for Pol
             evaluation: value.evaluation,
             enforcement_result: value.enforcement_result,
             undo_available: value.undo_available,
+            delivery_pending: false,
+        }
+    }
+}
+impl PolicyProjection {
+    fn pending(policy: lattice_domain::DevicePolicy) -> Self {
+        let evaluation =
+            lattice_policy::PolicyEngine::new(policy.first_seen_at).evaluate(&policy, Utc::now());
+        Self {
+            owner_decision: policy.owner_decision,
+            protection: policy.protection,
+            evaluation,
+            enforcement_result: lattice_domain::EnforcementStatus::ManualRequired,
+            undo_available: matches!(
+                policy.owner_decision,
+                OwnerDecision::Approved | OwnerDecision::Quarantined
+            ),
+            delivery_pending: true,
         }
     }
 }

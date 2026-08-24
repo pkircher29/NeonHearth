@@ -167,6 +167,13 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                     },
                 )
                 .await?;
+        } else {
+            // The committed discovery projection is authoritative.  Do not
+            // let an old automatic match extend a device's deadline after its
+            // current evidence no longer supports identification.
+            self.repo
+                .set_identification(device, Identification::Unknown)
+                .await?;
         }
         self.evaluate(self.repo.load(device).await?.unwrap_or(policy), now)
             .await
@@ -189,17 +196,47 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
         let evaluation = evaluate_policy(&p, now);
+        let previously_published = self.repo.published_decision(p.device_id).await?;
+        let prior_matches = |result: EnforcementResult| {
+            previously_published.as_ref().is_some_and(|last| {
+                last.evaluation == evaluation
+                    && last.requested_action == evaluation.requested_action
+                    && last.enforcement_result == result
+            })
+        };
         let enforcement = if matches!(
             evaluation.requested_action,
             RequestedAction::None | RequestedAction::OwnerAttention
         ) || p.protection != Protection::None
         {
             EnforcementResult::NotRequested
+        } else if prior_matches(EnforcementResult::Verified) {
+            // A durable acknowledged verification is an idempotency fence for
+            // irreversible actions such as PersistentFilter.
+            EnforcementResult::Verified
+        } else if prior_matches(EnforcementResult::ManualRequired)
+            && !self.repo.enforcement_retry_due(p.device_id, now).await?
+        {
+            EnforcementResult::ManualRequired
+        } else if prior_matches(EnforcementResult::Failed)
+            && !self.repo.enforcement_retry_due(p.device_id, now).await?
+        {
+            EnforcementResult::Failed
         } else {
             self.actuator
                 .enforce(p.device_id, evaluation.requested_action)
                 .await
         };
+        match enforcement {
+            EnforcementResult::ManualRequired | EnforcementResult::Failed => {
+                self.repo
+                    .schedule_enforcement_retry(p.device_id, now)
+                    .await?;
+            }
+            EnforcementResult::Verified | EnforcementResult::NotRequested => {
+                self.repo.clear_enforcement_retry(p.device_id).await?;
+            }
+        }
         if enforcement == EnforcementResult::Verified
             && matches!(
                 evaluation.requested_action,
@@ -222,7 +259,7 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         if let Some(bus) = &self.events
             && self
                 .repo
-                .reserve_decision_publication(p.device_id, &fingerprint)
+                .prepare_decision_publication(p.device_id, &fingerprint)
                 .await?
         {
             let event = PolicyChanged {

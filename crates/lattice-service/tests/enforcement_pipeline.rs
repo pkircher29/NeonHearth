@@ -296,7 +296,7 @@ async fn changed_enforcement_result_emits_a_new_typed_policy_event() -> anyhow::
     assert_eq!(bus.current_sequence().await, 2);
     let verified =
         PolicyCoordinator::with_actuator(repo, Some(bus.clone()), FakeActuator::default());
-    verified.reject(device, at(60)).await?;
+    verified.reject(device, at(61)).await?;
     assert_eq!(bus.current_sequence().await, 3);
     let restarted_repo = PolicyRepository::new(pool.clone());
     assert_eq!(
@@ -535,5 +535,66 @@ async fn policy_failure_after_a_committed_discovery_keeps_the_cycle_degraded() -
         "durable discovery output is retained"
     );
     assert_eq!(state.service_status().await, "degraded");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_outbox_decision_is_republished_and_acknowledged_after_restart()
+-> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let policy = repo.enroll(device).await?;
+    let evaluation =
+        lattice_policy::PolicyEngine::new(policy.first_seen_at).evaluate(&policy, at(60));
+    let fingerprint = serde_json::to_string(&(
+        evaluation,
+        "policy facts evaluated",
+        EnforcementResult::NotRequested,
+        false,
+    ))?;
+    assert!(
+        repo.prepare_decision_publication(device, &fingerprint)
+            .await?
+    );
+    let bus = EventBus::new(8, 8);
+    let restarted =
+        PolicyCoordinator::with_actuator(repo.clone(), Some(bus.clone()), FakeActuator::default());
+    restarted.evaluate(policy, at(60)).await?;
+    assert_eq!(bus.current_sequence().await, 1);
+    assert!(!repo.pending_decision(device).await?);
+    assert_eq!(
+        repo.published_decision(device)
+            .await?
+            .unwrap()
+            .enforcement_result,
+        EnforcementResult::NotRequested
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn verified_decision_is_not_reactuated_on_a_later_sweep() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let actuator = FakeActuator::default();
+    let coordinator =
+        PolicyCoordinator::with_actuator(repo, Some(EventBus::new(8, 8)), actuator.clone());
+    coordinator.enroll_and_evaluate(device, at(108)).await?;
+    coordinator.sweep(at(108)).await?;
+    assert_eq!(actuator.0.load(Ordering::SeqCst), 1);
     Ok(())
 }

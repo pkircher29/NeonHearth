@@ -176,14 +176,30 @@ impl PolicyRepository {
         Ok(policies)
     }
 
-    /// Durably reserves a policy event before its in-memory publication. A
-    /// restart can retry an unacknowledged reservation, so no decision is
-    /// deduplicated before it has been published.
-    pub async fn reserve_decision_publication(
+    /// Durably prepare event publication.  A matching pending row deliberately
+    /// returns true: a crash after publish but before acknowledgement is
+    /// retried at-least-once.  Superseded pending rows are discarded only when
+    /// a newer current decision is prepared for the same device.
+    pub async fn prepare_decision_publication(
         &self,
         device_id: DeviceId,
         fingerprint: &str,
     ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let published: Option<String> =
+            sqlx::query_scalar("SELECT decision_fingerprint FROM device_policy WHERE device_id=?")
+                .bind(device_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if published.as_deref() == Some(fingerprint) {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM policy_outbox WHERE device_id=? AND fingerprint<>?")
+            .bind(device_id.to_string())
+            .bind(fingerprint)
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query(
             "INSERT OR IGNORE INTO policy_outbox(device_id, fingerprint, created_at)
              SELECT ?, ?, ?
@@ -197,9 +213,17 @@ impl PolicyRepository {
         .bind(Utc::now().to_rfc3339())
         .bind(device_id.to_string())
         .bind(fingerprint)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM policy_outbox WHERE device_id=? AND fingerprint=?",
+        )
+        .bind(device_id.to_string())
+        .bind(fingerprint)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1 || pending == 1)
     }
 
     /// Acknowledge only after the event bus accepted publication. Keeping the
@@ -234,16 +258,65 @@ impl PolicyRepository {
         &self,
         device_id: DeviceId,
     ) -> anyhow::Result<Option<PolicyChanged>> {
-        let value: Option<String> = sqlx::query_scalar(
+        let value: Option<Option<String>> = sqlx::query_scalar(
             "SELECT published_decision_json FROM device_policy WHERE device_id=?",
         )
         .bind(device_id.to_string())
         .fetch_optional(&self.pool)
         .await?;
         value
+            .flatten()
             .as_deref()
             .map(|v| decode(v, "published policy decision"))
             .transpose()
+    }
+
+    pub async fn pending_decision(&self, device_id: DeviceId) -> anyhow::Result<bool> {
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM policy_outbox WHERE device_id=?")
+                .bind(device_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(pending != 0)
+    }
+
+    pub async fn enforcement_retry_due(
+        &self,
+        device_id: DeviceId,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let retry: Option<Option<String>> =
+            sqlx::query_scalar("SELECT enforcement_retry_at FROM device_policy WHERE device_id=?")
+                .bind(device_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        retry
+            .flatten()
+            .as_deref()
+            .map(|at| parse_time(at, "enforcement retry timestamp").map(|at| at <= now))
+            .transpose()
+            .map(|x| x.unwrap_or(true))
+    }
+
+    pub async fn schedule_enforcement_retry(
+        &self,
+        device_id: DeviceId,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE device_policy SET enforcement_retry_at=? WHERE device_id=?")
+            .bind((now + Duration::minutes(1)).to_rfc3339())
+            .bind(device_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear_enforcement_retry(&self, device_id: DeviceId) -> anyhow::Result<()> {
+        sqlx::query("UPDATE device_policy SET enforcement_retry_at=NULL WHERE device_id=?")
+            .bind(device_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn set_identification(
