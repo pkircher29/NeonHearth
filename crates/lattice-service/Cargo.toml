@@ -21,6 +21,7 @@ serde_json.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
+tracing.workspace = true
 utoipa.workspace = true
 uuid.workspace = true
 thiserror.workspace = true

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use lattice_service::{AppState, app};
+use lattice_service::runtime::StartupResult;
 use lattice_service::{Platform, platform_paths};
 use lattice_store::{InstallRepository, M2StateRepository};
 use std::path::PathBuf;
@@ -34,27 +35,37 @@ async fn main() -> Result<()> {
         .initialize(Utc::now())
         .await
         .context("initialize install state")?;
+    let state = AppState::new(token, M2StateRepository::new(pool.clone()))?;
+    let startup = lattice_service::runtime::build(state.clone(), M2StateRepository::new(pool.clone())).await;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     #[cfg(unix)]
     let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("register SIGTERM handler")?;
     #[cfg(not(unix))]
     let terminate = ();
     let listener = TcpListener::bind("127.0.0.1:58120").await?;
-    axum::serve(
-        listener,
-        app(AppState::new(token, M2StateRepository::new(pool.clone()))?),
-    )
-    .with_graceful_shutdown(shutdown_signal(terminate))
-    .await?;
+    let server = axum::serve(listener, app(state)).with_graceful_shutdown(shutdown_signal(terminate, shutdown_tx.clone()));
+    match startup {
+        StartupResult::Worker(worker) => {
+            let worker = worker.run(shutdown_rx);
+            tokio::pin!(worker);
+            tokio::select! { result = server => result?, _ = &mut worker => {} }
+            let _ = shutdown_tx.send(true);
+            worker.await;
+        }
+        StartupResult::Degraded => server.await?,
+    }
     drop(pool);
     Ok(())
 }
 
 #[cfg(unix)]
-async fn shutdown_signal(mut terminate: tokio::signal::unix::Signal) {
+async fn shutdown_signal(mut terminate: tokio::signal::unix::Signal, shutdown: tokio::sync::watch::Sender<bool>) {
     tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    let _ = shutdown.send(true);
 }
 #[cfg(not(unix))]
-async fn shutdown_signal(_: ()) {
+async fn shutdown_signal(_: (), shutdown: tokio::sync::watch::Sender<bool>) {
     let _ = tokio::signal::ctrl_c().await;
+    let _ = shutdown.send(true);
 }
