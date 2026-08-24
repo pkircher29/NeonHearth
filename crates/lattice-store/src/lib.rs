@@ -9,6 +9,7 @@ mod home;
 mod install;
 mod maintenance_db;
 mod policy;
+mod remote_access;
 mod w6;
 
 pub use advisory::*;
@@ -22,6 +23,7 @@ pub use home::*;
 pub use install::{InstallRepository, InstallState};
 pub use maintenance_db::*;
 pub use policy::{ActuationAttempt, ActuationReservation, PendingDecision, PolicyRepository};
+pub use remote_access::*;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},

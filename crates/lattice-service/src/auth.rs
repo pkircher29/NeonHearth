@@ -16,13 +16,20 @@ impl FromRequestParts<AppState> for Authorized {
             .get_all(axum::http::header::AUTHORIZATION)
             .iter()
             .collect();
-        let valid = values.len() == 1
-            && values[0]
-                .to_str()
-                .ok()
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .filter(|v| !v.is_empty())
-                .is_some_and(|v| state.token_matches(v));
+        // A phone session authenticated by the remote-access layer is an
+        // alternative principal; the marker cannot arrive from the wire.
+        let phone = parts
+            .extensions
+            .get::<crate::tailscale::PhoneAuthorized>()
+            .is_some();
+        let valid = phone
+            || (values.len() == 1
+                && values[0]
+                    .to_str()
+                    .ok()
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .filter(|v| !v.is_empty())
+                    .is_some_and(|v| state.token_matches(v)));
         async move {
             if valid {
                 Ok(Self)
