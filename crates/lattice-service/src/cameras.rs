@@ -1315,7 +1315,7 @@ pub(crate) async fn close_session_route(
     }
 }
 
-#[utoipa::path(get, path = "/api/v1/cameras/{id}/snapshot", params(("stream_id" = Option<String>, Query, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")), responses((status = 200, content_type = "image/jpeg", body = crate::api::BinaryMedia), (status = 400), (status = 401), (status = 404), (status = 413), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras/{id}/snapshot", params(("stream_id" = Option<String>, Query, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 200, content_type = "image/jpeg", body = crate::api::BinaryMedia), (status = 400), (status = 401), (status = 404), (status = 413), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn snapshot_route(
     _: Authorized,
     State(state): State<AppState>,

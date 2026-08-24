@@ -157,7 +157,7 @@ async fn openapi_truthfully_documents_camera_and_media_routes() {
     assert_eq!(camera["properties"]["confidence"]["minimum"], 0.0);
     assert_eq!(camera["properties"]["confidence"]["maximum"], 1.0);
     let inventory = &doc["components"]["schemas"]["CameraInventoryProjection"];
-    assert_eq!(inventory["properties"]["serial"]["maxLength"], 256);
+    assert_eq!(inventory["properties"]["serial"]["maxLength"], 128);
     assert_eq!(inventory["properties"]["capabilities"]["maxItems"], 32);
     let session_request =
         &doc["components"]["schemas"]["CameraSessionRequest"]["properties"]["stream_id"];
@@ -189,8 +189,7 @@ fn owner_inventory_serial_is_bounded_but_export_and_debug_are_redacted() {
             .contains("OWNER-SERIAL-42")
     );
     assert!(
-        !inventory
-            .to_redacted_export_json()
+        !lattice_service::api::serialize_camera_inventory_for_support_export(&inventory)
             .unwrap()
             .contains("OWNER-SERIAL-42")
     );

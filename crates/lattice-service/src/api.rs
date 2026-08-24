@@ -19,22 +19,25 @@ pub struct Health {
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraSummary {
-    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
+    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
     pub camera_id: String,
+    #[schema(pattern = "^(camera|possible_camera|unknown)$")]
     pub classification: String,
     #[schema(minimum = 0, maximum = 1)]
     pub confidence: f32,
+    #[schema(pattern = "^(healthy|degraded|unknown)$")]
     pub health: String,
     pub observed_at: DateTime<Utc>,
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraList {
     pub items: Vec<CameraSummary>,
-    #[schema(value_type = Option<String>, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
+    #[schema(value_type = Option<String>, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
     pub next_after: Option<String>,
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraDetail {
+    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
     pub camera_id: String,
     pub classification: String,
     #[schema(minimum = 0, maximum = 1)]
@@ -45,21 +48,24 @@ pub struct CameraDetail {
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraHealth {
+    #[schema(pattern = "^(healthy|degraded|unknown)$")]
     pub health: String,
+    #[schema(minimum = 0, maximum = 1)]
     pub confidence: f32,
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraInventoryProjection {
-    #[schema(max_length = 256)]
+    #[schema(max_length = 128)]
     pub manufacturer: Option<String>,
-    #[schema(max_length = 256)]
+    #[schema(max_length = 128)]
     pub model: Option<String>,
-    #[schema(max_length = 256)]
+    #[schema(max_length = 128)]
     pub firmware: Option<String>,
-    #[schema(max_length = 256)]
+    #[schema(max_length = 128)]
     pub serial: Option<String>,
-    #[schema(max_items = 32)]
+    #[schema(max_items = 32, value_type = Vec<String>)]
     pub capabilities: Vec<String>,
+    #[schema(pattern = "^(healthy|degraded)$")]
     pub health: String,
 }
 
@@ -89,6 +95,14 @@ impl CameraInventoryProjection {
     pub fn to_redacted_export_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(&self.redacted_for_export())
     }
+}
+
+/// Authoritative support-export serialization seam. No support-export endpoint
+/// exists yet; callers must use this serial-free projection serializer.
+pub fn serialize_camera_inventory_for_support_export(
+    inventory: &CameraInventoryProjection,
+) -> Result<String, serde_json::Error> {
+    inventory.to_redacted_export_json()
 }
 
 impl fmt::Debug for CameraInventoryProjection {
@@ -125,13 +139,13 @@ impl From<lattice_store::CameraInventoryRecord> for CameraInventoryProjection {
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraSessionResponse {
-    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
+    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
     pub session_id: String,
 }
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CameraSessionRequest {
-    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
+    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
     pub stream_id: String,
 }
 pub struct BinaryMedia;
@@ -155,7 +169,7 @@ pub struct CameraQuery {
     pub after: Option<lattice_camera::CameraId>,
 }
 
-#[utoipa::path(get, path = "/api/v1/cameras", params(("limit" = Option<usize>, Query, minimum = 1, maximum = 256), ("after" = Option<String>, Query, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")), responses((status = 200, body = CameraList), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras", params(("limit" = Option<usize>, Query, minimum = 1, maximum = 256), ("after" = Option<String>, Query, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 200, body = CameraList), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
 pub async fn cameras(
     _: Authorized,
     State(state): State<AppState>,
