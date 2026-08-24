@@ -124,8 +124,13 @@ pub async fn state(
     let policy = PolicyRepository::new(state.state_repository().pool().clone());
     let mut mapped = Vec::with_capacity(devices.len());
     for device in devices {
-        let policy_projection = match (policy.load(device.device_id).await, policy.published_decision(device.device_id).await) {
-            (Ok(Some(policy_row)), Ok(Some(value))) => Some(PolicyProjection::from((policy_row, value))),
+        let policy_projection = match (
+            policy.load(device.device_id).await,
+            policy.published_decision(device.device_id).await,
+        ) {
+            (Ok(Some(policy_row)), Ok(Some(value))) => {
+                Some(PolicyProjection::from((policy_row, value)))
+            }
             (Ok(_), Ok(None)) => None,
             _ => return Err(StatusCode::SERVICE_UNAVAILABLE),
         };
@@ -171,7 +176,9 @@ mod tests {
     }
 }
 impl From<(lattice_domain::DevicePolicy, lattice_domain::PolicyChanged)> for PolicyProjection {
-    fn from((policy, value): (lattice_domain::DevicePolicy, lattice_domain::PolicyChanged)) -> Self {
+    fn from(
+        (policy, value): (lattice_domain::DevicePolicy, lattice_domain::PolicyChanged),
+    ) -> Self {
         Self {
             owner_decision: policy.owner_decision,
             protection: policy.protection,
@@ -269,8 +276,11 @@ pub async fn policy_action(
         OwnerAction::Approve => coordinator.approve(request.device_id, now).await,
         OwnerAction::Reject => coordinator.reject(request.device_id, now).await,
         OwnerAction::Quarantine => coordinator.quarantine(request.device_id, now).await,
-        OwnerAction::ExtendOnce { until } => coordinator.extend_once(request.device_id, until, now).await,
-    }.map_err(|_| StatusCode::BAD_REQUEST)?;
+        OwnerAction::ExtendOnce { until } => {
+            coordinator.extend_once(request.device_id, until, now).await
+        }
+    }
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok(Json(PolicyActionResponse {
         evaluation: result.evaluation,
         enforcement_result: result.enforcement,

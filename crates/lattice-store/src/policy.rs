@@ -2,7 +2,8 @@ use anyhow::{Context, ensure};
 use chrono::{DateTime, Duration, Utc};
 use lattice_domain::{
     AUTOMATIC_IDENTITY_THRESHOLD_BPS, AUTOMATIC_POLICY_DEADLINE_HOURS, DeviceId, DevicePolicy,
-    Identification, OwnerDecision, PolicyChanged, Protection, RiskSignal, UNKNOWN_POLICY_DEADLINE_HOURS,
+    Identification, OwnerDecision, PolicyChanged, Protection, RiskSignal,
+    UNKNOWN_POLICY_DEADLINE_HOURS,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::SqlitePool;
@@ -161,9 +162,10 @@ impl PolicyRepository {
     /// Returns the durable policy projection for every enrolled device. Runtime
     /// maintenance uses this rather than waiting for another discovery event.
     pub async fn list(&self) -> anyhow::Result<Vec<DevicePolicy>> {
-        let ids: Vec<String> = sqlx::query_scalar("SELECT device_id FROM device_policy ORDER BY device_id")
-            .fetch_all(&self.pool)
-            .await?;
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT device_id FROM device_policy ORDER BY device_id")
+                .fetch_all(&self.pool)
+                .await?;
         let mut policies = Vec::with_capacity(ids.len());
         for id in ids {
             let id = DeviceId::parse(&id).context("invalid persisted policy device id")?;
@@ -228,10 +230,20 @@ impl PolicyRepository {
         Ok(())
     }
 
-    pub async fn published_decision(&self, device_id: DeviceId) -> anyhow::Result<Option<PolicyChanged>> {
-        let value: Option<String> = sqlx::query_scalar("SELECT published_decision_json FROM device_policy WHERE device_id=?")
-            .bind(device_id.to_string()).fetch_optional(&self.pool).await?;
-        value.as_deref().map(|v| decode(v, "published policy decision")).transpose()
+    pub async fn published_decision(
+        &self,
+        device_id: DeviceId,
+    ) -> anyhow::Result<Option<PolicyChanged>> {
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT published_decision_json FROM device_policy WHERE device_id=?",
+        )
+        .bind(device_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        value
+            .as_deref()
+            .map(|v| decode(v, "published policy decision"))
+            .transpose()
     }
 
     pub async fn set_identification(

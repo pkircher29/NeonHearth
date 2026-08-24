@@ -188,7 +188,11 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource>
             state,
             bindings,
             config,
-            crate::policy::PolicyCoordinator::with_state(policy_repo, Some(policy_events), policy_state),
+            crate::policy::PolicyCoordinator::with_state(
+                policy_repo,
+                Some(policy_events),
+                policy_state,
+            ),
         )
     }
 }

@@ -1267,6 +1267,7 @@ dependencies = [
  "lattice-policy",
  "lattice-sensor",
  "lattice-store",
+ "lattice-w6",
  "secrecy",
  "serde",
  "serde_json",

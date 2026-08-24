@@ -19,7 +19,9 @@ use lattice_service::{
     },
     policy::{EnforcementResult, PolicyActuator, PolicyCoordinator},
 };
-use lattice_store::{InstallRepository, M2StateRepository, PolicyRepository, connect_memory, connect_path};
+use lattice_store::{
+    InstallRepository, M2StateRepository, PolicyRepository, connect_memory, connect_path,
+};
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::{
@@ -45,7 +47,9 @@ impl PolicyActuator for FakeActuator {
 struct OutcomeActuator(EnforcementResult);
 #[async_trait]
 impl PolicyActuator for OutcomeActuator {
-    async fn enforce(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult { self.0 }
+    async fn enforce(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult {
+        self.0
+    }
 }
 
 struct QueuedSource(Mutex<VecDeque<Result<Vec<NeighborRow>, NeighborError>>>);
@@ -296,7 +300,11 @@ async fn changed_enforcement_result_emits_a_new_typed_policy_event() -> anyhow::
     assert_eq!(bus.current_sequence().await, 3);
     let restarted_repo = PolicyRepository::new(pool.clone());
     assert_eq!(
-        restarted_repo.published_decision(device).await?.unwrap().enforcement_result,
+        restarted_repo
+            .published_decision(device)
+            .await?
+            .unwrap()
+            .enforcement_result,
         EnforcementResult::Verified,
         "resync projections must retain the acknowledged enforcement result"
     );
@@ -306,7 +314,9 @@ async fn changed_enforcement_result_emits_a_new_typed_policy_event() -> anyhow::
 #[tokio::test]
 async fn runtime_sweep_evaluates_persisted_policies_without_new_discovery() -> anyhow::Result<()> {
     let pool = connect_memory().await?;
-    InstallRepository::new(pool.clone()).initialize(at(0)).await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
     let repo = PolicyRepository::new(pool.clone());
     repo.mark_successful_service_start(at(0)).await?;
     let device = DeviceId::new();
@@ -328,7 +338,9 @@ async fn runtime_sweep_evaluates_persisted_policies_without_new_discovery() -> a
 #[tokio::test]
 async fn only_verified_enforcement_persists_a_blocked_presence_transition() -> anyhow::Result<()> {
     let pool = connect_memory().await?;
-    InstallRepository::new(pool.clone()).initialize(at(0)).await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
     let policy_repo = PolicyRepository::new(pool.clone());
     policy_repo.mark_successful_service_start(at(0)).await?;
     let device = DeviceId::new();
@@ -336,48 +348,81 @@ async fn only_verified_enforcement_persists_a_blocked_presence_transition() -> a
         .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
 
     let verified = PolicyCoordinator::with_actuator_and_state(
-        policy_repo.clone(), None, FakeActuator::default(), M2StateRepository::new(pool.clone()),
+        policy_repo.clone(),
+        None,
+        FakeActuator::default(),
+        M2StateRepository::new(pool.clone()),
     );
     verified.enroll_and_evaluate(device, at(108)).await?;
     assert_eq!(
-        M2StateRepository::new(pool.clone()).list_device_snapshots(8, None).await?[0]
-            .presence.as_ref().map(|p| p.to_state),
+        M2StateRepository::new(pool.clone())
+            .list_device_snapshots(8, None)
+            .await?[0]
+            .presence
+            .as_ref()
+            .map(|p| p.to_state),
         Some(lattice_domain::PresenceState::Blocked),
     );
 
     let manual_device = DeviceId::new();
     sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
         .bind(manual_device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
-    let manual = PolicyCoordinator::with_state(policy_repo, None, M2StateRepository::new(pool.clone()));
+    let manual =
+        PolicyCoordinator::with_state(policy_repo, None, M2StateRepository::new(pool.clone()));
     manual.enroll_and_evaluate(manual_device, at(108)).await?;
-    assert_ne!(M2StateRepository::new(pool).list_device_snapshots(8, None).await?[1]
-        .presence.as_ref().map(|p| p.to_state), Some(lattice_domain::PresenceState::Blocked));
+    assert_ne!(
+        M2StateRepository::new(pool)
+            .list_device_snapshots(8, None)
+            .await?[1]
+            .presence
+            .as_ref()
+            .map(|p| p.to_state),
+        Some(lattice_domain::PresenceState::Blocked)
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn failed_enforcement_never_claims_blocked_presence() -> anyhow::Result<()> {
     let pool = connect_memory().await?;
-    InstallRepository::new(pool.clone()).initialize(at(0)).await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
     let policy_repo = PolicyRepository::new(pool.clone());
     policy_repo.mark_successful_service_start(at(0)).await?;
     let device = DeviceId::new();
     sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
         .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
     let coordinator = PolicyCoordinator::with_actuator_and_state(
-        policy_repo, None, OutcomeActuator(EnforcementResult::Failed), M2StateRepository::new(pool.clone()),
+        policy_repo,
+        None,
+        OutcomeActuator(EnforcementResult::Failed),
+        M2StateRepository::new(pool.clone()),
     );
-    assert_eq!(coordinator.enroll_and_evaluate(device, at(108)).await?.enforcement, EnforcementResult::Failed);
-    let blocked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM presence_transitions WHERE device_id=? AND to_state='blocked'")
-        .bind(device.to_string()).fetch_one(&pool).await?;
+    assert_eq!(
+        coordinator
+            .enroll_and_evaluate(device, at(108))
+            .await?
+            .enforcement,
+        EnforcementResult::Failed
+    );
+    let blocked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM presence_transitions WHERE device_id=? AND to_state='blocked'",
+    )
+    .bind(device.to_string())
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(blocked, 0);
     Ok(())
 }
 
 #[tokio::test]
-async fn protected_devices_keep_owner_actions_available_without_automatic_blocking() -> anyhow::Result<()> {
+async fn protected_devices_keep_owner_actions_available_without_automatic_blocking()
+-> anyhow::Result<()> {
     let pool = connect_memory().await?;
-    InstallRepository::new(pool.clone()).initialize(at(0)).await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
     let repo = PolicyRepository::new(pool.clone());
     repo.mark_successful_service_start(at(0)).await?;
     for protection in [
@@ -391,43 +436,104 @@ async fn protected_devices_keep_owner_actions_available_without_automatic_blocki
             .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
         repo.enroll(device).await?;
         repo.set_protection(device, protection).await?;
-        repo.set_risk(device, lattice_domain::RiskSignal::HighConfidenceDanger { confidence_basis_points: 9_500, evidence: "confirmed".into() }).await?;
+        repo.set_risk(
+            device,
+            lattice_domain::RiskSignal::HighConfidenceDanger {
+                confidence_basis_points: 9_500,
+                evidence: "confirmed".into(),
+            },
+        )
+        .await?;
         let coordinator = PolicyCoordinator::with_actuator_and_state(
-            repo.clone(), None, FakeActuator::default(), M2StateRepository::new(pool.clone()),
+            repo.clone(),
+            None,
+            FakeActuator::default(),
+            M2StateRepository::new(pool.clone()),
         );
-        assert_eq!(coordinator.evaluate(repo.load(device).await?.unwrap(), at(61)).await?.requested_action, RequestedAction::OwnerAttention);
-        assert_eq!(coordinator.approve(device, at(61)).await?.requested_action, RequestedAction::OwnerAttention);
-        assert_eq!(repo.load(device).await?.unwrap().owner_decision, lattice_domain::OwnerDecision::Approved);
-        assert_eq!(coordinator.quarantine(device, at(61)).await?.requested_action, RequestedAction::Quarantine);
-        assert_eq!(repo.load(device).await?.unwrap().owner_decision, lattice_domain::OwnerDecision::Quarantined);
-        assert!(coordinator.extend_once(device, at(300), at(61)).await.is_ok());
+        assert_eq!(
+            coordinator
+                .evaluate(repo.load(device).await?.unwrap(), at(61))
+                .await?
+                .requested_action,
+            RequestedAction::OwnerAttention
+        );
+        assert_eq!(
+            coordinator.approve(device, at(61)).await?.requested_action,
+            RequestedAction::OwnerAttention
+        );
+        assert_eq!(
+            repo.load(device).await?.unwrap().owner_decision,
+            lattice_domain::OwnerDecision::Approved
+        );
+        assert_eq!(
+            coordinator
+                .quarantine(device, at(61))
+                .await?
+                .requested_action,
+            RequestedAction::Quarantine
+        );
+        assert_eq!(
+            repo.load(device).await?.unwrap().owner_decision,
+            lattice_domain::OwnerDecision::Quarantined
+        );
+        assert!(
+            coordinator
+                .extend_once(device, at(300), at(61))
+                .await
+                .is_ok()
+        );
     }
     Ok(())
 }
 
 #[tokio::test]
-async fn policy_failure_after_a_committed_discovery_keeps_the_cycle_degraded() -> anyhow::Result<()> {
+async fn policy_failure_after_a_committed_discovery_keeps_the_cycle_degraded() -> anyhow::Result<()>
+{
     let pool = connect_memory().await?;
-    InstallRepository::new(pool.clone()).initialize(at(0)).await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
     let policy_repo = PolicyRepository::new(pool.clone());
     policy_repo.mark_successful_service_start(at(0)).await?;
     let state_repo = M2StateRepository::new(pool.clone());
     let state = AppState::new("owner-token-0123456789abcdefghijkl", state_repo.clone())?;
     let binding = NeighborInterfaceBinding::for_interface(InterfaceId::new(7))?;
     let pipeline = PersistentDiscoveryPipeline::open(
-        state_repo, neighbor_discovery_sources(&[binding])?, [DeviceId::new()].into_iter(), Default::default(), 16, 16,
-    ).await?;
-    let policy = PolicyCoordinator::with_actuator(policy_repo, Some(state.events().clone()), FakeActuator::default());
+        state_repo,
+        neighbor_discovery_sources(&[binding])?,
+        [DeviceId::new()].into_iter(),
+        Default::default(),
+        16,
+        16,
+    )
+    .await?;
+    let policy = PolicyCoordinator::with_actuator(
+        policy_repo,
+        Some(state.events().clone()),
+        FakeActuator::default(),
+    );
     let mut coordinator = NeighborCoordinator::with_policy(
-        QueuedSource(Mutex::new(VecDeque::from([Ok(vec![neighbor_row(1)])]))), pipeline, state.clone(), [binding],
-        NeighborCoordinatorConfig { poll_interval: Duration::seconds(5), support_ttl: Duration::seconds(4), tracker: NeighborTrackerConfig::default() }, policy,
+        QueuedSource(Mutex::new(VecDeque::from([Ok(vec![neighbor_row(1)])]))),
+        pipeline,
+        state.clone(),
+        [binding],
+        NeighborCoordinatorConfig {
+            poll_interval: Duration::seconds(5),
+            support_ttl: Duration::seconds(4),
+            tracker: NeighborTrackerConfig::default(),
+        },
+        policy,
     )?;
     sqlx::query("CREATE TRIGGER injected_policy_failure BEFORE INSERT ON device_policy BEGIN SELECT RAISE(ABORT, 'injected policy failure'); END")
         .execute(&pool).await?;
 
     let cycle = coordinator.cycle(at(60)).await?;
 
-    assert_eq!(cycle.outcomes().len(), 1, "durable discovery output is retained");
+    assert_eq!(
+        cycle.outcomes().len(),
+        1,
+        "durable discovery output is retained"
+    );
     assert_eq!(state.service_status().await, "degraded");
     Ok(())
 }

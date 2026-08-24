@@ -99,15 +99,18 @@ fn policy_event_contract_serializes_stable_names() {
         enforcement_result: EnforcementStatus::Verified,
         undo_available: false,
     });
-    assert_eq!(serde_json::to_value(&payload).unwrap(), serde_json::json!({
-        "type": "policy_changed", "data": {
-            "device_id": "018f47a0-9b5c-7a22-8a33-112233445566",
-            "policy_version": 1,
-            "evaluation": {"policy_version": 1, "reason": "unknown_deadline_expired", "requested_action": "quarantine", "deadline": null, "warning": null},
-            "requested_action": "quarantine",
-            "evidence_summary": "policy facts evaluated",
-            "enforcement_result": "verified",
-            "undo_available": false
-        }
-    }));
+    assert_eq!(
+        serde_json::to_value(&payload).unwrap(),
+        serde_json::json!({
+            "type": "policy_changed", "data": {
+                "device_id": "018f47a0-9b5c-7a22-8a33-112233445566",
+                "policy_version": 1,
+                "evaluation": {"policy_version": 1, "reason": "unknown_deadline_expired", "requested_action": "quarantine", "deadline": null, "warning": null},
+                "requested_action": "quarantine",
+                "evidence_summary": "policy facts evaluated",
+                "enforcement_result": "verified",
+                "undo_available": false
+            }
+        })
+    );
 }
