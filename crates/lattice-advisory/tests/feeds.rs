@@ -2,10 +2,12 @@ use chrono::{Duration, TimeZone, Utc};
 use lattice_advisory::{
     feed::{CisaKevFeed, FeedError, ModifiedWindow, NvdFeed},
     transport::{
-        FeedRequest, FixtureReply, FixtureTransport, KEV_URL, MAX_AGGREGATE_RECORDS, MAX_PAGES,
-        MAX_RESPONSE_BYTES, MAX_RESULTS_PER_PAGE, NVD_URL, TransportError,
+        Clock, FeedRequest, FixtureReply, FixtureTransport, KEV_URL, MAX_AGGREGATE_RECORDS,
+        MAX_PAGES, MAX_RESPONSE_BYTES, MAX_RESULTS_PER_PAGE, NVD_URL, TransportError,
+        is_public_feed_address,
     },
 };
+use std::sync::{Arc, Mutex};
 
 fn at(seconds: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(seconds, 0).single().unwrap()
@@ -15,6 +17,19 @@ fn nvd_page(start: usize, total: usize, items: usize) -> String {
         r#"{{"startIndex":{start},"resultsPerPage":{items},"totalResults":{total},"vulnerabilities":[{}]}}"#,
         (0..items).map(|_| "{}").collect::<Vec<_>>().join(",")
     )
+}
+
+#[derive(Clone, Debug)]
+struct MutableClock(Arc<Mutex<chrono::DateTime<Utc>>>);
+impl MutableClock {
+    fn set(&self, now: chrono::DateTime<Utc>) {
+        *self.0.lock().unwrap() = now;
+    }
+}
+impl Clock for MutableClock {
+    fn now(&self) -> chrono::DateTime<Utc> {
+        *self.0.lock().unwrap()
+    }
 }
 
 #[test]
@@ -145,4 +160,96 @@ fn constants_match_the_hard_resource_bounds() {
     assert_eq!(MAX_RESPONSE_BYTES, 4 * 1024 * 1024);
     assert_eq!(MAX_PAGES, 128);
     assert_eq!(MAX_AGGREGATE_RECORDS, 256_000);
+}
+
+#[test]
+fn only_public_unicast_addresses_are_eligible_for_pinned_official_hosts() {
+    use std::net::IpAddr;
+    assert!(is_public_feed_address("8.8.8.8".parse().unwrap()));
+    assert!(is_public_feed_address(
+        "2606:4700:4700::1111".parse().unwrap()
+    ));
+    for address in [
+        "0.0.0.0",
+        "127.0.0.1",
+        "10.0.0.1",
+        "100.64.0.1",
+        "169.254.1.1",
+        "172.16.0.1",
+        "192.0.2.1",
+        "192.168.0.1",
+        "198.18.0.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "224.0.0.1",
+        "240.0.0.1",
+        "::",
+        "::1",
+        "::ffff:127.0.0.1",
+        "fc00::1",
+        "fe80::1",
+        "ff00::1",
+        "2001:db8::1",
+    ] {
+        assert!(
+            !is_public_feed_address(address.parse::<IpAddr>().unwrap()),
+            "{address}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_cache_expires_after_exact_seven_day_grace() {
+    let initial = at(100);
+    let clock = MutableClock(Arc::new(Mutex::new(initial)));
+    let transport = FixtureTransport::with_clock(
+        [
+            Ok(FixtureReply::json(nvd_page(0, 1, 1))),
+            Err(TransportError::Unavailable),
+        ],
+        clock.clone(),
+    );
+    let feed = NvdFeed::with_clock(transport, clock.clone());
+    let window = ModifiedWindow::new(at(0), at(1)).unwrap();
+    feed.sync(window.clone()).await.unwrap();
+    clock.set(initial + Duration::hours(1) + Duration::days(7) + Duration::seconds(1));
+    assert!(matches!(
+        feed.sync(window).await,
+        Err(FeedError::CacheExpired)
+    ));
+}
+
+#[tokio::test]
+async fn stale_cache_is_available_at_the_exact_seven_day_boundary() {
+    let initial = at(200);
+    let clock = MutableClock(Arc::new(Mutex::new(initial)));
+    let transport = FixtureTransport::with_clock(
+        [
+            Ok(FixtureReply::json(nvd_page(0, 1, 1))),
+            Err(TransportError::Unavailable),
+        ],
+        clock.clone(),
+    );
+    let feed = NvdFeed::with_clock(transport, clock.clone());
+    let window = ModifiedWindow::new(at(0), at(1)).unwrap();
+    feed.sync(window.clone()).await.unwrap();
+    clock.set(initial + Duration::hours(1) + Duration::days(7));
+    assert!(feed.sync(window).await.unwrap().is_stale());
+}
+
+#[tokio::test]
+async fn cisa_http_and_schema_failures_serve_stale_cached_records() {
+    let transport = FixtureTransport::queued([
+        Ok(FixtureReply::json(r#"{"vulnerabilities":[{}]}"#)),
+        Ok(FixtureReply::status(503)),
+    ]);
+    let feed = CisaKevFeed::new(transport);
+    feed.sync().await.unwrap();
+    assert!(feed.sync().await.unwrap().is_stale());
+    let schema = CisaKevFeed::new(FixtureTransport::queued([
+        Ok(FixtureReply::json(r#"{"vulnerabilities":[{}]}"#)),
+        Ok(FixtureReply::json(r#"{"wrong":[]}"#)),
+    ]));
+    schema.sync().await.unwrap();
+    assert!(schema.sync().await.unwrap().is_stale());
 }

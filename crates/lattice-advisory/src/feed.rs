@@ -1,12 +1,16 @@
 use crate::transport::{
-    FeedRequest, FeedResponse, FeedTransport, KEV_URL, MAX_AGGREGATE_RECORDS, MAX_PAGES,
-    MAX_RESULTS_PER_PAGE, NVD_URL, TransportError,
+    Clock, FeedRequest, FeedResponse, FeedTransport, KEV_URL, MAX_AGGREGATE_RECORDS, MAX_PAGES,
+    MAX_RESULTS_PER_PAGE, NVD_URL, SystemClock, TransportError,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 const CACHE_TTL: Duration = Duration::hours(1);
+pub const MAX_STALE_AGE: Duration = Duration::days(7);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModifiedWindow {
@@ -19,7 +23,7 @@ impl ModifiedWindow {
         Ok(Self { start, end })
     }
     pub fn since(start: DateTime<Utc>) -> Result<Self, FeedError> {
-        Self::new(start, Utc::now())
+        Self::new(start, SystemClock.now())
     }
 }
 
@@ -50,6 +54,8 @@ pub enum FeedError {
     RecordLimit,
     #[error("cache protocol error")]
     CacheProtocol,
+    #[error("cached feed records have expired")]
+    CacheExpired,
     #[error(transparent)]
     Transport(TransportError),
 }
@@ -61,12 +67,17 @@ struct Cached {
 pub struct NvdFeed<T> {
     transport: T,
     cache: Mutex<HashMap<String, Cached>>,
+    clock: Arc<dyn Clock>,
 }
 impl<T> NvdFeed<T> {
     pub fn new(transport: T) -> Self {
+        Self::with_clock(transport, SystemClock)
+    }
+    pub fn with_clock(transport: T, clock: impl Clock + 'static) -> Self {
         Self {
             transport,
             cache: Mutex::new(HashMap::new()),
+            clock: Arc::new(clock),
         }
     }
 }
@@ -96,7 +107,7 @@ impl<T: FeedTransport> NvdFeed<T> {
                     let Some(cached) = cached else {
                         return Err(FeedError::Unavailable(TransportError::Unavailable));
                     };
-                    if cached.result.cache_expires_at < response.retrieved_at {
+                    if cached.result.cache_expires_at < self.clock.now() {
                         return Err(FeedError::Unavailable(TransportError::Unavailable));
                     }
                     cached.result.response
@@ -132,7 +143,7 @@ impl<T: FeedTransport> NvdFeed<T> {
                 return Err(FeedError::RecordLimit);
             }
             all.extend(records);
-            let expiry = response.retrieved_at + CACHE_TTL;
+            let expiry = self.clock.now() + CACHE_TTL;
             let result = FeedResult {
                 source_url: NVD_URL.into(),
                 records: all.clone(),
@@ -179,6 +190,16 @@ impl<T: FeedTransport> NvdFeed<T> {
         error: TransportError,
     ) -> Result<FeedResult, FeedError> {
         if let Some(cached) = self.cache.lock().expect("cache lock").get(key).cloned() {
+            let Some(stale_until) = cached
+                .result
+                .cache_expires_at
+                .checked_add_signed(MAX_STALE_AGE)
+            else {
+                return Err(FeedError::CacheExpired);
+            };
+            if self.clock.now() > stale_until {
+                return Err(FeedError::CacheExpired);
+            }
             let mut result = cached.result;
             result.warnings.push(FeedWarning::Stale(error));
             Ok(result)
@@ -212,12 +233,17 @@ fn parse_nvd(body: &str) -> Result<(usize, usize, usize, Vec<Value>), FeedError>
 pub struct CisaKevFeed<T> {
     transport: T,
     cache: Mutex<Option<Cached>>,
+    clock: Arc<dyn Clock>,
 }
 impl<T> CisaKevFeed<T> {
     pub fn new(transport: T) -> Self {
+        Self::with_clock(transport, SystemClock)
+    }
+    pub fn with_clock(transport: T, clock: impl Clock + 'static) -> Self {
         Self {
             transport,
             cache: Mutex::new(None),
+            clock: Arc::new(clock),
         }
     }
 }
@@ -237,23 +263,17 @@ impl<T: FeedTransport> CisaKevFeed<T> {
                 let Some(cached) = cached else {
                     return Err(FeedError::Unavailable(TransportError::Unavailable));
                 };
-                if cached.result.cache_expires_at < response.retrieved_at {
+                if cached.result.cache_expires_at < self.clock.now() {
                     return Err(FeedError::Unavailable(TransportError::Unavailable));
                 }
                 return Ok(cached.result);
             }
             Ok(response) if response.status == 200 => response,
             Ok(response) => {
-                return Err(FeedError::Unavailable(TransportError::HttpStatus(
-                    response.status,
-                )));
+                return self.stale_or_unavailable(TransportError::HttpStatus(response.status));
             }
             Err(error) => {
-                if let Some(mut cached) = cached {
-                    cached.result.warnings.push(FeedWarning::Stale(error));
-                    return Ok(cached.result);
-                }
-                return Err(FeedError::Unavailable(error));
+                return self.stale_or_unavailable(error);
             }
         };
         let value: Value = match serde_json::from_str(&response.body) {
@@ -275,7 +295,7 @@ impl<T: FeedTransport> CisaKevFeed<T> {
             source_url: KEV_URL.into(),
             records,
             response: response.clone(),
-            cache_expires_at: response.retrieved_at + CACHE_TTL,
+            cache_expires_at: self.clock.now() + CACHE_TTL,
             warnings: Vec::new(),
         };
         *self.cache.lock().expect("cache lock") = Some(Cached {
@@ -285,6 +305,16 @@ impl<T: FeedTransport> CisaKevFeed<T> {
     }
     fn stale_or_unavailable(&self, error: TransportError) -> Result<FeedResult, FeedError> {
         if let Some(mut cached) = self.cache.lock().expect("cache lock").clone() {
+            let Some(stale_until) = cached
+                .result
+                .cache_expires_at
+                .checked_add_signed(MAX_STALE_AGE)
+            else {
+                return Err(FeedError::CacheExpired);
+            };
+            if self.clock.now() > stale_until {
+                return Err(FeedError::CacheExpired);
+            }
             cached.result.warnings.push(FeedWarning::Stale(error));
             Ok(cached.result)
         } else {

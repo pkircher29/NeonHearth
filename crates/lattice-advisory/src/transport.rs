@@ -2,6 +2,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use reqwest::header::{ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use std::{
     collections::VecDeque,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
     time::Duration as StdDuration,
 };
@@ -15,6 +16,17 @@ pub const MAX_RESULTS_PER_PAGE: usize = 2_000;
 pub const MAX_PAGES: usize = 128;
 pub const MAX_AGGREGATE_RECORDS: usize = 256_000;
 const MAX_VALIDATOR_BYTES: usize = 1024;
+
+pub trait Clock: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> DateTime<Utc>;
+}
+#[derive(Clone, Debug, Default)]
+pub struct SystemClock;
+impl Clock for SystemClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TransportError {
@@ -34,6 +46,8 @@ pub enum TransportError {
     MalformedDocument,
     #[error("transport unavailable")]
     Unavailable,
+    #[error("official host resolved to an unsafe address")]
+    UnsafeAddress,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,23 +154,34 @@ pub struct FeedResponse {
     pub source_url: String,
 }
 
-#[derive(Clone, Debug)]
 pub struct ProductionTransport {
     client: reqwest::Client,
+    clock: Arc<dyn Clock>,
 }
 impl ProductionTransport {
     pub fn new() -> Result<Self, TransportError> {
+        Self::with_clock(SystemClock)
+    }
+    pub fn with_clock(clock: impl Clock + 'static) -> Result<Self, TransportError> {
+        let nvd = resolve_public_host("services.nvd.nist.gov")?;
+        let cisa = resolve_public_host("www.cisa.gov")?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .connect_timeout(StdDuration::from_secs(10))
             .timeout(StdDuration::from_secs(30))
             .pool_max_idle_per_host(2)
             .no_gzip()
             .no_brotli()
             .no_deflate()
+            .resolve_to_addrs("services.nvd.nist.gov", &nvd)
+            .resolve_to_addrs("www.cisa.gov", &cisa)
             .build()
             .map_err(|_| TransportError::Unavailable)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            clock: Arc::new(clock),
+        })
     }
 }
 impl FeedTransport for ProductionTransport {
@@ -181,7 +206,7 @@ impl FeedTransport for ProductionTransport {
             return Ok(FeedResponse {
                 status,
                 body: String::new(),
-                retrieved_at: Utc::now(),
+                retrieved_at: self.clock.now(),
                 etag,
                 last_modified,
                 source_url: request.url,
@@ -230,7 +255,7 @@ impl FeedTransport for ProductionTransport {
         Ok(FeedResponse {
             status,
             body,
-            retrieved_at: Utc::now(),
+            retrieved_at: self.clock.now(),
             etag,
             last_modified,
             source_url: request.url,
@@ -275,16 +300,37 @@ impl FixtureReply {
         self
     }
 }
-#[derive(Clone, Debug)]
 pub struct FixtureTransport {
     replies: Arc<Mutex<VecDeque<Result<FixtureReply, TransportError>>>>,
     requests: Arc<Mutex<Vec<FeedRequest>>>,
+    clock: Arc<dyn Clock>,
+}
+impl Clone for FixtureTransport {
+    fn clone(&self) -> Self {
+        Self {
+            replies: self.replies.clone(),
+            requests: self.requests.clone(),
+            clock: self.clock.clone(),
+        }
+    }
+}
+impl std::fmt::Debug for FixtureTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FixtureTransport").finish_non_exhaustive()
+    }
 }
 impl FixtureTransport {
     pub fn queued(replies: impl IntoIterator<Item = Result<FixtureReply, TransportError>>) -> Self {
+        Self::with_clock(replies, SystemClock)
+    }
+    pub fn with_clock(
+        replies: impl IntoIterator<Item = Result<FixtureReply, TransportError>>,
+        clock: impl Clock + 'static,
+    ) -> Self {
         Self {
             replies: Arc::new(Mutex::new(replies.into_iter().collect())),
             requests: Arc::new(Mutex::new(Vec::new())),
+            clock: Arc::new(clock),
         }
     }
     pub fn from_json(body: &str) -> Self {
@@ -313,7 +359,7 @@ impl FeedTransport for FixtureTransport {
         Ok(FeedResponse {
             status: reply.status,
             body: reply.body,
-            retrieved_at: Utc::now(),
+            retrieved_at: self.clock.now(),
             etag: reply.etag,
             last_modified: reply.last_modified,
             source_url: request.url,
@@ -369,5 +415,49 @@ fn validate_exact_url(raw: &str) -> Result<(), TransportError> {
         Ok(())
     } else {
         Err(TransportError::UnsafeUrl)
+    }
+}
+
+fn resolve_public_host(host: &str) -> Result<Vec<SocketAddr>, TransportError> {
+    let addresses: Vec<_> = (host, 443)
+        .to_socket_addrs()
+        .map_err(|_| TransportError::Unavailable)?
+        .collect();
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| !is_public_feed_address(address.ip()))
+    {
+        return Err(TransportError::UnsafeAddress);
+    }
+    Ok(addresses)
+}
+pub fn is_public_feed_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ip) => {
+            let [a, b, ..] = ip.octets();
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 192 && matches!(b, 0 | 2))
+                || (a == 198 && ((18..=19).contains(&b) || b == 51))
+                || (a == 203 && b == 0)
+                || a >= 240)
+        }
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_public_feed_address(IpAddr::V4(v4));
+            }
+            let segments = ip.segments();
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00 == 0xfc00)
+                || (segments[0] & 0xffc0 == 0xfe80)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+        }
     }
 }
