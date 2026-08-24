@@ -268,11 +268,13 @@ impl<
             }
         };
         let observed_at = Self::floor_second(now);
+        let mut policy_degraded = false;
         // A quiet network still needs policy progress: deadline warnings and
         // expiry actions are driven by the durable clock, not new sightings.
         if self.policy.enabled().await.unwrap_or(false)
             && let Err(error) = self.policy.sweep(observed_at).await
         {
+            policy_degraded = true;
             tracing::warn!("policy runtime sweep degraded: {error}");
             self.state
                 .transition_service_status(ServiceRuntimeStatus::Degraded, observed_at)
@@ -348,6 +350,7 @@ impl<
                         )
                         .await
                 {
+                    policy_degraded = true;
                     tracing::warn!(
                         "policy evaluation degraded after durable discovery commit: {error}"
                     );
@@ -375,16 +378,22 @@ impl<
                 && self.policy.needs_recovery(device).await.unwrap_or(false)
                 && let Err(error) = self.policy.enroll_and_evaluate(device, observed_at).await
             {
+                policy_degraded = true;
                 tracing::warn!(
                     "policy recovery degraded after duplicate durable discovery: {error}"
                 );
+                self.state
+                    .transition_service_status(ServiceRuntimeStatus::Degraded, observed_at)
+                    .await;
             }
             outcomes.push(outcome);
         }
         self.tracker = staged_tracker;
-        self.state
-            .transition_service_status(ServiceRuntimeStatus::Ready, observed_at)
-            .await;
+        if !policy_degraded {
+            self.state
+                .transition_service_status(ServiceRuntimeStatus::Ready, observed_at)
+                .await;
+        }
         Ok(NeighborCycle {
             outcomes,
             commit_sequence: self.pipeline.commit_sequence(),

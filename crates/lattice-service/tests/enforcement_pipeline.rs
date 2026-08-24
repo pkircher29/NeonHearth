@@ -404,3 +404,30 @@ async fn protected_devices_keep_owner_actions_available_without_automatic_blocki
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn policy_failure_after_a_committed_discovery_keeps_the_cycle_degraded() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone()).initialize(at(0)).await?;
+    let policy_repo = PolicyRepository::new(pool.clone());
+    policy_repo.mark_successful_service_start(at(0)).await?;
+    let state_repo = M2StateRepository::new(pool.clone());
+    let state = AppState::new("owner-token-0123456789abcdefghijkl", state_repo.clone())?;
+    let binding = NeighborInterfaceBinding::for_interface(InterfaceId::new(7))?;
+    let pipeline = PersistentDiscoveryPipeline::open(
+        state_repo, neighbor_discovery_sources(&[binding])?, [DeviceId::new()].into_iter(), Default::default(), 16, 16,
+    ).await?;
+    let policy = PolicyCoordinator::with_actuator(policy_repo, Some(state.events().clone()), FakeActuator::default());
+    let mut coordinator = NeighborCoordinator::with_policy(
+        QueuedSource(Mutex::new(VecDeque::from([Ok(vec![neighbor_row(1)])]))), pipeline, state.clone(), [binding],
+        NeighborCoordinatorConfig { poll_interval: Duration::seconds(5), support_ttl: Duration::seconds(4), tracker: NeighborTrackerConfig::default() }, policy,
+    )?;
+    sqlx::query("CREATE TRIGGER injected_policy_failure BEFORE INSERT ON device_policy BEGIN SELECT RAISE(ABORT, 'injected policy failure'); END")
+        .execute(&pool).await?;
+
+    let cycle = coordinator.cycle(at(60)).await?;
+
+    assert_eq!(cycle.outcomes().len(), 1, "durable discovery output is retained");
+    assert_eq!(state.service_status().await, "degraded");
+    Ok(())
+}
