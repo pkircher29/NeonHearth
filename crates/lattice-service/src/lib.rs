@@ -5,6 +5,7 @@ pub mod platform;
 pub mod policy;
 pub mod runtime;
 mod state;
+pub mod vault;
 pub mod ws;
 use axum::{
     Router,
@@ -16,6 +17,7 @@ use axum::{
 pub use platform::{Platform, PlatformPaths, platform_paths};
 use serde::Deserialize;
 pub use state::{AppState, InvalidServiceToken, ServiceRuntimeStatus};
+pub use vault::{CredentialRef, FakeVault, KeyringVault, Vault, VaultCapability, VaultError};
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(api::health))

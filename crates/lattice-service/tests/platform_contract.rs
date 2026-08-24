@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use lattice_service::{Platform, platform_paths};
+use lattice_service::{KeyringVault, Platform, VaultCapability, VaultError, platform_paths};
 
 #[test]
 fn linux_paths_are_service_owned() {
@@ -42,5 +42,16 @@ fn paths_are_not_user_or_repository_owned() {
             assert!(!rendered.contains("/home/"));
             assert!(!rendered.contains("/repo/"));
         }
+    }
+}
+
+#[tokio::test]
+async fn platform_vault_capability_fails_closed_without_storing_a_secret() {
+    match KeyringVault::capability().await {
+        VaultCapability::Available => assert!(KeyringVault::platform().await.is_ok()),
+        VaultCapability::Unavailable => assert!(matches!(
+            KeyringVault::platform().await,
+            Err(VaultError::Unavailable)
+        )),
     }
 }

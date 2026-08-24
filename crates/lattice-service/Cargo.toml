@@ -30,6 +30,10 @@ tracing.workspace = true
 utoipa.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+keyring.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
