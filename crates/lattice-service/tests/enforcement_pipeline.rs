@@ -42,6 +42,12 @@ impl PolicyActuator for FakeActuator {
     }
 }
 
+struct OutcomeActuator(EnforcementResult);
+#[async_trait]
+impl PolicyActuator for OutcomeActuator {
+    async fn enforce(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult { self.0 }
+}
+
 struct QueuedSource(Mutex<VecDeque<Result<Vec<NeighborRow>, NeighborError>>>);
 #[async_trait]
 impl NeighborSnapshotSource for QueuedSource {
@@ -288,6 +294,12 @@ async fn changed_enforcement_result_emits_a_new_typed_policy_event() -> anyhow::
         PolicyCoordinator::with_actuator(repo, Some(bus.clone()), FakeActuator::default());
     verified.reject(device, at(60)).await?;
     assert_eq!(bus.current_sequence().await, 3);
+    let restarted_repo = PolicyRepository::new(pool.clone());
+    assert_eq!(
+        restarted_repo.published_decision(device).await?.unwrap().enforcement_result,
+        EnforcementResult::Verified,
+        "resync projections must retain the acknowledged enforcement result"
+    );
     Ok(())
 }
 
@@ -310,5 +322,85 @@ async fn runtime_sweep_evaluates_persisted_policies_without_new_discovery() -> a
     assert_eq!(decisions[0].requested_action, RequestedAction::Quarantine);
     assert_eq!(decisions[0].enforcement, EnforcementResult::Verified);
     assert_eq!(actuator.0.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_verified_enforcement_persists_a_blocked_presence_transition() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone()).initialize(at(0)).await?;
+    let policy_repo = PolicyRepository::new(pool.clone());
+    policy_repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+
+    let verified = PolicyCoordinator::with_actuator_and_state(
+        policy_repo.clone(), None, FakeActuator::default(), M2StateRepository::new(pool.clone()),
+    );
+    verified.enroll_and_evaluate(device, at(108)).await?;
+    assert_eq!(
+        M2StateRepository::new(pool.clone()).list_device_snapshots(8, None).await?[0]
+            .presence.as_ref().map(|p| p.to_state),
+        Some(lattice_domain::PresenceState::Blocked),
+    );
+
+    let manual_device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(manual_device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let manual = PolicyCoordinator::with_state(policy_repo, None, M2StateRepository::new(pool.clone()));
+    manual.enroll_and_evaluate(manual_device, at(108)).await?;
+    assert_ne!(M2StateRepository::new(pool).list_device_snapshots(8, None).await?[1]
+        .presence.as_ref().map(|p| p.to_state), Some(lattice_domain::PresenceState::Blocked));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_enforcement_never_claims_blocked_presence() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone()).initialize(at(0)).await?;
+    let policy_repo = PolicyRepository::new(pool.clone());
+    policy_repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let coordinator = PolicyCoordinator::with_actuator_and_state(
+        policy_repo, None, OutcomeActuator(EnforcementResult::Failed), M2StateRepository::new(pool.clone()),
+    );
+    assert_eq!(coordinator.enroll_and_evaluate(device, at(108)).await?.enforcement, EnforcementResult::Failed);
+    let blocked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM presence_transitions WHERE device_id=? AND to_state='blocked'")
+        .bind(device.to_string()).fetch_one(&pool).await?;
+    assert_eq!(blocked, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn protected_devices_keep_owner_actions_available_without_automatic_blocking() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone()).initialize(at(0)).await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    for protection in [
+        lattice_domain::Protection::Router,
+        lattice_domain::Protection::Collector,
+        lattice_domain::Protection::AdministratorPhone,
+        lattice_domain::Protection::SafetyDevice,
+    ] {
+        let device = DeviceId::new();
+        sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+            .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+        repo.enroll(device).await?;
+        repo.set_protection(device, protection).await?;
+        repo.set_risk(device, lattice_domain::RiskSignal::HighConfidenceDanger { confidence_basis_points: 9_500, evidence: "confirmed".into() }).await?;
+        let coordinator = PolicyCoordinator::with_actuator_and_state(
+            repo.clone(), None, FakeActuator::default(), M2StateRepository::new(pool.clone()),
+        );
+        assert_eq!(coordinator.evaluate(repo.load(device).await?.unwrap(), at(61)).await?.requested_action, RequestedAction::OwnerAttention);
+        assert_eq!(coordinator.approve(device, at(61)).await?.requested_action, RequestedAction::OwnerAttention);
+        assert_eq!(repo.load(device).await?.unwrap().owner_decision, lattice_domain::OwnerDecision::Approved);
+        assert_eq!(coordinator.quarantine(device, at(61)).await?.requested_action, RequestedAction::Quarantine);
+        assert_eq!(repo.load(device).await?.unwrap().owner_decision, lattice_domain::OwnerDecision::Quarantined);
+        assert!(coordinator.extend_once(device, at(300), at(61)).await.is_ok());
+    }
     Ok(())
 }

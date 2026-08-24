@@ -124,10 +124,10 @@ pub async fn state(
     let policy = PolicyRepository::new(state.state_repository().pool().clone());
     let mut mapped = Vec::with_capacity(devices.len());
     for device in devices {
-        let policy_projection = match policy.load(device.device_id).await {
-            Ok(Some(value)) => lattice_service_policy_projection(&policy, value, Utc::now()).await.ok(),
-            Ok(None) => None,
-            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        let policy_projection = match (policy.load(device.device_id).await, policy.published_decision(device.device_id).await) {
+            (Ok(Some(policy_row)), Ok(Some(value))) => Some(PolicyProjection::from((policy_row, value))),
+            (Ok(_), Ok(None)) => None,
+            _ => return Err(StatusCode::SERVICE_UNAVAILABLE),
         };
         mapped.push(map_device(device, policy_projection));
     }
@@ -170,19 +170,16 @@ mod tests {
         assert_eq!(state.events().current_sequence().await, 1);
     }
 }
-async fn lattice_service_policy_projection(
-    _: &PolicyRepository,
-    policy: lattice_domain::DevicePolicy,
-    now: DateTime<Utc>,
-) -> anyhow::Result<PolicyProjection> {
-    let evaluation = lattice_policy::PolicyEngine::new(policy.first_seen_at).evaluate(&policy, now);
-    Ok(PolicyProjection {
-        owner_decision: policy.owner_decision,
-        protection: policy.protection,
-        evaluation,
-        enforcement_result: lattice_domain::EnforcementStatus::NotRequested,
-        undo_available: matches!(policy.owner_decision, OwnerDecision::Approved | OwnerDecision::Quarantined),
-    })
+impl From<(lattice_domain::DevicePolicy, lattice_domain::PolicyChanged)> for PolicyProjection {
+    fn from((policy, value): (lattice_domain::DevicePolicy, lattice_domain::PolicyChanged)) -> Self {
+        Self {
+            owner_decision: policy.owner_decision,
+            protection: policy.protection,
+            evaluation: value.evaluation,
+            enforcement_result: value.enforcement_result,
+            undo_available: value.undo_available,
+        }
+    }
 }
 fn map_device(d: StoredDeviceSnapshot, policy: Option<PolicyProjection>) -> DeviceSnapshot {
     DeviceSnapshot {
@@ -262,9 +259,10 @@ pub async fn policy_action(
     State(state): State<AppState>,
     Json(request): Json<PolicyActionRequest>,
 ) -> Result<Json<PolicyActionResponse>, StatusCode> {
-    let coordinator = crate::policy::PolicyCoordinator::new(
+    let coordinator = crate::policy::PolicyCoordinator::with_state(
         PolicyRepository::new(state.state_repository().pool().clone()),
         Some(state.events().clone()),
+        state.state_repository().clone(),
     );
     let now = Utc::now();
     let result = match request.action {

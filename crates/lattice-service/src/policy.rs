@@ -5,7 +5,7 @@ use lattice_domain::{
     PolicyReason, Protection, RequestedAction, RiskSignal,
 };
 use lattice_event_bus::EventBus;
-use lattice_store::PolicyRepository;
+use lattice_store::{M2StateRepository, PolicyRepository};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,19 +46,32 @@ pub struct PolicyCoordinator<A = ManualRequiredActuator> {
     repo: PolicyRepository,
     events: Option<EventBus>,
     actuator: Arc<A>,
+    presence: Option<M2StateRepository>,
 }
 
 impl PolicyCoordinator<ManualRequiredActuator> {
     pub fn new(repo: PolicyRepository, events: Option<EventBus>) -> Self {
         Self::with_actuator(repo, events, ManualRequiredActuator)
     }
+    pub fn with_state(repo: PolicyRepository, events: Option<EventBus>, presence: M2StateRepository) -> Self {
+        Self::with_actuator_and_state(repo, events, ManualRequiredActuator, presence)
+    }
 }
 impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
     pub fn with_actuator(repo: PolicyRepository, events: Option<EventBus>, actuator: A) -> Self {
+        Self { repo, events, actuator: Arc::new(actuator), presence: None }
+    }
+    pub fn with_actuator_and_state(
+        repo: PolicyRepository,
+        events: Option<EventBus>,
+        actuator: A,
+        presence: M2StateRepository,
+    ) -> Self {
         Self {
             repo,
             events,
             actuator: Arc::new(actuator),
+            presence: Some(presence),
         }
     }
     pub async fn enroll_and_evaluate(
@@ -116,6 +129,12 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 .enforce(p.device_id, evaluation.requested_action)
                 .await
         };
+        if enforcement == EnforcementResult::Verified
+            && matches!(evaluation.requested_action, RequestedAction::Quarantine | RequestedAction::PermanentBan)
+            && let Some(presence) = &self.presence
+        {
+            presence.record_verified_block(p.device_id, now).await?;
+        }
         let undo_available = matches!(
             p.owner_decision,
             OwnerDecision::Approved | OwnerDecision::Quarantined
@@ -132,21 +151,22 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 .reserve_decision_publication(p.device_id, &fingerprint)
                 .await?
         {
+            let event = PolicyChanged {
+                device_id: p.device_id,
+                policy_version: evaluation.policy_version,
+                evaluation,
+                requested_action: evaluation.requested_action,
+                evidence_summary: evidence_summary(&p),
+                enforcement_result: enforcement,
+                undo_available,
+            };
             bus.publish(
                 now,
-                EventPayload::PolicyChanged(PolicyChanged {
-                    device_id: p.device_id,
-                    policy_version: evaluation.policy_version,
-                    evaluation,
-                    requested_action: evaluation.requested_action,
-                    evidence_summary: evidence_summary(&p),
-                    enforcement_result: enforcement,
-                    undo_available,
-                }),
+                EventPayload::PolicyChanged(event.clone()),
             )
             .await;
             self.repo
-                .mark_decision_published(p.device_id, &fingerprint)
+                .mark_decision_published(p.device_id, &fingerprint, &event)
                 .await?;
         }
         Ok(AuditedDecision {

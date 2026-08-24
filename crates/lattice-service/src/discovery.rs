@@ -179,6 +179,7 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource>
                 lattice_sensor::neighbor::NeighborError::InvalidConfig,
             ));
         }
+        let policy_state = lattice_store::M2StateRepository::new(pipeline.state.pool().clone());
         let policy_repo = lattice_store::PolicyRepository::new(pipeline.state.pool().clone());
         let policy_events = state.events().clone();
         Self::with_policy(
@@ -187,7 +188,7 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource>
             state,
             bindings,
             config,
-            crate::policy::PolicyCoordinator::new(policy_repo, Some(policy_events)),
+            crate::policy::PolicyCoordinator::with_state(policy_repo, Some(policy_events), policy_state),
         )
     }
 }

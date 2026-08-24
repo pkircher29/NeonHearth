@@ -176,6 +176,38 @@ impl M2StateRepository {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+    /// Persist an enforcement control fact only after the caller has verified
+    /// that the requested network action succeeded.  The next identifier is
+    /// allocated inside the transaction so it cannot collide with discovery
+    /// transitions.
+    pub async fn record_verified_block(
+        &self,
+        device_id: DeviceId,
+        at: DateTime<Utc>,
+    ) -> Result<(), CheckpointError> {
+        let mut tx = self.pool.begin().await?;
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT to_state FROM presence_transitions WHERE device_id=? ORDER BY occurred_at DESC, transition_id DESC LIMIT 1",
+        ).bind(device_id.to_string()).fetch_optional(&mut *tx).await?;
+        if current.as_deref() == Some("blocked") {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let from = current.as_deref().unwrap_or("unknown");
+        // Discovery owns non-negative ids in its checkpoint.  Policy controls
+        // use a disjoint negative range so a later discovery commit cannot
+        // collide with a transition it did not allocate.
+        let transition_id: i64 = sqlx::query_scalar("SELECT COALESCE(MIN(transition_id), 0) - 1 FROM presence_transitions WHERE transition_id < 0")
+            .fetch_one(&mut *tx).await?;
+        sqlx::query("INSERT INTO presence_transitions(transition_id,device_id,from_state,to_state,occurred_at,reason,trigger_source,trigger_kind,evidence_observed_at,evidence_valid_until,trigger_arrival_at,correction_of) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)")
+            .bind(transition_id).bind(device_id.to_string()).bind(from).bind("blocked")
+            .bind(at.to_rfc3339()).bind("verified_policy_enforcement").bind("policy")
+            .bind("enforcement_blocked").bind(at.to_rfc3339()).bind(Option::<String>::None)
+            .bind(at.to_rfc3339())
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
     pub fn with_config(pool: SqlitePool, config: M2StateConfig) -> Result<Self, CheckpointError> {
         if config.max_checkpoint_bytes == 0
             || config.max_discovery_summary_bytes == 0

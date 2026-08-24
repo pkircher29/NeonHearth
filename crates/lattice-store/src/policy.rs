@@ -2,7 +2,7 @@ use anyhow::{Context, ensure};
 use chrono::{DateTime, Duration, Utc};
 use lattice_domain::{
     AUTOMATIC_IDENTITY_THRESHOLD_BPS, AUTOMATIC_POLICY_DEADLINE_HOURS, DeviceId, DevicePolicy,
-    Identification, OwnerDecision, Protection, RiskSignal, UNKNOWN_POLICY_DEADLINE_HOURS,
+    Identification, OwnerDecision, PolicyChanged, Protection, RiskSignal, UNKNOWN_POLICY_DEADLINE_HOURS,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::SqlitePool;
@@ -207,12 +207,14 @@ impl PolicyRepository {
         &self,
         device_id: DeviceId,
         fingerprint: &str,
+        decision: &PolicyChanged,
     ) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "UPDATE device_policy SET decision_fingerprint=?, updated_at=? WHERE device_id=?",
+            "UPDATE device_policy SET decision_fingerprint=?, published_decision_json=?, updated_at=? WHERE device_id=?",
         )
         .bind(fingerprint)
+        .bind(encode(decision)?)
         .bind(Utc::now().to_rfc3339())
         .bind(device_id.to_string())
         .execute(&mut *tx)
@@ -224,6 +226,12 @@ impl PolicyRepository {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn published_decision(&self, device_id: DeviceId) -> anyhow::Result<Option<PolicyChanged>> {
+        let value: Option<String> = sqlx::query_scalar("SELECT published_decision_json FROM device_policy WHERE device_id=?")
+            .bind(device_id.to_string()).fetch_optional(&self.pool).await?;
+        value.as_deref().map(|v| decode(v, "published policy decision")).transpose()
     }
 
     pub async fn set_identification(
