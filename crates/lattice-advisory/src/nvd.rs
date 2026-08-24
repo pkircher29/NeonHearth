@@ -52,41 +52,41 @@ pub fn parse_nvd(
         let published = time(cve, "published")?;
         let modified = time(cve, "lastModified")?;
         let severity = severity(cve);
-        let mut cpes = Vec::new();
+        let mut seen = BTreeSet::new();
         if let Some(configurations) = cve.get("configurations").and_then(Value::as_array) {
             for configuration in configurations {
-                collect_nodes(configuration.get("nodes"), &mut cpes)?;
+                visit_nodes(configuration.get("nodes"), &mut |cpe_match| {
+                    let parsed = cpe(cpe_match)?;
+                    // CPE criteria is the stable identity. Keep the first occurrence in JSON traversal order.
+                    if !seen.insert(parsed.0) {
+                        return Ok(());
+                    }
+                    if output.len() == MAX_PARSER_OUTPUTS {
+                        return Err(NvdParseError::Oversized);
+                    }
+                    output.push(NormalizedAdvisory::new(AdvisoryInput {
+                        source: AdvisorySource::Nvd,
+                        source_id: id.to_owned(),
+                        source_url: NVD_URL.into(),
+                        title: title.into(),
+                        vendor: parsed.1,
+                        model: Some(parsed.2),
+                        firmware: parsed.3,
+                        published_at: published,
+                        modified_at: modified,
+                        retrieved_at,
+                        cache_expires_at,
+                        freshness: Freshness::Fresh,
+                        source_trust: SourceTrust::OfficialApi,
+                        severity,
+                        exploitability: Exploitability::Unknown,
+                        exposure: Exposure::Unknown,
+                        confidence: Confidence::Medium,
+                        remediation: Remediation::Upgrade,
+                    })?);
+                    Ok(())
+                })?;
             }
-        }
-        let mut seen = BTreeSet::new();
-        for cpe_match in cpes {
-            let parsed = cpe(cpe_match)?;
-            if !seen.insert(parsed.0.clone()) {
-                continue;
-            }
-            if output.len() == MAX_PARSER_OUTPUTS {
-                return Err(NvdParseError::Oversized);
-            }
-            output.push(NormalizedAdvisory::new(AdvisoryInput {
-                source: AdvisorySource::Nvd,
-                source_id: id.to_owned(),
-                source_url: NVD_URL.into(),
-                title: title.into(),
-                vendor: parsed.1,
-                model: Some(parsed.2),
-                firmware: parsed.3,
-                published_at: published,
-                modified_at: modified,
-                retrieved_at,
-                cache_expires_at,
-                freshness: Freshness::Fresh,
-                source_trust: SourceTrust::OfficialApi,
-                severity,
-                exploitability: Exploitability::Unknown,
-                exposure: Exposure::Unknown,
-                confidence: Confidence::Medium,
-                remediation: Remediation::Upgrade,
-            })?);
         }
     }
     Ok(output)
@@ -103,9 +103,9 @@ fn time(cve: &Value, field: &str) -> Result<DateTime<Utc>, NvdParseError> {
         .parse()
         .map_err(|_| NvdParseError::Malformed)
 }
-fn collect_nodes<'a>(
-    nodes: Option<&'a Value>,
-    output: &mut Vec<&'a Value>,
+fn visit_nodes(
+    nodes: Option<&Value>,
+    visitor: &mut impl FnMut(&Value) -> Result<(), NvdParseError>,
 ) -> Result<(), NvdParseError> {
     let Some(nodes) = nodes else {
         return Ok(());
@@ -114,11 +114,11 @@ fn collect_nodes<'a>(
         if let Some(matches) = node.get("cpeMatch") {
             for cpe_match in matches.as_array().ok_or(NvdParseError::Malformed)? {
                 if cpe_match.get("vulnerable").and_then(Value::as_bool) != Some(false) {
-                    output.push(cpe_match);
+                    visitor(cpe_match)?;
                 }
             }
         }
-        collect_nodes(node.get("children"), output)?;
+        visit_nodes(node.get("children"), visitor)?;
     }
     Ok(())
 }
