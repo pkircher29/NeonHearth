@@ -465,7 +465,7 @@ async fn canonical_version_zero_ids_are_accepted_but_noncanonical_ids_are_reject
     for value in [
         "not-a-uuid",                              // malformed
         "00000000-0000-0000-0000-000000000001%20", // trailing space
-        uppercase.as_str(),
+        uppercase,
     ] {
         assert_eq!(
             response(&router, format!("/api/v1/cameras/{value}"))
