@@ -1,0 +1,130 @@
+# cargo-deny configuration for the NeonHearth (lattice) workspace.
+# Run locally with: cargo deny check
+# CI runs this via EmbarkStudios/cargo-deny-action (see .github/workflows/ci.yml).
+# Rationale and maintenance notes: docs/build/supply-chain.md
+
+[graph]
+# Check the dependency graph for every target we ship on, not just the host.
+# Release targets per docs/build/toolchain.md: Windows 11 x64 and a
+# mainstream systemd Linux distribution.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = false
+
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Vulnerabilities and unsound crates fail the build ("deny" is the default for
+# `vulnerability` and `unsound` in current cargo-deny; listed here for clarity).
+version = 2
+# Unmaintained warnings surface in logs but do not fail the gate yet; each one
+# must be triaged and either replaced or moved to `ignore` with a reason.
+unmaintained = "workspace"
+yanked = "deny"
+# Every entry here MUST carry the reason it is temporarily accepted and what
+# unblocks removal. These are NOT permanent acceptances: all of the entries
+# below require semver-incompatible dependency upgrades (Cargo.toml changes)
+# and are tracked as open defects in docs/build/supply-chain.md ("Action
+# required" section). New advisories still fail the gate.
+ignore = [
+    # -- wasmtime 27.0.0 (used only by lattice-audit-wasm to sandbox audit
+    #    modules). All fixes require upgrading past the pinned major
+    #    (>=36.0.7 / >=43.0.1 / >=47.0.3 depending on advisory); no fix exists
+    #    within the 27.x line. Upgrade wasmtime in Cargo.toml, then delete
+    #    this whole block. Several advisories only apply to configurations we
+    #    do not use (Winch backend, aarch64 Cranelift, pooling allocator,
+    #    component model / WASI-http), but the upgrade is required regardless.
+    { id = "RUSTSEC-2025-0046", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2025-0118", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0020", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0021", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0085", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0086", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0087", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0088", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0089", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0091", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0092", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0093", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0094", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0095", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0096", reason = "aarch64 Cranelift only (not a release target); fixed by same wasmtime upgrade" },
+    { id = "RUSTSEC-2026-0222", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    # -- hickory-proto 0.25.2 (DNS parsing in lattice-sensor).
+    { id = "RUSTSEC-2026-0118", reason = "DNSSEC NSEC3 loop: no safe upgrade published; we do not enable DnssecDnsHandle; revisit when fixed release exists" },
+    { id = "RUSTSEC-2026-0119", reason = "encoder CPU amplification: fix requires 0.26.x (semver bump in Cargo.toml); tracked in supply-chain.md" },
+    # -- quick-xml 0.38.4 (SSDP/device-description parsing).
+    { id = "RUSTSEC-2026-0194", reason = "quadratic attribute check: fix requires 0.41.x (semver bump in Cargo.toml); tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0195", reason = "NsReader allocation DoS: fix requires 0.41.x (semver bump in Cargo.toml); tracked in supply-chain.md" },
+]
+
+[licenses]
+version = 2
+# Allowlist derived from what the dependency tree actually uses (verified with
+# `cargo deny check licenses`). Permissive licenses only for third-party code.
+# GPL-family licenses are NOT allowed in dependencies; the workspace's own
+# crates are AGPL-3.0-or-later and are permitted via `exceptions` below.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # CDLA-Permissive-2.0 covers the Mozilla CA bundle data shipped by
+    # webpki-roots; it is a permissive data license.
+    "CDLA-Permissive-2.0",
+    # MPL-2.0 is deliberately NOT listed: nothing in the current tree uses it.
+    # If a dependency introduces it, see docs/build/supply-chain.md before
+    # allowing (file-level copyleft is acceptable for unmodified crates).
+]
+confidence-threshold = 0.8
+exceptions = [
+    # First-party workspace crates only: the workspace is AGPL-3.0-or-later.
+    # AGPL must never be accepted for third-party dependencies.
+    { name = "lattice-domain", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-camera", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-store", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-event-bus", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-sensor", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-intelligence", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-policy", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-service", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-advisory", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-audit-wasm", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-w6", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-doctor", allow = ["AGPL-3.0-or-later"] },
+    { name = "fixture-gen", allow = ["AGPL-3.0-or-later"] },
+    { name = "w6-fixture-recorder", allow = ["AGPL-3.0-or-later"] },
+]
+
+[bans]
+# Duplicate versions bloat the binary and widen the audit surface; warn for now.
+multiple-versions = "warn"
+# Workspace crates reference each other by path without version requirements.
+# allow-wildcard-paths only exempts crates marked `publish = false`, which the
+# workspace crates do not yet declare, so this is "warn" for now. Restore to
+# "deny" once every workspace crate sets `publish = false` in its Cargo.toml
+# (tracked in docs/build/supply-chain.md). No registry/git wildcard exists in
+# the tree today; a new one would still surface here as a warning.
+wildcards = "warn"
+allow-wildcard-paths = true
+deny = [
+    # The TLS stack is rustls-only (ring). OpenSSL linkage must never appear.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+    # git2/libgit2 and curl pull large C surfaces we do not use.
+    { name = "git2" },
+    { name = "curl" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

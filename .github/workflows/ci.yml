@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "codex/**"
+      - "claude/**"
+  pull_request:
+    branches:
+      - main
+      - "codex/**"
+      - "claude/**"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      # rust-toolchain.toml pins the channel; dtolnay/rust-toolchain@stable
+      # respects the repo's rust-toolchain.toml when present.
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Toolchain evidence: record the resolved compiler version in the log
+      # (docs/build/toolchain.md requires CI to record this).
+      - name: Record resolved toolchain versions
+        run: |
+          rustc --version --verbose
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+  deny:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # No extra feature flags: match the graph settings in deny.toml so the
+          # CI gate checks exactly what `cargo deny check` checks locally.
+          arguments: ""
+
+  web:
+    name: Web (desktop app)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Record resolved Node/npm versions
+        run: |
+          node --version
+          npm --version
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test -- --run
+
+      - name: Type/lint check
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Generate Rust SBOMs (CycloneDX JSON, one per crate)
+        run: cargo cyclonedx --format json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install desktop app dependencies
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Generate npm SBOM (CycloneDX JSON)
+        run: npm sbom --sbom-format cyclonedx --package-lock-only > desktop.cdx.json
+        working-directory: apps/desktop
+
+      - name: Collect SBOMs
+        run: |
+          mkdir -p sbom-out
+          find crates tools apps -name '*.cdx.json' -exec cp {} sbom-out/ \;
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom-out/
+          if-no-files-found: error
