@@ -1210,6 +1210,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-policy"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lattice-domain",
+]
+
+[[package]]
 name = "lattice-sensor"
 version = "0.1.0"
 dependencies = [

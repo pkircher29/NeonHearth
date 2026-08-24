@@ -3,12 +3,14 @@
 mod checkpoint;
 mod flow;
 mod install;
+mod policy;
 
 use anyhow::Context;
 pub use checkpoint::*;
 pub use flow::{CompactionPolicy, FlowIngestor, FlowRepository, FlowStoreError};
 use fs2::FileExt;
 pub use install::{InstallRepository, InstallState};
+pub use policy::PolicyRepository;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},

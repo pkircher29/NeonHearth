@@ -6,6 +6,7 @@ members = [
     "crates/lattice-event-bus",
     "crates/lattice-sensor",
     "crates/lattice-intelligence",
+    "crates/lattice-policy",
     "crates/lattice-service",
     "tools/fixture-gen",
 ]
