@@ -56,4 +56,30 @@ fn adapter_rejects_public_and_cross_interface_targets_before_evidence() {
             Err(TargetGuardError::TargetNotPrivate) | Err(TargetGuardError::OutsideApprovedPrefix)
         ));
     }
+    assert!(matches!(
+        camera_evidence_from_observation(
+            &g,
+            InterfaceId::new(99),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 4)),
+            CameraEvidenceFamily::Onvif,
+            "fixture",
+            "onvif_camera_profile",
+            1.0,
+            Utc::now()
+        ),
+        Err(TargetGuardError::InterfaceNotEligible)
+    ));
+    assert!(matches!(
+        camera_evidence_from_observation(
+            &g,
+            InterfaceId::new(1),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 2, 4)),
+            CameraEvidenceFamily::Onvif,
+            "fixture",
+            "onvif_camera_profile",
+            1.0,
+            Utc::now()
+        ),
+        Err(TargetGuardError::OutsideApprovedPrefix)
+    ));
 }
