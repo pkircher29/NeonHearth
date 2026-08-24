@@ -25,6 +25,13 @@ reference; no credential, raw RTSP URI, SOAP, header, target address, or MAC
 may appear in JSON, support export/debug output, diagnostics, media arguments,
 or temporary artifacts.
 
+The fixture also derives its approved binding through a real in-memory
+`TargetGuard` configuration and rejects a wrong subnet or interface before it
+reaches the registry. Its ONVIF transport, RTSP connector, proxy peer, vault,
+and FFmpeg process are still fakes: this proves contract composition and
+fail-closed authorization wiring, **not** a production socket, operating-system
+vault, camera, or network acceptance result.
+
 ## Owner real-host procedure
 
 1. Confirm the owner-administered interface and a narrow private subnet are
