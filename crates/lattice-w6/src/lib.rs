@@ -124,6 +124,12 @@ pub trait Transport: Send {
     async fn profile(&mut self) -> Result<Profile, Error>;
     async fn state(&mut self) -> Result<DeviceState, Error>;
     async fn apply(&mut self, capability: Capability) -> Result<(), Error>;
+    /// Restore a previously observed fixture state. Production adapters must
+    /// implement this only from documented vendor support; the default refuses
+    /// to invent an undo endpoint.
+    async fn restore(&mut self, _previous: DeviceState) -> Result<(), Error> {
+        Err(Error::ManualRequired)
+    }
 }
 
 pub struct Connector<T> {
@@ -270,6 +276,20 @@ impl<T: Transport> Connector<T> {
                 .filter_capacity
                 .map(|c| c.saturating_sub(after.filter_entries)),
         })
+    }
+    /// Restore an exact state captured by a verified mutation and verify the
+    /// appliance reported it back. This is intentionally an injected transport
+    /// capability, not a guessed HTTP reversal.
+    pub async fn restore(&mut self, previous: DeviceState) -> Result<Verification, Error> {
+        self.require_trusted()?;
+        self.transport.restore(previous.clone()).await?;
+        let mut renewed = false;
+        let after = self.call_state(&mut renewed).await?;
+        if after == previous {
+            Ok(Verification::Verified)
+        } else {
+            Err(Error::VerificationFailed)
+        }
     }
     async fn call_state(&mut self, renewed: &mut bool) -> Result<DeviceState, Error> {
         match self.transport.state().await {

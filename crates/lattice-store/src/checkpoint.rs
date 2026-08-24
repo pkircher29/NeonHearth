@@ -208,6 +208,25 @@ impl M2StateRepository {
         tx.commit().await?;
         Ok(())
     }
+    /// A release changes durable control state only after the actuator verified
+    /// restoration. It deliberately reports Unknown rather than inventing a
+    /// network association from the control-plane response.
+    pub async fn record_verified_unblock(
+        &self,
+        device_id: DeviceId,
+        at: DateTime<Utc>,
+    ) -> Result<(), CheckpointError> {
+        let mut tx = self.pool.begin().await?;
+        let transition_id: i64 = sqlx::query_scalar("SELECT COALESCE(MIN(transition_id), 0) - 1 FROM presence_transitions WHERE transition_id < 0")
+            .fetch_one(&mut *tx).await?;
+        sqlx::query("INSERT INTO presence_transitions(transition_id,device_id,from_state,to_state,occurred_at,reason,trigger_source,trigger_kind,evidence_observed_at,evidence_valid_until,trigger_arrival_at,correction_of) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)")
+            .bind(transition_id).bind(device_id.to_string()).bind("blocked").bind("unknown")
+            .bind(at.to_rfc3339()).bind("verified_policy_release").bind("policy")
+            .bind("enforcement_unblocked").bind(at.to_rfc3339()).bind(Option::<String>::None)
+            .bind(at.to_rfc3339()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
     pub fn with_config(pool: SqlitePool, config: M2StateConfig) -> Result<Self, CheckpointError> {
         if config.max_checkpoint_bytes == 0
             || config.max_discovery_summary_bytes == 0
@@ -462,7 +481,7 @@ impl M2StateRepository {
                     "owner string exceeds configured bound".into(),
                 ));
             }
-            let presence_row = sqlx::query("SELECT to_state,occurred_at,trigger_source,trigger_kind FROM presence_transitions WHERE device_id=? ORDER BY occurred_at DESC,transition_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
+            let presence_row = sqlx::query("SELECT to_state,occurred_at,trigger_source,trigger_kind FROM presence_transitions WHERE device_id=? ORDER BY CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN 1 ELSE 0 END DESC, occurred_at DESC, transition_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
             let presence = if let Some(r) = presence_row {
                 Some(StoredPresenceSummary {
                     to_state: parse_presence_state(&corrupt_get!(r, String, "to_state"))?,

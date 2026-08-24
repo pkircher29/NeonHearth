@@ -42,6 +42,9 @@ impl PolicyActuator for FakeActuator {
         self.0.fetch_add(1, Ordering::SeqCst);
         EnforcementResult::Verified
     }
+    async fn undo(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult {
+        EnforcementResult::Verified
+    }
 }
 
 struct OutcomeActuator(EnforcementResult);
@@ -596,5 +599,50 @@ async fn verified_decision_is_not_reactuated_on_a_later_sweep() -> anyhow::Resul
     coordinator.enroll_and_evaluate(device, at(108)).await?;
     coordinator.sweep(at(108)).await?;
     assert_eq!(actuator.0.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_approval_records_unblock_only_after_verified_undo() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let coordinator = PolicyCoordinator::with_actuator_and_state(
+        repo,
+        Some(EventBus::new(8, 8)),
+        FakeActuator::default(),
+        M2StateRepository::new(pool.clone()),
+    );
+    coordinator.enroll_and_evaluate(device, at(108)).await?;
+    assert_eq!(
+        M2StateRepository::new(pool.clone())
+            .list_device_snapshots(8, None)
+            .await?[0]
+            .presence
+            .as_ref()
+            .unwrap()
+            .to_state,
+        lattice_domain::PresenceState::Blocked
+    );
+    assert_eq!(
+        coordinator.approve(device, at(109)).await?.enforcement,
+        EnforcementResult::Verified
+    );
+    assert_ne!(
+        M2StateRepository::new(pool)
+            .list_device_snapshots(8, None)
+            .await?[0]
+            .presence
+            .as_ref()
+            .unwrap()
+            .to_state,
+        lattice_domain::PresenceState::Blocked
+    );
     Ok(())
 }

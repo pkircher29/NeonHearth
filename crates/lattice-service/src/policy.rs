@@ -9,7 +9,7 @@ use lattice_store::{M2StateRepository, PolicyRepository};
 use lattice_w6::{
     Connector, DiscoveryStatus, Error as W6Error, RequestedQuarantine, Transport, Verification,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +24,9 @@ pub use lattice_domain::EnforcementStatus as EnforcementResult;
 #[async_trait]
 pub trait PolicyActuator: Send + Sync {
     async fn enforce(&self, device: DeviceId, action: RequestedAction) -> EnforcementResult;
+    async fn undo(&self, _device: DeviceId, _action: RequestedAction) -> EnforcementResult {
+        EnforcementResult::ManualRequired
+    }
 }
 
 /// Policy bridge for an owner-authenticated, trusted W6 connector.
@@ -33,12 +36,14 @@ pub trait PolicyActuator: Send + Sync {
 /// capabilities and are not production HTTP endpoint guesses.
 pub struct W6PolicyActuator<T> {
     connector: Mutex<Connector<T>>,
+    previous: Mutex<HashMap<DeviceId, lattice_w6::DeviceState>>,
 }
 
 impl<T: Transport> W6PolicyActuator<T> {
     pub fn new(connector: Connector<T>) -> Self {
         Self {
             connector: Mutex::new(connector),
+            previous: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -57,6 +62,9 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
         }
         match connector.quarantine(request).await {
             Ok(report) if report.verification == Verification::Verified => {
+                if let Some(previous) = report.previous {
+                    self.previous.lock().await.insert(_device, previous);
+                }
                 EnforcementResult::Verified
             }
             Ok(_)
@@ -74,6 +82,25 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
                 | W6Error::SessionExpired
                 | W6Error::VerificationFailed,
             ) => EnforcementResult::Failed,
+        }
+    }
+    async fn undo(&self, device: DeviceId, action: RequestedAction) -> EnforcementResult {
+        if !matches!(
+            action,
+            RequestedAction::Quarantine | RequestedAction::PermanentBan
+        ) {
+            return EnforcementResult::ManualRequired;
+        }
+        let Some(previous) = self.previous.lock().await.get(&device).cloned() else {
+            return EnforcementResult::ManualRequired;
+        };
+        let mut connector = self.connector.lock().await;
+        match connector.restore(previous).await {
+            Ok(Verification::Verified) => EnforcementResult::Verified,
+            Ok(Verification::Unverified) | Err(W6Error::VerificationFailed) => {
+                EnforcementResult::Failed
+            }
+            Err(_) => EnforcementResult::ManualRequired,
         }
     }
 }
@@ -292,10 +319,29 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         d: DeviceId,
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
+        let prior = self.repo.published_decision(d).await?;
         self.repo
             .set_owner_decision(d, OwnerDecision::Approved)
             .await?;
-        self.evaluate(self.repo.load(d).await?.unwrap(), now).await
+        let mut result = self
+            .evaluate(self.repo.load(d).await?.unwrap(), now)
+            .await?;
+        if let Some(prior) = prior
+            && prior.enforcement_result == EnforcementResult::Verified
+            && matches!(
+                prior.requested_action,
+                RequestedAction::Quarantine | RequestedAction::PermanentBan
+            )
+        {
+            let undo = self.actuator.undo(d, prior.requested_action).await;
+            if undo == EnforcementResult::Verified
+                && let Some(presence) = &self.presence
+            {
+                presence.record_verified_unblock(d, now).await?;
+            }
+            result.enforcement = undo;
+        }
+        Ok(result)
     }
     pub async fn reject(&self, d: DeviceId, now: DateTime<Utc>) -> anyhow::Result<AuditedDecision> {
         self.repo
