@@ -10,6 +10,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 
 pub const VENDOR_SCHEMA_ID: &str = "neonhearth.vendor-advisory.v1";
 pub const MAX_VENDOR_BYTES: usize = 1024 * 1024;
@@ -65,11 +66,20 @@ impl VendorSource {
 #[derive(Clone, Default)]
 pub struct VendorRegistry {
     sources: Vec<VendorSource>,
+    ambiguous_urls: BTreeSet<String>,
 }
 impl VendorRegistry {
     pub fn new(sources: impl IntoIterator<Item = VendorSource>) -> Self {
+        let sources: Vec<_> = sources.into_iter().collect();
+        let mut seen = BTreeSet::new();
+        let ambiguous_urls = sources
+            .iter()
+            .filter(|source| !seen.insert(source.url.clone()))
+            .map(|source| source.url.clone())
+            .collect();
         Self {
-            sources: sources.into_iter().collect(),
+            sources,
+            ambiguous_urls,
         }
     }
 }
@@ -106,6 +116,11 @@ pub fn parse_vendor(
 ) -> Result<Vec<NormalizedAdvisory>, VendorParseError> {
     if body.len() > MAX_VENDOR_BYTES {
         return Err(VendorParseError::Oversized);
+    }
+    if signature.is_some_and(|signature| !signature_input_valid(signature))
+        || registry.ambiguous_urls.contains(source_url)
+    {
+        return Err(VendorParseError::Malformed);
     }
     let source = registry
         .sources
@@ -154,6 +169,9 @@ pub fn parse_vendor(
             .map_err(Into::into)
         })
         .collect()
+}
+fn signature_input_valid(signature: &VendorSignature) -> bool {
+    !signature.key_id.is_empty() && signature.key_id.len() <= 128 && signature.encoded.len() <= 86
 }
 fn trust(
     source: &VendorSource,

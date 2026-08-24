@@ -4,7 +4,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use lattice_advisory::{
     Exploitability, Severity, SourceTrust, VersionConstraint,
     kev::parse_kev,
-    nvd::parse_nvd,
+    nvd::{MAX_CPE_DEPTH, MAX_CPE_NODES, parse_nvd},
     transport::{KEV_URL, NVD_URL},
     vendor::{VendorRegistry, VendorSignature, VendorSource, parse_vendor},
 };
@@ -58,6 +58,89 @@ fn nvd_rejects_more_than_2000_outputs_before_expanding() {
     assert!(parse_nvd(&body, at(1), at(2)).is_err());
 }
 
+fn nvd_with_nodes(nodes: serde_json::Value) -> String {
+    serde_json::json!({"vulnerabilities":[{"cve":{
+        "id":"CVE-2026-0010", "published":"1970-01-01T00:00:00Z", "lastModified":"1970-01-01T00:00:00Z",
+        "descriptions":[{"lang":"en","value":"title"}], "configurations":[{"nodes":nodes}]
+    }}]}).to_string()
+}
+
+#[test]
+fn nvd_iterative_traversal_enforces_depth_node_and_json_order_budgets() {
+    let mut nested =
+        serde_json::json!([{"cpeMatch":[{"criteria":"cpe:2.3:a:acme:deep:1:*:*:*:*:*:*:*"}]}]);
+    for _ in 1..MAX_CPE_DEPTH {
+        nested = serde_json::json!([{"children":nested}]);
+    }
+    assert!(parse_nvd(&nvd_with_nodes(nested.clone()), at(1), at(2)).is_ok());
+    nested = serde_json::json!([{"children":nested}]);
+    assert!(parse_nvd(&nvd_with_nodes(nested), at(1), at(2)).is_err());
+    let boundary =
+        serde_json::Value::Array((0..MAX_CPE_NODES).map(|_| serde_json::json!({})).collect());
+    assert!(parse_nvd(&nvd_with_nodes(boundary), at(1), at(2)).is_ok());
+    let wide = serde_json::Value::Array(
+        (0..MAX_CPE_NODES + 1)
+            .map(|_| serde_json::json!({}))
+            .collect(),
+    );
+    assert!(parse_nvd(&nvd_with_nodes(wide), at(1), at(2)).is_err());
+    let ordered = nvd_with_nodes(serde_json::json!([{"cpeMatch":[
+        {"criteria":"cpe:2.3:a:acme:first:1:*:*:*:*:*:*:*"}, {"criteria":"cpe:2.3:a:acme:second:1:*:*:*:*:*:*:*"}
+    ]}]));
+    let values = parse_nvd(&ordered, at(1), at(2)).unwrap();
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.input().model.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("first"), Some("second")]
+    );
+}
+
+#[test]
+fn nvd_keeps_escaped_wildcards_literal_and_falls_back_for_unescaped_selectors() {
+    let escaped = nvd_with_nodes(
+        serde_json::json!([{"cpeMatch":[{"criteria":"cpe:2.3:a:acme\\*:\\-camera:\\*:*:*:*:*:*:*:*"}]}]),
+    );
+    let value = parse_nvd(&escaped, at(1), at(2)).unwrap();
+    assert_eq!(value[0].input().vendor, "acme*");
+    assert_eq!(value[0].input().model.as_deref(), Some("-camera"));
+    assert_eq!(
+        value[0].input().firmware,
+        VersionConstraint::Exact("*".into())
+    );
+    let wildcard = nvd_with_nodes(
+        serde_json::json!([{"cpeMatch":[{"criteria":"cpe:2.3:a:*:camera:*:*:*:*:*:*:*:*"}]}]),
+    );
+    let value = parse_nvd(&wildcard, at(1), at(2)).unwrap();
+    assert_eq!(value.len(), 1);
+    assert_eq!(value[0].input().vendor, "unknown");
+    assert_eq!(value[0].input().model, None);
+    assert_eq!(value[0].input().firmware, VersionConstraint::Any);
+}
+
+#[test]
+fn nvd_retains_generic_cves_and_distinguishes_full_cpe_selectors() {
+    let bare = r#"{"vulnerabilities":[{"cve":{"id":"CVE-2026-0011","published":"1970-01-01T00:00:00Z","lastModified":"1970-01-01T00:00:00Z","descriptions":[{"lang":"en","value":"title"}]}}]}"#;
+    let generic = parse_nvd(bare, at(1), at(2)).unwrap();
+    assert_eq!(generic[0].input().vendor, "unknown");
+    assert_eq!(generic[0].input().model, None);
+    let no_vulnerable = nvd_with_nodes(
+        serde_json::json!([{"cpeMatch":[{"vulnerable":false,"criteria":"cpe:2.3:a:acme:camera:1:*:*:*:*:*:*:*"}]}]),
+    );
+    assert_eq!(
+        parse_nvd(&no_vulnerable, at(1), at(2)).unwrap()[0]
+            .input()
+            .vendor,
+        "unknown"
+    );
+    let body = nvd_with_nodes(serde_json::json!([{"cpeMatch":[
+        {"criteria":"cpe:2.3:a:acme:camera:*:*:*:*:*:*:*:*","versionEndExcluding":"2"},
+        {"criteria":"cpe:2.3:a:acme:camera:*:*:*:*:*:*:*:*","versionEndExcluding":"3"}
+    ]}]));
+    assert_eq!(parse_nvd(&body, at(1), at(2)).unwrap().len(), 2);
+}
+
 #[test]
 fn kev_includes_every_catalog_item_and_requires_documented_fields() {
     let body = r#"{"vulnerabilities":[{"cveID":"CVE-2026-0001","vendorProject":"Acme","product":"Camera","vulnerabilityName":"Acme Camera RCE","dateAdded":"1970-01-01","shortDescription":"desc","requiredAction":"Update","dueDate":"1970-01-02","knownRansomwareCampaignUse":"Unknown"}]}"#;
@@ -75,6 +158,13 @@ fn kev_includes_every_catalog_item_and_requires_documented_fields() {
         .is_err()
     );
     assert!(parse_kev(&body.replace("CVE-2026-0001", "CVE-x"), at(3), at(4)).is_err());
+}
+
+#[test]
+fn kev_rejects_overlong_or_control_discarded_text() {
+    let body = r#"{"vulnerabilities":[{"cveID":"CVE-2026-0001","vendorProject":"Acme","product":"Camera","vulnerabilityName":"name","dateAdded":"1970-01-01","shortDescription":"desc","requiredAction":"Update","dueDate":"1970-01-02","knownRansomwareCampaignUse":"Unknown"}]}"#;
+    assert!(parse_kev(&body.replace("desc", &"x".repeat(513)), at(1), at(2)).is_err());
+    assert!(parse_kev(&body.replace("Update", "Up\ndate"), at(1), at(2)).is_err());
 }
 
 #[test]
@@ -104,6 +194,40 @@ fn registered_unsigned_vendor_document_has_low_trust_and_is_schema_bounded() {
             body,
             "https://evil.test/feed",
             None,
+            at(1),
+            at(2),
+            &registry
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn vendor_registry_rejects_duplicate_source_urls_and_oversized_signature_inputs() {
+    let registry = VendorRegistry::new([
+        VendorSource::unsigned("https://advisories.acme.test/feed"),
+        VendorSource::unsigned("https://advisories.acme.test/feed"),
+    ]);
+    let body = r#"{"schema_id":"neonhearth.vendor-advisory.v1","advisories":[]}"#;
+    assert!(
+        parse_vendor(
+            body,
+            "https://advisories.acme.test/feed",
+            None,
+            at(1),
+            at(2),
+            &registry
+        )
+        .is_err()
+    );
+    let signature = VendorSignature::new("k".repeat(513), "A".repeat(1000));
+    let registry =
+        VendorRegistry::new([VendorSource::unsigned("https://advisories.acme.test/feed")]);
+    assert!(
+        parse_vendor(
+            body,
+            "https://advisories.acme.test/feed",
+            Some(&signature),
             at(1),
             at(2),
             &registry

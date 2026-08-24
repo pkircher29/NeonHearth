@@ -128,7 +128,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const MAX_FIELD: usize = 512;
+pub const MAX_FIELD: usize = 512;
 pub const MAX_PARSER_OUTPUTS: usize = 2_000;
 
 pub fn is_strict_cve(value: &str) -> bool {

@@ -1,8 +1,8 @@
 use crate::transport::{KEV_URL, MAX_RESPONSE_BYTES};
 use crate::{
     AdvisoryError, AdvisoryInput, AdvisorySource, Confidence, Exploitability, Exposure, Freshness,
-    MAX_PARSER_OUTPUTS, NormalizedAdvisory, Remediation, Severity, SourceTrust, VersionConstraint,
-    is_strict_cve,
+    MAX_FIELD, MAX_PARSER_OUTPUTS, NormalizedAdvisory, Remediation, Severity, SourceTrust,
+    VersionConstraint, is_strict_cve,
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
@@ -51,8 +51,9 @@ pub fn parse_kev(
             if !matches!(ransomware, "Known" | "Unknown") {
                 return Err(KevParseError::Malformed);
             }
-            let _ = value("shortDescription")?;
-            let _ = value("requiredAction")?;
+            discarded(value("shortDescription")?)?;
+            discarded(value("requiredAction")?)?;
+            discarded(ransomware)?;
             NormalizedAdvisory::new(AdvisoryInput {
                 source: AdvisorySource::CisaKev,
                 source_id: id.into(),
@@ -80,6 +81,13 @@ pub fn parse_kev(
             .map_err(Into::into)
         })
         .collect()
+}
+fn discarded(value: &str) -> Result<(), KevParseError> {
+    if value.len() > MAX_FIELD || value.chars().any(char::is_control) {
+        Err(KevParseError::Malformed)
+    } else {
+        Ok(())
+    }
 }
 fn date(value: &str) -> Result<DateTime<Utc>, KevParseError> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
