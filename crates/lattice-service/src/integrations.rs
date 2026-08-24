@@ -415,6 +415,9 @@ pub struct IntegrationPolicyList {
     pub items: Vec<IntegrationPolicy>,
 }
 
+// axum's Response as the error is the established handler-helper idiom in this
+// crate; boxing every early-return adds noise for a cold path.
+#[allow(clippy::result_large_err)]
 async fn snapshots(state: &AppState) -> Result<Vec<lattice_store::StoredDeviceSnapshot>, Response> {
     state
         .state_repository()

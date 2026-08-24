@@ -63,7 +63,9 @@ async fn system_snapshot_smoke_test_uses_local_nonzero_interfaces() {
 #[cfg(windows)]
 #[tokio::test]
 async fn system_snapshot_smoke_test_uses_local_nonzero_interfaces() {
-    use lattice_sensor::neighbor::{NeighborSnapshotSource, SystemNeighborSnapshotSource};
+    use lattice_sensor::neighbor::{
+        NeighborError, NeighborSnapshotSource, SystemNeighborSnapshotSource,
+    };
     use lattice_sensor::{InterfaceOverride, SystemInterfaceManager};
 
     let inventory = SystemInterfaceManager.snapshot().unwrap();
@@ -77,10 +79,15 @@ async fn system_snapshot_smoke_test_uses_local_nonzero_interfaces() {
         "native smoke host must expose an eligible interface"
     );
     let config = NeighborSnapshotConfig::new(256, allowed.clone()).unwrap();
-    let rows = SystemNeighborSnapshotSource::new(config)
-        .snapshot()
-        .await
-        .unwrap();
-    assert!(rows.len() <= 256);
-    assert!(rows.iter().all(|row| allowed.contains(&row.interface())));
+    match SystemNeighborSnapshotSource::new(config).snapshot().await {
+        Ok(rows) => {
+            assert!(rows.len() <= 256);
+            assert!(rows.iter().all(|row| allowed.contains(&row.interface())));
+        }
+        // A busy host can legitimately hold more neighbor-table entries than
+        // this smoke config's raw ceiling. Production must reject oversized
+        // tables, and that rejection is pinned by deterministic fixture tests.
+        Err(NeighborError::Capacity) => {}
+        Err(error) => panic!("unexpected sanitized snapshot status: {error}"),
+    }
 }
