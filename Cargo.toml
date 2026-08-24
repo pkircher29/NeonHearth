@@ -8,6 +8,7 @@ members = [
     "crates/lattice-intelligence",
     "crates/lattice-policy",
     "crates/lattice-service",
+    "crates/lattice-w6",
     "tools/fixture-gen",
 ]
 
