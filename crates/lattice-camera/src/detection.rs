@@ -5,6 +5,9 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 const MAX_EVIDENCE: usize = 64;
+const MIN_FAMILY_CONFIDENCE: f32 = 0.2;
+const MIN_COMBINED_CONFIDENCE: f32 = 0.6;
+const SINGLE_WEAK_FAMILY_CAP: f32 = 0.35;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,7 +122,14 @@ fn normalized_fact(family: CameraEvidenceFamily, value: String) -> Result<String
     let contains_secret = ["://", "@", "password", "bearer", "authorization", "header", "body"]
         .iter()
         .any(|needle| fact.contains(needle));
-    let marker = fact
+    let metadata_family = matches!(
+        family,
+        CameraEvidenceFamily::Onvif
+            | CameraEvidenceFamily::Upnp
+            | CameraEvidenceFamily::Http
+            | CameraEvidenceFamily::Tls
+    );
+    let marker = metadata_family && fact
         .strip_prefix("vendor:")
         .or_else(|| fact.strip_prefix("model:"))
         .is_some_and(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
@@ -196,14 +206,31 @@ pub fn classify_candidate(
         .filter(|e| e.fact != "camera_contradiction")
         .map(|e| e.family)
         .collect();
+    let family_scores: Vec<_> = families
+        .iter()
+        .map(|family| {
+            evidence
+                .iter()
+                .filter(|e| e.family == *family && e.fact != "camera_contradiction")
+                .map(|e| e.confidence.get())
+                .fold(0.0, f32::max)
+        })
+        .collect();
+    let strong_profile_confidence = evidence
+        .iter()
+        .filter(|e| e.family == CameraEvidenceFamily::Onvif && e.fact == "onvif_camera_profile")
+        .map(|e| e.confidence.get())
+        .fold(0.0, f32::max);
+    let qualifying_scores: Vec<_> = family_scores
+        .iter()
+        .copied()
+        .filter(|score| *score >= MIN_FAMILY_CONFIDENCE)
+        .collect();
+    let qualifying_total: f32 = qualifying_scores.iter().sum();
     let classification = if contradiction {
         CameraClassification::Unknown
-    } else if families.len() >= 2
-        || evidence.iter().any(|e| {
-            e.family == CameraEvidenceFamily::Onvif
-                && e.fact == "onvif_camera_profile"
-                && e.confidence.get() >= 0.8
-        })
+    } else if strong_profile_confidence >= 0.8
+        || (qualifying_scores.len() >= 2 && qualifying_total >= MIN_COMBINED_CONFIDENCE)
     {
         CameraClassification::Camera
     } else if !families.is_empty() {
@@ -214,11 +241,13 @@ pub fn classify_candidate(
     let score = if contradiction {
         0.0
     } else {
-        families
-            .iter()
-            .map(|family| evidence.iter().filter(|e| e.family == *family && e.fact != "camera_contradiction").map(|e| e.confidence.get()).fold(0.0, f32::max))
-            .sum::<f32>()
-            .min(1.0)
+        if strong_profile_confidence >= 0.8 {
+            strong_profile_confidence
+        } else if qualifying_scores.len() == 1 {
+            qualifying_total.min(SINGLE_WEAK_FAMILY_CAP)
+        } else {
+            qualifying_total.min(1.0)
+        }
     };
     Ok(CameraCandidate {
         id,

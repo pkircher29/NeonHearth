@@ -190,7 +190,7 @@ impl<'de, const MAX: usize> Deserialize<'de> for BoundedText<MAX> {
                 Ok(BoundedText(value.to_owned()))
             }
         }
-        deserializer.deserialize_string(BoundedTextVisitor::<MAX>)
+        deserializer.deserialize_str(BoundedTextVisitor::<MAX>)
     }
 }
 

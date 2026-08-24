@@ -101,10 +101,12 @@ fn evidence_serde_preserves_bounds_for_plain_and_escaped_input() {
     let oversized_source = "x".repeat(129);
     let oversized_fact = "x".repeat(257);
     for payload in [
-        format!(r#"{{\"family\":\"http\",\"source\":\"{oversized_source}\",\"fact\":\"camera_web\",\"confidence\":0.5,\"observed_at\":\"2026-08-24T00:00:00Z\",\"expires_at\":null}}"#),
-        format!(r#"{{\"family\":\"http\",\"source\":\"fixture\",\"fact\":\"{}\",\"confidence\":0.5,\"observed_at\":\"2026-08-24T00:00:00Z\",\"expires_at\":null}}"#, oversized_fact.replace('x', "\\u0078")),
+        format!(r#"{{"family":"http","source":"{oversized_source}","fact":"camera_web","confidence":0.5,"observed_at":"2026-08-24T00:00:00Z","expires_at":null}}"#),
+        format!(r#"{{"family":"http","source":"{}","fact":"camera_web","confidence":0.5,"observed_at":"2026-08-24T00:00:00Z","expires_at":null}}"#, oversized_source.replace('x', "\\u0078")),
+        format!(r#"{{"family":"http","source":"fixture","fact":"{}","confidence":0.5,"observed_at":"2026-08-24T00:00:00Z","expires_at":null}}"#, oversized_fact.replace('x', "\\u0078")),
         r#"{"family":"http","source":"Password=leak","fact":"camera_web","confidence":0.5,"observed_at":"2026-08-24T00:00:00Z","expires_at":null}"#.to_owned(),
     ] {
+        assert!(serde_json::from_str::<serde_json::Value>(&payload).is_ok(), "invalid fixture: {payload}");
         assert!(serde_json::from_str::<CameraEvidence>(&payload).is_err(), "{payload}");
     }
 }
@@ -161,7 +163,7 @@ fn weak_evidence_requires_independent_families_and_does_not_inflate_score() {
     )
     .unwrap();
     assert_eq!(one.classification, CameraClassification::PossibleCamera);
-    assert_eq!(one.confidence.get(), 0.8);
+    assert!(one.confidence.get() < 0.5);
 
     let repeated = classify_candidate(
         id,
@@ -173,7 +175,7 @@ fn weak_evidence_requires_independent_families_and_does_not_inflate_score() {
     )
     .unwrap();
     assert_eq!(repeated.classification, CameraClassification::PossibleCamera);
-    assert_eq!(repeated.confidence.get(), 0.9);
+    assert!(repeated.confidence.get() < 0.5);
 
     let independent = classify_candidate(
         id,
@@ -186,6 +188,46 @@ fn weak_evidence_requires_independent_families_and_does_not_inflate_score() {
     .unwrap();
     assert_eq!(independent.classification, CameraClassification::Camera);
     assert_eq!(independent.confidence.get(), 1.0);
+}
+
+#[test]
+fn metadata_markers_are_limited_to_metadata_families() {
+    let now = Utc::now();
+    for family in [
+        CameraEvidenceFamily::Onvif,
+        CameraEvidenceFamily::Upnp,
+        CameraEvidenceFamily::Http,
+        CameraEvidenceFamily::Tls,
+    ] {
+        assert!(CameraEvidence::new(family, "fixture", "vendor:axis", 0.4, now, None).is_ok());
+    }
+    for family in [
+        CameraEvidenceFamily::WsDiscovery,
+        CameraEvidenceFamily::Rtsp,
+        CameraEvidenceFamily::Service,
+        CameraEvidenceFamily::Behavior,
+    ] {
+        assert!(CameraEvidence::new(family, "fixture", "model:q3536", 0.4, now, None).is_err());
+    }
+}
+
+#[test]
+fn weak_families_need_independent_qualifying_confidence() {
+    let id = CameraId::from_uuid(Uuid::nil());
+    let now = Utc::now();
+    for confidence in [0.0, 0.1] {
+        let candidate = classify_candidate(
+            id,
+            [
+                CameraEvidence::new(CameraEvidenceFamily::Rtsp, "rtsp", "rtsp_camera", confidence, now, None).unwrap(),
+                CameraEvidence::new(CameraEvidenceFamily::Http, "http", "camera_web", confidence, now, None).unwrap(),
+            ],
+            now,
+        )
+        .unwrap();
+        assert_ne!(candidate.classification, CameraClassification::Camera);
+        assert!(candidate.confidence.get() < 0.5);
+    }
 }
 
 #[test]
