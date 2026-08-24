@@ -129,6 +129,21 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_FIELD: usize = 512;
+pub const MAX_PARSER_OUTPUTS: usize = 2_000;
+
+pub fn is_strict_cve(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("CVE-") else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    let (Some(year), Some(sequence), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    year.len() == 4
+        && year.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.len() >= 4
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AdvisorySource {
@@ -362,3 +377,4 @@ pub mod feed;
 pub mod kev;
 pub mod nvd;
 pub mod transport;
+pub mod vendor;

@@ -1,7 +1,8 @@
 use crate::transport::{KEV_URL, MAX_RESPONSE_BYTES};
 use crate::{
     AdvisoryError, AdvisoryInput, AdvisorySource, Confidence, Exploitability, Exposure, Freshness,
-    NormalizedAdvisory, Remediation, Severity, SourceTrust, VersionConstraint,
+    MAX_PARSER_OUTPUTS, NormalizedAdvisory, Remediation, Severity, SourceTrust, VersionConstraint,
+    is_strict_cve,
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
@@ -11,7 +12,7 @@ pub enum KevParseError {
     Malformed,
     #[error("KEV document exceeds limit")]
     Oversized,
-    #[error(transparent)]
+    #[error("KEV advisory is invalid")]
     Advisory(#[from] AdvisoryError),
 }
 pub fn parse_kev(
@@ -23,34 +24,42 @@ pub fn parse_kev(
         return Err(KevParseError::Oversized);
     }
     let root: Value = serde_json::from_str(body).map_err(|_| KevParseError::Malformed)?;
-    let xs = root
+    let entries = root
         .get("vulnerabilities")
         .and_then(Value::as_array)
         .ok_or(KevParseError::Malformed)?;
-    xs.iter()
-        .map(|x| {
-            let get = |n| {
-                x.get(n)
+    if entries.len() > MAX_PARSER_OUTPUTS {
+        return Err(KevParseError::Oversized);
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            let value = |field| {
+                entry
+                    .get(field)
                     .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
                     .ok_or(KevParseError::Malformed)
             };
-            let id = get("cveID")?;
-            let vendor = get("vendorProject")?;
-            let product = get("product")?;
-            let title = get("vulnerabilityName")?;
-            let added = NaiveDate::parse_from_str(get("dateAdded")?, "%Y-%m-%d")
-                .map_err(|_| KevParseError::Malformed)?
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc();
-            let active = matches!(get("knownRansomwareCampaignUse")?, "Known" | "Yes");
+            let id = value("cveID")?;
+            if !is_strict_cve(id) {
+                return Err(KevParseError::Malformed);
+            }
+            let added = date(value("dateAdded")?)?;
+            let due = date(value("dueDate")?)?;
+            let ransomware = value("knownRansomwareCampaignUse")?;
+            if !matches!(ransomware, "Known" | "Unknown") {
+                return Err(KevParseError::Malformed);
+            }
+            let _ = value("shortDescription")?;
+            let _ = value("requiredAction")?;
             NormalizedAdvisory::new(AdvisoryInput {
                 source: AdvisorySource::CisaKev,
                 source_id: id.into(),
                 source_url: KEV_URL.into(),
-                title: title.into(),
-                vendor: vendor.into(),
-                model: Some(product.into()),
+                title: value("vulnerabilityName")?.into(),
+                vendor: value("vendorProject")?.into(),
+                model: Some(value("product")?.into()),
                 firmware: VersionConstraint::Any,
                 published_at: added,
                 modified_at: added,
@@ -59,16 +68,23 @@ pub fn parse_kev(
                 freshness: Freshness::Fresh,
                 source_trust: SourceTrust::OfficialApi,
                 severity: Severity::Unknown,
-                exploitability: if active {
-                    Exploitability::ActiveKnownExploitation
-                } else {
-                    Exploitability::Unknown
-                },
+                exploitability: Exploitability::ActiveKnownExploitation,
                 exposure: Exposure::Unknown,
                 confidence: Confidence::Medium,
-                remediation: Remediation::Upgrade,
+                remediation: if due < retrieved_at {
+                    Remediation::Mitigate
+                } else {
+                    Remediation::Upgrade
+                },
             })
             .map_err(Into::into)
         })
         .collect()
+}
+fn date(value: &str) -> Result<DateTime<Utc>, KevParseError> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| KevParseError::Malformed)?
+        .and_hms_opt(0, 0, 0)
+        .ok_or(KevParseError::Malformed)
+        .map(|value| value.and_utc())
 }
