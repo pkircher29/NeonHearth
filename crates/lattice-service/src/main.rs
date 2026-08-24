@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use lattice_service::{AppState, app};
 use lattice_service::runtime::StartupResult;
+use lattice_service::{AppState, app};
 use lattice_service::{Platform, platform_paths};
 use lattice_store::{InstallRepository, M2StateRepository};
 use std::path::PathBuf;
@@ -36,7 +36,8 @@ async fn main() -> Result<()> {
         .await
         .context("initialize install state")?;
     let state = AppState::new(token, M2StateRepository::new(pool.clone()))?;
-    let startup = lattice_service::runtime::build(state.clone(), M2StateRepository::new(pool.clone())).await;
+    let startup =
+        lattice_service::runtime::build(state.clone(), M2StateRepository::new(pool.clone())).await;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     #[cfg(unix)]
     let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -44,14 +45,22 @@ async fn main() -> Result<()> {
     #[cfg(not(unix))]
     let terminate = ();
     let listener = TcpListener::bind("127.0.0.1:58120").await?;
-    let server = axum::serve(listener, app(state)).with_graceful_shutdown(shutdown_signal(terminate, shutdown_tx.clone()));
+    let server = axum::serve(listener, app(state))
+        .with_graceful_shutdown(shutdown_signal(terminate, shutdown_tx.clone()));
     match startup {
         StartupResult::Worker(worker) => {
-            let worker = worker.run(shutdown_rx);
-            tokio::pin!(worker);
-            tokio::select! { result = server => result?, _ = &mut worker => {} }
+            let mut worker = tokio::spawn(worker.run(shutdown_rx));
+            tokio::pin!(server);
+            let server_result = tokio::select! {
+                result = &mut server => result.map_err(anyhow::Error::from),
+                result = &mut worker => result.map(|_| ()).map_err(anyhow::Error::from),
+            };
             let _ = shutdown_tx.send(true);
-            worker.await;
+            let _ = (&mut server).await;
+            if !worker.is_finished() {
+                let _ = worker.await;
+            }
+            server_result?;
         }
         StartupResult::Degraded => server.await?,
     }
@@ -60,7 +69,10 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(unix)]
-async fn shutdown_signal(mut terminate: tokio::signal::unix::Signal, shutdown: tokio::sync::watch::Sender<bool>) {
+async fn shutdown_signal(
+    mut terminate: tokio::signal::unix::Signal,
+    shutdown: tokio::sync::watch::Sender<bool>,
+) {
     tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
     let _ = shutdown.send(true);
 }

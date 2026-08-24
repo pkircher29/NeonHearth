@@ -1,8 +1,8 @@
 mod api;
 mod auth;
 pub mod discovery;
-pub mod runtime;
 pub mod platform;
+pub mod runtime;
 mod state;
 pub mod ws;
 use axum::{
