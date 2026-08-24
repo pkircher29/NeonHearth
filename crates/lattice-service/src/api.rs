@@ -57,6 +57,7 @@ pub struct CameraQuery {
     pub after: Option<lattice_camera::CameraId>,
 }
 
+#[utoipa::path(get, path = "/api/v1/cameras", responses((status = 200, body = serde_json::Value), (status = 401), (status = 400)), security(("bearer_auth" = [])))]
 pub async fn cameras(
     _: Authorized,
     State(state): State<AppState>,
@@ -68,7 +69,7 @@ pub async fn cameras(
         return Err(StatusCode::BAD_REQUEST);
     }
     let repo = lattice_store::CameraRepository::new(state.state_repository().pool().clone());
-    let rows = repo
+    let (rows, has_more) = repo
         .list_cameras(limit, query.after)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -82,10 +83,9 @@ pub async fn cameras(
             observed_at: r.observed_at,
         })
         .collect::<Vec<_>>();
-    Ok(Json(
-        serde_json::json!({"items": items, "next_after": items.last().map(|x| x.camera_id.clone())}),
-    ))
+    Ok(Json(serde_json::json!({"items": items, "next_after": has_more.then(|| items.last().map(|x| x.camera_id.clone())).flatten()})))
 }
+#[utoipa::path(get, path = "/api/v1/cameras/{id}", responses((status = 200, body = CameraDetail), (status = 401), (status = 404)), security(("bearer_auth" = [])))]
 pub async fn camera(
     _: Authorized,
     State(state): State<AppState>,
@@ -109,6 +109,7 @@ pub async fn camera(
         inventory: None,
     }))
 }
+#[utoipa::path(get, path = "/api/v1/cameras/{id}/health", responses((status = 200, body = CameraHealth), (status = 401), (status = 404)), security(("bearer_auth" = [])))]
 pub async fn camera_health(
     _: Authorized,
     State(state): State<AppState>,
@@ -128,6 +129,7 @@ pub async fn camera_health(
         confidence: r.confidence.get(),
     }))
 }
+#[utoipa::path(get, path = "/api/v1/cameras/{id}/inventory", responses((status = 200, body = CameraInventoryProjection), (status = 401), (status = 404)), security(("bearer_auth" = [])))]
 pub async fn camera_inventory(
     _: Authorized,
     State(state): State<AppState>,
@@ -480,7 +482,7 @@ pub async fn event_ticket(
     }))
 }
 #[derive(OpenApi)]
-#[openapi(paths(health, state, policy_action, event_ticket), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction)), modifiers(&SecurityAddon))]
+#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction, CameraSummary, CameraDetail, CameraHealth, CameraInventoryProjection, CameraSessionResponse)), modifiers(&SecurityAddon))]
 pub struct ApiDoc;
 struct SecurityAddon;
 impl Modify for SecurityAddon {
