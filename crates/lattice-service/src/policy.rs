@@ -43,10 +43,7 @@ pub trait PolicyActuator: Send + Sync {
         _device: DeviceId,
         _action: RequestedAction,
     ) -> ActuationReconciliation {
-        // The default actuator is deliberately non-mutating.  Real actuators
-        // must override this with trusted readback; test-only non-mutating
-        // actuators retain the historic bounded retry behaviour.
-        ActuationReconciliation::ProvenNotApplied
+        ActuationReconciliation::Indeterminate
     }
     async fn undo_available(&self, _device: DeviceId, _action: RequestedAction) -> bool {
         false
@@ -367,6 +364,20 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
     ) -> anyhow::Result<AuditedDecision> {
         let evaluation = evaluate_policy(&p, now);
         let previously_published = self.repo.published_decision(p.device_id).await?;
+        // Recover the historical split-ack crash window from older binaries:
+        // an acknowledged matching verified decision proves publication was
+        // durable, so its exact stale reservation can be retired without any
+        // actuator call.
+        if let Some(last) = &previously_published
+            && last.enforcement_result == EnforcementResult::Verified
+            && let Some(attempt) = self.repo.actuation_attempt(p.device_id).await?
+            && attempt.policy_version == last.policy_version
+            && attempt.action == last.requested_action
+        {
+            self.repo
+                .clear_actuation_attempt(p.device_id, attempt.policy_version, attempt.action)
+                .await?;
+        }
         let release_action = self.repo.release_retry_action(p.device_id).await?;
         if let Some(action) = release_action {
             if !self.repo.release_retry_due(p.device_id, now).await? {
@@ -539,34 +550,29 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 bus.publish(now, EventPayload::PolicyChanged(event.clone()))
                     .await;
             }
-            self.repo
-                .mark_decision_published(p.device_id, &fingerprint, &event)
-                .await?;
-            // The journal may be removed only after the verified decision has
-            // a durable acknowledgement.  A crash at any earlier point keeps
-            // it for read-only reconciliation on restart.
-            if enforcement == EnforcementResult::Verified
+            let attempt = if enforcement == EnforcementResult::Verified
                 && matches!(
                     evaluation.requested_action,
                     RequestedAction::Quarantine | RequestedAction::PermanentBan
-                )
-                && self
-                    .repo
+                ) {
+                self.repo
                     .actuation_attempt(p.device_id)
                     .await?
-                    .is_some_and(|attempt| {
+                    .filter(|attempt| {
                         attempt.policy_version == evaluation.policy_version
                             && attempt.action == evaluation.requested_action
                     })
-            {
-                self.repo
-                    .clear_actuation_attempt(
-                        p.device_id,
-                        evaluation.policy_version,
-                        evaluation.requested_action,
-                    )
-                    .await?;
-            }
+            } else {
+                None
+            };
+            self.repo
+                .mark_decision_published_and_clear_attempt(
+                    p.device_id,
+                    &fingerprint,
+                    &event,
+                    attempt.as_ref(),
+                )
+                .await?;
         }
         Ok(AuditedDecision {
             evaluation,

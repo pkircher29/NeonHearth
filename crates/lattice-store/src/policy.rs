@@ -336,6 +336,20 @@ impl PolicyRepository {
         fingerprint: &str,
         decision: &PolicyChanged,
     ) -> anyhow::Result<()> {
+        self.mark_decision_published_and_clear_attempt(device_id, fingerprint, decision, None)
+            .await
+    }
+
+    /// Atomically acknowledge the decision/outbox and retire precisely the
+    /// matching verified actuation reservation.  Splitting these writes would
+    /// leave a post-ack crash window that blocks later owner actions.
+    pub async fn mark_decision_published_and_clear_attempt(
+        &self,
+        device_id: DeviceId,
+        fingerprint: &str,
+        decision: &PolicyChanged,
+        attempt: Option<&ActuationAttempt>,
+    ) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE device_policy SET decision_fingerprint=?, published_decision_json=?, updated_at=? WHERE device_id=?",
@@ -351,6 +365,17 @@ impl PolicyRepository {
             .bind(fingerprint)
             .execute(&mut *tx)
             .await?;
+        if let Some(attempt) = attempt {
+            let result = sqlx::query("DELETE FROM policy_actuation_journal WHERE device_id=? AND policy_version=? AND action_json=?")
+                .bind(device_id.to_string())
+                .bind(i64::from(attempt.policy_version))
+                .bind(encode(&attempt.action)?)
+                .execute(&mut *tx).await?;
+            ensure!(
+                result.rows_affected() == 1,
+                "actuation journal entry changed before acknowledgement"
+            );
+        }
         tx.commit().await?;
         Ok(())
     }

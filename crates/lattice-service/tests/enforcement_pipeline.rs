@@ -17,7 +17,7 @@ use lattice_service::{
         NeighborCoordinatorConfig, NeighborInterfaceBinding, PersistentDiscoveryPipeline,
         neighbor_discovery_sources,
     },
-    policy::{EnforcementResult, PolicyActuator, PolicyCoordinator},
+    policy::{ActuationReconciliation, EnforcementResult, PolicyActuator, PolicyCoordinator},
 };
 use lattice_store::{
     InstallRepository, M2StateRepository, PolicyRepository, connect_memory, connect_path,
@@ -42,6 +42,9 @@ impl PolicyActuator for FakeActuator {
         self.0.fetch_add(1, Ordering::SeqCst);
         EnforcementResult::Verified
     }
+    async fn reconcile(&self, _: DeviceId, _: RequestedAction) -> ActuationReconciliation {
+        ActuationReconciliation::ProvenNotApplied
+    }
     async fn undo(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult {
         EnforcementResult::Verified
     }
@@ -65,6 +68,9 @@ impl PolicyActuator for CountingOutcomeActuator {
     async fn enforce(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult {
         self.0.fetch_add(1, Ordering::SeqCst);
         self.1
+    }
+    async fn reconcile(&self, _: DeviceId, _: RequestedAction) -> ActuationReconciliation {
+        ActuationReconciliation::ProvenNotApplied
     }
 }
 
