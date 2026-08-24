@@ -1,4 +1,4 @@
-import type { Bandwidth, BandwidthFrame, CameraDetail, CameraHealth, CameraInventoryProjection, CameraList, CameraSessionResponse, DeviceSnapshot, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
+import type { Bandwidth, BandwidthFrame, CameraDetail, CameraHealth, CameraInventoryProjection, CameraList, CameraSessionResponse, DeviceSnapshot, EnforcementStatus, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
@@ -12,6 +12,16 @@ export interface ApiClientOptions {
 export interface SnapshotPageOptions {
   limit?: number;
   after?: string;
+}
+
+/**
+ * Wire shape of `OwnerAction` in lattice-service (serde snake_case, externally
+ * tagged): unit variants travel as bare strings, ExtendOnce as an object.
+ */
+export type OwnerActionInput = 'approve' | 'reject' | 'quarantine' | { extend_once: { until: string } };
+export interface PolicyActionResult {
+  evaluation: PolicyEvaluation;
+  enforcement_result: EnforcementStatus;
 }
 
 export interface ApiClient {
@@ -32,6 +42,7 @@ export interface ApiClient {
   startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse>;
   closeCameraSession(sessionId: string): Promise<void>;
   authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): void;
+  policyAction(deviceId: string, action: OwnerActionInput): Promise<PolicyActionResult>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -190,6 +201,18 @@ function isCameraHealth(value: unknown): value is CameraHealth { return isRecord
 const isSessionId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 function isSession(value: unknown): value is CameraSessionResponse { return isRecord(value) && exact(value,['session_id']) && isSessionId(value.session_id); }
 
+const ownerActionKinds = new Set(['approve', 'reject', 'quarantine']);
+function isOwnerActionInput(value: unknown): value is OwnerActionInput {
+  if (typeof value === 'string') return ownerActionKinds.has(value);
+  return isRecord(value) && exact(value, ['extend_once']) && isRecord(value.extend_once)
+    && exact(value.extend_once, ['until']) && isDate(value.extend_once.until);
+}
+function isPolicyActionResult(value: unknown): value is PolicyActionResult {
+  return isRecord(value) && exact(value, ['evaluation', 'enforcement_result'])
+    && isPolicyEvaluation(value.evaluation)
+    && typeof value.enforcement_result === 'string' && enforcementStatuses.has(value.enforcement_result);
+}
+
 function isEventTicket(value: unknown): value is EventTicket {
   return isRecord(value) && typeof value.ticket === 'string' && value.ticket.length > 0 && isSequence(value.expires_in_seconds);
 }
@@ -289,11 +312,21 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
   async function cameraSnapshot(id: string, streamId?: string): Promise<Blob> { if(!isOpaqueId(id)||(streamId!==undefined&&!isOpaqueId(streamId)))throw new Error('Invalid camera id'); const response=await fetchImpl(apiUrl(`/api/v1/cameras/${id}/snapshot${streamId?`?stream_id=${encodeURIComponent(streamId)}`:''}`),authorized('GET')); if(!response.ok)throw new Error(`Request failed with status ${response.status}`); if(response.headers.get('content-type')?.split(';')[0] !== 'image/jpeg') throw new Error('Invalid camera snapshot media type'); const blob=await response.blob(); if(blob.size > 8*1024*1024) throw new Error('Camera snapshot exceeds safety bound'); return blob; }
   async function startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse> { if(!isOpaqueId(id)||!isOpaqueId(streamId))throw new Error('Invalid camera session id'); const v=await request(`/api/v1/cameras/${id}/sessions`,{...authorized('POST'),headers:{Authorization:`Bearer ${serviceToken}`,'content-type':'application/json'},body:JSON.stringify({stream_id:streamId})}); if(!isSession(v))throw new Error('Invalid camera session'); return v; }
   async function closeCameraSession(sessionId: string): Promise<void> { if(!isSessionId(sessionId))throw new Error('Invalid camera session id'); const response=await fetchImpl(apiUrl(`/api/v1/camera-sessions/${sessionId}`),{method:'DELETE',headers:{Authorization:`Bearer ${serviceToken}`}}); if(!response.ok)throw new Error(`Request failed with status ${response.status}`); }
+  async function policyAction(deviceId: string, action: OwnerActionInput): Promise<PolicyActionResult> {
+    if (!isDeviceId(deviceId) || !isOwnerActionInput(action)) throw new Error('Invalid policy action');
+    const value = await request('/api/v1/policy/action', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${serviceToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ device_id: deviceId, action })
+    });
+    if (!isPolicyActionResult(value)) throw new Error('Invalid policy action response');
+    return value;
+  }
   function authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): void {
     const target = new URL(url, baseUrl); const origin = new URL(baseUrl).origin;
     if (target.origin !== origin || target.username || target.password || target.search || target.hash || target.pathname.includes('%') || !/^\/api\/v1\/camera-sessions\/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/(?:playlist\.m3u8|segments\/[A-Za-z0-9_.-]{1,255})$/.test(target.pathname)) throw new Error('Camera media request rejected');
     xhr.setRequestHeader('Authorization', `Bearer ${serviceToken}`);
   }
 
-  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr };
+  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction };
 }

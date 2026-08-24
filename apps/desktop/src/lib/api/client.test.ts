@@ -385,6 +385,56 @@ describe('createApiClient', () => {
     expect(onMessage).toHaveBeenCalledWith(event(policy));
   });
 
+  it('posts owner policy actions with the exact wire shape and validates the response', async () => {
+    const id = validDevice.device_id;
+    const ok = { evaluation: { policy_version: 1, reason: 'owner_approved', requested_action: 'none', deadline: null, warning: null }, enforcement_result: 'not_requested' };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(ok), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+
+    await expect(client.policyAction(id, 'approve')).resolves.toEqual(ok);
+    await expect(client.policyAction(id, 'reject')).resolves.toEqual(ok);
+    await expect(client.policyAction(id, 'quarantine')).resolves.toEqual(ok);
+    await expect(client.policyAction(id, { extend_once: { until: '2026-08-26T00:00:00Z' } })).resolves.toEqual(ok);
+
+    expect(fetchImpl).toHaveBeenNthCalledWith(1, 'https://collector.example/api/v1/policy/action', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ device_id: id, action: 'approve' })
+    });
+    expect(fetchImpl).toHaveBeenNthCalledWith(4, 'https://collector.example/api/v1/policy/action', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ device_id: id, action: { extend_once: { until: '2026-08-26T00:00:00Z' } } })
+    });
+  });
+
+  it('rejects invalid policy actions before fetching and maps policy action failures', async () => {
+    const id = validDevice.device_id;
+    const fetchImpl = vi.fn();
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+
+    await expect(client.policyAction('not-a-device-id', 'approve')).rejects.toThrow('Invalid policy action');
+    await expect(client.policyAction(id, 'destroy' as never)).rejects.toThrow('Invalid policy action');
+    await expect(client.policyAction(id, { extend_once: { until: 'not-a-date' } })).rejects.toThrow('Invalid policy action');
+    await expect(client.policyAction(id, { extend_once: { until: '2026-08-26T00:00:00+00:00' } })).rejects.toThrow('Invalid policy action');
+    await expect(client.policyAction(id, { extend_once: { until: '2026-08-26T00:00:00Z' }, extra: 1 } as never)).rejects.toThrow('Invalid policy action');
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    const denied = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(null, { status: 400 })) });
+    await expect(denied.policyAction(id, 'reject')).rejects.toThrow('Request failed with status 400');
+
+    const evaluation = { policy_version: 1, reason: 'owner_approved', requested_action: 'none', deadline: null, warning: null };
+    for (const malformed of [
+      { evaluation, enforcement_result: 'success' },
+      { evaluation: { ...evaluation, reason: 'invented' }, enforcement_result: 'not_requested' },
+      { evaluation: { ...evaluation, reason: 'owner_rejected' }, enforcement_result: 'not_requested' },
+      { evaluation, enforcement_result: 'not_requested', extra: true }
+    ]) {
+      const bad = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 })) });
+      await expect(bad.policyAction(id, 'approve')).rejects.toThrow('Invalid policy action response');
+    }
+  });
+
   it('requires the canonical correction_of key on presence events', async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ticket: 'ticket', expires_in_seconds: 60 }), { status: 200 }));
     class FakeWebSocket { onopen = null; onclose = null; onerror = null; onmessage: ((event: MessageEvent<string>) => void) | null = null; constructor(_: string) {} }
