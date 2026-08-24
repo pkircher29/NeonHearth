@@ -102,6 +102,27 @@ describe('createApiClient', () => {
     });
   });
 
+  it('hydrates all snapshot pages at one sequence and rejects cursor cycles', async () => {
+    const id = '018f47a0-9b5c-7a22-8a33-112233445599';
+    const page = (devices: unknown[], next_after: string | null) => ({ sequence: 9, devices, next_after, service_status: 'ready' });
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(page([], id)), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(page([], null)), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+    await expect(client.snapshotAll({ limit: 1 })).resolves.toMatchObject({ sequence: 9, devices: [] });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+
+    const cycleFetch = vi.fn(async () => new Response(JSON.stringify(page([], id)), { status: 200 }));
+    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: cycleFetch }).snapshotAll()).rejects.toThrow('cursor cycle');
+  });
+
+  it('rejects a paginated sequence watermark change', async () => {
+    const id = '018f47a0-9b5c-7a22-8a33-445566778899';
+    const response = (sequence: number) => new Response(JSON.stringify({ sequence, devices: [], next_after: null, service_status: 'ready' }), { status: 200 });
+    const fetchImpl = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ sequence: 1, devices: [], next_after: id, service_status: 'ready' }), { status: 200 })).mockResolvedValueOnce(response(2));
+    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl }).snapshotAll()).rejects.toThrow('sequence changed');
+  });
+
   it('rejects invalid snapshot pages before fetching', async () => {
     const fetchImpl = vi.fn();
     const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });

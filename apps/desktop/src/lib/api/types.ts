@@ -1,17 +1,17 @@
 export type PresenceState = 'online' | 'quiet' | 'offline' | 'blocked' | 'unknown';
 
 export interface PresenceChanged {
-  transition_id?: number;
+  transition_id: number;
   device_id: string;
   from: PresenceState;
   to: PresenceState;
   reason: string;
-  occurred_at?: string;
-  trigger_source?: string;
-  trigger_kind?: string;
-  evidence_observed_at?: string;
-  evidence_valid_until?: string | null;
-  trigger_arrival_at?: string;
+  occurred_at: string;
+  trigger_source: string;
+  trigger_kind: string;
+  evidence_observed_at: string;
+  evidence_valid_until: string | null;
+  trigger_arrival_at: string;
   correction_of?: number | null;
 }
 
@@ -88,7 +88,7 @@ export interface Bandwidth {
   available: boolean;
   upload: number | null;
   download: number | null;
-  coverage: string | null;
+  coverage: Coverage | null;
   observed_at: string | null;
 }
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { EventEnvelope } from '../api/types';
-import { applySnapshot, initialLiveState, reduceLiveMessage } from './live';
+import { applySnapshot, bandwidthTier, initialLiveState, reduceLiveMessage } from './live';
 
 const serviceStatus = (sequence: number, state = 'ready'): EventEnvelope => ({
   sequence,
@@ -15,15 +15,39 @@ const presence = (sequence: number): EventEnvelope => ({
   payload: {
     type: 'presence_changed',
     data: {
+      transition_id: sequence,
       device_id: '0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b',
       from: 'unknown',
       to: 'online',
-      reason: 'observed'
+      reason: 'observed',
+      occurred_at: '2026-08-23T00:00:00Z',
+      trigger_source: 'sensor',
+      trigger_kind: 'reply',
+      evidence_observed_at: '2026-08-23T00:00:00Z',
+      evidence_valid_until: null,
+      trigger_arrival_at: '2026-08-23T00:00:00Z',
+      correction_of: null
     }
   }
 });
+const bandwidth = (sequence: number): EventEnvelope => ({
+  sequence,
+  occurred_at: '2026-08-23T00:00:00Z',
+  payload: { type: 'bandwidth_frame', data: { interval_ms: 1000, observed_at: '2026-08-23T00:00:00Z', emitted_at: '2026-08-23T00:00:00Z', samples: [{ device_id: '0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b', delta: { upload: 1, download: 2 }, upload_bytes_per_second: 2_000_000, download_bytes_per_second: 1_000_000, coverage: 'complete' }] } }
+});
 
 describe('reduceLiveMessage', () => {
+  it('starts with a complete empty dashboard state and exact bandwidth tiers', () => {
+    expect(initialLiveState.devices).toEqual({});
+    expect(initialLiveState.coverage).toBe('unavailable');
+    expect(initialLiveState.protocolMix).toBeNull();
+    expect(bandwidthTier(999_999)).toBe('blue');
+    expect(bandwidthTier(1_000_000)).toBe('cyan');
+    expect(bandwidthTier(10_000_000)).toBe('cyan');
+    expect(bandwidthTier(10_000_001)).toBe('gold');
+    expect(bandwidthTier(30_000_000)).toBe('gold');
+    expect(bandwidthTier(30_000_001)).toBe('pink');
+  });
   it('returns the identical state for duplicate or out-of-order events', () => {
     const current = { ...initialLiveState, sequence: 4, connected: true, serviceStatus: 'ready' };
 
@@ -34,13 +58,13 @@ describe('reduceLiveMessage', () => {
   it('advances the sequence and service status for the next status event', () => {
     const result = reduceLiveMessage(initialLiveState, { type: 'event', data: serviceStatus(1, 'degraded') });
 
-    expect(result).toEqual({ sequence: 1, connected: true, needsResync: false, serviceStatus: 'degraded' });
+    expect(result).toMatchObject({ sequence: 1, connected: true, needsResync: false, serviceStatus: 'degraded' });
   });
 
   it('marks the stream untrusted for an event sequence gap', () => {
     const current = { ...initialLiveState, sequence: 4, connected: true, serviceStatus: 'ready' };
 
-    expect(reduceLiveMessage(current, { type: 'event', data: serviceStatus(6, 'degraded') })).toEqual({
+    expect(reduceLiveMessage(current, { type: 'event', data: serviceStatus(6, 'degraded') })).toMatchObject({
       sequence: 4,
       connected: false,
       needsResync: true,
@@ -55,7 +79,7 @@ describe('reduceLiveMessage', () => {
     expect(reduceLiveMessage(latched, { type: 'event', data: serviceStatus(5, 'ready') })).toBe(latched);
     expect(reduceLiveMessage(latched, { type: 'event', data: serviceStatus(7, 'degraded') })).toBe(latched);
     expect(reduceLiveMessage(latched, { type: 'resync_required' })).toBe(latched);
-    expect(applySnapshot(latched, { sequence: 7, devices: [], next_after: null, service_status: 'ready' })).toEqual({
+    expect(applySnapshot(latched, { sequence: 7, devices: [], next_after: null, service_status: 'ready' })).toMatchObject({
       sequence: 7,
       connected: true,
       needsResync: false,
@@ -66,7 +90,7 @@ describe('reduceLiveMessage', () => {
   it('marks the stream untrusted when the server requires a resync', () => {
     const current = { ...initialLiveState, sequence: 4, connected: true, serviceStatus: 'ready' };
 
-    expect(reduceLiveMessage(current, { type: 'resync_required' })).toEqual({
+    expect(reduceLiveMessage(current, { type: 'resync_required' })).toMatchObject({
       sequence: 4,
       connected: false,
       needsResync: true,
@@ -77,11 +101,20 @@ describe('reduceLiveMessage', () => {
   it('advances a next presence event without changing service status', () => {
     const current = { ...initialLiveState, sequence: 4, connected: true, serviceStatus: 'ready' };
 
-    expect(reduceLiveMessage(current, { type: 'event', data: presence(5) })).toEqual({
+    expect(reduceLiveMessage(current, { type: 'event', data: presence(5) })).toMatchObject({
       sequence: 5,
       connected: true,
       needsResync: false,
       serviceStatus: 'ready'
     });
+  });
+
+  it('creates an explicit unavailable placeholder for an event-only device', () => {
+    const result = reduceLiveMessage(applySnapshot(initialLiveState, { sequence: 0, devices: [], next_after: null, service_status: 'ready' }), { type: 'event', data: bandwidth(1) });
+    const device = result.devices['0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b'];
+    expect(device.identity).toEqual({ available: false, classification: null, confidence: null });
+    expect(result.deviceOrder).toEqual([device.device_id]);
+    expect(result.coverage).toBe('complete');
+    expect(result.aggregate).toEqual({ upload: 2_000_000, download: 1_000_000 });
   });
 });

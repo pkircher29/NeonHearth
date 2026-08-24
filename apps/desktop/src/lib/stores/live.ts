@@ -1,9 +1,77 @@
-import type { DeviceSnapshot, ServerMessage, Snapshot, Coverage } from '../api/types';
-export interface ThroughputPoint { at:string; upload:number; download:number }
-export interface LiveState { sequence:number; connected:boolean; needsResync:boolean; serviceStatus:string; devices:Record<string,DeviceSnapshot>; deviceOrder:string[]; throughput:ThroughputPoint[]; timeline:ServerMessage[]; coverage:Coverage|'unavailable'|'mixed'; aggregate:{upload:number;download:number}; protocolMix:null }
-export const initialLiveState:LiveState={sequence:0,connected:false,needsResync:false,serviceStatus:'unknown'} as LiveState;
-const sum=(s:LiveState):LiveState=>{const v=Object.values(s.devices).map(d=>d.bandwidth).filter(b=>b.available),c=new Set(v.map(b=>b.coverage));return {...s,aggregate:{upload:v.reduce((n,b)=>n+(b.upload??0),0),download:v.reduce((n,b)=>n+(b.download??0),0)},coverage:c.size===0?'unavailable':c.size===1?[...c][0]! as Coverage:'mixed'};};
-export function applySnapshot(_:LiveState,x:Snapshot):LiveState{if(x.devices.length===0)return {sequence:x.sequence,connected:true,needsResync:false,serviceStatus:x.service_status} as LiveState;const devices:Record<string,DeviceSnapshot>={},order:string[]=[];for(const d of x.devices){if(!devices[d.device_id])order.push(d.device_id);devices[d.device_id]=d;}return sum({...initialLiveState,sequence:x.sequence,connected:true,serviceStatus:x.service_status,devices,deviceOrder:order,throughput:[],timeline:[],coverage:'unavailable',aggregate:{upload:0,download:0},protocolMix:null});}
-export function reduceLiveMessage(s:LiveState,m:ServerMessage):LiveState{if(s.needsResync)return s;if(m.type==='resync_required')return {...s,connected:false,needsResync:true};const e=m.data;if(e.sequence<=s.sequence)return s;if(e.sequence>s.sequence+1)return {...s,connected:false,needsResync:true};if(!('devices' in s))return {...s,sequence:e.sequence,connected:true,needsResync:false,serviceStatus:e.payload.type==='service_status'?e.payload.data.state:s.serviceStatus};let n={...s,sequence:e.sequence,connected:true,timeline:[...s.timeline,m].slice(-120)};if(e.payload.type==='service_status')n.serviceStatus=e.payload.data.state;if(e.payload.type==='presence_changed'){const d=n.devices[e.payload.data.device_id];if(d)n.devices={...n.devices,[d.device_id]:{...d,presence:{...d.presence,state:e.payload.data.to,observed_at:e.payload.data.occurred_at,source:e.payload.data.trigger_source,kind:e.payload.data.trigger_kind}}};}if(e.payload.type==='bandwidth_frame'){n.devices={...n.devices};for(const x of e.payload.data.samples){const d=n.devices[x.device_id];if(d)n.devices[x.device_id]={...d,bandwidth:{available:true,upload:x.upload_bytes_per_second,download:x.download_bytes_per_second,coverage:x.coverage,observed_at:e.payload.data.observed_at}};}const a=e.payload.data.samples.reduce((z,x)=>({upload:z.upload+x.upload_bytes_per_second,download:z.download+x.download_bytes_per_second}),{upload:0,download:0});n.throughput=[...n.throughput,{at:e.occurred_at,...a}].slice(-240);}return sum(n);}
-export function bandwidthTier(b:number):'blue'|'cyan'|'gold'|'pink'{const m=b/1_000_000;return m<=5?'blue':m<=15?'cyan':m<=30?'gold':'pink';}
-export function topDevices(s:LiveState,limit=5){return s.deviceOrder.map(id=>s.devices[id]).filter(Boolean).sort((a,b)=>(b.bandwidth.upload??0)+(b.bandwidth.download??0)-(a.bandwidth.upload??0)-(a.bandwidth.download??0)).slice(0,limit);}
+import type { Coverage, DeviceSnapshot, EventEnvelope, ServerMessage, Snapshot } from '../api/types';
+
+export interface ThroughputPoint { at: string; upload: number; download: number }
+export type CoverageSummary = Coverage | 'unavailable' | 'mixed';
+export type ProtocolMix = Record<string, number>;
+export interface LiveState {
+  sequence: number;
+  connected: boolean;
+  needsResync: boolean;
+  serviceStatus: string;
+  devices: Record<string, DeviceSnapshot>;
+  deviceOrder: string[];
+  throughput: ThroughputPoint[];
+  timeline: ServerMessage[];
+  coverage: CoverageSummary;
+  aggregate: { upload: number; download: number };
+  protocolMix: ProtocolMix | null;
+}
+
+export const initialLiveState: LiveState = { sequence: 0, connected: false, needsResync: false, serviceStatus: 'unknown', devices: {}, deviceOrder: [], throughput: [], timeline: [], coverage: 'unavailable', aggregate: { upload: 0, download: 0 }, protocolMix: null };
+
+function summarize(state: LiveState): LiveState {
+  const bandwidth = Object.values(state.devices).map((device) => device.bandwidth).filter((value) => value.available);
+  const coverages = new Set(bandwidth.map((value) => value.coverage).filter((value): value is Coverage => value !== null));
+  return { ...state, aggregate: { upload: bandwidth.reduce((sum, value) => sum + (value.upload ?? 0), 0), download: bandwidth.reduce((sum, value) => sum + (value.download ?? 0), 0) }, coverage: coverages.size === 0 ? 'unavailable' : coverages.size === 1 ? [...coverages][0]! : 'mixed' };
+}
+
+export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
+  const devices: Record<string, DeviceSnapshot> = {};
+  const deviceOrder: string[] = [];
+  for (const device of snapshot.devices) { if (!(device.device_id in devices)) deviceOrder.push(device.device_id); devices[device.device_id] = device; }
+  const next = { sequence: snapshot.sequence, connected: true, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: [], timeline: [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: 0, download: 0 }, protocolMix: null };
+  return summarize(next);
+}
+
+function placeholder(id: string, occurredAt: string): DeviceSnapshot {
+  return { device_id: id, first_seen_at: occurredAt, last_seen_at: occurredAt, owner_name: null, owner_type: null, owner_confirmed: false, presence: { state: 'unknown', observed_at: null, source: null, kind: null }, evidence: null, identity: { available: false, classification: null, confidence: null }, bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null } };
+}
+function protocolMixFrom(frame: EventEnvelope['payload'] & { type: 'bandwidth_frame' }): ProtocolMix | null {
+  const counts: Record<string, number> = {};
+  for (const sample of frame.data.samples) { const protocol = (sample as unknown as { protocol?: unknown }).protocol; if (typeof protocol === 'string' && protocol.length > 0) counts[protocol] = (counts[protocol] ?? 0) + sample.upload_bytes_per_second + sample.download_bytes_per_second; }
+  const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
+  return total ? Object.fromEntries(Object.entries(counts).map(([protocol, value]) => [protocol, value / total * 100])) : null;
+}
+
+export function reduceLiveMessage(state: LiveState, message: ServerMessage): LiveState {
+  if (state.needsResync) return state;
+  if (message.type === 'resync_required') return { ...state, connected: false, needsResync: true };
+  const event = message.data;
+  if (event.sequence <= state.sequence) return state;
+  if (event.sequence > state.sequence + 1) return { ...state, connected: false, needsResync: true };
+  const next: LiveState = { ...state, sequence: event.sequence, connected: true, devices: state.devices, deviceOrder: state.deviceOrder, throughput: state.throughput, timeline: [...state.timeline, message].slice(-120), coverage: state.coverage, aggregate: state.aggregate, protocolMix: state.protocolMix };
+  if (event.payload.type === 'service_status') next.serviceStatus = event.payload.data.state;
+  if (event.payload.type === 'presence_changed') {
+    const id = event.payload.data.device_id;
+    const current = next.devices[id] ?? placeholder(id, event.occurred_at);
+    if (!(id in next.devices)) next.deviceOrder = [...next.deviceOrder, id];
+    next.devices = { ...next.devices, [id]: { ...current, last_seen_at: event.occurred_at, presence: { state: event.payload.data.to, observed_at: event.payload.data.occurred_at, source: event.payload.data.trigger_source, kind: event.payload.data.trigger_kind } } };
+  }
+  if (event.payload.type === 'bandwidth_frame') {
+    next.devices = { ...next.devices };
+    let upload = 0; let download = 0;
+    for (const sample of event.payload.data.samples) {
+      upload += sample.upload_bytes_per_second; download += sample.download_bytes_per_second;
+      const current = next.devices[sample.device_id] ?? placeholder(sample.device_id, event.occurred_at);
+      if (!(sample.device_id in next.devices)) next.deviceOrder = [...next.deviceOrder, sample.device_id];
+      next.devices[sample.device_id] = { ...current, last_seen_at: event.occurred_at, bandwidth: { available: true, upload: sample.upload_bytes_per_second, download: sample.download_bytes_per_second, coverage: sample.coverage, observed_at: event.payload.data.observed_at } };
+    }
+    next.aggregate = { upload, download };
+    next.throughput = [...next.throughput, { at: event.occurred_at, upload, download }].slice(-240);
+    next.protocolMix = protocolMixFrom(event.payload) ?? next.protocolMix;
+  }
+  return summarize(next);
+}
+
+export function bandwidthTier(totalBps: number): 'blue' | 'cyan' | 'gold' | 'pink' { const megabits = totalBps / 1_000_000; return megabits < 1 ? 'blue' : megabits <= 10 ? 'cyan' : megabits <= 30 ? 'gold' : 'pink'; }
+export function topDevices(state: LiveState, limit = 5): DeviceSnapshot[] { return state.deviceOrder.map((id) => state.devices[id]).filter((device): device is DeviceSnapshot => Boolean(device)).sort((a, b) => (b.bandwidth.upload ?? 0) + (b.bandwidth.download ?? 0) - (a.bandwidth.upload ?? 0) - (a.bandwidth.download ?? 0)).slice(0, limit); }

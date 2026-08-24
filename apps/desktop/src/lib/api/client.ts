@@ -17,6 +17,7 @@ export interface SnapshotPageOptions {
 export interface ApiClient {
   health(): Promise<Health>;
   snapshot(options?: SnapshotPageOptions): Promise<Snapshot>;
+  snapshotAll(options?: { limit?: number; maxPages?: number; maxRecords?: number }): Promise<Snapshot>;
   issueEventTicket(): Promise<EventTicket>;
   openEvents(
     afterSequence: number,
@@ -49,12 +50,12 @@ function isServerMessage(value: unknown): value is ServerMessage {
   if (payload.type === 'bandwidth_frame') return isBandwidthFrame(payload.data);
   return payload.type === 'presence_changed' && isRecord(payload.data)
     && isSequence(payload.data.transition_id)
-    && typeof payload.data.device_id === 'string'
-    && typeof payload.data.from === 'string'
-    && typeof payload.data.to === 'string'
-    && typeof payload.data.reason === 'string'
+    && isDeviceId(payload.data.device_id)
+    && presenceStates.has(String(payload.data.from))
+    && presenceStates.has(String(payload.data.to))
+    && typeof payload.data.reason === 'string' && payload.data.reason.length > 0
     && isDate(payload.data.occurred_at) && typeof payload.data.trigger_source === 'string'
-    && typeof payload.data.trigger_kind === 'string' && isDate(payload.data.evidence_observed_at)
+    && payload.data.trigger_source.length > 0 && typeof payload.data.trigger_kind === 'string' && payload.data.trigger_kind.length > 0 && isDate(payload.data.evidence_observed_at)
     && (payload.data.evidence_valid_until === null || isDate(payload.data.evidence_valid_until))
     && isDate(payload.data.trigger_arrival_at)
     && (payload.data.correction_of === null || isSequence(payload.data.correction_of));
@@ -162,6 +163,31 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
     return value;
   }
 
+  async function snapshotAll(options: { limit?: number; maxPages?: number; maxRecords?: number } = {}): Promise<Snapshot> {
+    const limit = options.limit ?? 256;
+    const maxPages = options.maxPages ?? 256;
+    const maxRecords = options.maxRecords ?? 65536;
+    if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 256 || !Number.isSafeInteger(maxRecords) || maxRecords < 1 || maxRecords > 65536) throw new Error('Invalid snapshot bounds');
+    const devices: DeviceSnapshot[] = [];
+    let after: string | undefined;
+    let sequence: number | undefined;
+    let serviceStatus = 'unknown';
+    const cursors = new Set<string>();
+    for (let page = 0; page < maxPages; page += 1) {
+      const current = await snapshot({ limit, ...(after ? { after } : {}) });
+      if (sequence === undefined) sequence = current.sequence;
+      if (current.sequence !== sequence) throw new Error('Snapshot sequence changed');
+      serviceStatus = current.service_status;
+      devices.push(...current.devices);
+      if (devices.length > maxRecords) throw new Error('Snapshot exceeds safety bound');
+      if (current.next_after === null) return { sequence, devices, next_after: null, service_status: serviceStatus };
+      if (cursors.has(current.next_after)) throw new Error('Snapshot cursor cycle');
+      cursors.add(current.next_after);
+      after = current.next_after;
+    }
+    throw new Error('Snapshot page bound exceeded');
+  }
+
   async function issueEventTicket(): Promise<EventTicket> {
     const value = await request('/api/v1/events/ticket', authorized('POST'));
     if (!isEventTicket(value)) throw new Error('Invalid event ticket response');
@@ -190,5 +216,5 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
       return socket;
   }
 
-  return { health, snapshot, issueEventTicket, openEvents };
+  return { health, snapshot, snapshotAll, issueEventTicket, openEvents };
 }
