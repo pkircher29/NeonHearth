@@ -1,4 +1,4 @@
-use crate::{CameraId, Confidence};
+use crate::{BoundedText, CameraId, Confidence};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -35,7 +35,7 @@ pub enum CameraHealth {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CameraEvidence {
     family: CameraEvidenceFamily,
     source: String,
@@ -57,7 +57,7 @@ impl CameraEvidence {
         Ok(Self {
             family,
             source: safe_source(source.into())?,
-            fact: bounded(fact.into(), 256)?,
+            fact: normalized_fact(family, fact.into())?,
             confidence: Confidence::new(confidence).map_err(|_| DetectionError::InvalidEvidence)?,
             observed_at,
             expires_at,
@@ -100,32 +100,41 @@ fn bounded(value: String, max: usize) -> Result<String, DetectionError> {
     }
 }
 fn safe_source(value: String) -> Result<String, DetectionError> {
-    if value.contains("://")
+    let normalized = value.to_ascii_lowercase();
+    if normalized.contains("://")
         || value.contains('@')
-        || value.contains("password")
-        || value.contains("bearer")
-        || value.contains("authorization")
-        || value.contains("header=")
-        || value.contains("body=")
+        || normalized.contains("password")
+        || normalized.contains("bearer")
+        || normalized.contains("authorization")
+        || normalized.contains("header")
+        || normalized.contains("body")
     {
         return Err(DetectionError::InvalidEvidence);
     }
     bounded(value, 128)
 }
 
-fn allowed(family: CameraEvidenceFamily, fact: &str) -> bool {
-    if fact.contains("://")
-        || fact.contains("password")
-        || fact.contains("bearer")
-        || fact.contains("authorization")
-        || fact.contains("body=")
-        || fact.contains("header=")
-    {
-        return false;
+fn normalized_fact(family: CameraEvidenceFamily, value: String) -> Result<String, DetectionError> {
+    let fact = value.to_ascii_lowercase();
+    let contains_secret = ["://", "@", "password", "bearer", "authorization", "header", "body"]
+        .iter()
+        .any(|needle| fact.contains(needle));
+    let marker = fact
+        .strip_prefix("vendor:")
+        .or_else(|| fact.strip_prefix("model:"))
+        .is_some_and(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
+    if contains_secret || (!allowed(family, &fact) && !marker) {
+        return Err(DetectionError::InvalidEvidence);
     }
+    bounded(fact, 256)
+}
+
+fn allowed(family: CameraEvidenceFamily, fact: &str) -> bool {
     matches!(
         (family, fact),
         (CameraEvidenceFamily::Onvif, "onvif_camera_profile")
+            | (CameraEvidenceFamily::Onvif, "onvif_namespace")
+            | (CameraEvidenceFamily::WsDiscovery, "ws_discovery_type")
             | (CameraEvidenceFamily::WsDiscovery, "ws_discovery_scope")
             | (CameraEvidenceFamily::Rtsp, "rtsp_camera")
             | (CameraEvidenceFamily::Upnp, "upnp_camera")
@@ -137,6 +146,30 @@ fn allowed(family: CameraEvidenceFamily, fact: &str) -> bool {
     )
 }
 
+impl<'de> Deserialize<'de> for CameraEvidence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            family: CameraEvidenceFamily,
+            source: BoundedText<128>,
+            fact: BoundedText<256>,
+            confidence: Confidence,
+            observed_at: DateTime<Utc>,
+            expires_at: Option<DateTime<Utc>>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.family,
+            wire.source.into_inner(),
+            wire.fact.into_inner(),
+            wire.confidence.get(),
+            wire.observed_at,
+            wire.expires_at,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 pub fn classify_candidate(
     id: CameraId,
     inputs: impl IntoIterator<Item = CameraEvidence>,
@@ -145,13 +178,14 @@ pub fn classify_candidate(
     let mut evidence = Vec::new();
     let mut seen = BTreeSet::new();
     for item in inputs {
-        if evidence.len() >= MAX_EVIDENCE
-            || item.expires_at.is_some_and(|expiry| expiry <= now)
+        if item.expires_at.is_some_and(|expiry| expiry <= now)
             || !allowed(item.family, &item.fact)
         {
             continue;
         }
-        if seen.insert((item.family, item.source.clone(), item.fact.clone())) {
+        if seen.insert((item.family, item.source.clone(), item.fact.clone()))
+            && evidence.len() < MAX_EVIDENCE
+        {
             evidence.push(item);
         }
     }
@@ -164,9 +198,12 @@ pub fn classify_candidate(
         .collect();
     let classification = if contradiction {
         CameraClassification::Unknown
-    } else if evidence
-        .iter()
-        .any(|e| e.family == CameraEvidenceFamily::Onvif && e.fact == "onvif_camera_profile")
+    } else if families.len() >= 2
+        || evidence.iter().any(|e| {
+            e.family == CameraEvidenceFamily::Onvif
+                && e.fact == "onvif_camera_profile"
+                && e.confidence.get() >= 0.8
+        })
     {
         CameraClassification::Camera
     } else if !families.is_empty() {
@@ -177,10 +214,9 @@ pub fn classify_candidate(
     let score = if contradiction {
         0.0
     } else {
-        evidence
+        families
             .iter()
-            .filter(|e| e.fact != "camera_contradiction")
-            .map(|e| e.confidence.get())
+            .map(|family| evidence.iter().filter(|e| e.family == *family && e.fact != "camera_contradiction").map(|e| e.confidence.get()).fold(0.0, f32::max))
             .sum::<f32>()
             .min(1.0)
     };

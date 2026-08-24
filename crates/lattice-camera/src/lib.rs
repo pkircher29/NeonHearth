@@ -153,6 +153,10 @@ impl<const MAX: usize> BoundedText<MAX> {
             Ok(())
         }
     }
+
+    pub(crate) fn into_inner(self) -> String {
+        self.0
+    }
 }
 
 impl<const MAX: usize> Serialize for BoundedText<MAX> {
