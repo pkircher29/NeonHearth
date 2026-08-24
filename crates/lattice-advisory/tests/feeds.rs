@@ -253,3 +253,51 @@ async fn cisa_http_and_schema_failures_serve_stale_cached_records() {
     schema.sync().await.unwrap();
     assert!(schema.sync().await.unwrap().is_stale());
 }
+
+#[tokio::test]
+async fn cisa_304_refreshes_expiry_and_retains_cached_provenance() {
+    let initial = at(300);
+    let clock = MutableClock(Arc::new(Mutex::new(initial)));
+    let transport = FixtureTransport::with_clock(
+        [
+            Ok(FixtureReply::json(r#"{"vulnerabilities":[{}]}"#)
+                .with_headers(Some("old"), Some("old-date"))),
+            Ok(FixtureReply::status(304).with_headers(Some("new"), None)),
+            Err(TransportError::Unavailable),
+        ],
+        clock.clone(),
+    );
+    let feed = CisaKevFeed::with_clock(transport, clock.clone());
+    let initial_result = feed.sync().await.unwrap();
+    clock.set(initial + Duration::minutes(59));
+    let revalidated = feed.sync().await.unwrap();
+    assert_eq!(revalidated.records, initial_result.records);
+    assert_eq!(revalidated.response.etag.as_deref(), Some("new"));
+    assert_eq!(
+        revalidated.response.last_modified.as_deref(),
+        Some("old-date")
+    );
+    assert_eq!(
+        revalidated.cache_expires_at,
+        initial + Duration::minutes(59) + Duration::hours(1)
+    );
+    clock.set(initial + Duration::hours(1) + Duration::minutes(30));
+    assert!(feed.sync().await.unwrap().is_stale());
+}
+
+#[tokio::test]
+async fn cisa_304_after_expiry_is_unavailable_without_extending_cache() {
+    let initial = at(400);
+    let clock = MutableClock(Arc::new(Mutex::new(initial)));
+    let transport = FixtureTransport::with_clock(
+        [
+            Ok(FixtureReply::json(r#"{"vulnerabilities":[{}]}"#)),
+            Ok(FixtureReply::status(304)),
+        ],
+        clock.clone(),
+    );
+    let feed = CisaKevFeed::with_clock(transport, clock.clone());
+    feed.sync().await.unwrap();
+    clock.set(initial + Duration::hours(1) + Duration::seconds(1));
+    assert!(matches!(feed.sync().await, Err(FeedError::Unavailable(_))));
+}

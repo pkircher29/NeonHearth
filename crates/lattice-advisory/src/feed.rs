@@ -266,7 +266,18 @@ impl<T: FeedTransport> CisaKevFeed<T> {
                 if cached.result.cache_expires_at < self.clock.now() {
                     return Err(FeedError::Unavailable(TransportError::Unavailable));
                 }
-                return Ok(cached.result);
+                let mut result = cached.result;
+                if response.etag.is_some() {
+                    result.response.etag = response.etag;
+                }
+                if response.last_modified.is_some() {
+                    result.response.last_modified = response.last_modified;
+                }
+                result.cache_expires_at = self.clock.now() + CACHE_TTL;
+                *self.cache.lock().expect("cache lock") = Some(Cached {
+                    result: result.clone(),
+                });
+                return Ok(result);
             }
             Ok(response) if response.status == 200 => response,
             Ok(response) => {
