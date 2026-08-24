@@ -55,6 +55,13 @@ pub struct CameraDetail {
     pub health: String,
     pub observed_at: DateTime<Utc>,
     pub inventory: Option<CameraInventoryProjection>,
+    #[schema(max_items = 64)]
+    pub streams: Vec<CameraStreamProjection>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct CameraStreamProjection {
+    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
+    pub stream_id: String,
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraHealth {
@@ -252,6 +259,15 @@ pub async fn camera(
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
             .map(CameraInventoryProjection::from),
+        streams: repo
+            .load_stream_refs(id)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .into_iter()
+            .map(|profile| CameraStreamProjection {
+                stream_id: profile.stream_id().to_string(),
+            })
+            .collect(),
     }))
 }
 #[utoipa::path(get, path = "/api/v1/cameras/{id}/health", params(("id" = String, Path, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")), responses((status = 200, body = CameraHealth), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
@@ -618,7 +634,7 @@ pub async fn event_ticket(
     }))
 }
 #[derive(OpenApi)]
-#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse, BinaryMedia)), modifiers(&SecurityAddon))]
+#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraStreamProjection, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse, BinaryMedia)), modifiers(&SecurityAddon))]
 pub struct ApiDoc;
 struct SecurityAddon;
 impl Modify for SecurityAddon {

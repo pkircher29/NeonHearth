@@ -44,7 +44,7 @@ describe('createApiClient', () => {
       if (url.endsWith('/inventory')) return new Response(JSON.stringify(inventory), { status: 200 });
       if (url.endsWith('/health')) return new Response(JSON.stringify({ health: 'healthy', confidence: 0.5 }), { status: 200 });
       if (url.includes('/cameras?')) return new Response(JSON.stringify({ items: [summary], next_after: null }), { status: 200 });
-      if (url.endsWith(id)) return new Response(JSON.stringify({ ...summary, inventory }), { status: 200 });
+      if (url.endsWith(id)) return new Response(JSON.stringify({ ...summary, inventory, streams: [] }), { status: 200 });
       return new Response(JSON.stringify({ items: [summary], next_after: null }), { status: 200 });
     });
     const client = createApiClient({ baseUrl: 'https://collector.example/base', serviceToken: 'secret', fetchImpl });
@@ -62,7 +62,7 @@ describe('createApiClient', () => {
 
   it('rejects unsafe camera fields, bounds violations, media types, and error statuses', async () => {
     const id = '018f47a0-9b5c-7a22-8a33-112233445599';
-    const base = { camera_id: id, classification: 'camera', confidence: 0.5, health: 'healthy', observed_at: '2026-01-01T00:00:00Z', inventory: null };
+    const base = { camera_id: id, classification: 'camera', confidence: 0.5, health: 'healthy', observed_at: '2026-01-01T00:00:00Z', inventory: null, streams: [] };
     for (const malformed of [{ ...base, endpoint: 'rtsp://unsafe' }, { ...base, confidence: 2 }, { ...base, classification: 'invented' }]) {
       await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 })) }).camera(id)).rejects.toThrow('Invalid camera response');
     }
