@@ -462,11 +462,37 @@ async fn openapi_documents_advisory_route_and_security() {
     let limit = params.iter().find(|p| p["name"] == "limit").unwrap();
     assert_eq!(limit["schema"]["maximum"], 128);
     let projection = &doc["components"]["schemas"]["AdvisoryProjection"];
-    assert_eq!(projection["properties"]["source"]["maxLength"], 32);
-    assert!(projection["properties"]["source"]["pattern"].is_string());
+    assert_eq!(
+        projection["properties"]["source"]["pattern"],
+        "^(nvd|cisa_kev|vendor)$"
+    );
+    assert_eq!(projection["properties"]["source_id"]["minLength"], 1);
+    assert_eq!(projection["properties"]["source_id"]["maxLength"], 512);
+    assert_eq!(projection["properties"]["source_url"]["minLength"], 1);
+    assert_eq!(projection["properties"]["source_url"]["maxLength"], 512);
+    assert_eq!(
+        projection["properties"]["source_url"]["pattern"],
+        "^https://"
+    );
+    assert_eq!(projection["properties"]["title"]["minLength"], 1);
+    assert_eq!(projection["properties"]["title"]["maxLength"], 512);
+    assert_eq!(projection["properties"]["vendor"]["minLength"], 1);
+    assert_eq!(projection["properties"]["vendor"]["maxLength"], 512);
+    assert_eq!(projection["properties"]["model"]["minLength"], 1);
+    assert_eq!(projection["properties"]["model"]["maxLength"], 512);
+    assert_eq!(projection["properties"]["firmware"]["minLength"], 1);
+    assert_eq!(projection["properties"]["firmware"]["maxLength"], 258);
     assert_eq!(
         projection["properties"]["provenance_sha256"]["maxLength"],
         64
+    );
+    assert_eq!(
+        projection["properties"]["provenance_sha256"]["minLength"],
+        64
+    );
+    assert_eq!(
+        projection["properties"]["provenance_sha256"]["pattern"],
+        "^[0-9a-f]{64}$"
     );
     assert!(projection["properties"]["advisory_id"]["pattern"].is_string());
 }

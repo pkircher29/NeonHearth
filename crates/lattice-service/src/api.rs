@@ -106,19 +106,19 @@ pub struct AdvisoryProjection {
     pub advisory_id: String,
     #[schema(max_length = 32, pattern = "^(nvd|cisa_kev|vendor)$")]
     pub source: String,
-    #[schema(max_length = 512)]
+    #[schema(min_length = 1, max_length = 512)]
     pub source_id: String,
-    #[schema(max_length = 64)]
+    #[schema(min_length = 64, max_length = 64, pattern = "^[0-9a-f]{64}$")]
     pub provenance_sha256: String,
-    #[schema(max_length = 512, pattern = "^https://")]
+    #[schema(min_length = 1, max_length = 512, pattern = "^https://")]
     pub source_url: String,
-    #[schema(max_length = 512)]
+    #[schema(min_length = 1, max_length = 512)]
     pub title: String,
-    #[schema(max_length = 128)]
+    #[schema(min_length = 1, max_length = 512)]
     pub vendor: String,
-    #[schema(max_length = 128)]
+    #[schema(min_length = 1, max_length = 512)]
     pub model: Option<String>,
-    #[schema(max_length = 128)]
+    #[schema(min_length = 1, max_length = 258)]
     pub firmware: Option<String>,
     #[schema(max_length = 32)]
     #[schema(pattern = "^(fresh|stale|future_dated)$")]
@@ -141,6 +141,8 @@ pub struct AdvisoryProjection {
 fn sanitized_source_url(raw: &str) -> String {
     Url::parse(raw)
         .map(|mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
             url.set_query(None);
             url.set_fragment(None);
             url.to_string()
@@ -156,6 +158,7 @@ fn firmware_projection(value: &lattice_advisory::VersionConstraint) -> Option<St
         lattice_advisory::VersionConstraint::Range { min, max } => Some(format!("{min}..{max}")),
     }
 }
+
 #[derive(Serialize, ToSchema)]
 pub struct AdvisoryRisk {
     #[schema(pattern = "^(none|low|medium|high|critical|unknown)$")]
@@ -697,6 +700,14 @@ mod tests {
     use lattice_store::connect_memory;
 
     const TOKEN: &str = "owner-token-0123456789abcdefghijkl";
+
+    #[test]
+    fn sanitized_source_url_removes_credentials_query_and_fragment() {
+        assert_eq!(
+            sanitized_source_url("https://user:password@example.test/path?token=secret#fragment"),
+            "https://example.test/path"
+        );
+    }
 
     #[tokio::test]
     async fn snapshot_watermark_precedes_events_published_after_capture() {
