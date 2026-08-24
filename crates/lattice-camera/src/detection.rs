@@ -188,9 +188,7 @@ pub fn classify_candidate(
     let mut evidence = Vec::new();
     let mut seen = BTreeSet::new();
     for item in inputs {
-        if item.expires_at.is_some_and(|expiry| expiry <= now)
-            || !allowed(item.family, &item.fact)
-        {
+        if item.expires_at.is_some_and(|expiry| expiry <= now) {
             continue;
         }
         if seen.insert((item.family, item.source.clone(), item.fact.clone()))

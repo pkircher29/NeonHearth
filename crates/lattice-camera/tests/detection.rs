@@ -212,6 +212,34 @@ fn metadata_markers_are_limited_to_metadata_families() {
 }
 
 #[test]
+fn normalized_metadata_marker_is_retained_by_candidate_classification() {
+    let now = Utc::now();
+    let id = CameraId::from_uuid(Uuid::nil());
+    let marker = CameraEvidence::new(
+        CameraEvidenceFamily::Http,
+        "fixture",
+        "Vendor:Axis-Q3536",
+        0.4,
+        now,
+        None,
+    )
+    .unwrap();
+    assert!(CameraEvidence::new(
+        CameraEvidenceFamily::Service,
+        "fixture",
+        "vendor:axis-q3536",
+        0.4,
+        now,
+        None,
+    )
+    .is_err());
+
+    let candidate = classify_candidate(id, [marker], now).unwrap();
+    assert_eq!(candidate.evidence.len(), 1);
+    assert_eq!(candidate.evidence[0].fact(), "vendor:axis-q3536");
+}
+
+#[test]
 fn weak_families_need_independent_qualifying_confidence() {
     let id = CameraId::from_uuid(Uuid::nil());
     let now = Utc::now();
