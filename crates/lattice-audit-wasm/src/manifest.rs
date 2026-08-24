@@ -17,6 +17,19 @@ const MAX_REQUESTS: u32 = 1024;
 const MAX_TIME_SECS: u64 = 300;
 const MAX_FUEL: u64 = 10_000_000_000;
 const MAX_MEMORY_PAGES: u32 = 1024;
+pub(crate) fn valid_limits(limits: &Limits) -> bool {
+    limits.max_bytes > 0
+        && limits.max_bytes <= MAX_WASM_BYTES
+        && limits.max_requests > 0
+        && limits.max_requests <= MAX_REQUESTS
+        && !limits.max_time.is_zero()
+        && limits.max_time.subsec_nanos() == 0
+        && limits.max_time.as_secs() <= MAX_TIME_SECS
+        && limits.max_fuel > 0
+        && limits.max_fuel <= MAX_FUEL
+        && limits.max_memory_pages > 0
+        && limits.max_memory_pages <= MAX_MEMORY_PAGES
+}
 
 fn bounded_string<'de, D: serde::Deserializer<'de>>(d: D, max: usize) -> Result<String, D::Error> {
     struct V(usize);
@@ -441,17 +454,18 @@ impl AuditManifest {
                 "invalid evidence schema".into(),
             ));
         }
-        if limits.max_bytes == 0
-            || limits.max_bytes > MAX_WASM_BYTES
-            || limits.max_requests == 0
-            || limits.max_requests > MAX_REQUESTS
-            || limits.max_time.is_zero()
-            || limits.max_time.subsec_nanos() != 0
-            || limits.max_time.as_secs() > MAX_TIME_SECS
-            || limits.max_fuel == 0
-            || limits.max_fuel > MAX_FUEL
-            || limits.max_memory_pages == 0
-            || limits.max_memory_pages > MAX_MEMORY_PAGES
+        if !valid_limits(&limits)
+        /*if limits.max_bytes == 0
+        || limits.max_bytes > MAX_WASM_BYTES
+        || limits.max_requests == 0
+        || limits.max_requests > MAX_REQUESTS
+        || limits.max_time.is_zero()
+        || limits.max_time.subsec_nanos() != 0
+        || limits.max_time.as_secs() > MAX_TIME_SECS
+        || limits.max_fuel == 0
+        || limits.max_fuel > MAX_FUEL
+        || limits.max_memory_pages == 0
+        || limits.max_memory_pages > MAX_MEMORY_PAGES*/
         {
             return Err(AuditError::InvalidManifest("invalid limits".into()));
         }

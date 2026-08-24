@@ -1,4 +1,4 @@
-use crate::{AuditError, Limits, VerifiedManifest};
+use crate::{AuditError, Limits, VerifiedManifest, manifest::valid_limits};
 use std::{
     sync::{
         Arc,
@@ -168,6 +168,18 @@ impl Sandbox {
         verified: VerifiedManifest,
         limits: &Limits,
     ) -> Result<Self, AuditError> {
+        let signed = verified.limits();
+        if !valid_limits(limits)
+            || limits.max_bytes > signed.max_bytes
+            || limits.max_requests > signed.max_requests
+            || limits.max_time > signed.max_time
+            || limits.max_fuel > signed.max_fuel
+            || limits.max_memory_pages > signed.max_memory_pages
+        {
+            return Err(AuditError::InvalidManifest(
+                "invalid effective limits".into(),
+            ));
+        }
         let mut config = Config::new();
         config.consume_fuel(true);
         config.async_support(true);

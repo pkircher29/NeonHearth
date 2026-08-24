@@ -61,7 +61,11 @@ impl Budget {
             }),
         }
     }
-    fn reserve(&self, request_bytes: usize, response_cap: usize) -> Result<(), BrokerError> {
+    fn reserve(
+        &self,
+        request_bytes: usize,
+        response_cap: usize,
+    ) -> Result<Reservation<'_>, BrokerError> {
         let mut b = self
             .inner
             .lock()
@@ -83,7 +87,12 @@ impl Budget {
             .bytes
             .checked_add(total)
             .ok_or(BrokerError::BudgetExhausted)?;
-        Ok(())
+        Ok(Reservation {
+            budget: self,
+            request_bytes,
+            response_cap,
+            committed: false,
+        })
     }
     fn refund(&self, response_cap: usize, actual: usize) {
         let Ok(mut b) = self.inner.lock() else { return };
@@ -110,6 +119,25 @@ impl Budget {
             .checked_add(bytes)
             .ok_or(BrokerError::BudgetExhausted)?;
         Ok(())
+    }
+}
+struct Reservation<'a> {
+    budget: &'a Budget,
+    request_bytes: usize,
+    response_cap: usize,
+    committed: bool,
+}
+impl Reservation<'_> {
+    fn commit(mut self, actual: usize) {
+        self.budget.refund(self.response_cap, actual);
+        self.committed = true;
+    }
+}
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.budget.release(self.request_bytes, self.response_cap);
+        }
     }
 }
 pub struct ExchangeRequest {
@@ -183,7 +211,6 @@ impl Broker {
         {
             return Err(BrokerError::CapabilityDenied);
         }
-        let deadline = Instant::now() + request.limits.max_time;
         let target = self
             .authorizer
             .authorize(request.target, request.interface, request.port)?;
@@ -196,7 +223,9 @@ impl Broker {
         {
             return Err(BrokerError::BudgetExhausted);
         }
-        let deadline = deadline.min(Instant::now() + limits.max_time);
+        let deadline = Instant::now()
+            .checked_add(limits.max_time)
+            .ok_or(BrokerError::DeadlineExceeded)?;
         if request.cancellation.is_cancelled() {
             return Err(BrokerError::Cancelled);
         }
@@ -215,7 +244,7 @@ impl Broker {
             deadline,
             cancellation: request.cancellation.clone(),
         };
-        let output = tokio::select! { _=request.cancellation.cancelled()=>return Err(BrokerError::Cancelled), value=sandbox.execute(&request.input,&host)=>value? };
+        let output = tokio::select! { _=request.cancellation.cancelled()=>return Err(BrokerError::Cancelled), value=tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), sandbox.execute(&request.input,&host))=>match value { Ok(Ok(value))=>value, Ok(Err(AuditError::TimedOut))=>return Err(BrokerError::DeadlineExceeded), Ok(Err(AuditError::Cancelled))=>return Err(BrokerError::Cancelled), Ok(Err(AuditError::BudgetExhausted|AuditError::RequestLimitExceeded))=>return Err(BrokerError::BudgetExhausted), Ok(Err(AuditError::HostRejected))=>return Err(BrokerError::ExchangeFailed), Ok(Err(error))=>return Err(BrokerError::Sandbox(error)), Err(_)=>return Err(BrokerError::DeadlineExceeded) } };
         if request.cancellation.is_cancelled() {
             return Err(BrokerError::Cancelled);
         }
@@ -275,12 +304,13 @@ impl AuditHost for BrokerHost {
         if Instant::now() >= self.deadline {
             return Err(AuditHostError::DeadlineExceeded);
         }
-        self.budget
-            .reserve(request.len(), response_cap)
-            .map_err(|e| match e {
-                BrokerError::BudgetExhausted => AuditHostError::BudgetExhausted,
-                _ => AuditHostError::ExchangeFailed,
-            })?;
+        let reservation =
+            self.budget
+                .reserve(request.len(), response_cap)
+                .map_err(|e| match e {
+                    BrokerError::BudgetExhausted => AuditHostError::BudgetExhausted,
+                    _ => AuditHostError::ExchangeFailed,
+                })?;
         let refreshed = self
             .authorizer
             .authorize(
@@ -288,12 +318,8 @@ impl AuditHost for BrokerHost {
                 self.target.interface(),
                 self.target.port(),
             )
-            .map_err(|_| {
-                self.budget.release(request.len(), response_cap);
-                AuditHostError::Denied
-            })?;
+            .map_err(|_| AuditHostError::Denied)?;
         if refreshed != self.target {
-            self.budget.release(request.len(), response_cap);
             return Err(AuditHostError::Denied);
         }
         let call = self.exchange.exchange(
@@ -310,7 +336,7 @@ impl AuditHost for BrokerHost {
         if response.bytes.len() > response_cap {
             return Err(AuditHostError::ExchangeFailed);
         }
-        self.budget.refund(response_cap, response.bytes.len());
+        reservation.commit(response.bytes.len());
         Ok(response.bytes)
     }
 }

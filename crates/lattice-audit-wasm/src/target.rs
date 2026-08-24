@@ -9,8 +9,8 @@ pub enum TargetError {
     InvalidInterface,
     #[error("port must be nonzero")]
     InvalidPort,
-    #[error("target authorization failed: {0}")]
-    Rejected(String),
+    #[error("target authorization failed")]
+    Rejected,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
