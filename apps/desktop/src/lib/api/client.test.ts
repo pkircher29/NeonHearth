@@ -196,4 +196,17 @@ describe('createApiClient', () => {
     socket.onmessage?.({ data: JSON.stringify({ type: 'event', data: { sequence: 1, occurred_at: '2026-08-23T00:00:00Z', payload: { type: 'service_status', data: { state: 1, detail: 'bad' } } } }) } as MessageEvent<string>);
     expect(onMessage).not.toHaveBeenCalled();
   });
+
+  it('accepts a canonical fractional UTC timestamp in websocket frames', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ticket: 'ticket', expires_in_seconds: 60 }), { status: 200 }));
+    class FakeWebSocket { onopen = null; onclose = null; onerror = null; onmessage: ((event: MessageEvent<string>) => void) | null = null; constructor(_: string) {} }
+    const onMessage = vi.fn();
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl, WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket });
+    const socket = await client.openEvents(0, onMessage, vi.fn()) as unknown as FakeWebSocket;
+    const message = { type: 'event', data: { sequence: 1, occurred_at: '2026-08-23T00:00:00.123456789Z', payload: { type: 'service_status', data: { state: 'ready', detail: 'fractional UTC' } } } };
+
+    socket.onmessage?.({ data: JSON.stringify(message) } as MessageEvent<string>);
+
+    expect(onMessage).toHaveBeenCalledWith(message);
+  });
 });
