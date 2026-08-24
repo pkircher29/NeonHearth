@@ -301,3 +301,25 @@ async fn cisa_304_after_expiry_is_unavailable_without_extending_cache() {
     clock.set(initial + Duration::hours(1) + Duration::seconds(1));
     assert!(matches!(feed.sync().await, Err(FeedError::Unavailable(_))));
 }
+
+#[tokio::test]
+async fn nvd_304_rotates_cached_validators_for_the_next_conditional_request() {
+    let transport = FixtureTransport::queued([
+        Ok(FixtureReply::json(nvd_page(0, 1, 1)).with_headers(Some("old-tag"), Some("old-date"))),
+        Ok(FixtureReply::status(304).with_headers(Some("new-tag"), Some("new-date"))),
+        Err(TransportError::Unavailable),
+    ]);
+    let feed = NvdFeed::new(transport.clone());
+    let window = ModifiedWindow::new(at(0), at(1)).unwrap();
+    feed.sync(window.clone()).await.unwrap();
+    let revalidated = feed.sync(window.clone()).await.unwrap();
+    assert_eq!(revalidated.response.etag.as_deref(), Some("new-tag"));
+    assert_eq!(
+        revalidated.response.last_modified.as_deref(),
+        Some("new-date")
+    );
+    let _ = feed.sync(window).await;
+    let next = &transport.requests()[2];
+    assert_eq!(next.etag.as_deref(), Some("new-tag"));
+    assert_eq!(next.last_modified.as_deref(), Some("new-date"));
+}

@@ -110,7 +110,14 @@ impl<T: FeedTransport> NvdFeed<T> {
                     if cached.result.cache_expires_at < self.clock.now() {
                         return Err(FeedError::Unavailable(TransportError::Unavailable));
                     }
-                    cached.result.response
+                    let mut merged = cached.result.response;
+                    if response.etag.is_some() {
+                        merged.etag = response.etag;
+                    }
+                    if response.last_modified.is_some() {
+                        merged.last_modified = response.last_modified;
+                    }
+                    merged
                 }
                 Ok(response) if response.status == 200 => response,
                 Ok(response) => {
