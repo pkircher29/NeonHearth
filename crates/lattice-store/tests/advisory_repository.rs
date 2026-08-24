@@ -501,7 +501,7 @@ async fn schema_has_migration_and_advisory_uniqueness() -> anyhow::Result<()> {
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(version, 18);
+    assert_eq!(version, 21);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM advisories")
         .fetch_one(&pool)
         .await?;

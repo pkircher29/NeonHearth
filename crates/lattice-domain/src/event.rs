@@ -1,5 +1,5 @@
 use crate::policy::{EnforcementStatus, Evaluation, RequestedAction};
-use crate::{ByteCount, Coverage, DeviceId, PresenceChanged};
+use crate::{ByteCount, Coverage, DeviceId, HomeChanged, PresenceChanged};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -11,6 +11,7 @@ pub enum EventPayload {
     ServiceStatus(ServiceStatus),
     BandwidthFrame(BandwidthFrame),
     PolicyChanged(PolicyChanged),
+    HomeChanged(HomeChanged),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]

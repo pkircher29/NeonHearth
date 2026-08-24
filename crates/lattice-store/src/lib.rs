@@ -4,6 +4,7 @@ mod advisory;
 mod camera;
 mod checkpoint;
 mod flow;
+mod home;
 mod install;
 mod policy;
 mod w6;
@@ -14,6 +15,7 @@ pub use camera::*;
 pub use checkpoint::*;
 pub use flow::{CompactionPolicy, FlowIngestor, FlowRepository, FlowStoreError};
 use fs2::FileExt;
+pub use home::*;
 pub use install::{InstallRepository, InstallState};
 pub use policy::{ActuationAttempt, ActuationReservation, PendingDecision, PolicyRepository};
 use sqlx::{
