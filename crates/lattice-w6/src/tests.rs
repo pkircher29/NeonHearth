@@ -10,6 +10,8 @@ struct Fixture {
     renewals: u32,
     expire_on: Vec<&'static str>,
     persistent_entries_to_add: u32,
+    restore_expiries: u32,
+    restore_mismatch: bool,
 }
 #[async_trait]
 impl Transport for Fixture {
@@ -23,6 +25,16 @@ impl Transport for Fixture {
     async fn renew(&mut self) -> Result<(), Error> {
         self.renewals += 1;
         self.expired = false;
+        Ok(())
+    }
+    async fn restore(&mut self, previous: DeviceState) -> Result<(), Error> {
+        if self.restore_expiries > 0 {
+            self.restore_expiries -= 1;
+            return Err(Error::SessionExpired);
+        }
+        if !self.restore_mismatch {
+            self.state = previous;
+        }
         Ok(())
     }
     async fn profile(&mut self) -> Result<Profile, Error> {
@@ -89,12 +101,49 @@ fn fixture(c: Vec<Capability>, used: u32) -> Fixture {
         renewals: 0,
         expire_on: Vec::new(),
         persistent_entries_to_add: 1,
+        restore_expiries: 0,
+        restore_mismatch: false,
     }
 }
 
 fn trusted(f: Fixture) -> Connector<Fixture> {
     let profile = f.profile.clone();
     Connector::with_profiles(f, vec![profile])
+}
+
+#[tokio::test]
+async fn restore_renews_once_and_shares_budget_with_readback() {
+    let mut f = fixture(vec![Capability::DenyInternet], 0);
+    f.restore_expiries = 1;
+    f.expire_on = vec!["state"];
+    let mut c = trusted(f);
+    c.login("u", SecretString::from("secret")).await.unwrap();
+    let previous = DeviceState {
+        deny_internet: false,
+        disconnect_now: false,
+        deny_wifi_association: false,
+        deny_lan: false,
+        persistent_filter: false,
+        filter_entries: 0,
+    };
+    assert_eq!(c.restore(previous).await, Err(Error::SessionExpired));
+}
+
+#[tokio::test]
+async fn restore_renews_and_verifies_readback() {
+    let mut f = fixture(vec![Capability::DenyInternet], 0);
+    f.restore_expiries = 1;
+    let mut c = trusted(f);
+    c.login("u", SecretString::from("secret")).await.unwrap();
+    let previous = DeviceState {
+        deny_internet: false,
+        disconnect_now: false,
+        deny_wifi_association: false,
+        deny_lan: false,
+        persistent_filter: false,
+        filter_entries: 0,
+    };
+    assert_eq!(c.restore(previous).await, Ok(Verification::Verified));
 }
 
 #[tokio::test]

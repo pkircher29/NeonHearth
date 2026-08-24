@@ -352,8 +352,16 @@ impl<T: Transport> Connector<T> {
     /// capability, not a guessed HTTP reversal.
     pub async fn restore(&mut self, previous: DeviceState) -> Result<Verification, Error> {
         self.require_trusted()?;
-        self.transport.restore(previous.clone()).await?;
         let mut renewed = false;
+        match self.transport.restore(previous.clone()).await {
+            Ok(()) => {}
+            Err(Error::SessionExpired) => {
+                self.transport.renew().await?;
+                renewed = true;
+                self.transport.restore(previous.clone()).await?;
+            }
+            Err(error) => return Err(error),
+        }
         let after = self.call_state(&mut renewed).await?;
         if after == previous {
             Ok(Verification::Verified)
