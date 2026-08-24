@@ -1,33 +1,32 @@
 <script lang="ts">
-  import type { PolicyChanged } from '../api/types';
-  import type { LiveState } from '../stores/live';
+  import type { GuardPolicy, LiveState } from '../stores/live';
 
   let { state }: { state: LiveState } = $props();
   const policies = $derived(Object.values(state.policies).sort((a, b) => rank(b) - rank(a)));
   const attention = $derived(policies.filter((policy) => policy.requested_action !== 'none').length);
   const verified = $derived(policies.filter((policy) => policy.enforcement_result === 'verified').length);
 
-  function rank(policy: PolicyChanged): number {
+  function rank(policy: GuardPolicy): number {
     if (policy.enforcement_result === 'failed') return 5;
     if (policy.requested_action === 'owner_attention') return 4;
     if (policy.requested_action === 'permanent_ban') return 3;
     if (policy.requested_action === 'quarantine') return 2;
     return 1;
   }
-  function title(policy: PolicyChanged): string {
+  function title(policy: GuardPolicy): string {
     const device = state.devices[policy.device_id];
     return device?.owner_name ?? device?.identity.classification ?? 'Unconfirmed device';
   }
-  function action(policy: PolicyChanged): string {
+  function action(policy: GuardPolicy): string {
     return policy.requested_action === 'none' ? 'Monitoring'
       : policy.requested_action === 'owner_attention' ? 'Owner attention'
       : policy.requested_action === 'permanent_ban' ? 'Permanent ban'
       : 'Quarantine';
   }
-  function reason(policy: PolicyChanged): string {
+  function reason(policy: GuardPolicy): string {
     return policy.evaluation.reason.replaceAll('_', ' ');
   }
-  function deadline(policy: PolicyChanged): string {
+  function deadline(policy: GuardPolicy): string {
     if (!policy.evaluation.deadline) return 'No active deadline';
     return `Due ${new Date(policy.evaluation.deadline.due_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}`;
   }

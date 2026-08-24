@@ -151,6 +151,28 @@ describe('reduceLiveMessage', () => {
     expect(result.timeline).toHaveLength(1);
   });
 
+  it('hydrates durable policy state from a resync snapshot', () => {
+    const device = {
+      ...resultDevice('018f47a0-9b5c-7a22-8a33-112233445599'),
+      policy: {
+        owner_decision: 'quarantined' as const,
+        protection: 'none' as const,
+        evaluation: { policy_version: 1, reason: 'owner_quarantined' as const, requested_action: 'quarantine' as const, deadline: null, warning: null },
+        enforcement_result: 'verified' as const,
+        undo_available: true
+      }
+    };
+
+    const hydrated = applySnapshot({ ...initialLiveState, needsResync: true }, {
+      sequence: 12, next_after: null, service_status: 'ready', devices: [device]
+    });
+
+    expect(hydrated.needsResync).toBe(false);
+    expect(hydrated.policies[device.device_id]).toMatchObject({
+      requested_action: 'quarantine', enforcement_result: 'verified', undo_available: true
+    });
+  });
+
   it('excludes devices without available bandwidth from top devices', () => {
     const snapshot = applySnapshot(initialLiveState, {
       sequence: 1, next_after: null, service_status: 'ready', devices: [
@@ -164,5 +186,5 @@ describe('reduceLiveMessage', () => {
 });
 
 function resultDevice(device_id: string) {
-  return { device_id, first_seen_at: '2026-08-23T00:00:00Z', last_seen_at: '2026-08-23T00:00:00Z', owner_name: null, owner_type: null, owner_confirmed: false, presence: { state: 'unknown' as const, observed_at: null, source: null, kind: null }, evidence: null, identity: { available: false, classification: null, confidence: null } };
+  return { device_id, first_seen_at: '2026-08-23T00:00:00Z', last_seen_at: '2026-08-23T00:00:00Z', owner_name: null, owner_type: null, owner_confirmed: false, presence: { state: 'unknown' as const, observed_at: null, source: null, kind: null }, evidence: null, identity: { available: false, classification: null, confidence: null }, bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null }, policy: null };
 }

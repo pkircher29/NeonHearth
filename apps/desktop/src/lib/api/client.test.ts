@@ -8,7 +8,8 @@ describe('createApiClient', () => {
     owner_name: null, owner_type: null, owner_confirmed: false,
     presence: { state: 'unknown', observed_at: null, source: null, kind: null }, evidence: null,
     identity: { available: false, classification: null, confidence: null },
-    bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null }
+    bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null },
+    policy: null
   };
 
   it('accepts a fully typed snapshot and rejects malformed nested projections', async () => {
@@ -38,6 +39,28 @@ describe('createApiClient', () => {
     ]) {
       const malformed = structuredClone(snapshot);
       mutate(malformed);
+      const badFetch = vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 }));
+      await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: badFetch }).snapshot()).rejects.toThrow('Invalid snapshot response');
+    }
+  });
+
+  it('accepts a durable policy snapshot and rejects inconsistent nested policy state', async () => {
+    const policy = {
+      owner_decision: 'quarantined', protection: 'none',
+      evaluation: { policy_version: 1, reason: 'owner_quarantined', requested_action: 'quarantine', deadline: null, warning: null },
+      enforcement_result: 'verified', undo_available: true
+    };
+    const snapshot = { sequence: 1, devices: [{ ...validDevice, policy }], next_after: null, service_status: 'ready' };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200 }));
+    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl }).snapshot()).resolves.toEqual(snapshot);
+
+    for (const malformedPolicy of [
+      { ...policy, owner_decision: 'invented' },
+      { ...policy, protection: 'administrator_laptop' },
+      { ...policy, evaluation: { ...policy.evaluation, requested_action: 'permanent_ban', reason: 'owner_quarantined' } },
+      { ...policy, enforcement_result: 'success' }
+    ]) {
+      const malformed = { ...snapshot, devices: [{ ...validDevice, policy: malformedPolicy }] };
       const badFetch = vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 }));
       await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: badFetch }).snapshot()).rejects.toThrow('Invalid snapshot response');
     }

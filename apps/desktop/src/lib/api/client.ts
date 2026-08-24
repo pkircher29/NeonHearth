@@ -1,4 +1,4 @@
-import type { Bandwidth, BandwidthFrame, DeviceSnapshot, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, Presence, ServerMessage, Snapshot } from './types';
+import type { Bandwidth, BandwidthFrame, DeviceSnapshot, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
@@ -74,6 +74,14 @@ const requestedActions = new Set(['none', 'quarantine', 'permanent_ban', 'owner_
 const enforcementStatuses = new Set(['not_requested', 'verified', 'manual_required', 'failed']);
 const deadlineKinds = new Set(['unknown48_hours', 'automatic7_days']);
 const deadlineWarnings = new Set(['hours24', 'hours6', 'hour1']);
+const ownerDecisions = new Set(['pending', 'approved', 'rejected', 'quarantined']);
+const protections = new Set(['none', 'router', 'collector', 'administrator_phone', 'safety_device']);
+const actionForReason = new Map([
+  ['pending_confirmation', 'none'], ['baseline_exempt', 'none'], ['high_confidence_danger', 'quarantine'],
+  ['unknown_deadline_expired', 'quarantine'], ['automatic_deadline_expired', 'quarantine'],
+  ['owner_extension', 'none'], ['owner_approved', 'none'], ['owner_rejected', 'permanent_ban'],
+  ['owner_quarantined', 'quarantine'], ['protected_device', 'owner_attention']
+]);
 const utcRfc3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const isDate = (value: unknown): value is string => {
   if (typeof value !== 'string' || !utcRfc3339.test(value)) return false;
@@ -124,9 +132,18 @@ function isPolicyEvaluation(value: unknown): value is PolicyEvaluation {
     || typeof value.reason !== 'string' || !policyReasons.has(value.reason)
     || typeof value.requested_action !== 'string' || !requestedActions.has(value.requested_action)
     || !(value.warning === null || (typeof value.warning === 'string' && deadlineWarnings.has(value.warning)))) return false;
+  if (actionForReason.get(value.reason) !== value.requested_action) return false;
   return value.deadline === null || (isRecord(value.deadline)
     && typeof value.deadline.kind === 'string' && deadlineKinds.has(value.deadline.kind)
     && isDate(value.deadline.due_at));
+}
+function isPolicyProjection(value: unknown): value is PolicyProjection {
+  return isRecord(value)
+    && typeof value.owner_decision === 'string' && ownerDecisions.has(value.owner_decision)
+    && typeof value.protection === 'string' && protections.has(value.protection)
+    && isPolicyEvaluation(value.evaluation)
+    && typeof value.enforcement_result === 'string' && enforcementStatuses.has(value.enforcement_result)
+    && typeof value.undo_available === 'boolean';
 }
 function isPolicyChanged(value: unknown): value is PolicyChanged {
   return isRecord(value) && isDeviceId(value.device_id) && isPolicyVersion(value.policy_version)
@@ -142,7 +159,8 @@ function isDeviceSnapshot(value: unknown): value is DeviceSnapshot {
     && (value.owner_name === null || typeof value.owner_name === 'string')
     && (value.owner_type === null || typeof value.owner_type === 'string') && typeof value.owner_confirmed === 'boolean'
     && isPresence(value.presence) && (value.evidence === null || isEvidence(value.evidence))
-    && isIdentity(value.identity) && isBandwidth(value.bandwidth);
+    && isIdentity(value.identity) && isBandwidth(value.bandwidth)
+    && Object.hasOwn(value, 'policy') && (value.policy === null || isPolicyProjection(value.policy));
 }
 
 function isSnapshot(value: unknown): value is Snapshot {

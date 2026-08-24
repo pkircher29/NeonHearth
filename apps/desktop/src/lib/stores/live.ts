@@ -1,8 +1,15 @@
-import type { Coverage, DeviceSnapshot, PolicyChanged, ServerMessage, Snapshot } from '../api/types';
+import type { Coverage, DeviceSnapshot, EnforcementStatus, PolicyEvaluation, RequestedAction, ServerMessage, Snapshot } from '../api/types';
 
 export interface ThroughputPoint { at: string; upload: number; download: number }
 export type CoverageSummary = Coverage | 'unavailable' | 'mixed';
 export type ProtocolMix = Record<string, number>;
+export interface GuardPolicy {
+  device_id: string;
+  evaluation: PolicyEvaluation;
+  requested_action: RequestedAction;
+  enforcement_result: EnforcementStatus;
+  undo_available: boolean;
+}
 export interface LiveState {
   sequence: number;
   connected: boolean;
@@ -15,7 +22,7 @@ export interface LiveState {
   coverage: CoverageSummary;
   aggregate: { upload: number; download: number };
   protocolMix: ProtocolMix | null;
-  policies: Record<string, PolicyChanged>;
+  policies: Record<string, GuardPolicy>;
 }
 
 export const initialLiveState: LiveState = { sequence: 0, connected: false, needsResync: false, serviceStatus: 'unknown', devices: {}, deviceOrder: [], throughput: [], timeline: [], coverage: 'unavailable', aggregate: { upload: 0, download: 0 }, protocolMix: null, policies: {} };
@@ -29,15 +36,26 @@ function summarize(state: LiveState): LiveState {
 export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
   const devices: Record<string, DeviceSnapshot> = {};
   const deviceOrder: string[] = [];
-  for (const device of snapshot.devices) { if (!(device.device_id in devices)) deviceOrder.push(device.device_id); devices[device.device_id] = device; }
+  const policies: Record<string, GuardPolicy> = {};
+  for (const device of snapshot.devices) {
+    if (!(device.device_id in devices)) deviceOrder.push(device.device_id);
+    devices[device.device_id] = device;
+    if (device.policy) policies[device.device_id] = {
+      device_id: device.device_id,
+      evaluation: device.policy.evaluation,
+      requested_action: device.policy.evaluation.requested_action,
+      enforcement_result: device.policy.enforcement_result,
+      undo_available: device.policy.undo_available
+    };
+  }
   // A snapshot is a trustworthy baseline, but it is not evidence that the
   // event socket is open. The connection orchestrator marks it live on open.
-  const next = { sequence: snapshot.sequence, connected: false, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: [], timeline: [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: 0, download: 0 }, protocolMix: null, policies: {} };
+  const next = { sequence: snapshot.sequence, connected: false, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: [], timeline: [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: 0, download: 0 }, protocolMix: null, policies };
   return summarize(next);
 }
 
 function placeholder(id: string, occurredAt: string): DeviceSnapshot {
-  return { device_id: id, first_seen_at: occurredAt, last_seen_at: occurredAt, owner_name: null, owner_type: null, owner_confirmed: false, presence: { state: 'unknown', observed_at: null, source: null, kind: null }, evidence: null, identity: { available: false, classification: null, confidence: null }, bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null } };
+  return { device_id: id, first_seen_at: occurredAt, last_seen_at: occurredAt, owner_name: null, owner_type: null, owner_confirmed: false, presence: { state: 'unknown', observed_at: null, source: null, kind: null }, evidence: null, identity: { available: false, classification: null, confidence: null }, bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null }, policy: null };
 }
 export function reduceLiveMessage(state: LiveState, message: ServerMessage): LiveState {
   if (state.needsResync) return state;

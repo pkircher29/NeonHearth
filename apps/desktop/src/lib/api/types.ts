@@ -51,6 +51,15 @@ export interface PolicyChanged {
   enforcement_result: EnforcementStatus;
   undo_available: boolean;
 }
+export type OwnerDecision = 'pending' | 'approved' | 'rejected' | 'quarantined';
+export type Protection = 'none' | 'router' | 'collector' | 'administrator_phone' | 'safety_device';
+export interface PolicyProjection {
+  owner_decision: OwnerDecision;
+  protection: Protection;
+  evaluation: PolicyEvaluation;
+  enforcement_result: EnforcementStatus;
+  undo_available: boolean;
+}
 
 // Bandwidth frames are emitted by the collector at a bounded cadence.
 export type EventPayload =
@@ -86,6 +95,7 @@ export interface DeviceSnapshot {
   evidence: Evidence | null;
   identity: Identity;
   bandwidth: Bandwidth;
+  policy: PolicyProjection | null;
 }
 
 export interface Presence {
