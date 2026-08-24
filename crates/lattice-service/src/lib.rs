@@ -17,7 +17,9 @@ use axum::{
 pub use platform::{Platform, PlatformPaths, platform_paths};
 use serde::Deserialize;
 pub use state::{AppState, InvalidServiceToken, ServiceRuntimeStatus};
-pub use vault::{CredentialRef, FakeVault, KeyringVault, Vault, VaultCapability, VaultError};
+pub use vault::{
+    CredentialRef, FakeVault, KeyringBackend, KeyringVault, Vault, VaultCapability, VaultError,
+};
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(api::health))

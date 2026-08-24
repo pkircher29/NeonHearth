@@ -1,17 +1,18 @@
 use async_trait::async_trait;
 use lattice_camera::{CameraId, StreamId, StreamSourceRef};
 use secrecy::SecretString;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use uuid::Uuid;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use zeroize::Zeroize;
 
 const CAMERA_VAULT_SERVICE: &str = "neonhearth-camera-vault-v1";
+const CREDENTIAL_REF_BYTES: usize = 36;
 
 #[derive(Clone, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -42,7 +43,24 @@ impl fmt::Debug for CredentialRef {
 
 impl<'de> Deserialize<'de> for CredentialRef {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+        struct CredentialRefVisitor;
+
+        impl Visitor<'_> for CredentialRefVisitor {
+            type Value = CredentialRef;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a canonical UUIDv7 credential reference")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value.len() != CREDENTIAL_REF_BYTES {
+                    return Err(E::custom("invalid credential reference"));
+                }
+                CredentialRef::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(CredentialRefVisitor)
     }
 }
 
@@ -178,7 +196,7 @@ impl Vault for FakeVault {
         source: SecretString,
     ) -> Result<StreamSourceRef, VaultError> {
         let reference = generated_stream_ref()?;
-        self.record_label(stream_slot(owner, stream, &reference)?);
+        self.record_label(stream_slot(owner, stream, &reference));
         self.streams
             .lock()
             .expect("fake vault streams poisoned")
@@ -191,7 +209,6 @@ impl Vault for FakeVault {
         stream: StreamId,
         reference: &StreamSourceRef,
     ) -> Result<SecretString, VaultError> {
-        validate_stream_ref(reference)?;
         self.streams
             .lock()
             .expect("fake vault streams poisoned")
@@ -221,10 +238,7 @@ impl Vault for FakeVault {
             }
         }
         for (stream, reference) in streams {
-            let Ok(label) = stream_slot(owner, *stream, reference) else {
-                failed = true;
-                continue;
-            };
+            let label = stream_slot(owner, *stream, reference);
             self.delete_attempts
                 .lock()
                 .expect("fake vault attempts poisoned")
@@ -260,10 +274,39 @@ pub enum VaultCapability {
 
 /// The keyring 4.1.6 `v1` backend uses native Credential Manager on Windows
 /// and zbus Secret Service on Linux. No alternative secret store is used.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KeyringVault;
+#[async_trait]
+#[doc(hidden)]
+pub trait KeyringBackend: Send + Sync {
+    async fn put(&self, slot: String, secret: SecretString) -> Result<(), VaultError>;
+    async fn get(&self, slot: String) -> Result<SecretString, VaultError>;
+    /// `NotFound` means the exact slot was already absent and is idempotent.
+    async fn delete(&self, slot: String) -> Result<(), VaultError>;
+}
+
+#[derive(Default)]
+struct SystemKeyring;
+
+#[derive(Clone)]
+pub struct KeyringVault {
+    backend: Arc<dyn KeyringBackend>,
+}
+
+impl fmt::Debug for KeyringVault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("KeyringVault")
+    }
+}
 
 impl KeyringVault {
+    #[doc(hidden)]
+    pub fn with_backend(backend: Arc<dyn KeyringBackend>) -> Self {
+        Self { backend }
+    }
+
+    fn system() -> Self {
+        Self::with_backend(Arc::new(SystemKeyring))
+    }
+
     pub async fn capability() -> VaultCapability {
         if Self::ensure_available().await.is_ok() {
             VaultCapability::Available
@@ -273,7 +316,7 @@ impl KeyringVault {
     }
     pub async fn platform() -> Result<Self, VaultError> {
         Self::ensure_available().await?;
-        Ok(Self)
+        Ok(Self::system())
     }
     async fn ensure_available() -> Result<(), VaultError> {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -302,7 +345,9 @@ impl Vault for KeyringVault {
         credential: SecretString,
     ) -> Result<CredentialRef, VaultError> {
         let reference = CredentialRef::generate();
-        put_secret(credential_slot(owner, &reference), credential).await?;
+        self.backend
+            .put(credential_slot(owner, &reference), credential)
+            .await?;
         Ok(reference)
     }
     async fn get_credential(
@@ -311,7 +356,7 @@ impl Vault for KeyringVault {
         reference: &CredentialRef,
     ) -> Result<SecretString, VaultError> {
         validate_credential_ref(reference)?;
-        get_secret(credential_slot(owner, reference)).await
+        self.backend.get(credential_slot(owner, reference)).await
     }
     async fn put_stream_source(
         &self,
@@ -320,7 +365,9 @@ impl Vault for KeyringVault {
         source: SecretString,
     ) -> Result<StreamSourceRef, VaultError> {
         let reference = generated_stream_ref()?;
-        put_secret(stream_slot(owner, stream, &reference)?, source).await?;
+        self.backend
+            .put(stream_slot(owner, stream, &reference), source)
+            .await?;
         Ok(reference)
     }
     async fn get_stream_source(
@@ -329,7 +376,9 @@ impl Vault for KeyringVault {
         stream: StreamId,
         reference: &StreamSourceRef,
     ) -> Result<SecretString, VaultError> {
-        get_secret(stream_slot(owner, stream, reference)?).await
+        self.backend
+            .get(stream_slot(owner, stream, reference))
+            .await
     }
     async fn delete_camera_secrets(
         &self,
@@ -337,28 +386,31 @@ impl Vault for KeyringVault {
         credential: Option<&CredentialRef>,
         streams: &[(StreamId, StreamSourceRef)],
     ) -> Result<(), VaultError> {
-        let mut failed = false;
-        if let Some(reference) = credential
-            && (validate_credential_ref(reference).is_err()
-                || delete_secret(credential_slot(owner, reference))
-                    .await
-                    .is_err())
-        {
-            failed = true;
-        }
-        for (stream, reference) in streams {
-            match stream_slot(owner, *stream, reference) {
-                Ok(slot) => {
-                    if delete_secret(slot).await.is_err() {
-                        failed = true;
-                    }
-                }
-                Err(_) => {
-                    failed = true;
-                }
+        let mut partial_failure = false;
+        let mut unavailable = false;
+        if let Some(reference) = credential {
+            if validate_credential_ref(reference).is_err() {
+                partial_failure = true;
+            } else {
+                record_delete_result(
+                    self.backend.delete(credential_slot(owner, reference)).await,
+                    &mut unavailable,
+                    &mut partial_failure,
+                );
             }
         }
-        if failed {
+        for (stream, reference) in streams {
+            record_delete_result(
+                self.backend
+                    .delete(stream_slot(owner, *stream, reference))
+                    .await,
+                &mut unavailable,
+                &mut partial_failure,
+            );
+        }
+        if unavailable {
+            Err(VaultError::Unavailable)
+        } else if partial_failure {
             Err(VaultError::PartialDeletion)
         } else {
             Ok(())
@@ -378,13 +430,6 @@ fn validate_credential_ref(reference: &CredentialRef) -> Result<(), VaultError> 
         Err(VaultError::InvalidReference)
     }
 }
-fn validate_stream_ref(reference: &StreamSourceRef) -> Result<(), VaultError> {
-    if is_canonical_opaque_id(reference.as_str()) {
-        Ok(())
-    } else {
-        Err(VaultError::InvalidReference)
-    }
-}
 fn generated_stream_ref() -> Result<StreamSourceRef, VaultError> {
     StreamSourceRef::new(Uuid::now_v7().hyphenated().to_string())
         .map_err(|_| VaultError::InvalidReference)
@@ -392,13 +437,20 @@ fn generated_stream_ref() -> Result<StreamSourceRef, VaultError> {
 fn credential_slot(owner: CameraId, reference: &CredentialRef) -> String {
     format!("{owner}:{}", reference.as_str())
 }
-fn stream_slot(
-    owner: CameraId,
-    stream: StreamId,
-    reference: &StreamSourceRef,
-) -> Result<String, VaultError> {
-    validate_stream_ref(reference)?;
-    Ok(format!("{owner}:{stream}:{}", reference.as_str()))
+fn stream_slot(owner: CameraId, stream: StreamId, reference: &StreamSourceRef) -> String {
+    format!("{owner}:{stream}:{}", reference.as_str())
+}
+
+fn record_delete_result(
+    result: Result<(), VaultError>,
+    unavailable: &mut bool,
+    partial_failure: &mut bool,
+) {
+    match result {
+        Ok(()) | Err(VaultError::NotFound) => {}
+        Err(VaultError::Unavailable) => *unavailable = true,
+        Err(VaultError::InvalidReference | VaultError::PartialDeletion) => *partial_failure = true,
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -467,4 +519,19 @@ async fn delete_secret(slot: String) -> Result<(), VaultError> {
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 async fn delete_secret(_: String) -> Result<(), VaultError> {
     Err(VaultError::Unavailable)
+}
+
+#[async_trait]
+impl KeyringBackend for SystemKeyring {
+    async fn put(&self, slot: String, secret: SecretString) -> Result<(), VaultError> {
+        put_secret(slot, secret).await
+    }
+
+    async fn get(&self, slot: String) -> Result<SecretString, VaultError> {
+        get_secret(slot).await
+    }
+
+    async fn delete(&self, slot: String) -> Result<(), VaultError> {
+        delete_secret(slot).await
+    }
 }

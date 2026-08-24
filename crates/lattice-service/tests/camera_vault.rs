@@ -1,6 +1,10 @@
 use lattice_camera::{CameraId, StreamId, StreamSourceRef};
-use lattice_service::{CredentialRef, FakeVault, Vault, VaultError};
+use lattice_service::{CredentialRef, FakeVault, KeyringBackend, KeyringVault, Vault, VaultError};
 use secrecy::{ExposeSecret, SecretString};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 use uuid::Uuid;
 
 const CREDENTIAL_SENTINEL: &str = "camera-password-leak-sentinel";
@@ -8,6 +12,37 @@ const STREAM_SENTINEL: &str = "rtsp://viewer:camera-stream-leak-sentinel@192.0.2
 
 fn camera(n: u128) -> CameraId {
     CameraId::from_uuid(Uuid::from_u128(n))
+}
+
+struct ScriptedKeyring {
+    deletes: Mutex<VecDeque<Result<(), VaultError>>>,
+    labels: Mutex<Vec<String>>,
+}
+
+impl ScriptedKeyring {
+    fn new(deletes: impl IntoIterator<Item = Result<(), VaultError>>) -> Self {
+        Self {
+            deletes: Mutex::new(deletes.into_iter().collect()),
+            labels: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl KeyringBackend for ScriptedKeyring {
+    async fn put(&self, _: String, _: SecretString) -> Result<(), VaultError> {
+        Ok(())
+    }
+
+    async fn get(&self, label: String) -> Result<SecretString, VaultError> {
+        self.labels.lock().unwrap().push(label);
+        Ok(SecretString::from("fixture-only"))
+    }
+
+    async fn delete(&self, label: String) -> Result<(), VaultError> {
+        self.labels.lock().unwrap().push(label);
+        self.deletes.lock().unwrap().pop_front().unwrap_or(Ok(()))
+    }
 }
 
 #[tokio::test]
@@ -128,7 +163,7 @@ fn opaque_refs_are_canonical_and_reject_malformed_values() {
 }
 
 #[tokio::test]
-async fn fake_vault_rejects_a_noncanonical_stream_reference() {
+async fn fake_vault_accepts_shared_stream_source_refs_without_redefining_their_invariant() {
     let vault = FakeVault::new();
     let owner = camera(21);
     let stream = StreamId::from_uuid(Uuid::from_u128(22));
@@ -136,12 +171,16 @@ async fn fake_vault_rejects_a_noncanonical_stream_reference() {
 
     assert!(matches!(
         vault.get_stream_source(owner, stream, &malformed).await,
-        Err(VaultError::InvalidReference)
+        Err(VaultError::NotFound)
     ));
+    vault
+        .delete_camera_secrets(owner, None, &[(stream, malformed)])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
-async fn delete_continues_after_a_malformed_ref_and_removes_later_known_slots() {
+async fn delete_accepts_a_shared_ref_and_removes_later_known_slots() {
     let vault = FakeVault::new();
     let owner = camera(23);
     let stream = StreamId::from_uuid(Uuid::from_u128(24));
@@ -151,20 +190,107 @@ async fn delete_continues_after_a_malformed_ref_and_removes_later_known_slots() 
         .unwrap();
     let malformed = StreamSourceRef::new("not-a-canonical-reference").unwrap();
 
-    assert!(matches!(
-        vault
-            .delete_camera_secrets(
-                owner,
-                None,
-                &[(stream, malformed), (stream, source.clone())]
-            )
-            .await,
-        Err(VaultError::PartialDeletion)
-    ));
+    vault
+        .delete_camera_secrets(
+            owner,
+            None,
+            &[(stream, malformed), (stream, source.clone())],
+        )
+        .await
+        .unwrap();
     assert!(matches!(
         vault.get_stream_source(owner, stream, &source).await,
         Err(VaultError::NotFound)
     ));
+}
+
+#[tokio::test]
+async fn keyring_delete_attempts_every_valid_slot_and_unavailable_dominates_partial_failure() {
+    let backend = Arc::new(ScriptedKeyring::new([
+        Err(VaultError::Unavailable),
+        Err(VaultError::NotFound),
+        Err(VaultError::PartialDeletion),
+    ]));
+    let vault = KeyringVault::with_backend(backend.clone());
+    let owner = camera(30);
+    let credential: CredentialRef =
+        serde_json::from_str("\"0190c6d1-1234-7abc-8def-0123456789ab\"").unwrap();
+    let stream_a = StreamId::from_uuid(Uuid::from_u128(31));
+    let stream_b = StreamId::from_uuid(Uuid::from_u128(32));
+    let source_a = StreamSourceRef::new("opaque-source-ref").unwrap();
+    let source_b = StreamSourceRef::new("another-opaque-source-ref").unwrap();
+
+    assert!(matches!(
+        vault
+            .delete_camera_secrets(
+                owner,
+                Some(&credential),
+                &[(stream_a, source_a), (stream_b, source_b)],
+            )
+            .await,
+        Err(VaultError::Unavailable)
+    ));
+    assert_eq!(backend.labels.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn keyring_delete_returns_partial_after_every_slot_when_no_slot_is_unavailable() {
+    let backend = Arc::new(ScriptedKeyring::new([
+        Err(VaultError::PartialDeletion),
+        Err(VaultError::NotFound),
+    ]));
+    let vault = KeyringVault::with_backend(backend.clone());
+    let owner = camera(35);
+    let stream_a = StreamId::from_uuid(Uuid::from_u128(36));
+    let stream_b = StreamId::from_uuid(Uuid::from_u128(37));
+    let source_a = StreamSourceRef::new("opaque-source-ref").unwrap();
+    let source_b = StreamSourceRef::new("another-opaque-source-ref").unwrap();
+
+    assert!(matches!(
+        vault
+            .delete_camera_secrets(owner, None, &[(stream_a, source_a), (stream_b, source_b)])
+            .await,
+        Err(VaultError::PartialDeletion)
+    ));
+    assert_eq!(backend.labels.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn keyring_vault_accepts_all_shared_stream_source_refs_for_get_and_delete() {
+    let backend = Arc::new(ScriptedKeyring::new([]));
+    let vault = KeyringVault::with_backend(backend.clone());
+    let owner = camera(33);
+    let stream = StreamId::from_uuid(Uuid::from_u128(34));
+    let shared_ref = StreamSourceRef::new("opaque-source-ref").unwrap();
+
+    assert_eq!(
+        vault
+            .get_stream_source(owner, stream, &shared_ref)
+            .await
+            .unwrap()
+            .expose_secret(),
+        "fixture-only"
+    );
+    vault
+        .delete_camera_secrets(owner, None, &[(stream, shared_ref)])
+        .await
+        .unwrap();
+    assert_eq!(backend.labels.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn credential_ref_rejects_plain_and_escaped_oversized_json_without_losing_canonical_validation() {
+    let oversized = "x".repeat(8 * 1024);
+    let escaped_oversized = "\\u0078".repeat(8 * 1024);
+    assert!(serde_json::from_str::<CredentialRef>(&format!("\"{oversized}\"")).is_err());
+    assert!(serde_json::from_str::<CredentialRef>(&format!("\"{escaped_oversized}\"")).is_err());
+    assert!(
+        serde_json::from_str::<CredentialRef>("\"0190c6d1-1234-7abc-8def-0123456789ab\"").is_ok()
+    );
+    assert!(
+        serde_json::from_str::<CredentialRef>("\"\\u0030190c6d1-1234-7abc-8def-0123456789ab\"")
+            .is_ok()
+    );
 }
 
 #[test]
