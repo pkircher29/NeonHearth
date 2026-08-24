@@ -15,11 +15,14 @@ async function installFixture(page: Page) {
   await page.addInitScript(({ event }) => {
     class FixtureSocket {
       onopen?: () => void; onclose?: () => void; onerror?: () => void; onmessage?: (e: { data: string }) => void;
-      constructor() { setTimeout(() => this.onopen?.(), 0); setTimeout(() => this.onmessage?.({ data: JSON.stringify(event) }), 120); }
+      constructor() {
+        setTimeout(() => this.onopen?.(), 0);
+        (window as unknown as { emitPolicyUpdate: () => void }).emitPolicyUpdate = () =>
+          this.onmessage?.({ data: JSON.stringify(event) });
+      }
       close() { this.onclose?.(); }
-      send() { setTimeout(() => this.onmessage?.({ data: JSON.stringify(event) }), 80); }
+      send() {}
     }
-    // The app's ticketed WebSocket sends the subscription cursor through send().
     (window as unknown as { WebSocket: unknown }).WebSocket = FixtureSocket;
   }, { event: { type: 'event', data: { sequence: 2, occurred_at: at, payload: { type: 'policy_changed', data: update } } } });
 }
@@ -31,13 +34,18 @@ test('desktop Guard shows pending policy, live typed update, and remount lifecyc
   await page.getByRole('button', { name: 'Guard' }).first().click();
   await expect(page.getByText('Test guest')).toBeVisible();
   await expect(page.getByText('delivery pending')).toBeVisible();
+  const before = await page.locator('.policy-card').elementHandle();
+  expect(before).not.toBeNull();
+  await page.evaluate(() =>
+    (window as unknown as { emitPolicyUpdate: () => void }).emitPolicyUpdate()
+  );
   await expect(page.getByText('Permanent ban', { exact: true })).toBeVisible();
   await expect(page.locator('.enforcement')).toContainText('verified');
   await expect(page.getByText('Guard: owner rejected')).toBeVisible();
-  await page.getByRole('button', { name: 'Pulse' }).first().click();
-  await page.getByRole('button', { name: 'Guard' }).first().click();
   await expect(page.locator('.policy-card')).toHaveCount(1);
   await expect(page.locator('.policy-card')).toHaveAttribute('data-lifecycle-key', /\|2\|permanent_ban\|verified/);
+  const after = await page.locator('.policy-card').elementHandle();
+  expect(await before!.evaluate((node, replacement) => node !== replacement, after)).toBe(true);
   await expect(page.locator('.guard-orbit')).toHaveCSS('animation-name', 'none');
 });
 
