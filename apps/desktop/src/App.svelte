@@ -1,28 +1,8 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { createApiClient } from './lib/api/client';
-  import CollectorStatus, { type CollectorState } from './lib/components/CollectorStatus.svelte';
-
-  let collectorState: CollectorState = $state('connecting');
-  onMount(() => {
-    const publicClient = createApiClient({ baseUrl: window.location.origin, serviceToken: '' });
-    void publicClient.health().then(() => { collectorState = 'ready'; }, () => { collectorState = 'offline'; });
-  });
+  import { onMount } from 'svelte'; import { createApiClient } from './lib/api/client'; import CollectorStatus, { type CollectorState } from './lib/components/CollectorStatus.svelte'; import PulseView from './lib/components/PulseView.svelte'; import DevicesView from './lib/components/DevicesView.svelte';
+  let collectorState: CollectorState = $state('connecting'); let view = $state('pulse');
+  const nav = [['pulse','Pulse','◒'],['devices','Devices','◌'],['guard','Guard','⌁'],['cameras','Cameras','□'],['home','Home','⌂'],['doctor','Doctor','✚'],['history','History','↺'],['settings','Settings','⚙']];
+  onMount(() => { const client = createApiClient({ baseUrl: window.location.origin, serviceToken: '' }); void client.health().then(() => collectorState = 'ready', () => collectorState = 'offline'); });
 </script>
-
-<svelte:head><title>NeonHearth — See your network breathe.</title></svelte:head>
-
-<main>
-  <header class="masthead">
-    <p class="eyebrow">NEONHEARTH COLLECTOR</p>
-    <span class="coordinate" aria-hidden="true">LIVE / LOCAL / PAIRING REQUIRED</span>
-  </header>
-  <div class="instrument" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="trace"><i></i><i></i><i></i><i></i><i></i></div></div>
-  <section class="hero" aria-labelledby="hero-title">
-    <p class="thesis-mark" aria-hidden="true">∿</p>
-    <h1 id="hero-title">See your<br />network breathe.</h1>
-    <p class="lede">A quiet surface for the signals that matter. NeonHearth is standing by for its protected desktop pairing.</p>
-  </section>
-  <CollectorStatus state={collectorState} />
-  <footer><span>Protected live data connects after secure desktop pairing is wired.</span><span class="footer-rule" aria-hidden="true"></span><span>NO DEVICE DATA YET</span></footer>
-</main>
+<svelte:head><title>NeonHearth — Pulse</title></svelte:head>
+<div class="app-shell"><aside class="rail"><div class="brand"><span class="brand-mark">✦</span><span>NEON<br/>HEARTH</span></div><nav aria-label="Primary">{#each nav as item}<button class:active={view === item[0]} on:click={() => view = item[0]}><span class="nav-icon">{item[2]}</span><span>{item[1]}</span></button>{/each}</nav><div class="rail-foot"><span class="secure-icon">⌾</span><span>LOCAL<br/>ONLY</span></div></aside><header class="mobile-head"><div class="brand"><span class="brand-mark">✦</span><span>NEONHEARTH</span></div><span class="kicker">{view.toUpperCase()}</span></header><main>{#if view === 'pulse'}<PulseView/>{:else if view === 'devices'}<DevicesView/>{:else}<section class="not-ready"><span class="not-ready-mark">⌁</span><p class="kicker">{view.toUpperCase()}</p><h1>This room is still being wired.</h1><p class="muted">This view will arrive in a future build. Your secure pairing and private network data remain untouched.</p></section>{/if}</main><aside class="events-rail"><div class="section-title"><h2>Live thread</h2><span class="live-pill">● QUIET</span></div><div class="event-quiet"><span>⌁</span><strong>Nothing needs attention</strong><p class="muted">Events will appear here as your home changes.</p></div><CollectorStatus state={collectorState}/></aside><nav class="mobile-nav" aria-label="Mobile navigation">{#each nav.slice(0,5) as item}<button class:active={view === item[0]} on:click={() => view = item[0]}><span>{item[2]}</span>{item[1]}</button>{/each}</nav></div>
