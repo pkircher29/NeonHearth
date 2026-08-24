@@ -101,11 +101,23 @@ fn hls_session_contract_is_bounded_opaque_and_round_trips() {
     assert!(serde_json::from_value::<HlsSession>(unknown).is_err());
 }
 
+/// The production validator requires an absolute path; `/srv/...` is not
+/// absolute on Windows, so the fixture directory is anchored per platform
+/// and expected argument paths are built with the same `join` the code uses.
+fn media_dir(name: &str) -> std::path::PathBuf {
+    if cfg!(windows) {
+        std::path::PathBuf::from(format!("C:/srv/neonhearth/media/{name}"))
+    } else {
+        std::path::PathBuf::from(format!("/srv/neonhearth/media/{name}"))
+    }
+}
+
 #[test]
 fn hls_arguments_are_an_exact_shell_free_vector_with_localhost_only_input() {
     let token =
         LoopbackSourceToken::from_canonical("0190c6d1-1234-7abc-8def-0123456789ab").unwrap();
-    let args = hls_args(43123, &token, Path::new("/srv/neonhearth/media/session")).unwrap();
+    let dir = media_dir("session");
+    let args = hls_args(43123, &token, &dir).unwrap();
     assert_eq!(
         args,
         [
@@ -131,10 +143,14 @@ fn hls_arguments_are_an_exact_shell_free_vector_with_localhost_only_input() {
             "-hls_flags",
             "delete_segments+append_list+omit_endlist+independent_segments",
             "-hls_segment_filename",
-            "/srv/neonhearth/media/session/segment-%06d.ts",
-            "/srv/neonhearth/media/session/playlist.m3u8",
         ]
         .map(OsString::from)
+        .into_iter()
+        .chain([
+            dir.join("segment-%06d.ts").into_os_string(),
+            dir.join("playlist.m3u8").into_os_string(),
+        ])
+        .collect::<Vec<_>>()
     );
     let joined = args
         .iter()
@@ -149,7 +165,8 @@ fn hls_arguments_are_an_exact_shell_free_vector_with_localhost_only_input() {
 fn snapshot_arguments_are_fixed_to_one_jpeg_in_the_owned_directory() {
     let token =
         LoopbackSourceToken::from_canonical("0190c6d1-1234-7abc-8def-0123456789ab").unwrap();
-    let args = snapshot_args(43123, &token, Path::new("/srv/neonhearth/media/snapshot")).unwrap();
+    let dir = media_dir("snapshot");
+    let args = snapshot_args(43123, &token, &dir).unwrap();
     assert_eq!(
         args,
         [
@@ -170,9 +187,11 @@ fn snapshot_arguments_are_fixed_to_one_jpeg_in_the_owned_directory() {
             "image2",
             "-c:v",
             "mjpeg",
-            "/srv/neonhearth/media/snapshot/snapshot.jpg",
         ]
         .map(OsString::from)
+        .into_iter()
+        .chain([dir.join("snapshot.jpg").into_os_string()])
+        .collect::<Vec<_>>()
     );
     assert_eq!(SnapshotRequest::FILE_NAME, "snapshot.jpg");
 }
@@ -266,7 +285,7 @@ async fn fake_process_bounds_diagnostics_and_errors_are_sanitized() {
 #[tokio::test]
 async fn production_factory_rejects_even_a_same_length_flag_mutation_before_spawn() {
     let token = LoopbackSourceToken::new();
-    let mut args = hls_args(43123, &token, Path::new("/srv/neonhearth/media/session")).unwrap();
+    let mut args = hls_args(43123, &token, &media_dir("session")).unwrap();
     args[1] = OsString::from("-y");
     let spec =
         MediaProcessSpec::new(MediaJob::Hls, ffmpeg_executable().to_path_buf(), args).unwrap();
