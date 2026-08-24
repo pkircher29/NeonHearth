@@ -60,7 +60,7 @@ mod tests {
         let mut value = input();
         value.modified_at = at(2);
         let normalized = NormalizedAdvisory::new(value).unwrap();
-        assert_eq!(normalized.input.freshness, Freshness::FutureDated);
+        assert_eq!(normalized.input().freshness, Freshness::FutureDated);
     }
 
     #[test]
@@ -89,12 +89,32 @@ mod tests {
     fn provenance_is_deterministic() {
         let first = NormalizedAdvisory::new(input()).unwrap();
         let second = NormalizedAdvisory::new(input()).unwrap();
-        assert_eq!(first.provenance_sha256, second.provenance_sha256);
-        assert_eq!(first.provenance_sha256.len(), 64);
+        assert_eq!(first.provenance_sha256(), second.provenance_sha256());
+        assert_eq!(first.provenance_sha256().len(), 64);
+    }
+
+    #[test]
+    fn serde_round_trip_recomputes_and_verifies_provenance() {
+        let value = NormalizedAdvisory::new(input()).unwrap();
+        let json = serde_json::to_string(&value).unwrap();
+        let restored: NormalizedAdvisory = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.provenance_sha256(), value.provenance_sha256());
+        let tampered = json.replace(value.provenance_sha256(), &"0".repeat(64));
+        assert!(serde_json::from_str::<NormalizedAdvisory>(&tampered).is_err());
+    }
+
+    #[test]
+    fn future_dated_claim_without_future_timestamp_is_rejected() {
+        let mut value = input();
+        value.freshness = Freshness::FutureDated;
+        assert!(matches!(
+            NormalizedAdvisory::new(value),
+            Err(AdvisoryError::InvalidFreshness)
+        ));
     }
 }
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -187,10 +207,36 @@ pub struct AdvisoryInput {
     pub remediation: Remediation,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct NormalizedAdvisory {
-    pub input: AdvisoryInput,
-    pub provenance_sha256: String,
+    input: AdvisoryInput,
+    provenance_sha256: String,
+}
+
+impl NormalizedAdvisory {
+    pub fn input(&self) -> &AdvisoryInput {
+        &self.input
+    }
+    pub fn provenance_sha256(&self) -> &str {
+        &self.provenance_sha256
+    }
+}
+
+#[derive(Deserialize)]
+struct WireAdvisory {
+    input: AdvisoryInput,
+    provenance_sha256: String,
+}
+
+impl<'de> Deserialize<'de> for NormalizedAdvisory {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = WireAdvisory::deserialize(deserializer)?;
+        let normalized = Self::new(wire.input).map_err(serde::de::Error::custom)?;
+        if normalized.provenance_sha256 != wire.provenance_sha256 {
+            return Err(serde::de::Error::custom("provenance hash mismatch"));
+        }
+        Ok(normalized)
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -211,6 +257,8 @@ pub enum AdvisoryError {
     InvalidChronology,
     #[error("cache expiry predates retrieval timestamp")]
     InvalidCacheWindow,
+    #[error("future-dated freshness requires a future source timestamp")]
+    InvalidFreshness,
     #[error("invalid firmware version constraint")]
     InvalidVersion,
     #[error("could not canonicalize advisory: {0}")]
@@ -219,7 +267,7 @@ pub enum AdvisoryError {
 
 impl NormalizedAdvisory {
     pub fn new(mut input: AdvisoryInput) -> Result<Self, AdvisoryError> {
-        if input.source_id.is_empty() {
+        if input.source_id.trim().is_empty() {
             return Err(AdvisoryError::MissingSourceId);
         }
         validate_text("source_id", &input.source_id)?;
@@ -236,7 +284,12 @@ impl NormalizedAdvisory {
         if input.cache_expires_at < input.retrieved_at {
             return Err(AdvisoryError::InvalidCacheWindow);
         }
-        if input.published_at > input.retrieved_at || input.modified_at > input.retrieved_at {
+        let future =
+            input.published_at > input.retrieved_at || input.modified_at > input.retrieved_at;
+        if input.freshness == Freshness::FutureDated && !future {
+            return Err(AdvisoryError::InvalidFreshness);
+        }
+        if future {
             input.freshness = Freshness::FutureDated;
         }
         let canonical =
@@ -250,7 +303,7 @@ impl NormalizedAdvisory {
 }
 
 fn validate_text(name: &'static str, value: &str) -> Result<(), AdvisoryError> {
-    if value.is_empty() {
+    if value.trim().is_empty() {
         return Err(AdvisoryError::MissingField(name));
     }
     if value.len() > MAX_FIELD {
@@ -262,21 +315,32 @@ fn validate_text(name: &'static str, value: &str) -> Result<(), AdvisoryError> {
     Ok(())
 }
 fn validate_url(url: &str) -> Result<(), AdvisoryError> {
-    if !url.starts_with("https://") {
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) || url.contains('\\') {
+        return Err(AdvisoryError::UnsafeUrl);
+    }
+    let parsed = url::Url::parse(url).map_err(|_| AdvisoryError::UnsafeUrl)?;
+    if parsed.scheme() != "https" {
         return Err(AdvisoryError::NonHttpsUrl);
     }
-    let rest = &url[8..];
-    if rest.is_empty() || rest.contains('@') || rest.chars().any(char::is_control) {
+    if parsed.host().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err(AdvisoryError::UnsafeUrl);
     }
     validate_text("source_url", url)
 }
 fn validate_version(v: &VersionConstraint) -> Result<(), AdvisoryError> {
-    let valid = |s: &str| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control);
+    let valid = |s: &str| {
+        !s.trim().is_empty()
+            && s.len() <= 128
+            && !s.chars().any(|c| c.is_control() || c.is_whitespace())
+    };
     let ok = match v {
         VersionConstraint::Any => true,
         VersionConstraint::Exact(s) | VersionConstraint::LessThan(s) => valid(s),
-        VersionConstraint::Range { min, max } => valid(min) && valid(max),
+        VersionConstraint::Range { min, max } => valid(min) && valid(max) && min != max,
     };
     if ok {
         Ok(())

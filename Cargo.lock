@@ -1468,6 +1468,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-advisory"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "lattice-camera"
 version = "0.1.0"
 dependencies = [
