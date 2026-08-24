@@ -174,6 +174,20 @@ async fn persistent_filter_readback_rejects_an_oversized_result() {
 }
 
 #[tokio::test]
+async fn persistent_filter_readback_rejects_result_above_profile_capacity() {
+    let mut f = fixture(vec![Capability::PersistentFilter], 3);
+    f.profile.filter_capacity = Some(4);
+    f.persistent_entries_to_add = 2;
+    let mut c = trusted(f);
+    c.login("u", SecretString::from("x")).await.unwrap();
+
+    assert_eq!(
+        c.quarantine(RequestedQuarantine::PersistentFilter).await,
+        Err(Error::VerificationFailed)
+    );
+}
+
+#[tokio::test]
 async fn prior_internet_denial_does_not_verify_wifi_or_lan() {
     let mut f = fixture(
         vec![Capability::DenyWifiAssociation, Capability::DenyLan],

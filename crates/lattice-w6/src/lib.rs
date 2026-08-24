@@ -251,6 +251,9 @@ impl<T: Transport> Connector<T> {
         let matches = if capability == Capability::PersistentFilter {
             after.persistent_filter
                 && before.filter_entries.checked_add(1) == Some(after.filter_entries)
+                && profile
+                    .filter_capacity
+                    .is_some_and(|capacity| after.filter_entries <= capacity)
                 && after.filter_entries <= W6_PERSISTENT_FILTER_LIMIT
         } else {
             after.enabled(capability)
