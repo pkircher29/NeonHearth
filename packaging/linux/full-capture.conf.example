@@ -1,0 +1,20 @@
+# NeonHearth full capture mode drop-in (EXAMPLE - not active when merely
+# installed to /usr/share/doc/neonhearth/).
+#
+# The default unit grants no capabilities because this build's discovery uses
+# only unprivileged rtnetlink neighbor-table reads. When live packet capture
+# is enabled in a future build, activate full mode with:
+#
+#   install -D -m 0644 /usr/share/doc/neonhearth/full-capture.conf.example \
+#       /etc/systemd/system/neonhearth.service.d/full-capture.conf
+#   systemctl daemon-reload && systemctl restart neonhearth
+#
+# This is the documented Linux privilege ceiling
+# (docs/architecture/privilege-boundary.md): CAP_NET_RAW + CAP_NET_ADMIN,
+# nothing else. AmbientCapabilities on the unit is used instead of setcap on
+# the binary so the grant is declarative, auditable, and removed by deleting
+# this drop-in.
+
+[Service]
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX AF_PACKET

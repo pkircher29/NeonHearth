@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NeonHearth Windows 11 x64 installer definition (WiX v4).
+
+  Build (after running packaging\stage.ps1 to produce packaging\dist\windows):
+
+    wix extension add -g WixToolset.Util.wixext
+    wix build packaging\windows\NeonHearth.wxs ^
+        -ext WixToolset.Util.wixext ^
+        -bindpath dist=packaging\dist\windows ^
+        -arch x64 ^
+        -o packaging\dist\NeonHearth-0.1.0-x64.msi
+
+  STATUS / HONESTY: this file has been validated as well-formed XML on the
+  build machine only. `wix build` has NOT been run on this machine: the wix
+  CLI is not installed and cannot be installed here because no .NET SDK is
+  present ("dotnet tool install -g wix" fails with "No .NET SDKs were
+  found"). Schema-level and MSI-level validation remain outstanding.
+
+  Reality this authoring is based on (verified in source):
+  - The service binary is crates/lattice-service (main.rs). It requires the
+    LATTICE_SERVICE_TOKEN environment variable and binds 127.0.0.1:58120
+    (loopback) only. It has NO built-in service install mechanism, so MSI
+    ServiceInstall registers it.
+  - NO Windows Firewall rule is authored, deliberately: the listener is
+    loopback-only and Windows Firewall does not filter loopback traffic.
+    If a LAN listener is ever added, an inbound rule must be added then.
+  - The executable is linked against Npcap's Packet.dll (pnet_datalink), so
+    Npcap absence is a load-time failure, not a runtime degradation. The
+    configure-service.ps1 custom action therefore implements "limited mode"
+    by leaving the service registered but Manual/stopped when Npcap is
+    missing, and writes %ProgramData%\NeonHearth\NPCAP-REQUIRED.txt.
+  - Service state lives in %ProgramData%\NeonHearth (platform.rs). Uninstall
+    leaves it in place; configure-service.ps1 writes README-UNINSTALL.txt
+    there explaining that.
+  - UI assets (apps/desktop Vite bundle) are installed under ui\ for the
+    desktop shell. The service does not serve them over HTTP in this build.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package Name="NeonHearth"
+           Manufacturer="NeonHearth Project"
+           Version="0.1.0"
+           UpgradeCode="6f1f9d3e-52aa-4f3b-9b0a-3d2f4bfae8c1"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of NeonHearth is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Npcap presence: WinPcap-compatible Packet.dll in System32. The
+         configure-service.ps1 custom action performs the authoritative
+         check (it also looks in System32\Npcap); this property only feeds
+         the summary log. -->
+    <Property Id="NPCAP_COMPAT_PRESENT">
+      <DirectorySearch Id="System64Search" Path="[System64Folder]">
+        <FileSearch Id="PacketDllSearch" Name="Packet.dll" />
+      </DirectorySearch>
+    </Property>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="NeonHearth">
+        <Directory Id="UIFOLDER" Name="ui" />
+        <Directory Id="SCRIPTSFOLDER" Name="scripts" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="ServiceComponents" Directory="INSTALLFOLDER">
+      <Component Id="ServiceExecutable" Guid="6a7f0f92-1f0c-4c85-a67d-5cf1b2f27a11" Bitness="always64">
+        <File Id="LatticeServiceExe" Source="!(bindpath.dist)\bin\lattice-service.exe" KeyPath="yes" />
+        <!-- Dedicated service identity: the NT SERVICE\NeonHearth virtual
+             account (matches docs/architecture/privilege-boundary.md).
+             Start=auto is the with-Npcap default; configure-service.ps1
+             demotes it to demand when Npcap is absent (limited mode) and
+             performs the actual start, so no ServiceControl Start here. -->
+        <ServiceInstall Id="NeonHearthService"
+                        Name="NeonHearth"
+                        DisplayName="NeonHearth Collector"
+                        Description="NeonHearth home-network collector service (loopback API on 127.0.0.1:58120)."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="NT SERVICE\NeonHearth"
+                        Vital="yes">
+          <!-- Restart-on-failure recovery (mirrored by sc.exe in
+               configure-service.ps1 for resilience if this extension
+               element is unavailable). -->
+          <util:ServiceConfig FirstFailureActionType="restart"
+                              SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart"
+                              RestartServiceDelayInSeconds="5"
+                              ResetPeriodInDays="1" />
+        </ServiceInstall>
+        <!-- Clean uninstall: stop and delete the service. -->
+        <ServiceControl Id="NeonHearthServiceControl"
+                        Name="NeonHearth"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Desktop UI bundle staged by packaging\stage.ps1 (Vite build of
+         apps/desktop). WiX v4 wildcard harvesting. -->
+    <ComponentGroup Id="UiAssets" Directory="UIFOLDER">
+      <Files Include="!(bindpath.dist)\ui\**" />
+    </ComponentGroup>
+
+    <ComponentGroup Id="InstallScripts" Directory="SCRIPTSFOLDER">
+      <Component Id="ConfigureScript" Guid="b3f57a24-9c1e-4dd2-8a0b-77d0f2f4c9a2" Bitness="always64">
+        <File Id="ConfigureServicePs1" Source="!(bindpath.dist)\scripts\configure-service.ps1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Post-registration configuration: token generation, state-dir ACL,
+         Npcap detection / limited mode, recovery settings, data-retention
+         note, and service start when Npcap is present. Deferred + no
+         impersonation so it runs elevated after InstallServices. -->
+    <SetProperty Id="ConfigureNeonHearthService"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[SCRIPTSFOLDER]configure-service.ps1&quot; -Start"
+                 Sequence="execute"
+                 Before="ConfigureNeonHearthService" />
+    <CustomAction Id="ConfigureNeonHearthService"
+                  DllEntry="WixQuietExec64"
+                  BinaryRef="Wix4UtilCA_X64"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="ConfigureNeonHearthService"
+              After="InstallServices"
+              Condition="NOT Installed OR REINSTALL" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="NeonHearth" Level="1">
+      <ComponentGroupRef Id="ServiceComponents" />
+      <ComponentGroupRef Id="UiAssets" />
+      <ComponentGroupRef Id="InstallScripts" />
+    </Feature>
+  </Package>
+</Wix>
