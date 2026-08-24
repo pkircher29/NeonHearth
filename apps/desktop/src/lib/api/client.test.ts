@@ -456,4 +456,156 @@ describe('createApiClient', () => {
     expect(onMessage).toHaveBeenCalledTimes(1);
     expect(onMessage).toHaveBeenCalledWith(event(data));
   });
+
+  // ---- Network Doctor routes (M6 contract) ----
+  const doctorMeasurement = { metric: 'rtt_ms', value: 42.5, unit: 'milliseconds', observed_at: '2026-08-24T00:00:00Z' };
+  const passedCheck = { kind: 'collector_health', status: { state: 'passed' }, evidence: [doctorMeasurement], confidence: { basis_points: 9500 }, detail: null };
+  const failedCheck = { kind: 'gateway', status: { state: 'failed' }, evidence: [doctorMeasurement], confidence: { basis_points: 7000 }, detail: { detail: 'gateway_ping', sent: 5, received: 0 } };
+  const skippedCheck = { kind: 'dns', status: { state: 'skipped', because: { reason: 'dependency_failed', dependency: 'gateway' } }, evidence: [], confidence: { basis_points: 9500 }, detail: null };
+  const gatewayKind = { kind: 'gateway_unreachable' } as const;
+  const gatewayFinding = {
+    diagnosis: { kind: gatewayKind, evidence: [doctorMeasurement], confidence: { basis_points: 7000 }, impact: 'The router cannot be reached; all traffic beyond this host is blocked.' },
+    plan: { class: 'approval_required_reversible', action: { action: 'reboot_router' }, rationale: 'a router reboot disconnects every device and needs approval' }
+  };
+  const runEnvelope = {
+    run_id: 'run-0001',
+    started_at: '2026-08-24T00:00:00Z',
+    report: {
+      started_at: '2026-08-24T00:00:00Z', finished_at: '2026-08-24T00:00:05Z',
+      budget: { max_probes: 32, per_probe_timeout_ms: 1000 }, probes_used: 12, budget_exhausted: false,
+      checks: [passedCheck, failedCheck, skippedCheck]
+    },
+    findings: [gatewayFinding]
+  };
+  const repairReport = {
+    class: 'approval_required_reversible', description: 'reboot_router',
+    outcome: { outcome: 'completed', verdict: 'improved' },
+    verification: { verdict: 'improved', before: doctorMeasurement, after: { ...doctorMeasurement, value: 1.2 } },
+    rollback: { outcome: 'not_attempted', reason: 'not_needed' },
+    events: [{ sequence: 0, at: '2026-08-24T00:00:01Z', kind: { event: 'started', class: 'approval_required_reversible', description: 'reboot_router' } }]
+  };
+
+  it('runs a diagnostic with bearer auth and returns the validated typed envelope', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(runEnvelope), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+
+    await expect(client.doctorRun()).resolves.toEqual({ status: 'completed', run: runEnvelope });
+    expect(fetchImpl).toHaveBeenCalledExactlyOnceWith('https://collector.example/api/v1/doctor/run', {
+      method: 'POST', headers: { Authorization: 'Bearer secret' }
+    });
+  });
+
+  it('surfaces a concurrent diagnostic (409) as a typed already-running outcome', async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 409 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+
+    await expect(client.doctorRun()).resolves.toEqual({ status: 'already_running' });
+  });
+
+  it('rejects malformed diagnostic run envelopes', async () => {
+    for (const malformed of [
+      { ...runEnvelope, extra: true },
+      { ...runEnvelope, run_id: '' },
+      { ...runEnvelope, report: { ...runEnvelope.report, checks: [{ ...passedCheck, kind: 'invented' }] } },
+      { ...runEnvelope, report: { ...runEnvelope.report, checks: [{ ...passedCheck, confidence: { basis_points: 10_001 } }] } },
+      { ...runEnvelope, report: { ...runEnvelope.report, checks: [{ ...passedCheck, evidence: [{ ...doctorMeasurement, unit: 'furlongs' }] }] } },
+      { ...runEnvelope, report: { ...runEnvelope.report, checks: [{ ...skippedCheck, status: { state: 'skipped', because: { reason: 'dependency_failed' } } }] } },
+      { ...runEnvelope, report: { ...runEnvelope.report, budget: { max_probes: 0, per_probe_timeout_ms: 1000 } } },
+      { ...runEnvelope, findings: [{ ...gatewayFinding, plan: { class: 'invented', rationale: 'x' } }] },
+      { ...runEnvelope, findings: [{ ...gatewayFinding, executed: true }] }
+    ]) {
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 }));
+      const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+      await expect(client.doctorRun()).rejects.toThrow('Invalid doctor run response');
+    }
+  });
+
+  it('returns a typed empty report on 204 and the validated envelope on 200', async () => {
+    const empty = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(null, { status: 204 })) });
+    await expect(empty.doctorReport()).resolves.toBeNull();
+
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(runEnvelope), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+    await expect(client.doctorReport()).resolves.toEqual(runEnvelope);
+    expect(fetchImpl).toHaveBeenCalledExactlyOnceWith('https://collector.example/api/v1/doctor/report', {
+      method: 'GET', headers: { Authorization: 'Bearer secret' }
+    });
+
+    const malformed = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify({ ...runEnvelope, findings: 'none' }), { status: 200 })) });
+    await expect(malformed.doctorReport()).rejects.toThrow('Invalid doctor report response');
+  });
+
+  it('mints a doctor approval with the exact wire body and validates the approval', async () => {
+    const approval = { approval_id: 'appr-0001', expires_at: '2026-08-24T00:10:00Z' };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(approval), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+
+    await expect(client.doctorApprove(gatewayKind)).resolves.toEqual(approval);
+    expect(fetchImpl).toHaveBeenCalledExactlyOnceWith('https://collector.example/api/v1/doctor/approvals', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ diagnosis_kind: gatewayKind })
+    });
+
+    const missing = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(null, { status: 404 })) });
+    await expect(missing.doctorApprove(gatewayKind)).rejects.toThrow('Request failed with status 404');
+
+    for (const malformed of [
+      { ...approval, extra: true },
+      { approval_id: '', expires_at: approval.expires_at },
+      { approval_id: 'a'.repeat(129), expires_at: approval.expires_at },
+      { approval_id: 'appr\u0000mid', expires_at: approval.expires_at },
+      { approval_id: 'appr-0001', expires_at: 'not-a-date' }
+    ]) {
+      const bad = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 })) });
+      await expect(bad.doctorApprove(gatewayKind)).rejects.toThrow('Invalid doctor approval response');
+    }
+
+    const noFetch = vi.fn();
+    const strict = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: noFetch });
+    await expect(strict.doctorApprove({ kind: 'invented' } as never)).rejects.toThrow('Invalid doctor approval request');
+    expect(noFetch).not.toHaveBeenCalled();
+  });
+
+  it('executes repairs with the exact wire body, maps 403, and validates the repair report', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ repair: repairReport }), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+    const safeKind = { kind: 'router_fault' } as const;
+
+    await expect(client.doctorRepair(safeKind)).resolves.toEqual(repairReport);
+    await expect(client.doctorRepair(gatewayKind, 'appr-0001')).resolves.toEqual(repairReport);
+    expect(fetchImpl).toHaveBeenNthCalledWith(1, 'https://collector.example/api/v1/doctor/repair', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ diagnosis_kind: safeKind })
+    });
+    expect(fetchImpl).toHaveBeenNthCalledWith(2, 'https://collector.example/api/v1/doctor/repair', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ diagnosis_kind: gatewayKind, approval_id: 'appr-0001' })
+    });
+
+    const denied = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(null, { status: 403 })) });
+    await expect(denied.doctorRepair(gatewayKind, 'appr-0001')).rejects.toThrow('Request failed with status 403');
+
+    const noFetch = vi.fn();
+    const strict = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: noFetch });
+    await expect(strict.doctorRepair(gatewayKind, '')).rejects.toThrow('Invalid doctor repair request');
+    await expect(strict.doctorRepair(gatewayKind, 'a'.repeat(129))).rejects.toThrow('Invalid doctor repair request');
+    await expect(strict.doctorRepair(gatewayKind, 'bad\u0007id')).rejects.toThrow('Invalid doctor repair request');
+    await expect(strict.doctorRepair({ kind: 'invented' } as never)).rejects.toThrow('Invalid doctor repair request');
+    expect(noFetch).not.toHaveBeenCalled();
+
+    for (const malformed of [
+      { repair: { ...repairReport, extra: true } },
+      { repair: { ...repairReport, outcome: { outcome: 'completed' } } },
+      { repair: { ...repairReport, rollback: { outcome: 'not_attempted' } } },
+      { repair: { ...repairReport, verification: { verdict: 'improved', before: doctorMeasurement } } },
+      { repair: repairReport, note: 'extra' },
+      repairReport
+    ]) {
+      const bad = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 })) });
+      await expect(bad.doctorRepair(safeKind)).rejects.toThrow('Invalid doctor repair response');
+    }
+  });
 });
