@@ -6,7 +6,7 @@ fn at(seconds: i64) -> chrono::DateTime<Utc> {
 }
 
 fn device(vendor: &str, model: &str, firmware: &str) -> DeviceIdentity {
-    DeviceIdentity::new(vendor, model, firmware).unwrap()
+    DeviceIdentity::known(vendor, model, firmware).unwrap()
 }
 
 fn advisory(vendor: &str, model: Option<&str>, firmware: VersionConstraint) -> NormalizedAdvisory {
@@ -44,13 +44,13 @@ fn exact_match_is_distinct_from_possible_match() {
         &advisory("Acme", Some("Cam-1"), exact("1.2")),
     )
     .unwrap();
-    assert_eq!(exact.label, MatchLabel::Exact);
+    assert_eq!(exact.label(), MatchLabel::Exact);
     let possible = match_advisory(
-        &device("Acme", "Cam-1", "unknown"),
+        &DeviceIdentity::new("Acme", Some("Cam-1".into()), None).unwrap(),
         &advisory("Acme", Some("Cam-1"), VersionConstraint::Any),
     )
     .unwrap();
-    assert_eq!(possible.label, MatchLabel::Possible);
+    assert_eq!(possible.label(), MatchLabel::Possible);
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn mismatches_and_missing_device_are_conservative() {
             &advisory("Acme", Some("Cam-1"), exact("1.2"))
         )
         .unwrap()
-        .label,
+        .label(),
         MatchLabel::Contradicted
     );
     assert_eq!(
@@ -70,13 +70,13 @@ fn mismatches_and_missing_device_are_conservative() {
             &advisory("Acme", Some("Cam-1"), exact("1.2"))
         )
         .unwrap()
-        .label,
+        .label(),
         MatchLabel::Contradicted
     );
     assert_eq!(
         match_advisory(None, &advisory("Acme", Some("Cam-1"), exact("1.2")))
             .unwrap()
-            .label,
+            .label(),
         MatchLabel::Possible
     );
 }
@@ -96,7 +96,7 @@ fn ranges_are_possible_without_provider_comparator() {
                 &advisory("Acme", Some("Cam-1"), firmware)
             )
             .unwrap()
-            .label,
+            .label(),
             MatchLabel::Possible
         );
     }
@@ -116,7 +116,7 @@ fn freshness_and_trust_never_become_exact() {
         assert_ne!(
             match_advisory(&device("Acme", "Cam-1", "1.2"), &a)
                 .unwrap()
-                .label,
+                .label(),
             MatchLabel::Exact
         );
     }
@@ -129,7 +129,7 @@ fn freshness_and_trust_never_become_exact() {
         assert_ne!(
             match_advisory(&device("Acme", "Cam-1", "1.2"), &a)
                 .unwrap()
-                .label,
+                .label(),
             MatchLabel::Exact
         );
     }
@@ -143,7 +143,7 @@ fn ascii_case_matches_but_unicode_is_not_normalized() {
             &advisory("Acme", Some("cam-1"), exact("1.2"))
         )
         .unwrap()
-        .label,
+        .label(),
         MatchLabel::Exact
     );
     assert_eq!(
@@ -152,7 +152,7 @@ fn ascii_case_matches_but_unicode_is_not_normalized() {
             &advisory("Café", Some("Cam-1"), exact("1.2"))
         )
         .unwrap()
-        .label,
+        .label(),
         MatchLabel::Contradicted
     );
 }
@@ -163,15 +163,15 @@ fn contradictory_high_confidence_blocks_exact() {
     assert_eq!(
         match_advisory(&d, &advisory("Acme", Some("Cam-1"), exact("1.2")))
             .unwrap()
-            .label,
-        MatchLabel::Possible
+            .label(),
+        MatchLabel::Contradicted
     );
 }
 
 #[test]
 fn device_identity_rejects_whitespace_and_supports_serde_round_trip() {
-    assert!(DeviceIdentity::new(" Acme", "Cam-1", "1.2").is_err());
-    assert!(DeviceIdentity::new("Acme", "Cam-1", "1.2\n").is_err());
+    assert!(DeviceIdentity::new(" Acme", Some("Cam-1".into()), Some("1.2".into())).is_err());
+    assert!(DeviceIdentity::new("Acme", Some("Cam-1".into()), Some("1.2\n".into())).is_err());
     let identity = device("Acme", "Cam-1", "1.2").contradictory_high_confidence(true);
     let restored: DeviceIdentity =
         serde_json::from_str(&serde_json::to_string(&identity).unwrap()).unwrap();
@@ -188,6 +188,62 @@ fn compose_risk_rejects_mixed_source_ids() {
         compose_risk(&[first, second], None),
         Err(MatchError::MixedSourceIds)
     );
+}
+
+#[test]
+fn absent_optional_identity_fields_never_contradict_or_match_exactly() {
+    let d = DeviceIdentity::new("Acme", None, None).unwrap();
+    let a = advisory("Acme", Some("Cam-1"), exact("unknown"));
+    assert_eq!(
+        match_advisory(&d, &a).unwrap().label(),
+        MatchLabel::Possible
+    );
+    let generic = advisory("unknown", None, VersionConstraint::Any);
+    assert_eq!(
+        match_advisory(&d, &generic).unwrap().label(),
+        MatchLabel::Unknown
+    );
+}
+
+#[test]
+fn invalid_trust_and_empty_selectors_are_unknown_before_missing_device() {
+    let mut input = advisory("Acme", Some("Cam-1"), exact("1.2"))
+        .input()
+        .clone();
+    input.source_trust = SourceTrust::Invalid;
+    assert_eq!(
+        match_advisory(None, &NormalizedAdvisory::new(input).unwrap())
+            .unwrap()
+            .label(),
+        MatchLabel::Unknown
+    );
+    let generic = advisory("unknown", None, VersionConstraint::Any);
+    assert_eq!(
+        match_advisory(None, &generic).unwrap().label(),
+        MatchLabel::Unknown
+    );
+}
+
+#[test]
+fn risk_ranking_preserves_explicit_none_and_is_order_independent() {
+    let mut first = advisory("Acme", Some("Cam-1"), exact("1.2"));
+    let mut input = first.input().clone();
+    input.severity = Severity::None;
+    input.remediation = Remediation::None;
+    input.exploitability = Exploitability::None;
+    first = NormalizedAdvisory::new(input).unwrap();
+    let mut second = advisory("Acme", Some("Cam-1"), exact("1.2"));
+    let mut input = second.input().clone();
+    input.severity = Severity::Unknown;
+    input.remediation = Remediation::Unknown;
+    input.exploitability = Exploitability::Unknown;
+    second = NormalizedAdvisory::new(input).unwrap();
+    let a = compose_risk(&[first.clone(), second.clone()], None).unwrap();
+    let b = compose_risk(&[second, first], None).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a.severity, Severity::None);
+    assert_eq!(a.remediation, Remediation::None);
+    assert_eq!(a.exploitability, Exploitability::None);
 }
 
 #[test]

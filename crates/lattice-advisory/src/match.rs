@@ -7,35 +7,27 @@ use thiserror::Error;
 
 const MAX_EXPLANATION: usize = 512;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DeviceIdentity {
     vendor: String,
-    model: String,
-    firmware: String,
+    model: Option<String>,
+    firmware: Option<String>,
     contradictory_high_confidence: bool,
 }
 
 impl DeviceIdentity {
     pub fn new(
         vendor: impl Into<String>,
-        model: impl Into<String>,
-        firmware: impl Into<String>,
+        model: Option<String>,
+        firmware: Option<String>,
     ) -> Result<Self, MatchError> {
-        let (vendor, model, firmware) = (vendor.into(), model.into(), firmware.into());
-        for (name, value) in [
-            ("vendor", &vendor),
-            ("model", &model),
-            ("firmware", &firmware),
-        ] {
-            if value.is_empty() {
-                return Err(MatchError::InvalidDeviceField(name));
-            }
-            if value.len() > MAX_FIELD
-                || value.trim() != value
-                || value.chars().any(char::is_control)
-            {
-                return Err(MatchError::InvalidDeviceField(name));
-            }
+        let vendor = vendor.into();
+        validate_device_field("vendor", &vendor)?;
+        if let Some(value) = &model {
+            validate_device_field("model", value)?;
+        }
+        if let Some(value) = &firmware {
+            validate_device_field("firmware", value)?;
         }
         Ok(Self {
             vendor,
@@ -44,6 +36,13 @@ impl DeviceIdentity {
             contradictory_high_confidence: false,
         })
     }
+    pub fn known(
+        vendor: impl Into<String>,
+        model: impl Into<String>,
+        firmware: impl Into<String>,
+    ) -> Result<Self, MatchError> {
+        Self::new(vendor, Some(model.into()), Some(firmware.into()))
+    }
     pub fn contradictory_high_confidence(mut self, value: bool) -> Self {
         self.contradictory_high_confidence = value;
         self
@@ -51,14 +50,41 @@ impl DeviceIdentity {
     pub fn vendor(&self) -> &str {
         &self.vendor
     }
-    pub fn model(&self) -> &str {
-        &self.model
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
-    pub fn firmware(&self) -> &str {
-        &self.firmware
+    pub fn firmware(&self) -> Option<&str> {
+        self.firmware.as_deref()
     }
     pub fn has_contradictory_high_confidence(&self) -> bool {
         self.contradictory_high_confidence
+    }
+}
+
+fn validate_device_field(name: &'static str, value: &str) -> Result<(), MatchError> {
+    if value.is_empty()
+        || value.len() > MAX_FIELD
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        Err(MatchError::InvalidDeviceField(name))
+    } else {
+        Ok(())
+    }
+}
+#[derive(Deserialize)]
+struct DeviceIdentityWire {
+    vendor: String,
+    model: Option<String>,
+    firmware: Option<String>,
+    contradictory_high_confidence: bool,
+}
+impl<'de> Deserialize<'de> for DeviceIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = DeviceIdentityWire::deserialize(deserializer)?;
+        Self::new(wire.vendor, wire.model, wire.firmware)
+            .map(|d| d.contradictory_high_confidence(wire.contradictory_high_confidence))
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -77,10 +103,24 @@ pub enum MatchedField {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AdvisoryMatch {
-    pub label: MatchLabel,
-    pub matched_fields: Vec<MatchedField>,
-    pub explanation: String,
-    pub confidence: Confidence,
+    label: MatchLabel,
+    matched_fields: Vec<MatchedField>,
+    explanation: String,
+    confidence: Confidence,
+}
+impl AdvisoryMatch {
+    pub fn label(&self) -> MatchLabel {
+        self.label
+    }
+    pub fn matched_fields(&self) -> &[MatchedField] {
+        &self.matched_fields
+    }
+    pub fn explanation(&self) -> &str {
+        &self.explanation
+    }
+    pub fn confidence(&self) -> Confidence {
+        self.confidence
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -129,14 +169,14 @@ pub fn match_advisory<D: DeviceInput>(
     let selectors = !input.vendor.eq_ignore_ascii_case("unknown")
         || input.model.is_some()
         || !matches!(input.firmware, VersionConstraint::Any);
-    let Some(device) = device.as_device() else {
+    if input.source_trust == SourceTrust::Invalid {
         return Ok(result(
-            MatchLabel::Possible,
+            MatchLabel::Unknown,
             vec![],
-            "device evidence is unavailable",
+            "source trust is invalid",
             Confidence::Low,
         ));
-    };
+    }
     if !selectors {
         return Ok(result(
             MatchLabel::Unknown,
@@ -145,35 +185,50 @@ pub fn match_advisory<D: DeviceInput>(
             Confidence::Low,
         ));
     }
+    let Some(device) = device.as_device() else {
+        return Ok(result(
+            MatchLabel::Possible,
+            vec![],
+            "device evidence is unavailable",
+            Confidence::Low,
+        ));
+    };
     let vendor_match = input.vendor.eq_ignore_ascii_case("unknown")
         || input.vendor.eq_ignore_ascii_case(device.vendor());
     let model_match = input
         .model
         .as_ref()
-        .is_none_or(|m| m.eq_ignore_ascii_case(device.model()));
+        .is_none_or(|m| device.model().is_some_and(|d| m.eq_ignore_ascii_case(d)));
     let firmware_match = match &input.firmware {
-        VersionConstraint::Exact(v) => v.as_bytes() == device.firmware().as_bytes(),
+        VersionConstraint::Exact(v) => device
+            .firmware()
+            .is_some_and(|d| v.as_bytes() == d.as_bytes()),
         VersionConstraint::Any
         | VersionConstraint::LessThan(_)
         | VersionConstraint::Range { .. } => true,
     };
     let contradiction = !vendor_match
-        || input.model.as_ref().is_some_and(|_| !model_match)
-        || matches!(input.firmware, VersionConstraint::Exact(_)) && !firmware_match;
+        || input
+            .model
+            .as_ref()
+            .is_some_and(|_| device.model().is_some() && !model_match)
+        || matches!(input.firmware, VersionConstraint::Exact(_))
+            && device.firmware().is_some()
+            && !firmware_match;
+    if device.has_contradictory_high_confidence() {
+        return Ok(result(
+            MatchLabel::Contradicted,
+            vec![],
+            "high-confidence device evidence is contradictory",
+            Confidence::High,
+        ));
+    }
     if contradiction {
         return Ok(result(
             MatchLabel::Contradicted,
             matched(input, vendor_match, model_match, firmware_match),
             "identity evidence contradicts the advisory",
             Confidence::High,
-        ));
-    }
-    if input.source_trust == SourceTrust::Invalid {
-        return Ok(result(
-            MatchLabel::Unknown,
-            matched(input, vendor_match, model_match, firmware_match),
-            "source trust is invalid",
-            Confidence::Low,
         ));
     }
     let mut fields = Vec::new();
@@ -186,13 +241,16 @@ pub fn match_advisory<D: DeviceInput>(
     if matches!(input.firmware, VersionConstraint::Exact(_)) {
         fields.push(MatchedField::Firmware);
     }
-    let exact_allowed = input.freshness == Freshness::Fresh
+    let exact_allowed = !input.vendor.eq_ignore_ascii_case("unknown")
+        && input.freshness == Freshness::Fresh
         && matches!(
             input.source_trust,
             SourceTrust::OfficialApi | SourceTrust::VerifiedSignature
         )
         && input.model.is_some()
+        && device.model().is_some()
         && matches!(input.firmware, VersionConstraint::Exact(_))
+        && device.firmware().is_some()
         && !device.has_contradictory_high_confidence();
     if exact_allowed {
         Ok(result(
@@ -287,7 +345,7 @@ fn max_severity(a: Severity, b: Severity) -> Severity {
 }
 fn rank_severity(v: Severity) -> u8 {
     match v {
-        Severity::None => 0,
+        Severity::None => 1,
         Severity::Low => 1,
         Severity::Medium => 2,
         Severity::High => 3,
@@ -304,7 +362,7 @@ fn max_exploitability(a: Exploitability, b: Exploitability) -> Exploitability {
 }
 fn rank_exploitability(v: Exploitability) -> u8 {
     match v {
-        Exploitability::None => 0,
+        Exploitability::None => 1,
         Exploitability::ProofOfConcept => 1,
         Exploitability::ActiveKnownExploitation => 2,
         Exploitability::Unknown => 0,
@@ -319,7 +377,7 @@ fn max_remediation(a: Remediation, b: Remediation) -> Remediation {
 }
 fn rank_remediation(v: Remediation) -> u8 {
     match v {
-        Remediation::None => 0,
+        Remediation::None => 1,
         Remediation::Monitor => 1,
         Remediation::Mitigate => 2,
         Remediation::Upgrade => 3,
