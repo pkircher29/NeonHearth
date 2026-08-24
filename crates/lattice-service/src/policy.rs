@@ -6,7 +6,11 @@ use lattice_domain::{
 };
 use lattice_event_bus::EventBus;
 use lattice_store::{M2StateRepository, PolicyRepository};
+use lattice_w6::{
+    Connector, DiscoveryStatus, Error as W6Error, RequestedQuarantine, Transport, Verification,
+};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorOutcome {
@@ -20,6 +24,58 @@ pub use lattice_domain::EnforcementStatus as EnforcementResult;
 #[async_trait]
 pub trait PolicyActuator: Send + Sync {
     async fn enforce(&self, device: DeviceId, action: RequestedAction) -> EnforcementResult;
+}
+
+/// Policy bridge for an owner-authenticated, trusted W6 connector.
+///
+/// The fixture contract intentionally maps Quarantine to `DenyInternet` and
+/// PermanentBan to `PersistentFilter`; these are safe, explicit fixture
+/// capabilities and are not production HTTP endpoint guesses.
+pub struct W6PolicyActuator<T> {
+    connector: Mutex<Connector<T>>,
+}
+
+impl<T: Transport> W6PolicyActuator<T> {
+    pub fn new(connector: Connector<T>) -> Self {
+        Self {
+            connector: Mutex::new(connector),
+        }
+    }
+}
+
+#[async_trait]
+impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
+    async fn enforce(&self, _device: DeviceId, action: RequestedAction) -> EnforcementResult {
+        let request = match action {
+            RequestedAction::Quarantine => RequestedQuarantine::DenyInternet,
+            RequestedAction::PermanentBan => RequestedQuarantine::PersistentFilter,
+            _ => return EnforcementResult::ManualRequired,
+        };
+        let mut connector = self.connector.lock().await;
+        if connector.discovery_status() != DiscoveryStatus::Trusted {
+            return EnforcementResult::ManualRequired;
+        }
+        match connector.quarantine(request).await {
+            Ok(report) if report.verification == Verification::Verified => {
+                EnforcementResult::Verified
+            }
+            Ok(_)
+            | Err(
+                W6Error::ManualRequired
+                | W6Error::ReadOnly
+                | W6Error::CapacityExhausted
+                | W6Error::CapabilityUnavailable
+                | W6Error::UnknownProfile
+                | W6Error::InvalidCapacity,
+            ) => EnforcementResult::ManualRequired,
+            Err(
+                W6Error::Transport
+                | W6Error::Authentication
+                | W6Error::SessionExpired
+                | W6Error::VerificationFailed,
+            ) => EnforcementResult::Failed,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -53,13 +109,22 @@ impl PolicyCoordinator<ManualRequiredActuator> {
     pub fn new(repo: PolicyRepository, events: Option<EventBus>) -> Self {
         Self::with_actuator(repo, events, ManualRequiredActuator)
     }
-    pub fn with_state(repo: PolicyRepository, events: Option<EventBus>, presence: M2StateRepository) -> Self {
+    pub fn with_state(
+        repo: PolicyRepository,
+        events: Option<EventBus>,
+        presence: M2StateRepository,
+    ) -> Self {
         Self::with_actuator_and_state(repo, events, ManualRequiredActuator, presence)
     }
 }
 impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
     pub fn with_actuator(repo: PolicyRepository, events: Option<EventBus>, actuator: A) -> Self {
-        Self { repo, events, actuator: Arc::new(actuator), presence: None }
+        Self {
+            repo,
+            events,
+            actuator: Arc::new(actuator),
+            presence: None,
+        }
     }
     pub fn with_actuator_and_state(
         repo: PolicyRepository,
@@ -93,12 +158,18 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         let policy = self.repo.enroll(device).await?;
         if let Some(identity) = identification {
             let confidence_basis_points = (identity.confidence.clamp(0.0, 1.0) * 10_000.0) as u16;
-            self.repo.set_identification(device, Identification::Automatic {
-                confidence_basis_points,
-                evidence_families: identity.families.clone(),
-            }).await?;
+            self.repo
+                .set_identification(
+                    device,
+                    Identification::Automatic {
+                        confidence_basis_points,
+                        evidence_families: identity.families.clone(),
+                    },
+                )
+                .await?;
         }
-        self.evaluate(self.repo.load(device).await?.unwrap_or(policy), now).await
+        self.evaluate(self.repo.load(device).await?.unwrap_or(policy), now)
+            .await
     }
     pub async fn enabled(&self) -> anyhow::Result<bool> {
         Ok(self.repo.baseline_started_at().await?.is_some())
@@ -130,7 +201,10 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 .await
         };
         if enforcement == EnforcementResult::Verified
-            && matches!(evaluation.requested_action, RequestedAction::Quarantine | RequestedAction::PermanentBan)
+            && matches!(
+                evaluation.requested_action,
+                RequestedAction::Quarantine | RequestedAction::PermanentBan
+            )
             && let Some(presence) = &self.presence
         {
             presence.record_verified_block(p.device_id, now).await?;
@@ -160,11 +234,8 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 enforcement_result: enforcement,
                 undo_available,
             };
-            bus.publish(
-                now,
-                EventPayload::PolicyChanged(event.clone()),
-            )
-            .await;
+            bus.publish(now, EventPayload::PolicyChanged(event.clone()))
+                .await;
             self.repo
                 .mark_decision_published(p.device_id, &fingerprint, &event)
                 .await?;
