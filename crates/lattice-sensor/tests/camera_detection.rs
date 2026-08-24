@@ -53,8 +53,11 @@ fn adapter_rejects_public_and_cross_interface_targets_before_evidence() {
                 1.0,
                 Utc::now()
             ),
-            Err(CameraObservationError::Target(TargetGuardError::TargetNotPrivate))
-                | Err(CameraObservationError::Target(TargetGuardError::OutsideApprovedPrefix))
+            Err(CameraObservationError::Target(
+                TargetGuardError::TargetNotPrivate
+            )) | Err(CameraObservationError::Target(
+                TargetGuardError::OutsideApprovedPrefix
+            ))
         ));
     }
     assert!(matches!(
@@ -68,7 +71,9 @@ fn adapter_rejects_public_and_cross_interface_targets_before_evidence() {
             1.0,
             Utc::now()
         ),
-        Err(CameraObservationError::Target(TargetGuardError::InterfaceNotEligible))
+        Err(CameraObservationError::Target(
+            TargetGuardError::InterfaceNotEligible
+        ))
     ));
     assert!(matches!(
         camera_evidence_from_observation(
@@ -81,7 +86,9 @@ fn adapter_rejects_public_and_cross_interface_targets_before_evidence() {
             1.0,
             Utc::now()
         ),
-        Err(CameraObservationError::Target(TargetGuardError::OutsideApprovedPrefix))
+        Err(CameraObservationError::Target(
+            TargetGuardError::OutsideApprovedPrefix
+        ))
     ));
 }
 

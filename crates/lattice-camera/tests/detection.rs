@@ -50,15 +50,17 @@ fn duplicate_expired_and_secret_evidence_is_bounded_and_redacted() {
         Some(now - Duration::hours(1)),
     )
     .unwrap();
-    assert!(CameraEvidence::new(
-        CameraEvidenceFamily::Http,
-        "fixture",
-        "http://user:password@example.test/body",
-        0.8,
-        now,
-        None,
-    )
-    .is_err());
+    assert!(
+        CameraEvidence::new(
+            CameraEvidenceFamily::Http,
+            "fixture",
+            "http://user:password@example.test/body",
+            0.8,
+            now,
+            None,
+        )
+        .is_err()
+    );
     let candidate = classify_candidate(
         id,
         [
@@ -84,15 +86,9 @@ fn evidence_rejects_case_insensitive_secrets_and_unsafe_source_or_fact() {
         ("fixture", "BODY=raw response"),
         ("fixture", "Header=Set-Cookie"),
     ] {
-        assert!(CameraEvidence::new(
-            CameraEvidenceFamily::Http,
-            source,
-            fact,
-            0.5,
-            now,
-            None,
-        )
-        .is_err());
+        assert!(
+            CameraEvidence::new(CameraEvidenceFamily::Http, source, fact, 0.5, now, None,).is_err()
+        );
     }
 }
 
@@ -114,42 +110,50 @@ fn evidence_serde_preserves_bounds_for_plain_and_escaped_input() {
 #[test]
 fn evidence_constructor_accepts_exact_bounds_and_rejects_too_long_values() {
     let now = Utc::now();
-    assert!(CameraEvidence::new(
-        CameraEvidenceFamily::Http,
-        "s".repeat(128),
-        "camera_web",
-        0.5,
-        now,
-        None,
-    )
-    .is_ok());
-    assert!(CameraEvidence::new(
-        CameraEvidenceFamily::Http,
-        "s".repeat(129),
-        "camera_web",
-        0.5,
-        now,
-        None,
-    )
-    .is_err());
-    assert!(CameraEvidence::new(
-        CameraEvidenceFamily::Http,
-        "fixture",
-        format!("vendor:{}", "x".repeat(249)),
-        0.5,
-        now,
-        None,
-    )
-    .is_ok());
-    assert!(CameraEvidence::new(
-        CameraEvidenceFamily::Http,
-        "fixture",
-        format!("vendor:{}", "x".repeat(250)),
-        0.5,
-        now,
-        None,
-    )
-    .is_err());
+    assert!(
+        CameraEvidence::new(
+            CameraEvidenceFamily::Http,
+            "s".repeat(128),
+            "camera_web",
+            0.5,
+            now,
+            None,
+        )
+        .is_ok()
+    );
+    assert!(
+        CameraEvidence::new(
+            CameraEvidenceFamily::Http,
+            "s".repeat(129),
+            "camera_web",
+            0.5,
+            now,
+            None,
+        )
+        .is_err()
+    );
+    assert!(
+        CameraEvidence::new(
+            CameraEvidenceFamily::Http,
+            "fixture",
+            format!("vendor:{}", "x".repeat(249)),
+            0.5,
+            now,
+            None,
+        )
+        .is_ok()
+    );
+    assert!(
+        CameraEvidence::new(
+            CameraEvidenceFamily::Http,
+            "fixture",
+            format!("vendor:{}", "x".repeat(250)),
+            0.5,
+            now,
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -169,12 +173,23 @@ fn weak_evidence_requires_independent_families_and_does_not_inflate_score() {
         id,
         [
             evidence(CameraEvidenceFamily::Rtsp, "rtsp_camera"),
-            CameraEvidence::new(CameraEvidenceFamily::Rtsp, "other", "rtsp_camera", 0.9, now, None).unwrap(),
+            CameraEvidence::new(
+                CameraEvidenceFamily::Rtsp,
+                "other",
+                "rtsp_camera",
+                0.9,
+                now,
+                None,
+            )
+            .unwrap(),
         ],
         now,
     )
     .unwrap();
-    assert_eq!(repeated.classification, CameraClassification::PossibleCamera);
+    assert_eq!(
+        repeated.classification,
+        CameraClassification::PossibleCamera
+    );
     assert!(repeated.confidence.get() < 0.5);
 
     let independent = classify_candidate(
@@ -224,15 +239,17 @@ fn normalized_metadata_marker_is_retained_by_candidate_classification() {
         None,
     )
     .unwrap();
-    assert!(CameraEvidence::new(
-        CameraEvidenceFamily::Service,
-        "fixture",
-        "vendor:axis-q3536",
-        0.4,
-        now,
-        None,
-    )
-    .is_err());
+    assert!(
+        CameraEvidence::new(
+            CameraEvidenceFamily::Service,
+            "fixture",
+            "vendor:axis-q3536",
+            0.4,
+            now,
+            None,
+        )
+        .is_err()
+    );
 
     let candidate = classify_candidate(id, [marker], now).unwrap();
     assert_eq!(candidate.evidence.len(), 1);
@@ -247,8 +264,24 @@ fn weak_families_need_independent_qualifying_confidence() {
         let candidate = classify_candidate(
             id,
             [
-                CameraEvidence::new(CameraEvidenceFamily::Rtsp, "rtsp", "rtsp_camera", confidence, now, None).unwrap(),
-                CameraEvidence::new(CameraEvidenceFamily::Http, "http", "camera_web", confidence, now, None).unwrap(),
+                CameraEvidence::new(
+                    CameraEvidenceFamily::Rtsp,
+                    "rtsp",
+                    "rtsp_camera",
+                    confidence,
+                    now,
+                    None,
+                )
+                .unwrap(),
+                CameraEvidence::new(
+                    CameraEvidenceFamily::Http,
+                    "http",
+                    "camera_web",
+                    confidence,
+                    now,
+                    None,
+                )
+                .unwrap(),
             ],
             now,
         )
@@ -276,9 +309,22 @@ fn supports_every_family_with_bounded_vendor_model_and_contradictions() {
         (CameraEvidenceFamily::Http, "model:q3536-lve"),
     ];
     for (family, fact) in families {
-        assert!(CameraEvidence::new(family, "fixture", fact, 0.4, now, None).is_ok(), "{fact}");
+        assert!(
+            CameraEvidence::new(family, "fixture", fact, 0.4, now, None).is_ok(),
+            "{fact}"
+        );
     }
-    assert!(CameraEvidence::new(CameraEvidenceFamily::Http, "fixture", format!("vendor:{}", "x".repeat(257)), 0.4, now, None).is_err());
+    assert!(
+        CameraEvidence::new(
+            CameraEvidenceFamily::Http,
+            "fixture",
+            format!("vendor:{}", "x".repeat(257)),
+            0.4,
+            now,
+            None
+        )
+        .is_err()
+    );
 
     let contradiction = classify_candidate(
         id,
@@ -297,24 +343,51 @@ fn supports_every_family_with_bounded_vendor_model_and_contradictions() {
 fn exact_expiry_capacity_ordering_and_onvif_confidence_are_deterministic() {
     let id = CameraId::from_uuid(Uuid::nil());
     let now = Utc::now();
-    let expired_now = CameraEvidence::new(CameraEvidenceFamily::Rtsp, "a", "rtsp_camera", 1.0, now, Some(now)).unwrap();
-    let low_onvif = CameraEvidence::new(CameraEvidenceFamily::Onvif, "z", "onvif_camera_profile", 0.0, now, None).unwrap();
-    let candidate = classify_candidate(id, [expired_now, low_onvif], now).unwrap();
-    assert_eq!(candidate.evidence.len(), 1);
-    assert_eq!(candidate.classification, CameraClassification::PossibleCamera);
-    assert_eq!(candidate.confidence.get(), 0.0);
-
-    let input = (0..65).map(|number| CameraEvidence::new(
-        CameraEvidenceFamily::Service,
-        format!("source-{number:02}"),
-        "camera_service",
-        0.1,
+    let expired_now = CameraEvidence::new(
+        CameraEvidenceFamily::Rtsp,
+        "a",
+        "rtsp_camera",
+        1.0,
+        now,
+        Some(now),
+    )
+    .unwrap();
+    let low_onvif = CameraEvidence::new(
+        CameraEvidenceFamily::Onvif,
+        "z",
+        "onvif_camera_profile",
+        0.0,
         now,
         None,
-    ).unwrap());
+    )
+    .unwrap();
+    let candidate = classify_candidate(id, [expired_now, low_onvif], now).unwrap();
+    assert_eq!(candidate.evidence.len(), 1);
+    assert_eq!(
+        candidate.classification,
+        CameraClassification::PossibleCamera
+    );
+    assert_eq!(candidate.confidence.get(), 0.0);
+
+    let input = (0..65).map(|number| {
+        CameraEvidence::new(
+            CameraEvidenceFamily::Service,
+            format!("source-{number:02}"),
+            "camera_service",
+            0.1,
+            now,
+            None,
+        )
+        .unwrap()
+    });
     let capped = classify_candidate(id, input, now).unwrap();
     assert_eq!(capped.evidence.len(), 64);
-    assert!(capped.evidence.windows(2).all(|pair| pair[0].source() <= pair[1].source()));
+    assert!(
+        capped
+            .evidence
+            .windows(2)
+            .all(|pair| pair[0].source() <= pair[1].source())
+    );
 }
 
 #[test]
@@ -322,41 +395,76 @@ fn capacity_and_duplicate_selection_are_independent_of_input_order() {
     let id = CameraId::from_uuid(Uuid::nil());
     let now = Utc::now();
     let mut inputs: Vec<_> = (0..64)
-        .map(|number| CameraEvidence::new(
-            CameraEvidenceFamily::Service,
-            format!("weak-{number:02}"),
-            "camera_service",
-            0.2,
+        .map(|number| {
+            CameraEvidence::new(
+                CameraEvidenceFamily::Service,
+                format!("weak-{number:02}"),
+                "camera_service",
+                0.2,
+                now,
+                None,
+            )
+            .unwrap()
+        })
+        .collect();
+    inputs.push(
+        CameraEvidence::new(
+            CameraEvidenceFamily::Onvif,
+            "late-strong",
+            "onvif_camera_profile",
+            0.9,
             now,
             None,
-        ).unwrap())
-        .collect();
-    inputs.push(CameraEvidence::new(
-        CameraEvidenceFamily::Onvif,
-        "late-strong",
-        "onvif_camera_profile",
-        0.9,
-        now,
-        None,
-    ).unwrap());
-    inputs.push(CameraEvidence::new(
-        CameraEvidenceFamily::Onvif,
-        "late-contradiction",
-        "camera_contradiction",
-        1.0,
-        now,
-        None,
-    ).unwrap());
+        )
+        .unwrap(),
+    );
+    inputs.push(
+        CameraEvidence::new(
+            CameraEvidenceFamily::Onvif,
+            "late-contradiction",
+            "camera_contradiction",
+            1.0,
+            now,
+            None,
+        )
+        .unwrap(),
+    );
     let forward = classify_candidate(id, inputs.clone(), now).unwrap();
     inputs.reverse();
     let reversed = classify_candidate(id, inputs, now).unwrap();
     assert_eq!(forward, reversed);
     assert_eq!(forward.classification, CameraClassification::Unknown);
-    assert!(forward.evidence.iter().any(|item| item.fact() == "onvif_camera_profile"));
-    assert!(forward.evidence.iter().any(|item| item.fact() == "camera_contradiction"));
+    assert!(
+        forward
+            .evidence
+            .iter()
+            .any(|item| item.fact() == "onvif_camera_profile")
+    );
+    assert!(
+        forward
+            .evidence
+            .iter()
+            .any(|item| item.fact() == "camera_contradiction")
+    );
 
-    let older = CameraEvidence::new(CameraEvidenceFamily::Rtsp, "same", "rtsp_camera", 0.4, now - Duration::seconds(1), None).unwrap();
-    let stronger = CameraEvidence::new(CameraEvidenceFamily::Rtsp, "same", "rtsp_camera", 0.9, now, None).unwrap();
+    let older = CameraEvidence::new(
+        CameraEvidenceFamily::Rtsp,
+        "same",
+        "rtsp_camera",
+        0.4,
+        now - Duration::seconds(1),
+        None,
+    )
+    .unwrap();
+    let stronger = CameraEvidence::new(
+        CameraEvidenceFamily::Rtsp,
+        "same",
+        "rtsp_camera",
+        0.9,
+        now,
+        None,
+    )
+    .unwrap();
     let selected = classify_candidate(id, [older.clone(), stronger.clone()], now).unwrap();
     let reversed_selected = classify_candidate(id, [stronger, older], now).unwrap();
     assert_eq!(selected, reversed_selected);

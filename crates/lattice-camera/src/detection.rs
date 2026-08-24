@@ -78,6 +78,12 @@ impl CameraEvidence {
     pub const fn confidence(&self) -> Confidence {
         self.confidence
     }
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+    pub const fn expires_at(&self) -> Option<DateTime<Utc>> {
+        self.expires_at
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -119,9 +125,17 @@ fn safe_source(value: String) -> Result<String, DetectionError> {
 
 fn normalized_fact(family: CameraEvidenceFamily, value: String) -> Result<String, DetectionError> {
     let fact = value.to_ascii_lowercase();
-    let contains_secret = ["://", "@", "password", "bearer", "authorization", "header", "body"]
-        .iter()
-        .any(|needle| fact.contains(needle));
+    let contains_secret = [
+        "://",
+        "@",
+        "password",
+        "bearer",
+        "authorization",
+        "header",
+        "body",
+    ]
+    .iter()
+    .any(|needle| fact.contains(needle));
     let metadata_family = matches!(
         family,
         CameraEvidenceFamily::Onvif
@@ -129,10 +143,16 @@ fn normalized_fact(family: CameraEvidenceFamily, value: String) -> Result<String
             | CameraEvidenceFamily::Http
             | CameraEvidenceFamily::Tls
     );
-    let marker = metadata_family && fact
-        .strip_prefix("vendor:")
-        .or_else(|| fact.strip_prefix("model:"))
-        .is_some_and(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
+    let marker = metadata_family
+        && fact
+            .strip_prefix("vendor:")
+            .or_else(|| fact.strip_prefix("model:"))
+            .is_some_and(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            });
     if contains_secret || (!allowed(family, &fact) && !marker) {
         return Err(DetectionError::InvalidEvidence);
     }
@@ -278,8 +298,7 @@ fn selection_order(left: &CameraEvidence, right: &CameraEvidence) -> std::cmp::O
         .then_with(|| left.observed_at.cmp(&right.observed_at))
         .then_with(|| left.expires_at.cmp(&right.expires_at))
         .then_with(|| {
-            (right.family, &right.source, &right.fact)
-                .cmp(&(left.family, &left.source, &left.fact))
+            (right.family, &right.source, &right.fact).cmp(&(left.family, &left.source, &left.fact))
         })
 }
 
