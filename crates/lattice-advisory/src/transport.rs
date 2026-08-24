@@ -141,6 +141,9 @@ impl FeedRequest {
             if start > end || end - start > Duration::days(120) {
                 return Err(TransportError::InvalidWindow);
             }
+            if Self::nvd(self.start_index, self.results_per_page, start, end)?.url != self.url {
+                return Err(TransportError::UnsafeUrl);
+            }
         }
         Ok(())
     }

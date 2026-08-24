@@ -401,24 +401,36 @@ fn valid_optional(v: &Option<String>) -> bool {
         .is_none_or(|x| !x.is_empty() && x.len() <= 512 && !x.chars().any(char::is_control))
 }
 fn nvd_query_valid(url: &url::Url) -> bool {
-    let Some(query) = url.query() else {
+    if url.query().is_none() {
         return true;
+    }
+    let pairs: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+    if pairs.len() != 4 || url.query_pairs().count() != 4 {
+        return false;
+    }
+    let (Some(start), Some(page), Some(begin), Some(end)) = (
+        pairs.get("startIndex"),
+        pairs.get("resultsPerPage"),
+        pairs.get("lastModStartDate"),
+        pairs.get("lastModEndDate"),
+    ) else {
+        return false;
     };
-    let allowed = [
-        "startIndex",
-        "resultsPerPage",
-        "lastModStartDate",
-        "lastModEndDate",
-    ];
-    let pairs: Vec<_> = url.query_pairs().collect();
-    !pairs.is_empty()
-        && pairs
-            .iter()
-            .all(|(key, value)| allowed.contains(&key.as_ref()) && !value.is_empty())
-        && pairs
-            .iter()
-            .all(|(key, _)| pairs.iter().filter(|(other, _)| other == key).count() == 1)
-        && url.as_str().contains(query)
+    let (Ok(start), Ok(page), Ok(begin), Ok(end)) = (
+        start.parse::<usize>(),
+        page.parse::<usize>(),
+        chrono::DateTime::parse_from_rfc3339(begin),
+        chrono::DateTime::parse_from_rfc3339(end),
+    ) else {
+        return false;
+    };
+    lattice_advisory::transport::FeedRequest::nvd(
+        start,
+        page,
+        begin.with_timezone(&Utc),
+        end.with_timezone(&Utc),
+    )
+    .is_ok_and(|request| request.url == url.as_str())
 }
 fn explicit_port(raw: &str) -> bool {
     let authority = raw
