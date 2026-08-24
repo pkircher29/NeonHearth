@@ -40,7 +40,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
 };
-use url::Url;
+use url::{Host, Url};
 use zeroize::Zeroizing;
 
 use crate::{AppState, auth::Authorized, vault::Vault};
@@ -1624,10 +1624,16 @@ impl Upstream {
         if url.scheme() != "rtsp" || url.fragment().is_some() {
             return Err(RtspProxyError::InvalidSource);
         }
-        let host = url
-            .host_str()
-            .and_then(|host| host.parse::<IpAddr>().ok())
-            .ok_or(RtspProxyError::InvalidSource)?;
+        let host = match url.host().ok_or(RtspProxyError::InvalidSource)? {
+            Host::Ipv4(host) => IpAddr::V4(host),
+            Host::Ipv6(host) => IpAddr::V6(host),
+            // `rtsp` is a non-special URL scheme, so the URL crate represents
+            // numeric IPv4 hosts as `Domain`; parse only numeric addresses and
+            // continue rejecting DNS names.
+            Host::Domain(host) => host
+                .parse::<IpAddr>()
+                .map_err(|_| RtspProxyError::InvalidSource)?,
+        };
         let port = url.port().unwrap_or(554);
         if port == 0 || unsafe_path(url.path()) {
             return Err(RtspProxyError::InvalidSource);

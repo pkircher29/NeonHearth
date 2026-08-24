@@ -89,6 +89,18 @@ fn approved(target: [u8; 4]) -> ApprovedRtspTarget {
     ApprovedRtspTarget::new(binding(target), 8554).unwrap()
 }
 
+fn approved_ipv6(target: &str) -> ApprovedRtspTarget {
+    ApprovedRtspTarget::new(
+        AuthorizedBinding {
+            source: "2001:db8::5".parse().unwrap(),
+            interface_index: 7,
+            target: target.parse().unwrap(),
+        },
+        8554,
+    )
+    .unwrap()
+}
+
 fn limits() -> RtspProxyLimits {
     RtspProxyLimits {
         max_connections: 2,
@@ -173,6 +185,38 @@ async fn proxy_rejects_target_mismatch_before_any_connection_and_redacts_failure
     .unwrap_err();
     assert_eq!(error, RtspProxyError::TargetMismatch);
     assert_eq!(connector.connection_count().await, 0);
+}
+
+#[tokio::test]
+async fn proxy_compares_ipv6_vault_target_to_authorized_binding_numerically() {
+    let owner = HlsSessionId::new();
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(Vec::new()));
+    let error = LoopbackRtspProxy::start(
+        owner.clone(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@[2001:db8::6]:8554/live")),
+        approved_ipv6("2001:db8::5"),
+        connector.clone(),
+        limits(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, RtspProxyError::TargetMismatch);
+    assert_eq!(connector.connection_count().await, 0);
+
+    let proxy = LoopbackRtspProxy::start(
+        owner.clone(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!(
+            "rtsp://viewer:{PASSWORD}@[2001:0db8:0:0:0:0:0:5]:8554/live"
+        )),
+        approved_ipv6("2001:db8::5"),
+        connector,
+        limits(),
+    )
+    .await
+    .unwrap();
+    proxy.shutdown(&owner).await.unwrap();
 }
 
 #[tokio::test]
