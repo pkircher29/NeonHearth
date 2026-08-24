@@ -1,15 +1,19 @@
-use crate::DeviceId;
+use crate::{DeviceId, EvidenceFamily};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
+pub const UNKNOWN_POLICY_DEADLINE_HOURS: i64 = 48;
+pub const AUTOMATIC_POLICY_DEADLINE_HOURS: i64 = 7 * 24;
+pub const AUTOMATIC_IDENTITY_THRESHOLD_BPS: u16 = 8_500;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Identification {
     Unknown,
     Automatic {
         confidence_basis_points: u16,
-        evidence_families: u8,
+        evidence_families: Vec<EvidenceFamily>,
     },
 }
 
@@ -84,6 +88,16 @@ pub enum RequestedAction {
     Quarantine,
     PermanentBan,
     OwnerAttention,
+}
+
+/// API-safe result of attempting the requested enforcement action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementStatus {
+    NotRequested,
+    Verified,
+    ManualRequired,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]

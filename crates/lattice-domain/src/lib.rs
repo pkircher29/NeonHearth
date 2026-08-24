@@ -14,7 +14,7 @@ pub use evidence::{EvidenceFact, EvidenceFamily};
 pub use flow::{ByteCount, Coverage};
 pub use policy::{
     AUTOMATIC_IDENTITY_THRESHOLD_BPS, AUTOMATIC_POLICY_DEADLINE_HOURS, Deadline, DeadlineKind,
-    DeadlineWarning, DevicePolicy, Evaluation, Identification, OwnerDecision, PolicyReason,
-    Protection, RequestedAction, RiskSignal, UNKNOWN_POLICY_DEADLINE_HOURS,
+    DeadlineWarning, DevicePolicy, EnforcementStatus, Evaluation, Identification, OwnerDecision,
+    PolicyReason, Protection, RequestedAction, RiskSignal, UNKNOWN_POLICY_DEADLINE_HOURS,
 };
 pub use presence::{PresenceChanged, PresenceState};

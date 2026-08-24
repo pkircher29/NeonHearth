@@ -1,4 +1,4 @@
-use crate::policy::{Evaluation, RequestedAction};
+use crate::policy::{EnforcementStatus, Evaluation, RequestedAction};
 use crate::{ByteCount, Coverage, DeviceId, PresenceChanged};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,8 @@ pub struct PolicyChanged {
     pub evaluation: Evaluation,
     pub requested_action: RequestedAction,
     pub evidence_summary: String,
+    pub enforcement_result: EnforcementStatus,
+    pub undo_available: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]

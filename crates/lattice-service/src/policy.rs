@@ -15,13 +15,7 @@ pub enum ConnectorOutcome {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EnforcementResult {
-    NotRequested,
-    Verified,
-    ManualRequired,
-    Failed,
-}
+pub use lattice_domain::EnforcementStatus as EnforcementResult;
 
 #[async_trait]
 pub trait PolicyActuator: Send + Sync {
@@ -95,10 +89,15 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 .enforce(p.device_id, evaluation.requested_action)
                 .await
         };
+        let undo_available = matches!(
+            p.owner_decision,
+            OwnerDecision::Approved | OwnerDecision::Quarantined
+        );
         let fingerprint = serde_json::to_string(&(
             evaluation,
             evidence_summary(&p),
-            evaluation.requested_action,
+            enforcement,
+            undo_available,
         ))?;
         let changed = self
             .repo
@@ -113,6 +112,8 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                     evaluation,
                     requested_action: evaluation.requested_action,
                     evidence_summary: evidence_summary(&p),
+                    enforcement_result: enforcement,
+                    undo_available,
                 }),
             )
             .await;
@@ -124,10 +125,7 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             evidence_summary: evidence_summary(&p),
             requested_action: evaluation.requested_action,
             enforcement,
-            undo_available: matches!(
-                p.owner_decision,
-                OwnerDecision::Approved | OwnerDecision::Quarantined
-            ),
+            undo_available,
         })
     }
     pub async fn approve(
