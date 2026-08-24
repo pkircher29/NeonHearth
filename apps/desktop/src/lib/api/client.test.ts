@@ -57,6 +57,64 @@ describe('createApiClient', () => {
     await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl }).snapshot()).resolves.toEqual(snapshot);
   });
 
+  it('accepts canonical UTC timestamps, including fractional seconds, in state projections', async () => {
+    const device: any = structuredClone(validDevice);
+    device.first_seen_at = '2026-01-01T00:00:00.123Z';
+    device.last_seen_at = '2026-01-01T00:00:01.123456Z';
+    device.presence = { state: 'online', observed_at: '2026-01-01T00:00:02.1Z', source: 'sensor', kind: 'reply' };
+    device.evidence = { family: 'link_layer', source: 'neighbor', confidence: 0.5, observed_at: '2026-01-01T00:00:03.12Z', expires_at: '2026-01-01T00:00:04.123456789Z' };
+    device.bandwidth = { available: true, upload: 1, download: 2, coverage: 'complete', observed_at: '2026-01-01T00:00:05.123Z' };
+    const snapshot = { sequence: 1, devices: [device], next_after: null, service_status: 'ready' };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200 }));
+
+    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl }).snapshot()).resolves.toEqual(snapshot);
+  });
+
+  it('rejects invalid, impossible, and non-UTC timestamps in nested projections', async () => {
+    const snapshot = { sequence: 1, devices: [validDevice], next_after: null, service_status: 'ready' };
+    for (const mutate of [
+      (d: any) => { d.first_seen_at = 'bad'; },
+      (d: any) => { d.last_seen_at = '2026-02-30T00:00:00Z'; },
+      (d: any) => { d.presence = { state: 'online', observed_at: '2026-01-01T00:00:00+01:00', source: 'sensor', kind: 'reply' }; },
+      (d: any) => { d.evidence = { family: 'link_layer', source: 'neighbor', confidence: 0.5, observed_at: '2026-01-01T00:00:00Z', expires_at: '2026-02-30T00:00:00Z' }; },
+      (d: any) => { d.bandwidth = { available: true, upload: 1, download: 2, coverage: 'complete', observed_at: '2026-01-01T00:00:00+00:00' }; }
+    ]) {
+      const malformed = structuredClone(snapshot);
+      mutate(malformed.devices[0]);
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 }));
+      await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl }).snapshot()).rejects.toThrow('Invalid snapshot response');
+    }
+  });
+
+  it('requests validated snapshot pages while keeping the default path unchanged', async () => {
+    const snapshot = { sequence: 1, devices: [], next_after: null, service_status: 'ready' };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+
+    await client.snapshot();
+    await client.snapshot({ limit: 2, after: '018f47a0-9b5c-7a22-8a33-112233445599' });
+
+    expect(fetchImpl).toHaveBeenNthCalledWith(1, 'https://collector.example/api/v1/state', {
+      method: 'GET', headers: { Authorization: 'Bearer secret' }
+    });
+    expect(fetchImpl).toHaveBeenNthCalledWith(2, 'https://collector.example/api/v1/state?limit=2&after=018f47a0-9b5c-7a22-8a33-112233445599', {
+      method: 'GET', headers: { Authorization: 'Bearer secret' }
+    });
+  });
+
+  it('rejects invalid snapshot pages before fetching', async () => {
+    const fetchImpl = vi.fn();
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+
+    for (const options of [
+      { limit: 0 }, { limit: 257 }, { limit: 1.5 }, { limit: Number.MAX_SAFE_INTEGER + 1 },
+      { after: 'not-a-device-id' }, { after: '018F47A0-9B5C-7A22-8A33-112233445599' }
+    ]) {
+      await expect(client.snapshot(options)).rejects.toThrow('Invalid snapshot page');
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('accepts only nonnegative safe integer sequences', () => {
     expect(isSequence(0)).toBe(true);
     expect(isSequence(Number.MAX_SAFE_INTEGER)).toBe(true);
@@ -131,6 +189,9 @@ describe('createApiClient', () => {
 
     for (const sequence of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
       socket.onmessage?.({ data: JSON.stringify({ type: 'event', data: { sequence, occurred_at: '2026-08-23T00:00:00Z', payload: { type: 'service_status', data: { state: 'ready', detail: 'valid except sequence' } } } }) } as MessageEvent<string>);
+    }
+    for (const occurred_at of ['not-a-date', '2026-08-23T00:00:00+00:00']) {
+      socket.onmessage?.({ data: JSON.stringify({ type: 'event', data: { sequence: 1, occurred_at, payload: { type: 'service_status', data: { state: 'ready', detail: 'valid except timestamp' } } } }) } as MessageEvent<string>);
     }
     socket.onmessage?.({ data: JSON.stringify({ type: 'event', data: { sequence: 1, occurred_at: '2026-08-23T00:00:00Z', payload: { type: 'service_status', data: { state: 1, detail: 'bad' } } } }) } as MessageEvent<string>);
     expect(onMessage).not.toHaveBeenCalled();

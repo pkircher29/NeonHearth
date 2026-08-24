@@ -9,9 +9,14 @@ export interface ApiClientOptions {
   WebSocketImpl?: typeof WebSocket;
 }
 
+export interface SnapshotPageOptions {
+  limit?: number;
+  after?: string;
+}
+
 export interface ApiClient {
   health(): Promise<Health>;
-  snapshot(): Promise<Snapshot>;
+  snapshot(options?: SnapshotPageOptions): Promise<Snapshot>;
   issueEventTicket(): Promise<EventTicket>;
   openEvents(
     afterSequence: number,
@@ -38,7 +43,7 @@ function isServerMessage(value: unknown): value is ServerMessage {
   if (value.type === 'resync_required') return !('data' in value);
   if (value.type !== 'event' || !isRecord(value.data)) return false;
   const event = value.data;
-  if (!isSequence(event.sequence) || typeof event.occurred_at !== 'string' || !isRecord(event.payload)) return false;
+  if (!isSequence(event.sequence) || !isDate(event.occurred_at) || !isRecord(event.payload)) return false;
   const payload = event.payload;
   if (payload.type === 'service_status') return isRecord(payload.data) && typeof payload.data.state === 'string' && typeof payload.data.detail === 'string';
   return payload.type === 'presence_changed' && isRecord(payload.data)
@@ -55,16 +60,23 @@ function isHealth(value: unknown): value is Health {
 const presenceStates = new Set(['online', 'quiet', 'offline', 'blocked', 'unknown']);
 const evidenceFamilies = new Set(['link_layer', 'addressing', 'naming', 'service', 'cryptographic', 'router_hint', 'owner']);
 const coverages = new Set(['complete', 'router-reported', 'local-only', 'estimated']);
-const isDate = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+const utcRfc3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
+const isDate = (value: unknown): value is string => {
+  if (typeof value !== 'string' || !utcRfc3339.test(value)) return false;
+  const date = new Date(value);
+  return !Number.isNaN(date.valueOf()) && date.toISOString().slice(0, 19) === value.slice(0, 19);
+};
 const isConfidence = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
 const isBytes = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-const isDeviceId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+const isDeviceId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 
 function isPresence(value: unknown): value is Presence {
   if (!isRecord(value) || !presenceStates.has(String(value.state))) return false;
   const fields = [value.observed_at, value.source, value.kind];
   const noTransition = fields.every((field) => field === null);
-  const transition = fields.every((field) => typeof field === 'string' && field.length > 0);
+  const transition = isDate(value.observed_at)
+    && typeof value.source === 'string' && value.source.length > 0
+    && typeof value.kind === 'string' && value.kind.length > 0;
   return noTransition ? value.state === 'unknown' : transition;
 }
 function isEvidence(value: unknown): value is Evidence {
@@ -121,8 +133,18 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
     return value;
   }
 
-  async function snapshot(): Promise<Snapshot> {
-    const value = await request('/api/v1/state', authorized('GET'));
+  async function snapshot(options?: SnapshotPageOptions): Promise<Snapshot> {
+    if (options?.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 256)) {
+      throw new Error('Invalid snapshot page');
+    }
+    if (options?.after !== undefined && !isDeviceId(options.after)) {
+      throw new Error('Invalid snapshot page');
+    }
+    const params = new URLSearchParams();
+    if (options?.limit !== undefined) params.set('limit', String(options.limit));
+    if (options?.after !== undefined) params.set('after', options.after);
+    const query = params.toString();
+    const value = await request(query ? `/api/v1/state?${query}` : '/api/v1/state', authorized('GET'));
     if (!isSnapshot(value)) throw new Error('Invalid snapshot response');
     return value;
   }
