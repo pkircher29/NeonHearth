@@ -32,6 +32,9 @@ pub struct Sandbox {
     engine: Engine,
     module: Module,
     limits: Limits,
+    /// A module runs in a fresh store, but an engine epoch is global. Serialize
+    /// admissions so one invocation's deadline cannot interrupt another one.
+    execution: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +139,7 @@ impl Sandbox {
             engine,
             module,
             limits: verified.limits().clone(),
+            execution: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -147,6 +151,9 @@ impl Sandbox {
         if input.len() as u64 > self.limits.max_bytes || input.len() > i32::MAX as usize {
             return Err(AuditError::InputLimitExceeded);
         }
+        // Tokio's mutex is not poisonable. The guard covers the epoch ticker's
+        // entire lifetime, and max_time begins only after this admission.
+        let _execution = self.execution.lock().await;
         let max_memory = self.limits.max_memory_pages as usize * WASM_PAGE_SIZE as usize;
         let mut store = Store::new(
             &self.engine,

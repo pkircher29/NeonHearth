@@ -3,6 +3,7 @@ use lattice_audit_wasm::*;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::Duration,
 };
 
@@ -228,4 +229,47 @@ async fn epoch_deadline_enforces_max_time_without_leaking_into_the_next_executio
         clean.execute(b"next", &Host(0)).await.unwrap().output,
         b"next"
     );
+}
+
+struct SleepingHost;
+impl AuditHost for SleepingHost {
+    fn deterministic(&self) -> u32 {
+        std::thread::sleep(Duration::from_millis(250));
+        1
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_sandbox_admission_isolated_from_another_calls_epoch_ticker() {
+    let mut timed = limits();
+    timed.max_fuel = 10_000_000_000;
+    let module = wasm(
+        r#"(module
+          (import "audit" "deterministic" (func $d (result i32)))
+          (memory (export "memory") 1)
+          (func (export "run") (param i32 i32) (result i64) (local $remaining i32)
+            local.get 1 i32.eqz
+            if
+              loop $forever
+                br $forever
+              end
+            end
+            call $d drop
+            i32.const 300000000 local.set $remaining
+            loop $spin
+              local.get $remaining i32.const 1 i32.sub local.tee $remaining
+              br_if $spin
+            end
+            local.get 0 i64.extend_i32_u i64.const 32 i64.shl
+            local.get 1 i64.extend_i32_u i64.or))"#,
+    );
+    let sandbox = Arc::new(Sandbox::new(verified(&module, timed)).await.unwrap());
+    let slow_sandbox = Arc::clone(&sandbox);
+    let slow = tokio::spawn(async move { slow_sandbox.execute(&[], &SleepingHost).await });
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        sandbox.execute(b"ok", &SleepingHost).await.unwrap().output,
+        b"ok"
+    );
+    assert_eq!(slow.await.unwrap().unwrap_err(), AuditError::TimedOut);
 }
