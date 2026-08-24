@@ -12,6 +12,7 @@ members = [
     "crates/lattice-advisory",
     "crates/lattice-audit-wasm",
     "crates/lattice-w6",
+    "crates/lattice-doctor",
     "tools/fixture-gen",
     "tools/w6-fixture-recorder",
 ]

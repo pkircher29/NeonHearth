@@ -1954,6 +1954,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-doctor"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+ "utoipa",
+]
+
+[[package]]
 name = "lattice-domain"
 version = "0.1.0"
 dependencies = [
@@ -2093,6 +2104,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "url",
+ "utoipa",
  "uuid",
 ]
 
