@@ -52,6 +52,22 @@ impl AuditHost for Host {
         self.0
     }
 }
+struct ExchangeHost;
+#[async_trait::async_trait]
+impl AuditHost for ExchangeHost {
+    async fn deterministic(&self) -> u32 {
+        0
+    }
+    async fn exchange(
+        &self,
+        request: Vec<u8>,
+        response_cap: usize,
+    ) -> Result<Vec<u8>, AuditHostError> {
+        assert_eq!(request, b"ping");
+        assert_eq!(response_cap, 4);
+        Ok(b"pong".to_vec())
+    }
+}
 const ECHO: &str = r#"(module (memory (export "memory") 1 2) (func (export "run") (param i32 i32) (result i64) local.get 0 i64.extend_i32_u i64.const 32 i64.shl local.get 1 i64.extend_i32_u i64.or))"#;
 
 #[tokio::test]
@@ -76,6 +92,38 @@ async fn host_scalar_result_is_usable_by_the_guest() {
         sandbox.execute(&[], &Host(0x41)).await.unwrap().output,
         b"A"
     );
+}
+#[tokio::test]
+async fn exchange_import_consumes_guest_request_and_writes_only_the_declared_output_range() {
+    let module = wasm(
+        r#"(module
+      (import "audit" "exchange" (func $x (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 16) "ping")
+      (func (export "run") (param i32 i32) (result i64)
+        i32.const 16 i32.const 4 i32.const 32 i32.const 4 call $x drop
+        i64.const 32 i64.const 32 i64.shl i64.const 4 i64.or))"#,
+    );
+    let sandbox = Sandbox::new(verified(&module, limits())).await.unwrap();
+    assert_eq!(
+        sandbox.execute(&[], &ExchangeHost).await.unwrap().output,
+        b"pong"
+    );
+}
+#[tokio::test]
+async fn exchange_rejects_guest_pointer_and_response_capacity_out_of_bounds() {
+    for source in [
+        r#"(module (import "audit" "exchange" (func $x (param i32 i32 i32 i32) (result i32))) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i32.const 65535 i32.const 2 i32.const 0 i32.const 1 call $x drop i64.const 0))"#,
+        r#"(module (import "audit" "exchange" (func $x (param i32 i32 i32 i32) (result i32))) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i32.const 0 i32.const 0 i32.const 65535 i32.const 2 call $x drop i64.const 0))"#,
+    ] {
+        let sandbox = Sandbox::new(verified(&wasm(source), limits()))
+            .await
+            .unwrap();
+        assert_eq!(
+            sandbox.execute(&[], &ExchangeHost).await.unwrap_err(),
+            AuditError::InvalidAbi
+        );
+    }
 }
 #[tokio::test]
 async fn rejects_ambient_wasi_and_imported_memory_or_table() {

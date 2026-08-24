@@ -107,6 +107,10 @@ pub enum AuditError {
     InputLimitExceeded,
     #[error("request limit exceeded")]
     RequestLimitExceeded,
+    #[error("audit host rejected exchange")]
+    HostRejected,
+    #[error("audit execution cancelled")]
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]

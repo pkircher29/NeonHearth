@@ -16,6 +16,24 @@ const MAX_TABLE_ELEMENTS: u64 = 64;
 #[async_trait::async_trait]
 pub trait AuditHost: Send + Sync {
     async fn deterministic(&self) -> u32;
+    /// The guest supplies bytes and a bounded output buffer only.  It never
+    /// supplies an address, name, URL, CIDR, redirect, protocol, or port.
+    async fn exchange(
+        &self,
+        _request: Vec<u8>,
+        _response_cap: usize,
+    ) -> Result<Vec<u8>, AuditHostError> {
+        Err(AuditHostError::ExchangeFailed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditHostError {
+    Denied,
+    BudgetExhausted,
+    DeadlineExceeded,
+    Cancelled,
+    ExchangeFailed,
 }
 
 #[derive(Debug)]
@@ -43,6 +61,8 @@ enum ExecutionFailure {
     Memory,
     Table,
     Request,
+    InvalidAbi,
+    Host(AuditHostError),
 }
 
 struct StoreState<'a, H: AuditHost> {
@@ -228,6 +248,61 @@ impl Sandbox {
                 },
             )
             .map_err(|_| AuditError::InvalidAbi)?;
+        linker
+            .func_wrap_async(
+                "audit",
+                "exchange",
+                |mut caller: wasmtime::Caller<'_, StoreState<'_, H>>,
+                 (req_ptr, req_len, out_ptr, out_cap): (i32, i32, i32, i32)| {
+                    Box::new(async move {
+                        let (req_ptr, req_len, out_ptr, out_cap) = match (
+                            usize::try_from(req_ptr),
+                            usize::try_from(req_len),
+                            usize::try_from(out_ptr),
+                            usize::try_from(out_cap),
+                        ) {
+                            (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+                            _ => {
+                                caller.data_mut().failure = Some(ExecutionFailure::InvalidAbi);
+                                return Err(anyhow::anyhow!("invalid exchange pointers"));
+                            }
+                        };
+                        let memory = match caller.get_export("memory").and_then(|e| e.into_memory())
+                        {
+                            Some(memory) => memory,
+                            None => return Err(anyhow::anyhow!("missing memory")),
+                        };
+                        let end = |ptr: usize, len: usize| {
+                            ptr.checked_add(len)
+                                .filter(|end| *end <= memory.data_size(&caller))
+                        };
+                        if end(req_ptr, req_len).is_none() || end(out_ptr, out_cap).is_none() {
+                            caller.data_mut().failure = Some(ExecutionFailure::InvalidAbi);
+                            return Err(anyhow::anyhow!("exchange bounds"));
+                        }
+                        let request = memory.data(&caller)[req_ptr..req_ptr + req_len].to_vec();
+                        let host = caller.data().host;
+                        let response = match host.exchange(request, out_cap).await {
+                            Ok(response) if response.len() <= out_cap => response,
+                            Ok(_) | Err(AuditHostError::ExchangeFailed) => {
+                                caller.data_mut().failure =
+                                    Some(ExecutionFailure::Host(AuditHostError::ExchangeFailed));
+                                return Err(anyhow::anyhow!("exchange failed"));
+                            }
+                            Err(error) => {
+                                caller.data_mut().failure = Some(ExecutionFailure::Host(error));
+                                return Err(anyhow::anyhow!("exchange rejected"));
+                            }
+                        };
+                        memory
+                            .write(&mut caller, out_ptr, &response)
+                            .map_err(|_| anyhow::anyhow!("exchange write"))?;
+                        i32::try_from(response.len())
+                            .map_err(|_| anyhow::anyhow!("response too large"))
+                    })
+                },
+            )
+            .map_err(|_| AuditError::InvalidAbi)?;
 
         let instance = linker
             .instantiate_async(&mut store, &self.module)
@@ -274,7 +349,9 @@ fn validate_static_limits(wasm: &[u8], limits: &Limits) -> Result<(), AuditError
             Payload::ImportSection(section) => {
                 for import in section {
                     let import = import.map_err(|_| AuditError::InvalidModule)?;
-                    if import.module == "audit" && import.name == "deterministic" {
+                    if import.module == "audit"
+                        && matches!(import.name, "deterministic" | "exchange")
+                    {
                         if !matches!(import.ty, TypeRef::Func(_)) {
                             return Err(AuditError::InvalidAbi);
                         }
@@ -348,6 +425,11 @@ fn validate_abi(module: &Module) -> Result<(), AuditError> {
             {
                 return Err(AuditError::InvalidAbi);
             }
+        } else if import.module() == "audit" && import.name() == "exchange" {
+            if !matches!(import.ty(), ExternType::Func(ref function) if function.params().len() == 4 && function.params().all(|p| matches!(p, wasmtime::ValType::I32)) && function.results().len() == 1 && function.results().next().is_some_and(|r| matches!(r, wasmtime::ValType::I32)))
+            {
+                return Err(AuditError::InvalidAbi);
+            }
         } else {
             return Err(AuditError::ForbiddenImport(format!(
                 "{}::{}",
@@ -377,6 +459,13 @@ fn map_error<H: AuditHost>(store: &Store<StoreState<'_, H>>, error: &anyhow::Err
         Some(ExecutionFailure::Memory) => AuditError::MemoryLimitExceeded,
         Some(ExecutionFailure::Table) => AuditError::TableLimitExceeded,
         Some(ExecutionFailure::Request) => AuditError::RequestLimitExceeded,
+        Some(ExecutionFailure::InvalidAbi) => AuditError::InvalidAbi,
+        Some(ExecutionFailure::Host(AuditHostError::BudgetExhausted)) => {
+            AuditError::RequestLimitExceeded
+        }
+        Some(ExecutionFailure::Host(AuditHostError::DeadlineExceeded)) => AuditError::TimedOut,
+        Some(ExecutionFailure::Host(AuditHostError::Cancelled)) => AuditError::Cancelled,
+        Some(ExecutionFailure::Host(_)) => AuditError::HostRejected,
         None => match error.downcast_ref::<Trap>() {
             Some(Trap::OutOfFuel) => AuditError::FuelExhausted,
             Some(Trap::Interrupt) => AuditError::TimedOut,

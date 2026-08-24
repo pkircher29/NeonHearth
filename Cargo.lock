@@ -1931,6 +1931,8 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
+ "uuid",
  "wasmparser 0.219.2",
  "wasmtime",
  "wat",
@@ -4058,6 +4060,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
