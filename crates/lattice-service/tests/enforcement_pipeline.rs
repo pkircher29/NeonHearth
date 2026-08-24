@@ -55,6 +55,16 @@ impl PolicyActuator for OutcomeActuator {
     }
 }
 
+#[derive(Clone)]
+struct CountingOutcomeActuator(Arc<AtomicUsize>, EnforcementResult);
+#[async_trait]
+impl PolicyActuator for CountingOutcomeActuator {
+    async fn enforce(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        self.1
+    }
+}
+
 struct QueuedSource(Mutex<VecDeque<Result<Vec<NeighborRow>, NeighborError>>>);
 #[async_trait]
 impl NeighborSnapshotSource for QueuedSource {
@@ -644,5 +654,96 @@ async fn owner_approval_records_unblock_only_after_verified_undo() -> anyhow::Re
             .to_state,
         lattice_domain::PresenceState::Blocked
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn committed_identity_none_clears_stale_automatic_deadline_evidence() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let coordinator = PolicyCoordinator::with_actuator(repo.clone(), None, FakeActuator::default());
+    repo.enroll(device).await?;
+    repo.set_identification(
+        device,
+        lattice_domain::Identification::Automatic {
+            confidence_basis_points: 9_000,
+            evidence_families: vec![EvidenceFamily::LinkLayer, EvidenceFamily::Naming],
+        },
+    )
+    .await?;
+    let decision = coordinator
+        .enroll_identification_and_evaluate(device, None, at(108))
+        .await?;
+    assert_eq!(
+        repo.load(device).await?.unwrap().identification,
+        lattice_domain::Identification::Unknown
+    );
+    assert_eq!(decision.requested_action, RequestedAction::Quarantine);
+    Ok(())
+}
+
+#[tokio::test]
+async fn later_discovery_presence_cannot_supersede_verified_policy_block() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let coordinator = PolicyCoordinator::with_actuator_and_state(
+        repo,
+        None,
+        FakeActuator::default(),
+        M2StateRepository::new(pool.clone()),
+    );
+    coordinator.enroll_and_evaluate(device, at(108)).await?;
+    sqlx::query("INSERT INTO presence_transitions(transition_id,device_id,from_state,to_state,occurred_at,reason,trigger_source,trigger_kind,evidence_observed_at,evidence_valid_until,trigger_arrival_at,correction_of) VALUES(1,?,'unknown','online',?,'discovery','sensor','traffic',?,NULL,?,NULL)")
+        .bind(device.to_string()).bind(at(109).to_rfc3339()).bind(at(109).to_rfc3339()).bind(at(109).to_rfc3339()).execute(&pool).await?;
+    assert_eq!(
+        M2StateRepository::new(pool)
+            .list_device_snapshots(8, None)
+            .await?[0]
+            .presence
+            .as_ref()
+            .unwrap()
+            .to_state,
+        lattice_domain::PresenceState::Blocked
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn manual_required_enforcement_retries_on_a_bounded_schedule_not_each_sweep()
+-> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let coordinator = PolicyCoordinator::with_actuator(
+        repo,
+        Some(EventBus::new(8, 8)),
+        CountingOutcomeActuator(attempts.clone(), EnforcementResult::ManualRequired),
+    );
+    coordinator.enroll_and_evaluate(device, at(108)).await?;
+    coordinator.sweep(at(108)).await?;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    coordinator.sweep(at(109)).await?;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
     Ok(())
 }
