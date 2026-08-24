@@ -51,6 +51,9 @@ impl<T: Transport> W6PolicyActuator<T> {
             durable: None,
         }
     }
+    /// Injectable owner-authorized runtime path. The service binary deliberately
+    /// stays on `ManualRequiredActuator` until W1 supplies a concrete transport;
+    /// this constructor accepts only an already configured, trusted W6 connector.
     pub fn with_sqlite(connector: Connector<T>, pool: sqlx::SqlitePool) -> Self {
         Self {
             connector: Mutex::new(connector),
@@ -79,17 +82,17 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
             }
             Err(_) => return EnforcementResult::ManualRequired,
         };
-        if let Some(durable) = &self.durable {
-            if durable.save(_device, &prepared.previous).await.is_err() {
-                return EnforcementResult::Failed;
-            }
+        if let Some(durable) = &self.durable
+            && durable.save(_device, &prepared.previous).await.is_err()
+        {
+            return EnforcementResult::Failed;
         }
         match connector.apply_prepared(prepared).await {
             Ok(report) if report.verification == Verification::Verified => {
-                if self.durable.is_none() {
-                    if let Some(previous) = report.previous {
-                        self.previous.lock().await.insert(_device, previous);
-                    }
+                if self.durable.is_none()
+                    && let Some(previous) = report.previous
+                {
+                    self.previous.lock().await.insert(_device, previous);
                 }
                 EnforcementResult::Verified
             }
