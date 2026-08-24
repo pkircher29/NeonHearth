@@ -9,6 +9,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 lattice-camera = { path = "../lattice-camera" }
+lattice-advisory = { path = "../lattice-advisory" }
 futures-util.workspace = true
 getrandom.workspace = true
 chrono.workspace = true

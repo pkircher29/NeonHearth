@@ -5,6 +5,10 @@ use axum::{
     http::StatusCode,
 };
 use chrono::{DateTime, Utc};
+use lattice_advisory::{
+    AdvisorySource, Confidence, Exploitability, Exposure, Freshness, MatchLabel, Remediation,
+    Severity, SourceTrust,
+};
 use lattice_domain::{Coverage, DeviceId, EvidenceFamily, OwnerDecision, PresenceState};
 use lattice_store::{PendingDecision, PolicyRepository, StoredDeviceSnapshot};
 use serde::Deserialize;
@@ -84,6 +88,204 @@ pub struct CameraInventoryProjection {
     pub capabilities: Vec<String>,
     #[schema(pattern = "^(healthy|degraded)$")]
     pub health: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct AdvisoryList {
+    #[schema(max_items = 128)]
+    pub matches: Vec<AdvisoryProjection>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct AdvisoryProjection {
+    #[schema(max_length = 36)]
+    pub advisory_id: String,
+    #[schema(max_length = 32)]
+    pub source: String,
+    #[schema(max_length = 512)]
+    pub source_id: String,
+    #[schema(max_length = 64)]
+    pub provenance_sha256: String,
+    #[schema(max_length = 512)]
+    pub source_url: String,
+    #[schema(max_length = 512)]
+    pub title: String,
+    #[schema(max_length = 32)]
+    pub freshness: String,
+    pub source_trust: String,
+    pub retrieved_at: DateTime<Utc>,
+    pub cache_expires_at: DateTime<Utc>,
+    pub label: String,
+    #[schema(max_items = 8)]
+    pub matched_fields: Vec<String>,
+    #[schema(max_length = 512)]
+    pub explanation: String,
+    pub confidence: String,
+    pub risk: AdvisoryRisk,
+}
+#[derive(Serialize, ToSchema)]
+pub struct AdvisoryRisk {
+    pub severity: String,
+    pub exploitability: String,
+    pub exposure: String,
+    pub confidence: String,
+    pub remediation: String,
+}
+fn advisory_source(v: AdvisorySource) -> String {
+    match v {
+        AdvisorySource::Nvd => "nvd",
+        AdvisorySource::CisaKev => "cisa_kev",
+        AdvisorySource::Vendor => "vendor",
+    }
+    .into()
+}
+fn freshness_name(v: Freshness) -> String {
+    match v {
+        Freshness::Fresh => "fresh",
+        Freshness::Stale => "stale",
+        Freshness::FutureDated => "future_dated",
+    }
+    .into()
+}
+fn source_trust_name(v: SourceTrust) -> String {
+    match v {
+        SourceTrust::OfficialApi => "official_api",
+        SourceTrust::VerifiedSignature => "verified_signature",
+        SourceTrust::RegisteredHttps => "registered_https",
+        SourceTrust::Invalid => "invalid",
+    }
+    .into()
+}
+fn match_label(v: MatchLabel) -> String {
+    match v {
+        MatchLabel::Exact => "exact",
+        MatchLabel::Possible => "possible",
+        MatchLabel::Contradicted => "contradicted",
+        MatchLabel::Unknown => "unknown",
+    }
+    .into()
+}
+fn confidence_name(v: Confidence) -> String {
+    match v {
+        Confidence::Low => "low",
+        Confidence::Medium => "medium",
+        Confidence::High => "high",
+    }
+    .into()
+}
+fn severity_name(v: Severity) -> String {
+    match v {
+        Severity::None => "none",
+        Severity::Low => "low",
+        Severity::Medium => "medium",
+        Severity::High => "high",
+        Severity::Critical => "critical",
+        Severity::Unknown => "unknown",
+    }
+    .into()
+}
+fn exploitability_name(v: Exploitability) -> String {
+    match v {
+        Exploitability::None => "none",
+        Exploitability::ProofOfConcept => "proof_of_concept",
+        Exploitability::ActiveKnownExploitation => "active_known_exploitation",
+        Exploitability::Unknown => "unknown",
+    }
+    .into()
+}
+fn exposure_name(v: Exposure) -> String {
+    match v {
+        Exposure::NotExposed => "not_exposed",
+        Exposure::PotentiallyExposed => "potentially_exposed",
+        Exposure::Exposed => "exposed",
+        Exposure::Unknown => "unknown",
+    }
+    .into()
+}
+fn remediation_name(v: Remediation) -> String {
+    match v {
+        Remediation::Upgrade => "upgrade",
+        Remediation::Mitigate => "mitigate",
+        Remediation::Monitor => "monitor",
+        Remediation::None => "none",
+        Remediation::Unknown => "unknown",
+    }
+    .into()
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisoryQuery {
+    pub limit: Option<usize>,
+}
+
+#[utoipa::path(get, path = "/api/v1/devices/{device_id}/advisories", params(("device_id" = String, Path, format = Uuid), ("limit" = Option<usize>, Query, minimum = 1, maximum = 128)), responses((status = 200, body = AdvisoryList), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
+pub async fn device_advisories(
+    _: Authorized,
+    State(state): State<AppState>,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    query: Result<Query<AdvisoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<AdvisoryList>, StatusCode> {
+    let raw_device_id = device_id.clone();
+    let device_id =
+        lattice_domain::DeviceId::parse(&device_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if raw_device_id != device_id.to_string() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let Query(query) = query.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let limit = query.limit.unwrap_or(128);
+    if !(1..=128).contains(&limit) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let exists: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM devices WHERE device_id=?")
+            .bind(device_id.to_string())
+            .fetch_optional(state.state_repository().pool())
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if exists.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let repo = lattice_store::AdvisoryRepository::new(state.state_repository().pool().clone());
+    let rows = repo
+        .list_device_advisories(device_id, Utc::now())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let matches = rows
+        .into_iter()
+        .take(limit)
+        .map(|row| {
+            let input = row.advisory.input();
+            AdvisoryProjection {
+                advisory_id: row.advisory_id.to_string(),
+                source: advisory_source(input.source),
+                source_id: input.source_id.clone(),
+                provenance_sha256: row.advisory.provenance_sha256().to_owned(),
+                source_url: input.source_url.clone(),
+                title: input.title.clone(),
+                freshness: freshness_name(row.freshness),
+                source_trust: source_trust_name(input.source_trust),
+                retrieved_at: input.retrieved_at,
+                cache_expires_at: input.cache_expires_at,
+                label: match_label(row.matching.label()),
+                matched_fields: row
+                    .matching
+                    .matched_fields()
+                    .iter()
+                    .map(|f| format!("{:?}", f).to_lowercase())
+                    .collect(),
+                explanation: row.matching.explanation().to_owned(),
+                confidence: confidence_name(row.matching.confidence()),
+                risk: AdvisoryRisk {
+                    severity: severity_name(row.risk.severity),
+                    exploitability: exploitability_name(row.risk.exploitability),
+                    exposure: exposure_name(row.risk.exposure),
+                    confidence: confidence_name(row.risk.confidence),
+                    remediation: remediation_name(row.risk.remediation),
+                },
+            }
+        })
+        .collect();
+    Ok(Json(AdvisoryList { matches }))
 }
 
 pub struct BoundedCapability;
@@ -634,7 +836,7 @@ pub async fn event_ticket(
     }))
 }
 #[derive(OpenApi)]
-#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraStreamProjection, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse, BinaryMedia)), modifiers(&SecurityAddon))]
+#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory, device_advisories, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraStreamProjection, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse, BinaryMedia, AdvisoryList, AdvisoryProjection, AdvisoryRisk)), modifiers(&SecurityAddon))]
 pub struct ApiDoc;
 struct SecurityAddon;
 impl Modify for SecurityAddon {

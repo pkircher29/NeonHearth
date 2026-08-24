@@ -27,6 +27,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/cameras/{id}", get(api::camera))
         .route("/api/v1/cameras/{id}/health", get(api::camera_health))
         .route("/api/v1/cameras/{id}/inventory", get(api::camera_inventory))
+        .route(
+            "/api/v1/devices/{device_id}/advisories",
+            get(api::device_advisories),
+        )
         .route("/api/v1/policy/action", post(api::policy_action))
         .route("/api/v1/events/ticket", post(api::event_ticket))
         .route("/api/v1/events", get(events_socket))

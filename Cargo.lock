@@ -1679,6 +1679,7 @@ dependencies = [
  "getrandom 0.3.4",
  "http-body-util",
  "keyring",
+ "lattice-advisory",
  "lattice-camera",
  "lattice-domain",
  "lattice-event-bus",
