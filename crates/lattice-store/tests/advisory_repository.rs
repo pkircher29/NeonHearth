@@ -213,7 +213,7 @@ async fn match_requires_an_existing_device_and_fetch_metadata_never_stores_bodie
         .record_feed_fetch(
             &FeedFetch::new(
                 AdvisorySource::Nvd,
-                "https://example.test/feed".into(),
+                "https://services.nvd.nist.gov/rest/json/cves/2.0".into(),
                 at(102),
                 at(200),
             )?

@@ -98,8 +98,26 @@ impl FeedFetch {
         Ok(self)
     }
     fn validate(&self) -> Result<(), AdvisoryStoreError> {
+        let parsed = url::Url::parse(&self.source_url).map_err(|_| AdvisoryStoreError::Invalid)?;
+        let official = match self.source {
+            AdvisorySource::Nvd => {
+                parsed.host_str() == Some("services.nvd.nist.gov")
+                    && parsed.path() == "/rest/json/cves/2.0"
+            }
+            AdvisorySource::CisaKev => {
+                parsed.host_str() == Some("www.cisa.gov")
+                    && parsed.path()
+                        == "/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+            }
+            AdvisorySource::Vendor => true,
+        };
         if self.cache_expires_at < self.retrieved_at
-            || !self.source_url.starts_with("https://")
+            || parsed.scheme() != "https"
+            || parsed.username() != ""
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || parsed.host_str().is_none()
+            || !official
             || self.source_url.len() > 512
             || self.source_url.chars().any(char::is_control)
             || self
@@ -145,28 +163,20 @@ impl AdvisoryRepository {
         let input = value.input();
         let fields = Fields::from_input(input)?;
         let content = content_revision(input)?;
-        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        let existing: Option<String> = sqlx::query_scalar("SELECT advisory_id FROM advisories WHERE source=? AND source_id=? AND content_revision_sha256=?")
-            .bind(source(input.source)).bind(&input.source_id).bind(&content).fetch_optional(&mut *tx).await.map_err(map_sqlx)?;
-        let id = if let Some(raw) = existing {
-            decode_id(&raw)?
-        } else {
-            AdvisoryId::new()
-        };
-        sqlx::query("INSERT INTO advisories(advisory_id,source,source_id,content_revision_sha256,provenance_sha256,source_url,title,vendor,model,firmware_kind,firmware_min,firmware_max,published_at,modified_at,retrieved_at,cache_expires_at,provenance_freshness,effective_freshness,source_trust,severity,exploitability,exposure,confidence,remediation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,source_id,content_revision_sha256) DO UPDATE SET provenance_sha256=excluded.provenance_sha256,retrieved_at=excluded.retrieved_at,cache_expires_at=excluded.cache_expires_at,provenance_freshness=excluded.provenance_freshness,effective_freshness=excluded.effective_freshness,source_trust=excluded.source_trust")
-            .bind(id.to_string()).bind(source(input.source)).bind(&input.source_id).bind(content).bind(value.provenance_sha256())
+        let candidate = AdvisoryId::new();
+        let actual: String = sqlx::query_scalar("INSERT INTO advisories(advisory_id,source,source_id,content_revision_sha256,provenance_sha256,source_url,title,vendor,model,firmware_kind,firmware_min,firmware_max,published_at,modified_at,retrieved_at,cache_expires_at,provenance_freshness,effective_freshness,source_trust,severity,exploitability,exposure,confidence,remediation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,source_id,content_revision_sha256) DO UPDATE SET provenance_sha256=excluded.provenance_sha256,retrieved_at=excluded.retrieved_at,cache_expires_at=excluded.cache_expires_at,provenance_freshness=excluded.provenance_freshness,effective_freshness=excluded.effective_freshness,source_trust=excluded.source_trust RETURNING advisory_id")
+            .bind(candidate.to_string()).bind(source(input.source)).bind(&input.source_id).bind(content).bind(value.provenance_sha256())
             .bind(&input.source_url).bind(&input.title).bind(&input.vendor).bind(&input.model).bind(fields.kind).bind(fields.min).bind(fields.max)
             .bind(time(input.published_at)?).bind(time(input.modified_at)?).bind(time(input.retrieved_at)?).bind(time(input.cache_expires_at)?)
             .bind(freshness(input.freshness)).bind(freshness(input.freshness)).bind(trust(input.source_trust)).bind(severity(input.severity)).bind(exploitability(input.exploitability)).bind(exposure(input.exposure)).bind(confidence(input.confidence)).bind(remediation(input.remediation))
-            .execute(&mut *tx).await.map_err(map_sqlx)?;
-        tx.commit().await.map_err(map_sqlx)?;
-        Ok(id)
+            .fetch_one(&self.pool).await.map_err(map_sqlx)?;
+        decode_id(&actual)
     }
     pub async fn record_feed_fetch(&self, value: &FeedFetch) -> Result<(), AdvisoryStoreError> {
         value.validate()?;
         sqlx::query("INSERT INTO advisory_source_fetches(fetch_id,source,source_url,http_status,retrieved_at,cache_expires_at,effective_freshness,etag,last_modified,failure_class) VALUES(?,?,?,?,?,?,?,?,?,?)")
             .bind(Uuid::now_v7().to_string()).bind(source(value.source)).bind(&value.source_url).bind(value.http_status.map(i64::from)).bind(time(value.retrieved_at)?).bind(time(value.cache_expires_at)?)
-            .bind(freshness(Freshness::Fresh)).bind(&value.etag).bind(&value.last_modified).bind(value.failure_class.map(failure))
+            .bind(freshness(if value.failure_class.is_some() || value.http_status.is_some_and(|status| status >= 400) { Freshness::Stale } else { Freshness::Fresh })).bind(&value.etag).bind(&value.last_modified).bind(value.failure_class.map(failure))
             .execute(&self.pool).await.map_err(map_sqlx)?;
         Ok(())
     }
@@ -194,7 +204,7 @@ impl AdvisoryRepository {
         now: DateTime<Utc>,
     ) -> Result<Vec<DeviceAdvisory>, AdvisoryStoreError> {
         let now = time(now)?;
-        let rows: Vec<SqliteRow> = sqlx::query("SELECT a.advisory_id,a.source,a.source_id,a.provenance_sha256,a.source_url,a.title,a.vendor,a.model,a.firmware_kind,a.firmware_min,a.firmware_max,a.published_at,a.modified_at,a.retrieved_at,a.cache_expires_at,a.provenance_freshness,a.source_trust,a.severity,a.exploitability,a.exposure,a.confidence,a.remediation,m.match_label,m.matched_fields_json,m.explanation,m.match_confidence,m.severity,m.exploitability,m.exposure,m.confidence,m.remediation FROM advisory_matches m JOIN advisories a ON a.advisory_id=m.advisory_id WHERE m.device_id=? ORDER BY a.modified_at DESC,a.source,a.source_id,a.advisory_id LIMIT ?")
+        let rows: Vec<SqliteRow> = sqlx::query("SELECT a.advisory_id,a.source,a.source_id,a.provenance_sha256,a.source_url,a.title,a.vendor,a.model,a.firmware_kind,a.firmware_min,a.firmware_max,a.published_at,a.modified_at,a.retrieved_at,a.cache_expires_at,a.provenance_freshness,a.source_trust,a.severity,a.exploitability,a.exposure,a.confidence,a.remediation,m.match_label,m.matched_fields_json,m.explanation,m.match_confidence,m.severity,m.exploitability,m.exposure,m.confidence,m.remediation,a.content_revision_sha256 FROM advisory_matches m JOIN advisories a ON a.advisory_id=m.advisory_id WHERE m.device_id=? ORDER BY a.modified_at DESC,a.source,a.source_id,a.advisory_id LIMIT ?")
             .bind(device_id.to_string()).bind(i64::try_from(MAX_ROWS + 1).map_err(|_| AdvisoryStoreError::Capacity)?).fetch_all(&self.pool).await.map_err(map_sqlx)?;
         if rows.len() > MAX_ROWS {
             return Err(AdvisoryStoreError::Corrupt);
@@ -249,6 +259,7 @@ fn decode_row(r: SqliteRow, now: &str) -> Result<DeviceAdvisory, AdvisoryStoreEr
     let exposure_v: String = v!(28);
     let confidence_v: String = v!(29);
     let remediation_v: String = v!(30);
+    let stored_content: String = v!(31);
     let input = AdvisoryInput {
         source: decode_source(&src)?,
         source_id,
@@ -271,6 +282,9 @@ fn decode_row(r: SqliteRow, now: &str) -> Result<DeviceAdvisory, AdvisoryStoreEr
     };
     let advisory = NormalizedAdvisory::new(input).map_err(|_| AdvisoryStoreError::Corrupt)?;
     if advisory.provenance_sha256() != hash {
+        return Err(AdvisoryStoreError::Corrupt);
+    }
+    if content_revision(advisory.input())? != stored_content {
         return Err(AdvisoryStoreError::Corrupt);
     }
     let matching = AdvisoryMatch::from_persisted(
