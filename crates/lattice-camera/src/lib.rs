@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
@@ -31,7 +31,7 @@ pub enum CameraKind {
     Http,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct Confidence(f32);
 
 impl Confidence {
@@ -48,12 +48,37 @@ impl Confidence {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+impl TryFrom<f32> for Confidence {
+    type Error = CameraError;
+    fn try_from(value: f32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<Confidence> for f32 {
+    fn from(value: Confidence) -> Self {
+        value.0
+    }
+}
+
+impl Serialize for Confidence {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f32(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Confidence {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::try_from(f32::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct EvidenceInput {
-    pub kind: CameraKind,
-    pub source: String,
-    pub fact: String,
-    pub confidence: Confidence,
+    kind: CameraKind,
+    source: String,
+    fact: String,
+    confidence: Confidence,
 }
 
 impl EvidenceInput {
@@ -65,10 +90,10 @@ impl EvidenceInput {
     ) -> Result<Self, CameraError> {
         let source = source.into();
         let fact = fact.into();
-        if source.is_empty() || source.len() > 128 {
+        if source.trim().is_empty() || source.len() > 128 {
             return Err(CameraError::InvalidEvidence("source"));
         }
-        if fact.is_empty() || fact.len() > 256 {
+        if fact.trim().is_empty() || fact.len() > 256 {
             return Err(CameraError::InvalidEvidence("fact"));
         }
         Ok(Self {
@@ -77,6 +102,47 @@ impl EvidenceInput {
             fact,
             confidence,
         })
+    }
+
+    pub const fn kind(&self) -> CameraKind {
+        self.kind
+    }
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+    pub fn fact(&self) -> &str {
+        &self.fact
+    }
+    pub const fn confidence(&self) -> Confidence {
+        self.confidence
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct EvidenceInputWire {
+    kind: CameraKind,
+    source: String,
+    fact: String,
+    confidence: Confidence,
+}
+
+impl Serialize for EvidenceInput {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        EvidenceInputWire {
+            kind: self.kind,
+            source: self.source.clone(),
+            fact: self.fact.clone(),
+            confidence: self.confidence,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EvidenceInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = EvidenceInputWire::deserialize(deserializer)?;
+        Self::new(wire.kind, wire.source, wire.fact, wire.confidence)
+            .map_err(serde::de::Error::custom)
     }
 }
 
