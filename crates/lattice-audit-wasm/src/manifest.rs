@@ -107,6 +107,8 @@ pub enum AuditError {
     InputLimitExceeded,
     #[error("request limit exceeded")]
     RequestLimitExceeded,
+    #[error("byte budget exhausted")]
+    BudgetExhausted,
     #[error("audit host rejected exchange")]
     HostRejected,
     #[error("audit execution cancelled")]

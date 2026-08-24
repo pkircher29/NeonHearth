@@ -12,6 +12,13 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExchangeProtocol {
+    Tcp,
+    Http,
+    TlsMetadata,
+}
+
 #[derive(Debug, Error)]
 pub enum BrokerError {
     #[error("target authorization failed")]
@@ -55,7 +62,10 @@ impl Budget {
         }
     }
     fn reserve(&self, request_bytes: usize, response_cap: usize) -> Result<(), BrokerError> {
-        let mut b = self.inner.lock().expect("budget mutex");
+        let mut b = self
+            .inner
+            .lock()
+            .map_err(|_| BrokerError::BudgetExhausted)?;
         let total = (request_bytes as u64)
             .checked_add(response_cap as u64)
             .ok_or(BrokerError::BudgetExhausted)?;
@@ -65,27 +75,63 @@ impl Budget {
         {
             return Err(BrokerError::BudgetExhausted);
         }
-        b.requests += 1;
-        b.bytes += total;
+        b.requests = b
+            .requests
+            .checked_add(1)
+            .ok_or(BrokerError::BudgetExhausted)?;
+        b.bytes = b
+            .bytes
+            .checked_add(total)
+            .ok_or(BrokerError::BudgetExhausted)?;
         Ok(())
     }
     fn refund(&self, response_cap: usize, actual: usize) {
-        let mut b = self.inner.lock().expect("budget mutex");
+        let Ok(mut b) = self.inner.lock() else { return };
         b.bytes = b.bytes.saturating_sub((response_cap - actual) as u64)
     }
     fn release(&self, request_bytes: usize, response_cap: usize) {
-        let mut b = self.inner.lock().expect("budget mutex");
+        let Ok(mut b) = self.inner.lock() else { return };
         b.requests = b.requests.saturating_sub(1);
         b.bytes = b
             .bytes
             .saturating_sub((request_bytes + response_cap) as u64);
     }
+    fn charge_bytes(&self, bytes: usize) -> Result<(), BrokerError> {
+        let mut b = self
+            .inner
+            .lock()
+            .map_err(|_| BrokerError::BudgetExhausted)?;
+        let bytes = u64::try_from(bytes).map_err(|_| BrokerError::BudgetExhausted)?;
+        if bytes > b.max_bytes.saturating_sub(b.bytes) {
+            return Err(BrokerError::BudgetExhausted);
+        }
+        b.bytes = b
+            .bytes
+            .checked_add(bytes)
+            .ok_or(BrokerError::BudgetExhausted)?;
+        Ok(())
+    }
 }
 pub struct ExchangeRequest {
     pub payload: Vec<u8>,
+    pub protocol: ExchangeProtocol,
+    pub response_limit: usize,
+    pub deadline: Instant,
+    pub cancellation: CancellationToken,
 }
 pub struct ExchangeResponse {
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
+}
+impl ExchangeResponse {
+    pub fn try_new(bytes: Vec<u8>, response_limit: usize) -> Result<Self, BrokerError> {
+        if bytes.len() > response_limit {
+            return Err(BrokerError::ExchangeFailed);
+        }
+        Ok(Self { bytes })
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 #[async_trait]
 pub trait TargetBoundExchange: Send + Sync {
@@ -102,7 +148,7 @@ pub struct BrokerRequest {
     pub interface: u32,
     pub port: u16,
     pub capability: Capability,
-    pub approval_id: Option<Uuid>,
+    pub approval_id: Uuid,
     pub limits: Limits,
     pub cancellation: CancellationToken,
 }
@@ -125,7 +171,7 @@ impl Broker {
         }
     }
     pub async fn execute(&self, request: BrokerRequest) -> Result<BrokerResult, BrokerError> {
-        if request.approval_id.is_none() {
+        if request.approval_id.is_nil() {
             return Err(BrokerError::MissingApproval);
         }
         if capability_port(&request.capability) != request.port
@@ -137,24 +183,35 @@ impl Broker {
         {
             return Err(BrokerError::CapabilityDenied);
         }
+        let deadline = Instant::now() + request.limits.max_time;
         let target = self
             .authorizer
             .authorize(request.target, request.interface, request.port)?;
         let limits = intersect_limits(request.module.limits(), &request.limits);
-        if request.input.len() as u64 > limits.max_bytes {
+        if limits.max_bytes == 0
+            || limits.max_requests == 0
+            || limits.max_time.is_zero()
+            || limits.max_fuel == 0
+            || limits.max_memory_pages == 0
+        {
             return Err(BrokerError::BudgetExhausted);
         }
-        let deadline = Instant::now() + limits.max_time;
+        let deadline = deadline.min(Instant::now() + limits.max_time);
         if request.cancellation.is_cancelled() {
             return Err(BrokerError::Cancelled);
         }
-        let sandbox = Sandbox::new(request.module).await?;
+        let sandbox = Sandbox::new_with_limits(request.module, &limits).await?;
+        if Instant::now() >= deadline {
+            return Err(BrokerError::DeadlineExceeded);
+        }
+        let budget = Budget::new(&limits, deadline);
+        budget.charge_bytes(request.input.len())?;
         let host = BrokerHost {
             target,
             capability: request.capability,
             authorizer: Arc::clone(&self.authorizer),
             exchange: Arc::clone(&self.exchange),
-            budget: Budget::new(&limits, deadline),
+            budget,
             deadline,
             cancellation: request.cancellation.clone(),
         };
@@ -162,6 +219,7 @@ impl Broker {
         if request.cancellation.is_cancelled() {
             return Err(BrokerError::Cancelled);
         }
+        host.budget.charge_bytes(output.output.len())?;
         Ok(BrokerResult {
             target: request.target,
             bytes: output.output,
@@ -173,6 +231,13 @@ fn capability_port(capability: &Capability) -> u16 {
         Capability::TcpExchange { port }
         | Capability::HttpExchange { port }
         | Capability::TlsMetadata { port } => *port,
+    }
+}
+fn protocol(capability: &Capability) -> ExchangeProtocol {
+    match capability {
+        Capability::TcpExchange { .. } => ExchangeProtocol::Tcp,
+        Capability::HttpExchange { .. } => ExchangeProtocol::Http,
+        Capability::TlsMetadata { .. } => ExchangeProtocol::TlsMetadata,
     }
 }
 fn intersect_limits(a: &Limits, b: &Limits) -> Limits {
@@ -203,7 +268,7 @@ impl AuditHost for BrokerHost {
         request: Vec<u8>,
         response_cap: usize,
     ) -> Result<Vec<u8>, AuditHostError> {
-        let _selected_capability = &self.capability;
+        let selected_protocol = protocol(&self.capability);
         if self.cancellation.is_cancelled() {
             return Err(AuditHostError::Cancelled);
         }
@@ -231,9 +296,16 @@ impl AuditHost for BrokerHost {
             self.budget.release(request.len(), response_cap);
             return Err(AuditHostError::Denied);
         }
-        let call = self
-            .exchange
-            .exchange(&self.target, ExchangeRequest { payload: request });
+        let call = self.exchange.exchange(
+            &self.target,
+            ExchangeRequest {
+                payload: request,
+                protocol: selected_protocol,
+                response_limit: response_cap,
+                deadline: self.deadline,
+                cancellation: self.cancellation.clone(),
+            },
+        );
         let response = tokio::select! {_=self.cancellation.cancelled()=>return Err(AuditHostError::Cancelled),r=tokio::time::timeout_at(tokio::time::Instant::from_std(self.deadline),call)=>match r{Ok(Ok(v))=>v,Ok(Err(_))=>return Err(AuditHostError::ExchangeFailed),Err(_)=>return Err(AuditHostError::DeadlineExceeded)}};
         if response.bytes.len() > response_cap {
             return Err(AuditHostError::ExchangeFailed);

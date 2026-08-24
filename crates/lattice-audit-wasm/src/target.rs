@@ -29,7 +29,7 @@ impl AuthorizedTarget {
         }
         let valid = match target {
             IpAddr::V4(ip) => {
-                ip.is_private()
+                (ip.is_private() || ip.is_link_local())
                     && !ip.is_loopback()
                     && !ip.is_multicast()
                     && !ip.is_broadcast()

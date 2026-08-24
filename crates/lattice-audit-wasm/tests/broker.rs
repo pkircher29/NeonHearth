@@ -69,9 +69,9 @@ impl TargetBoundExchange for Exchange {
     ) -> Result<ExchangeResponse, BrokerError> {
         assert_eq!(authorized.target(), target());
         assert_eq!(request.payload, b"ping");
-        Ok(ExchangeResponse {
-            bytes: b"pong".to_vec(),
-        })
+        assert_eq!(request.protocol, ExchangeProtocol::Tcp);
+        assert_eq!(request.response_limit, 4);
+        ExchangeResponse::try_new(b"pong".to_vec(), request.response_limit)
     }
 }
 fn request(port: u16) -> BrokerRequest {
@@ -82,7 +82,7 @@ fn request(port: u16) -> BrokerRequest {
         interface: 7,
         port,
         capability: Capability::TcpExchange { port },
-        approval_id: Some(Uuid::new_v4()),
+        approval_id: Uuid::new_v4(),
         limits: limits(),
         cancellation: CancellationToken::new(),
     }
@@ -104,5 +104,15 @@ async fn broker_rejects_capability_port_mismatch_before_exchange() {
     assert!(matches!(
         broker.execute(r).await,
         Err(BrokerError::CapabilityDenied)
+    ));
+}
+#[tokio::test]
+async fn broker_rejects_nil_approval() {
+    let broker = Broker::new(Arc::new(Auth(AtomicUsize::new(0))), Arc::new(Exchange));
+    let mut r = request(80);
+    r.approval_id = Uuid::nil();
+    assert!(matches!(
+        broker.execute(r).await,
+        Err(BrokerError::MissingApproval)
     ));
 }

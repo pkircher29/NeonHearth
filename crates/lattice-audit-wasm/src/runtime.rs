@@ -61,6 +61,7 @@ enum ExecutionFailure {
     Memory,
     Table,
     Request,
+    Bytes,
     InvalidAbi,
     Host(AuditHostError),
 }
@@ -70,6 +71,7 @@ struct StoreState<'a, H: AuditHost> {
     limiter: LimitsState,
     requests: u32,
     max_requests: u32,
+    max_bytes: u64,
     failure: Option<ExecutionFailure>,
 }
 
@@ -159,11 +161,18 @@ impl Drop for EpochTicker {
 
 impl Sandbox {
     pub async fn new(verified: VerifiedManifest) -> Result<Self, AuditError> {
+        let limits = verified.limits().clone();
+        Self::new_with_limits(verified, &limits).await
+    }
+    pub async fn new_with_limits(
+        verified: VerifiedManifest,
+        limits: &Limits,
+    ) -> Result<Self, AuditError> {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.async_support(true);
         config.epoch_interruption(true);
-        validate_static_limits(verified.wasm(), verified.limits())?;
+        validate_static_limits(verified.wasm(), limits)?;
         let engine = Engine::new(&config).map_err(|_| AuditError::InvalidModule)?;
         let module =
             Module::new(&engine, verified.wasm()).map_err(|_| AuditError::InvalidModule)?;
@@ -171,7 +180,7 @@ impl Sandbox {
         Ok(Self {
             engine,
             module,
-            limits: verified.limits().clone(),
+            limits: limits.clone(),
             execution: tokio::sync::Mutex::new(()),
         })
     }
@@ -213,6 +222,7 @@ impl Sandbox {
                 },
                 requests: 0,
                 max_requests: self.limits.max_requests,
+                max_bytes: self.limits.max_bytes,
                 failure: None,
             },
         );
@@ -279,6 +289,21 @@ impl Sandbox {
                         if end(req_ptr, req_len).is_none() || end(out_ptr, out_cap).is_none() {
                             caller.data_mut().failure = Some(ExecutionFailure::InvalidAbi);
                             return Err(anyhow::anyhow!("exchange bounds"));
+                        }
+                        if req_len
+                            .checked_add(out_cap)
+                            .is_none_or(|n| n as u64 > caller.data().max_bytes)
+                        {
+                            caller.data_mut().failure = Some(ExecutionFailure::Bytes);
+                            return Err(anyhow::anyhow!("exchange byte budget"));
+                        }
+                        {
+                            let data = caller.data_mut();
+                            if data.requests >= data.max_requests {
+                                data.failure = Some(ExecutionFailure::Request);
+                                return Err(anyhow::anyhow!("request limit"));
+                            }
+                            data.requests += 1;
                         }
                         let request = memory.data(&caller)[req_ptr..req_ptr + req_len].to_vec();
                         let host = caller.data().host;
@@ -459,6 +484,7 @@ fn map_error<H: AuditHost>(store: &Store<StoreState<'_, H>>, error: &anyhow::Err
         Some(ExecutionFailure::Memory) => AuditError::MemoryLimitExceeded,
         Some(ExecutionFailure::Table) => AuditError::TableLimitExceeded,
         Some(ExecutionFailure::Request) => AuditError::RequestLimitExceeded,
+        Some(ExecutionFailure::Bytes) => AuditError::BudgetExhausted,
         Some(ExecutionFailure::InvalidAbi) => AuditError::InvalidAbi,
         Some(ExecutionFailure::Host(AuditHostError::BudgetExhausted)) => {
             AuditError::RequestLimitExceeded
