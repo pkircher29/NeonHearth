@@ -1295,6 +1295,7 @@ dependencies = [
  "fs2",
  "lattice-domain",
  "lattice-sensor",
+ "lattice-w6",
  "serde",
  "serde_json",
  "sha2 0.10.9",
