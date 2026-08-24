@@ -231,6 +231,38 @@ describe('createApiClient', () => {
     expect(onMessage).toHaveBeenCalledWith(message);
   });
 
+  it('accepts a complete policy lifecycle event and rejects unsafe policy projections', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ticket: 'ticket', expires_in_seconds: 60 }), { status: 200 }));
+    class FakeWebSocket { onopen = null; onclose = null; onerror = null; onmessage: ((event: MessageEvent<string>) => void) | null = null; constructor(_: string) {} }
+    const onMessage = vi.fn();
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl, WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket });
+    const socket = await client.openEvents(0, onMessage, vi.fn()) as unknown as FakeWebSocket;
+    const policy = {
+      device_id: validDevice.device_id,
+      policy_version: 1,
+      evaluation: {
+        policy_version: 1,
+        reason: 'pending_confirmation',
+        requested_action: 'none',
+        deadline: { kind: 'unknown48_hours', due_at: '2026-08-25T00:00:00Z' },
+        warning: 'hours24'
+      },
+      requested_action: 'none',
+      evidence_summary: 'identity=unknown;risk=none',
+      enforcement_result: 'not_requested',
+      undo_available: false
+    };
+    const event = (data: unknown) => ({ type: 'event', data: { sequence: 1, occurred_at: '2026-08-23T00:00:00Z', payload: { type: 'policy_changed', data } } });
+
+    socket.onmessage?.({ data: JSON.stringify(event(policy)) } as MessageEvent<string>);
+    socket.onmessage?.({ data: JSON.stringify(event({ ...policy, requested_action: 'invented_action' })) } as MessageEvent<string>);
+    socket.onmessage?.({ data: JSON.stringify(event({ ...policy, evaluation: { ...policy.evaluation, deadline: { kind: 'unknown48_hours', due_at: 'not-a-date' } } })) } as MessageEvent<string>);
+    socket.onmessage?.({ data: JSON.stringify(event({ ...policy, enforcement_result: 'success' })) } as MessageEvent<string>);
+
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(onMessage).toHaveBeenCalledWith(event(policy));
+  });
+
   it('requires the canonical correction_of key on presence events', async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ticket: 'ticket', expires_in_seconds: 60 }), { status: 200 }));
     class FakeWebSocket { onopen = null; onclose = null; onerror = null; onmessage: ((event: MessageEvent<string>) => void) | null = null; constructor(_: string) {} }

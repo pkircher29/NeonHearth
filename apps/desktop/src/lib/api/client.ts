@@ -1,4 +1,4 @@
-import type { Bandwidth, BandwidthFrame, DeviceSnapshot, Evidence, EventTicket, Health, Identity, Presence, ServerMessage, Snapshot } from './types';
+import type { Bandwidth, BandwidthFrame, DeviceSnapshot, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, Presence, ServerMessage, Snapshot } from './types';
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
@@ -48,6 +48,7 @@ function isServerMessage(value: unknown): value is ServerMessage {
   const payload = event.payload;
   if (payload.type === 'service_status') return isRecord(payload.data) && typeof payload.data.state === 'string' && typeof payload.data.detail === 'string';
   if (payload.type === 'bandwidth_frame') return isBandwidthFrame(payload.data);
+  if (payload.type === 'policy_changed') return isPolicyChanged(payload.data);
   return payload.type === 'presence_changed' && isRecord(payload.data)
     && isSequence(payload.data.transition_id)
     && isDeviceId(payload.data.device_id)
@@ -68,6 +69,11 @@ function isHealth(value: unknown): value is Health {
 const presenceStates = new Set(['online', 'quiet', 'offline', 'blocked', 'unknown']);
 const evidenceFamilies = new Set(['link_layer', 'addressing', 'naming', 'service', 'cryptographic', 'router_hint', 'owner']);
 const coverages = new Set(['complete', 'router-reported', 'local-only', 'estimated']);
+const policyReasons = new Set(['pending_confirmation', 'baseline_exempt', 'high_confidence_danger', 'unknown_deadline_expired', 'automatic_deadline_expired', 'owner_extension', 'owner_approved', 'owner_rejected', 'owner_quarantined', 'protected_device']);
+const requestedActions = new Set(['none', 'quarantine', 'permanent_ban', 'owner_attention']);
+const enforcementStatuses = new Set(['not_requested', 'verified', 'manual_required', 'failed']);
+const deadlineKinds = new Set(['unknown48_hours', 'automatic7_days']);
+const deadlineWarnings = new Set(['hours24', 'hours6', 'hour1']);
 const utcRfc3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const isDate = (value: unknown): value is string => {
   if (typeof value !== 'string' || !utcRfc3339.test(value)) return false;
@@ -109,6 +115,27 @@ function isBandwidthFrame(value: unknown): value is BandwidthFrame {
   return value.samples.every((sample) => isRecord(sample) && isDeviceId(sample.device_id) && isRecord(sample.delta)
     && isBytes(sample.delta.upload) && isBytes(sample.delta.download) && isBytes(sample.upload_bytes_per_second)
     && isBytes(sample.download_bytes_per_second) && typeof sample.coverage === 'string' && coverages.has(sample.coverage));
+}
+function isPolicyVersion(value: unknown): value is number {
+  return isSequence(value) && value <= 0xffff_ffff;
+}
+function isPolicyEvaluation(value: unknown): value is PolicyEvaluation {
+  if (!isRecord(value) || !isPolicyVersion(value.policy_version)
+    || typeof value.reason !== 'string' || !policyReasons.has(value.reason)
+    || typeof value.requested_action !== 'string' || !requestedActions.has(value.requested_action)
+    || !(value.warning === null || (typeof value.warning === 'string' && deadlineWarnings.has(value.warning)))) return false;
+  return value.deadline === null || (isRecord(value.deadline)
+    && typeof value.deadline.kind === 'string' && deadlineKinds.has(value.deadline.kind)
+    && isDate(value.deadline.due_at));
+}
+function isPolicyChanged(value: unknown): value is PolicyChanged {
+  return isRecord(value) && isDeviceId(value.device_id) && isPolicyVersion(value.policy_version)
+    && isPolicyEvaluation(value.evaluation) && value.policy_version === value.evaluation.policy_version
+    && typeof value.requested_action === 'string' && requestedActions.has(value.requested_action)
+    && value.requested_action === value.evaluation.requested_action
+    && typeof value.evidence_summary === 'string' && value.evidence_summary.length > 0 && value.evidence_summary.length <= 4096
+    && typeof value.enforcement_result === 'string' && enforcementStatuses.has(value.enforcement_result)
+    && typeof value.undo_available === 'boolean';
 }
 function isDeviceSnapshot(value: unknown): value is DeviceSnapshot {
   return isRecord(value) && isDeviceId(value.device_id) && isDate(value.first_seen_at) && isDate(value.last_seen_at)

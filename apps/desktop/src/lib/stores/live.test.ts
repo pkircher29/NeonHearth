@@ -35,6 +35,22 @@ const bandwidth = (sequence: number): EventEnvelope => ({
   occurred_at: '2026-08-23T00:00:00Z',
   payload: { type: 'bandwidth_frame', data: { interval_ms: 1000, observed_at: '2026-08-23T00:00:00Z', emitted_at: '2026-08-23T00:00:00Z', samples: [{ device_id: '0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b', delta: { upload: 1, download: 2 }, upload_bytes_per_second: 2_000_000, download_bytes_per_second: 1_000_000, coverage: 'complete' }] } }
 });
+const policy = (sequence: number): EventEnvelope => ({
+  sequence,
+  occurred_at: '2026-08-23T00:00:00Z',
+  payload: {
+    type: 'policy_changed',
+    data: {
+      device_id: '0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b',
+      policy_version: 1,
+      evaluation: { policy_version: 1, reason: 'unknown_deadline_expired', requested_action: 'quarantine', deadline: null, warning: null },
+      requested_action: 'quarantine',
+      evidence_summary: 'identity=unknown;risk=none',
+      enforcement_result: 'verified',
+      undo_available: true
+    }
+  }
+});
 
 describe('reduceLiveMessage', () => {
   it('starts with a complete empty dashboard state and exact bandwidth tiers', () => {
@@ -122,6 +138,17 @@ describe('reduceLiveMessage', () => {
     const result = reduceLiveMessage(initialLiveState, { type: 'event', data: bandwidth(1) });
 
     expect(result.protocolMix).toBeNull();
+  });
+
+  it('projects the latest policy state by device for the Guard view', () => {
+    const result = reduceLiveMessage(initialLiveState, { type: 'event', data: policy(1) });
+
+    expect(result.policies['0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b']).toMatchObject({
+      requested_action: 'quarantine',
+      enforcement_result: 'verified',
+      undo_available: true
+    });
+    expect(result.timeline).toHaveLength(1);
   });
 
   it('excludes devices without available bandwidth from top devices', () => {

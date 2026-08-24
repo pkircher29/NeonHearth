@@ -28,11 +28,36 @@ export interface ServiceStatus {
   detail: string;
 }
 
+export type PolicyReason = 'pending_confirmation' | 'baseline_exempt' | 'high_confidence_danger'
+  | 'unknown_deadline_expired' | 'automatic_deadline_expired' | 'owner_extension'
+  | 'owner_approved' | 'owner_rejected' | 'owner_quarantined' | 'protected_device';
+export type RequestedAction = 'none' | 'quarantine' | 'permanent_ban' | 'owner_attention';
+export type EnforcementStatus = 'not_requested' | 'verified' | 'manual_required' | 'failed';
+export type DeadlineWarning = 'hours24' | 'hours6' | 'hour1';
+export interface PolicyDeadline { kind: 'unknown48_hours' | 'automatic7_days'; due_at: string }
+export interface PolicyEvaluation {
+  policy_version: number;
+  reason: PolicyReason;
+  requested_action: RequestedAction;
+  deadline: PolicyDeadline | null;
+  warning: DeadlineWarning | null;
+}
+export interface PolicyChanged {
+  device_id: string;
+  policy_version: number;
+  evaluation: PolicyEvaluation;
+  requested_action: RequestedAction;
+  evidence_summary: string;
+  enforcement_result: EnforcementStatus;
+  undo_available: boolean;
+}
+
 // Bandwidth frames are emitted by the collector at a bounded cadence.
 export type EventPayload =
   | { type: 'presence_changed'; data: PresenceChanged }
   | { type: 'service_status'; data: ServiceStatus }
-  | { type: 'bandwidth_frame'; data: BandwidthFrame };
+  | { type: 'bandwidth_frame'; data: BandwidthFrame }
+  | { type: 'policy_changed'; data: PolicyChanged };
 
 export interface EventEnvelope {
   sequence: number;

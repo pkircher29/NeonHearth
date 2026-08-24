@@ -1,4 +1,4 @@
-import type { Coverage, DeviceSnapshot, EventEnvelope, ServerMessage, Snapshot } from '../api/types';
+import type { Coverage, DeviceSnapshot, PolicyChanged, ServerMessage, Snapshot } from '../api/types';
 
 export interface ThroughputPoint { at: string; upload: number; download: number }
 export type CoverageSummary = Coverage | 'unavailable' | 'mixed';
@@ -15,9 +15,10 @@ export interface LiveState {
   coverage: CoverageSummary;
   aggregate: { upload: number; download: number };
   protocolMix: ProtocolMix | null;
+  policies: Record<string, PolicyChanged>;
 }
 
-export const initialLiveState: LiveState = { sequence: 0, connected: false, needsResync: false, serviceStatus: 'unknown', devices: {}, deviceOrder: [], throughput: [], timeline: [], coverage: 'unavailable', aggregate: { upload: 0, download: 0 }, protocolMix: null };
+export const initialLiveState: LiveState = { sequence: 0, connected: false, needsResync: false, serviceStatus: 'unknown', devices: {}, deviceOrder: [], throughput: [], timeline: [], coverage: 'unavailable', aggregate: { upload: 0, download: 0 }, protocolMix: null, policies: {} };
 
 function summarize(state: LiveState): LiveState {
   const bandwidth = Object.values(state.devices).map((device) => device.bandwidth).filter((value) => value.available);
@@ -31,7 +32,7 @@ export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
   for (const device of snapshot.devices) { if (!(device.device_id in devices)) deviceOrder.push(device.device_id); devices[device.device_id] = device; }
   // A snapshot is a trustworthy baseline, but it is not evidence that the
   // event socket is open. The connection orchestrator marks it live on open.
-  const next = { sequence: snapshot.sequence, connected: false, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: [], timeline: [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: 0, download: 0 }, protocolMix: null };
+  const next = { sequence: snapshot.sequence, connected: false, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: [], timeline: [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: 0, download: 0 }, protocolMix: null, policies: {} };
   return summarize(next);
 }
 
@@ -44,7 +45,7 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
   const event = message.data;
   if (event.sequence <= state.sequence) return state;
   if (event.sequence > state.sequence + 1) return { ...state, connected: false, needsResync: true };
-  const next: LiveState = { ...state, sequence: event.sequence, connected: true, devices: state.devices, deviceOrder: state.deviceOrder, throughput: state.throughput, timeline: [...state.timeline, message].slice(-120), coverage: state.coverage, aggregate: state.aggregate, protocolMix: state.protocolMix };
+  const next: LiveState = { ...state, sequence: event.sequence, connected: true, devices: state.devices, deviceOrder: state.deviceOrder, throughput: state.throughput, timeline: [...state.timeline, message].slice(-120), coverage: state.coverage, aggregate: state.aggregate, protocolMix: state.protocolMix, policies: state.policies };
   if (event.payload.type === 'service_status') next.serviceStatus = event.payload.data.state;
   if (event.payload.type === 'presence_changed') {
     const id = event.payload.data.device_id;
@@ -66,6 +67,9 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
     // Rust's BandwidthSample intentionally has no protocol metadata, so this
     // projection remains unavailable rather than inventing a protocol mix.
     next.protocolMix = null;
+  }
+  if (event.payload.type === 'policy_changed') {
+    next.policies = { ...next.policies, [event.payload.data.device_id]: event.payload.data };
   }
   return summarize(next);
 }
