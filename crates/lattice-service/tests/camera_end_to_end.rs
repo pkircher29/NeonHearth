@@ -471,6 +471,23 @@ async fn fixture_pipeline_projects_only_sanitized_camera_data_and_reaps_idle_med
     assert!(observations.last().unwrap().kill_requested && observations.last().unwrap().awaited);
     for spec in media.specs().await {
         assert_clean(format!("{spec:?}"), &source_ref_label);
+        assert_clean(
+            spec.executable().to_string_lossy().as_bytes(),
+            &source_ref_label,
+        );
+        for arg in spec.args() {
+            assert_clean(arg.to_string_lossy().as_bytes(), &source_ref_label);
+        }
+        let input = spec
+            .args()
+            .windows(2)
+            .find(|pair| pair[0] == "-i")
+            .map(|pair| pair[1].to_string_lossy())
+            .unwrap();
+        assert!(input.starts_with("rtsp://127.0.0.1:"));
+        assert!(input.contains("/source/"));
+        let output = std::path::Path::new(spec.args().last().unwrap());
+        assert!(output.starts_with(dir.path()));
     }
     assert_clean(format!("{:?}", onvif), &source_ref_label);
     let export = lattice_service::api::serialize_camera_inventory_for_support_export(
