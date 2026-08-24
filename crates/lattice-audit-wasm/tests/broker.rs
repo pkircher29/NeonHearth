@@ -28,8 +28,15 @@ fn limits() -> Limits {
         max_memory_pages: 1,
     }
 }
+fn response(bytes: &[u8], limit: usize) -> Result<ExchangeResponse, BrokerError> {
+    let mut response = ExchangeResponse::new(limit);
+    response.extend_from_slice(bytes)?;
+    Ok(response)
+}
 fn verified(port: u16, limits: Limits) -> VerifiedManifest {
-    let w = module();
+    verified_wasm(module(), port, limits)
+}
+fn verified_wasm(w: Vec<u8>, port: u16, limits: Limits) -> VerifiedManifest {
     let mut m = AuditManifest::new(
         "broker-test".into(),
         1,
@@ -71,7 +78,7 @@ impl TargetBoundExchange for Exchange {
         assert_eq!(request.payload, b"ping");
         assert_eq!(request.protocol, ExchangeProtocol::Tcp);
         assert_eq!(request.response_limit, 4);
-        ExchangeResponse::try_new(b"pong".to_vec(), request.response_limit)
+        response(b"pong", request.response_limit)
     }
 }
 fn request(port: u16) -> BrokerRequest {
@@ -91,10 +98,166 @@ fn request(port: u16) -> BrokerRequest {
 async fn broker_composes_signed_module_and_fixed_target_exchange() {
     let auth = Arc::new(Auth(AtomicUsize::new(0)));
     let broker = Broker::new(auth.clone(), Arc::new(Exchange));
-    let result = broker.execute(request(80)).await.unwrap();
+    let request = request(80);
+    let approval_id = request.approval_id;
+    let result = broker.execute(request).await.unwrap();
     assert_eq!(result.target, target());
+    assert_eq!(result.approval_id, approval_id);
     assert_eq!(result.bytes, b"pong");
     assert_eq!(auth.0.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn response_accumulator_rejects_the_chunk_that_would_cross_its_limit() {
+    let mut response = ExchangeResponse::new(5);
+    response.extend_from_slice(b"abc").unwrap();
+    assert!(matches!(
+        response.extend_from_slice(b"def"),
+        Err(BrokerError::ExchangeFailed)
+    ));
+    assert_eq!(response.bytes(), b"abc");
+}
+
+struct RetargetAuth(AuthorizedTarget);
+impl TargetAuthorizer for RetargetAuth {
+    fn authorize(&self, _: IpAddr, _: u32, _: u16) -> Result<AuthorizedTarget, TargetError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn initial_authorization_must_exactly_match_target_interface_and_port() {
+    for authorized in [
+        AuthorizedTarget::new("192.168.1.45".parse().unwrap(), 7, 80).unwrap(),
+        AuthorizedTarget::new(target(), 8, 80).unwrap(),
+        AuthorizedTarget::new(target(), 7, 81).unwrap(),
+    ] {
+        let exchange = Arc::new(CountExchange(AtomicUsize::new(0)));
+        let result = Broker::new(Arc::new(RetargetAuth(authorized)), exchange.clone())
+            .execute(request(80))
+            .await;
+        assert!(matches!(
+            result,
+            Err(BrokerError::Target(TargetError::Rejected))
+        ));
+        assert_eq!(exchange.0.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn authorization_rejection_and_exchange_failure_remain_typed() {
+    struct Reject;
+    impl TargetAuthorizer for Reject {
+        fn authorize(&self, _: IpAddr, _: u32, _: u16) -> Result<AuthorizedTarget, TargetError> {
+            Err(TargetError::Rejected)
+        }
+    }
+    struct Fail;
+    #[async_trait]
+    impl TargetBoundExchange for Fail {
+        async fn exchange(
+            &self,
+            _: &AuthorizedTarget,
+            _: ExchangeRequest,
+        ) -> Result<ExchangeResponse, BrokerError> {
+            Err(BrokerError::ExchangeFailed)
+        }
+    }
+    assert!(matches!(
+        Broker::new(Arc::new(Reject), Arc::new(Fail))
+            .execute(request(80))
+            .await,
+        Err(BrokerError::Target(TargetError::Rejected))
+    ));
+    assert!(matches!(
+        Broker::new(Arc::new(Auth(AtomicUsize::new(0))), Arc::new(Fail))
+            .execute(request(80))
+            .await,
+        Err(BrokerError::ExchangeFailed)
+    ));
+}
+
+#[tokio::test]
+async fn lower_broker_request_fuel_memory_and_time_limits_constrain_the_sandbox() {
+    let cases = [
+        (wat::parse_str(r#"(module (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) (loop br 0) i64.const 0))"#).unwrap(), Limits { max_fuel: 100, ..limits() }),
+        (wat::parse_str(r#"(module (memory (export "memory") 2) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#).unwrap(), Limits { max_memory_pages: 1, ..limits() }),
+    ];
+    for (wasm, effective) in cases {
+        let mut signed = limits();
+        signed.max_fuel = 1_000_000;
+        signed.max_memory_pages = 2;
+        let mut r = request(80);
+        r.module = verified_wasm(wasm, 80, signed);
+        r.limits = effective;
+        assert!(
+            Broker::new(
+                Arc::new(Auth(AtomicUsize::new(0))),
+                Arc::new(CountExchange(AtomicUsize::new(0)))
+            )
+            .execute(r)
+            .await
+            .is_err()
+        );
+    }
+    let wasm = wat::parse_str(r#"(module (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) (loop br 0) i64.const 0))"#).unwrap();
+    let mut signed = limits();
+    signed.max_time = Duration::from_secs(2);
+    signed.max_fuel = 10_000_000_000;
+    let mut r = request(80);
+    r.module = verified_wasm(wasm, 80, signed);
+    r.limits.max_time = Duration::from_secs(1);
+    r.limits.max_fuel = 10_000_000_000;
+    assert!(matches!(
+        Broker::new(
+            Arc::new(Auth(AtomicUsize::new(0))),
+            Arc::new(CountExchange(AtomicUsize::new(0)))
+        )
+        .execute(r)
+        .await,
+        Err(BrokerError::DeadlineExceeded)
+    ));
+}
+
+#[tokio::test]
+async fn lower_request_ceiling_stops_a_two_exchange_guest_after_one_transport_call() {
+    let wasm = wat::parse_str(
+        r#"(module
+      (import "audit" "exchange" (func $x (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1) (data (i32.const 16) "ping")
+      (func (export "run") (param i32 i32) (result i64)
+        i32.const 16 i32.const 4 i32.const 32 i32.const 4 call $x drop
+        i32.const 16 i32.const 4 i32.const 32 i32.const 4 call $x drop i64.const 0))"#,
+    )
+    .unwrap();
+    let mut r = request(80);
+    r.module = verified_wasm(wasm, 80, limits());
+    r.limits.max_requests = 1;
+    let exchange = Arc::new(CountExchange(AtomicUsize::new(0)));
+    assert!(matches!(
+        Broker::new(Arc::new(Auth(AtomicUsize::new(0))), exchange.clone())
+            .execute(r)
+            .await,
+        Err(BrokerError::BudgetExhausted)
+    ));
+    assert_eq!(exchange.0.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn zero_and_huge_request_limits_fail_typed_without_panicking() {
+    for max_requests in [0, u32::MAX] {
+        let mut r = request(80);
+        r.limits.max_requests = max_requests;
+        assert!(matches!(
+            Broker::new(
+                Arc::new(Auth(AtomicUsize::new(0))),
+                Arc::new(CountExchange(AtomicUsize::new(0)))
+            )
+            .execute(r)
+            .await,
+            Err(BrokerError::BudgetExhausted)
+        ));
+    }
 }
 #[tokio::test]
 async fn broker_rejects_capability_port_mismatch_before_exchange() {
@@ -140,7 +303,7 @@ impl TargetBoundExchange for CountExchange {
         request: ExchangeRequest,
     ) -> Result<ExchangeResponse, BrokerError> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        ExchangeResponse::try_new(b"pong".to_vec(), request.response_limit)
+        response(b"pong", request.response_limit)
     }
 }
 
@@ -178,7 +341,7 @@ async fn all_protocols_are_propagated_and_invalid_capability_is_rejected_before_
             request: ExchangeRequest,
         ) -> Result<ExchangeResponse, BrokerError> {
             self.0.lock().unwrap().push(request.protocol);
-            ExchangeResponse::try_new(b"pong".to_vec(), request.response_limit)
+            response(b"pong", request.response_limit)
         }
     }
     for capability in [
@@ -277,7 +440,7 @@ impl TargetBoundExchange for BlockingExchange {
             std::future::pending::<()>().await;
             unreachable!()
         }
-        ExchangeResponse::try_new(b"pong".to_vec(), request.response_limit)
+        response(b"pong", request.response_limit)
     }
 }
 
@@ -308,4 +471,47 @@ async fn cancellation_drops_waiting_exchange_publishes_no_result_and_next_execut
     ));
     assert!(dropped.load(Ordering::Acquire));
     assert_eq!(broker.execute(request(80)).await.unwrap().bytes, b"pong");
+}
+
+#[tokio::test]
+async fn deadline_drops_waiting_exchange_and_returns_typed_error() {
+    let started = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let exchange = Arc::new(BlockingExchange {
+        started,
+        dropped: Arc::clone(&dropped),
+        calls: AtomicUsize::new(0),
+    });
+    assert!(matches!(
+        Broker::new(Arc::new(Auth(AtomicUsize::new(0))), exchange)
+            .execute(request(80))
+            .await,
+        Err(BrokerError::DeadlineExceeded)
+    ));
+    assert!(dropped.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn cancellation_observable_before_publication_wins_the_commit_point() {
+    struct CancelOnResponse;
+    #[async_trait]
+    impl TargetBoundExchange for CancelOnResponse {
+        async fn exchange(
+            &self,
+            _: &AuthorizedTarget,
+            request: ExchangeRequest,
+        ) -> Result<ExchangeResponse, BrokerError> {
+            request.cancellation.cancel();
+            response(b"pong", request.response_limit)
+        }
+    }
+    assert!(matches!(
+        Broker::new(
+            Arc::new(Auth(AtomicUsize::new(0))),
+            Arc::new(CancelOnResponse)
+        )
+        .execute(request(80))
+        .await,
+        Err(BrokerError::Cancelled)
+    ));
 }

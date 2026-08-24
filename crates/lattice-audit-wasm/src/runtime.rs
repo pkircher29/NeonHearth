@@ -520,3 +520,56 @@ fn map_error<H: AuditHost>(store: &Store<StoreState<'_, H>>, error: &anyhow::Err
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AuditManifest, Capability, EvidenceSchema, EvidenceType, RollbackPlan, SideEffectProfile,
+        TargetKind, verify_manifest,
+    };
+    use ed25519_dalek::SigningKey;
+    use sha2::{Digest, Sha256};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[tokio::test]
+    async fn effective_limits_cannot_broaden_the_signed_manifest() {
+        let wasm = wat::parse_str(r#"(module (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#).unwrap();
+        let signed = Limits {
+            max_bytes: 64,
+            max_requests: 2,
+            max_time: Duration::from_secs(1),
+            max_fuel: 100_000,
+            max_memory_pages: 1,
+        };
+        let mut manifest = AuditManifest::new(
+            "limits".into(),
+            1,
+            Sha256::digest(&wasm).into(),
+            TargetKind::NumericPrivateDevice,
+            BTreeSet::from([Capability::TcpExchange { port: 80 }]),
+            "test".into(),
+            SideEffectProfile::ReadOnly,
+            RollbackPlan {
+                required: false,
+                description: "none".into(),
+            },
+            EvidenceSchema {
+                fields: BTreeMap::from([("out".into(), EvidenceType::Bytes)]),
+            },
+            signed.clone(),
+        )
+        .unwrap();
+        let key = SigningKey::from_bytes(&[3; 32]);
+        manifest.sign(&key).unwrap();
+        let verified = verify_manifest(&manifest, &wasm, &key.verifying_key()).unwrap();
+        let broader = Limits {
+            max_bytes: 65,
+            ..signed
+        };
+        assert!(matches!(
+            Sandbox::new_with_limits(verified, &broader).await,
+            Err(AuditError::InvalidManifest(_))
+        ));
+    }
+}

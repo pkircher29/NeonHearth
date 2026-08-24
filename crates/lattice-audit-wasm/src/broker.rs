@@ -1,6 +1,6 @@
 use crate::{
     AuditError, AuditHost, AuditHostError, AuthorizedTarget, Capability, Limits, Sandbox,
-    TargetAuthorizer, TargetError, VerifiedManifest,
+    TargetAuthorizer, TargetError, VerifiedManifest, manifest::valid_limits,
 };
 use async_trait::async_trait;
 use std::{
@@ -101,9 +101,10 @@ impl Budget {
     fn release(&self, request_bytes: usize, response_cap: usize) {
         let Ok(mut b) = self.inner.lock() else { return };
         b.requests = b.requests.saturating_sub(1);
-        b.bytes = b
-            .bytes
-            .saturating_sub((request_bytes + response_cap) as u64);
+        let released = u64::try_from(request_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(response_cap).unwrap_or(u64::MAX));
+        b.bytes = b.bytes.saturating_sub(released);
     }
     fn charge_bytes(&self, bytes: usize) -> Result<(), BrokerError> {
         let mut b = self
@@ -153,20 +154,33 @@ pub struct ExchangeRequest {
 }
 pub struct ExchangeResponse {
     bytes: Vec<u8>,
+    limit: usize,
 }
 impl ExchangeResponse {
-    pub fn try_new(bytes: Vec<u8>, response_limit: usize) -> Result<Self, BrokerError> {
-        if bytes.len() > response_limit {
+    pub fn new(response_limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(response_limit.min(4096)),
+            limit: response_limit,
+        }
+    }
+    pub fn extend_from_slice(&mut self, chunk: &[u8]) -> Result<(), BrokerError> {
+        if chunk.len() > self.limit.saturating_sub(self.bytes.len()) {
             return Err(BrokerError::ExchangeFailed);
         }
-        Ok(Self { bytes })
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
     }
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 #[async_trait]
 pub trait TargetBoundExchange: Send + Sync {
+    /// Implementations must stream bounded chunks into `ExchangeResponse` and
+    /// never allocate or read beyond `request.response_limit` in aggregate.
     async fn exchange(
         &self,
         target: &AuthorizedTarget,
@@ -186,6 +200,7 @@ pub struct BrokerRequest {
 }
 pub struct BrokerResult {
     pub target: IpAddr,
+    pub approval_id: Uuid,
     pub bytes: Vec<u8>,
 }
 pub struct Broker {
@@ -215,6 +230,9 @@ impl Broker {
         {
             return Err(BrokerError::CapabilityDenied);
         }
+        if !valid_limits(&request.limits) {
+            return Err(BrokerError::BudgetExhausted);
+        }
         let limits = intersect_limits(request.module.limits(), &request.limits);
         if limits.max_bytes == 0
             || limits.max_requests == 0
@@ -233,6 +251,12 @@ impl Broker {
         let target = self
             .authorizer
             .authorize(request.target, request.interface, request.port)?;
+        if target.target() != request.target
+            || target.interface() != request.interface
+            || target.port() != request.port
+        {
+            return Err(BrokerError::Target(TargetError::Rejected));
+        }
         if Instant::now() >= deadline {
             return Err(BrokerError::DeadlineExceeded);
         }
@@ -258,8 +282,12 @@ impl Broker {
             return Err(BrokerError::Cancelled);
         }
         host.budget.charge_bytes(output.output.len())?;
+        // Cancellation observable before this explicit publication commit wins.
+        // Cancellation after the ready branch is selected is after commit.
+        tokio::select! { biased; _ = request.cancellation.cancelled() => return Err(BrokerError::Cancelled), _ = std::future::ready(()) => {} }
         Ok(BrokerResult {
             target: request.target,
+            approval_id: request.approval_id,
             bytes: output.output,
         })
     }
@@ -351,13 +379,14 @@ impl AuditHost for BrokerHost {
             },
         );
         let response = tokio::select! {_=self.cancellation.cancelled()=>return Err(AuditHostError::Cancelled),r=tokio::time::timeout_at(tokio::time::Instant::from_std(self.deadline),call)=>match r{Ok(Ok(v))=>v,Ok(Err(_))=>return Err(AuditHostError::ExchangeFailed),Err(_)=>return Err(AuditHostError::DeadlineExceeded)}};
-        if response.bytes.len() > response_cap {
+        let response_len = response.bytes().len();
+        if response_len > response_cap {
             return Err(AuditHostError::ExchangeFailed);
         }
         reservation
-            .commit(response.bytes.len())
+            .commit(response_len)
             .map_err(|_| AuditHostError::BudgetExhausted)?;
-        Ok(response.bytes)
+        Ok(response.into_bytes())
     }
 }
 
@@ -432,5 +461,12 @@ mod tests {
             Err(BrokerError::BudgetExhausted)
         ));
         budget.charge_bytes(1).unwrap_err();
+    }
+
+    #[test]
+    fn release_handles_usize_boundaries_without_addition_overflow() {
+        let budget = budget();
+        budget.release(usize::MAX, usize::MAX);
+        assert_eq!(snapshot(&budget), (0, 0));
     }
 }
