@@ -24,6 +24,9 @@ pub use lattice_domain::EnforcementStatus as EnforcementResult;
 #[async_trait]
 pub trait PolicyActuator: Send + Sync {
     async fn enforce(&self, device: DeviceId, action: RequestedAction) -> EnforcementResult;
+    fn undo_available(&self, _device: DeviceId, _action: RequestedAction) -> bool {
+        false
+    }
     async fn undo(&self, _device: DeviceId, _action: RequestedAction) -> EnforcementResult {
         EnforcementResult::ManualRequired
     }
@@ -102,6 +105,15 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
             }
             Err(_) => EnforcementResult::ManualRequired,
         }
+    }
+    fn undo_available(&self, device: DeviceId, action: RequestedAction) -> bool {
+        matches!(
+            action,
+            RequestedAction::Quarantine | RequestedAction::PermanentBan
+        ) && self
+            .previous
+            .try_lock()
+            .is_ok_and(|saved| saved.contains_key(&device))
     }
 }
 
@@ -277,6 +289,17 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             p.owner_decision,
             OwnerDecision::Approved | OwnerDecision::Quarantined
         );
+        self.finish(p, evaluation, enforcement, undo_available, now)
+            .await
+    }
+    async fn finish(
+        &self,
+        p: DevicePolicy,
+        evaluation: Evaluation,
+        enforcement: EnforcementResult,
+        undo_available: bool,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<AuditedDecision> {
         let fingerprint = serde_json::to_string(&(
             evaluation,
             evidence_summary(&p),
@@ -323,9 +346,7 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         self.repo
             .set_owner_decision(d, OwnerDecision::Approved)
             .await?;
-        let mut result = self
-            .evaluate(self.repo.load(d).await?.unwrap(), now)
-            .await?;
+        let p = self.repo.load(d).await?.unwrap();
         if let Some(prior) = prior
             && prior.enforcement_result == EnforcementResult::Verified
             && matches!(
@@ -333,15 +354,28 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 RequestedAction::Quarantine | RequestedAction::PermanentBan
             )
         {
-            let undo = self.actuator.undo(d, prior.requested_action).await;
+            let can_undo = self.actuator.undo_available(d, prior.requested_action);
+            let undo = if can_undo {
+                self.actuator.undo(d, prior.requested_action).await
+            } else {
+                EnforcementResult::ManualRequired
+            };
             if undo == EnforcementResult::Verified
                 && let Some(presence) = &self.presence
             {
                 presence.record_verified_unblock(d, now).await?;
             }
-            result.enforcement = undo;
+            return self
+                .finish(
+                    p.clone(),
+                    evaluate_policy(&p, now),
+                    undo,
+                    can_undo && undo != EnforcementResult::Verified,
+                    now,
+                )
+                .await;
         }
-        Ok(result)
+        self.evaluate(p, now).await
     }
     pub async fn reject(&self, d: DeviceId, now: DateTime<Utc>) -> anyhow::Result<AuditedDecision> {
         self.repo
