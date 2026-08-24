@@ -1,5 +1,6 @@
 //! Persistence interfaces and implementations for NeonHearth.
 
+mod advisory;
 mod camera;
 mod checkpoint;
 mod flow;
@@ -7,6 +8,7 @@ mod install;
 mod policy;
 mod w6;
 
+pub use advisory::*;
 use anyhow::Context;
 pub use camera::*;
 pub use checkpoint::*;

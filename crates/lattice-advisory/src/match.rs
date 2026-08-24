@@ -109,6 +109,30 @@ pub struct AdvisoryMatch {
     confidence: Confidence,
 }
 impl AdvisoryMatch {
+    /// Recreates a previously validated match from typed persistence columns.
+    pub fn from_persisted(
+        label: MatchLabel,
+        matched_fields: Vec<MatchedField>,
+        explanation: String,
+        confidence: Confidence,
+    ) -> Result<Self, MatchError> {
+        if explanation.is_empty()
+            || explanation.len() > MAX_EXPLANATION
+            || explanation.chars().any(char::is_control)
+            || matched_fields.len() > 3
+            || matched_fields
+                .windows(2)
+                .any(|pair| pair[0] as u8 >= pair[1] as u8)
+        {
+            return Err(MatchError::InvalidStoredMatch);
+        }
+        Ok(Self {
+            label,
+            matched_fields,
+            explanation,
+            confidence,
+        })
+    }
     pub fn label(&self) -> MatchLabel {
         self.label
     }
@@ -145,6 +169,8 @@ pub enum MatchError {
     MixedSourceIds,
     #[error("advisory group is empty or oversized")]
     InvalidGroup,
+    #[error("invalid stored advisory match")]
+    InvalidStoredMatch,
 }
 
 pub trait DeviceInput {

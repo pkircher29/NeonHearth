@@ -1718,6 +1718,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "fs2",
+ "lattice-advisory",
  "lattice-camera",
  "lattice-domain",
  "lattice-sensor",

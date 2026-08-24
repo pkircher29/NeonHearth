@@ -295,7 +295,7 @@ async fn writes_limits_schema_columns_checks_and_indexes_are_complete() -> anyho
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     Ok(())
 }
 
