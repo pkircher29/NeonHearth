@@ -5,11 +5,10 @@ use crate::{
     is_strict_cve,
 };
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-pub const MAX_CPE_DEPTH: usize = 64;
+pub const MAX_CPE_DEPTH: usize = 32;
 pub const MAX_CPE_NODES: usize = 8_192;
 const MAX_CPE_FIELD: usize = 128;
 #[derive(Debug, thiserror::Error)]
@@ -30,10 +29,7 @@ pub fn parse_nvd(
     if body.len() > MAX_RESPONSE_BYTES {
         return Err(NvdParseError::Oversized);
     }
-    let mut deserializer = serde_json::Deserializer::from_str(body);
-    deserializer.disable_recursion_limit();
-    let root = Value::deserialize(&mut deserializer).map_err(|_| NvdParseError::Malformed)?;
-    deserializer.end().map_err(|_| NvdParseError::Malformed)?;
+    let root: Value = serde_json::from_str(body).map_err(|_| NvdParseError::Malformed)?;
     let vulnerabilities = root
         .get("vulnerabilities")
         .and_then(Value::as_array)
