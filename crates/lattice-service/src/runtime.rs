@@ -29,6 +29,7 @@ pub struct NeighborRuntime {
 #[derive(Clone, Debug)]
 pub struct RuntimePlan {
     bindings: Vec<NeighborInterfaceBinding>,
+    sources: crate::discovery::DiscoverySources,
     snapshot: NeighborSnapshotConfig,
 }
 
@@ -70,10 +71,16 @@ pub fn plan_inventory(
         .map(NeighborInterfaceBinding::for_interface)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SanitizedStartupError::InvalidPlan)?;
+    let sources =
+        neighbor_discovery_sources(&bindings).map_err(|_| SanitizedStartupError::InvalidPlan)?;
     let snapshot =
         NeighborSnapshotConfig::new(MAX_NEIGHBOR_ROWS, bindings.iter().map(|b| b.interface()))
             .map_err(|_| SanitizedStartupError::InvalidPlan)?;
-    Ok(RuntimePlan { bindings, snapshot })
+    Ok(RuntimePlan {
+        bindings,
+        sources,
+        snapshot,
+    })
 }
 
 pub enum StartupResult {
@@ -100,13 +107,9 @@ pub async fn build_from_inventory(
         Ok(plan) => plan,
         Err(_) => return degraded(state).await,
     };
-    let sources = match neighbor_discovery_sources(plan.bindings()) {
-        Ok(s) => s,
-        Err(_) => return degraded(state).await,
-    };
     let pipeline = match PersistentDiscoveryPipeline::open(
         repository,
-        sources,
+        plan.sources,
         std::iter::repeat_with(DeviceId::new),
         Default::default(),
         FLOW_BATCH_LIMIT,
@@ -148,6 +151,18 @@ pub async fn run_loop<S: lattice_sensor::neighbor::NeighborSnapshotSource>(
     coordinator: &mut NeighborCoordinator<S>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
+    run_loop_with_clock(coordinator, shutdown, Utc::now).await;
+}
+
+/// Runtime loop with an injectable clock for deterministic coordinator tests.
+pub async fn run_loop_with_clock<S, C>(
+    coordinator: &mut NeighborCoordinator<S>,
+    shutdown: &mut watch::Receiver<bool>,
+    mut now: C,
+) where
+    S: lattice_sensor::neighbor::NeighborSnapshotSource,
+    C: FnMut() -> chrono::DateTime<Utc>,
+{
     if *shutdown.borrow() {
         return;
     }
@@ -166,7 +181,7 @@ pub async fn run_loop<S: lattice_sensor::neighbor::NeighborSnapshotSource>(
                 tokio::select! {
                     biased;
                     changed = shutdown.changed() => match changed { Ok(()) if *shutdown.borrow() => return, Ok(()) => {}, Err(_) => return },
-                    result = coordinator.cycle(Utc::now()) => if let Err(error) = result {
+                    result = coordinator.cycle(now()) => if let Err(error) = result {
                         tracing::warn!(category = error_category(&error), "neighbor discovery cycle degraded");
                     },
                 }
@@ -296,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_plan_rejects_no_eligible_and_accepts_over_capacity() {
+    fn inventory_plan_rejects_no_eligible_and_over_capacity() {
         assert!(matches!(
             plan_inventory(&InterfaceInventory::new(vec![interface(
                 1,
@@ -306,13 +321,30 @@ mod tests {
             )])),
             Err(SanitizedStartupError::NoEligibleInterfaces)
         ));
-        let plan = plan_inventory(&InterfaceInventory::new(
-            (1..=65)
-                .map(|id| interface(id, InterfaceClass::PhysicalWired, true, false))
-                .collect(),
-        ))
+        assert!(matches!(
+            plan_inventory(&InterfaceInventory::new(
+                (1..=65)
+                    .map(|id| interface(id, InterfaceClass::PhysicalWired, true, false))
+                    .collect(),
+            )),
+            Err(SanitizedStartupError::InvalidPlan)
+        ));
+    }
+
+    #[test]
+    fn inventory_duplicate_ids_are_deduplicated_by_inventory_before_planning() {
+        let plan = plan_inventory(&InterfaceInventory::new(vec![
+            interface(4, InterfaceClass::PhysicalWired, true, false),
+            interface(4, InterfaceClass::PhysicalWifi, true, false),
+        ]))
         .unwrap();
-        assert_eq!(plan.bindings().len(), 65);
+        assert_eq!(
+            plan.bindings()
+                .iter()
+                .map(|binding| binding.interface().get())
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
     }
 
     #[tokio::test]
@@ -367,5 +399,35 @@ mod tests {
         let error = result.unwrap_err();
         assert!(error.server_error().is_some());
         assert!(error.worker_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn supervisor_without_worker_returns_server_success_or_error() {
+        let (shutdown, _) = watch::channel(false);
+        assert!(supervise(async { Ok(()) }, None, shutdown).await.is_ok());
+        let (shutdown, _) = watch::channel(false);
+        let error = supervise(async { Err(io::Error::other("server")) }, None, shutdown)
+            .await
+            .unwrap_err();
+        assert!(error.server_error().is_some());
+        assert!(error.worker_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn supervisor_aggregates_worker_panic_and_server_error() {
+        let (shutdown, mut rx) = watch::channel(false);
+        let worker = tokio::spawn(async move { panic!("worker failure") });
+        let error = supervise(
+            async move {
+                rx.changed().await.unwrap();
+                Err(io::Error::other("server failure"))
+            },
+            Some(worker),
+            shutdown,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.server_error().is_some());
+        assert!(error.worker_error().unwrap().is_panic());
     }
 }

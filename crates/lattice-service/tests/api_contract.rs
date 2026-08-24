@@ -6,7 +6,12 @@ use axum::{
 use chrono::Utc;
 use http_body_util::BodyExt;
 use lattice_domain::{EventPayload, ServiceStatus};
-use lattice_service::{AppState, ServiceRuntimeStatus, app};
+use lattice_event_bus::Resume;
+use lattice_sensor::InterfaceInventory;
+use lattice_service::{
+    AppState, ServiceRuntimeStatus, app,
+    runtime::{StartupResult, build_from_inventory},
+};
 use lattice_store::{M2StateRepository, connect_memory};
 use tower::ServiceExt;
 const TOKEN: &str = "owner-token-0123456789abcdefghijkl";
@@ -550,4 +555,32 @@ async fn service_token_configuration_is_validated() {
         );
     }
     assert!(test_state().await.events().current_sequence().await == 0);
+}
+
+#[tokio::test]
+async fn no_eligible_startup_is_degraded_once_and_replays_before_state_snapshot() {
+    let pool = connect_memory().await.unwrap();
+    let repo = M2StateRepository::new(pool);
+    let state = AppState::new(TOKEN, repo.clone()).unwrap();
+    assert!(matches!(
+        build_from_inventory(state.clone(), repo.clone(), InterfaceInventory::default()).await,
+        StartupResult::Degraded
+    ));
+    assert_eq!(state.service_status().await, "degraded");
+    assert!(
+        matches!(state.events().resume_after(0).await, Resume::Events(ref events) if matches!(events.as_slice(), [event] if matches!(event.payload, EventPayload::ServiceStatus(ref status) if status.state == "degraded")))
+    );
+    assert!(matches!(
+        build_from_inventory(state.clone(), repo, InterfaceInventory::default()).await,
+        StartupResult::Degraded
+    ));
+    assert_eq!(state.events().current_sequence().await, 1);
+    let response = app(state)
+        .oneshot(authorized_state("/api/v1/state"))
+        .await
+        .unwrap();
+    let snapshot = body(response).await;
+    assert_eq!(snapshot["sequence"], 1);
+    assert_eq!(snapshot["service_status"], "degraded");
+    assert!(!snapshot.to_string().contains("adapter-"));
 }

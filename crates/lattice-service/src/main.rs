@@ -46,7 +46,11 @@ async fn main() -> Result<()> {
     let terminate = ();
     let listener = TcpListener::bind("127.0.0.1:58120").await?;
     let server = axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal(terminate, shutdown_tx.clone()))
+        .with_graceful_shutdown(shutdown_signal(
+            terminate,
+            shutdown_tx.clone(),
+            shutdown_rx.clone(),
+        ))
         .into_future();
     match startup {
         StartupResult::Worker(worker) => {
@@ -57,7 +61,9 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        StartupResult::Degraded => server.await?,
+        StartupResult::Degraded => {
+            lattice_service::runtime::supervise(server, None, shutdown_tx).await?
+        }
     }
     drop(pool);
     Ok(())
@@ -67,12 +73,28 @@ async fn main() -> Result<()> {
 async fn shutdown_signal(
     mut terminate: tokio::signal::unix::Signal,
     shutdown: tokio::sync::watch::Sender<bool>,
+    mut supervised_shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
-    let _ = shutdown.send(true);
+    if *supervised_shutdown.borrow() {
+        return;
+    }
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => { let _ = shutdown.send(true); },
+        _ = terminate.recv() => { let _ = shutdown.send(true); },
+        changed = supervised_shutdown.changed() => match changed { Ok(()) | Err(_) => {} },
+    }
 }
 #[cfg(not(unix))]
-async fn shutdown_signal(_: (), shutdown: tokio::sync::watch::Sender<bool>) {
-    let _ = tokio::signal::ctrl_c().await;
-    let _ = shutdown.send(true);
+async fn shutdown_signal(
+    _: (),
+    shutdown: tokio::sync::watch::Sender<bool>,
+    mut supervised_shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    if *supervised_shutdown.borrow() {
+        return;
+    }
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => { let _ = shutdown.send(true); },
+        changed = supervised_shutdown.changed() => match changed { Ok(()) | Err(_) => {} },
+    }
 }
