@@ -33,4 +33,61 @@ describe('createLiveConnection', () => {
     connection.stop();
     expect(timers.setTimeout).not.toHaveBeenCalled();
   });
+
+  it('ignores a stale close during resync and clears the stale retry before opening one replacement stream', async () => {
+    let receive: ((message: { type: 'resync_required' }) => void) | undefined;
+    let close: (() => void) | undefined;
+    const timers = { setTimeout: vi.fn(() => 1), clearTimeout: vi.fn() };
+    const client = clientStub({
+      openEvents: vi.fn(async (_sequence, onMessage, onState) => {
+        receive = onMessage as typeof receive;
+        close = () => onState('closed');
+        return { close } as unknown as WebSocket;
+      })
+    });
+    const connection = createLiveConnection({ client, timers });
+
+    await connection.start();
+    receive?.({ type: 'resync_required' });
+    close?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(client.snapshotAll).toHaveBeenCalledTimes(2);
+    expect(client.openEvents).toHaveBeenCalledTimes(2);
+    expect(timers.setTimeout).not.toHaveBeenCalled();
+    connection.stop();
+  });
+
+  it('cancels a pending retry when an explicit resync succeeds and ignores its late timer callback', async () => {
+    let receive: ((message: { type: 'resync_required' }) => void) | undefined;
+    let close: (() => void) | undefined;
+    let retryCallback: (() => void) | undefined;
+    const timers = {
+      setTimeout: vi.fn((callback: () => void) => { retryCallback = callback; return 7; }),
+      clearTimeout: vi.fn()
+    };
+    const client = clientStub({
+      openEvents: vi.fn(async (_sequence, onMessage, onState) => {
+        receive = onMessage as typeof receive;
+        close = () => onState('closed');
+        return { close } as unknown as WebSocket;
+      })
+    });
+    const connection = createLiveConnection({ client, timers });
+
+    await connection.start();
+    close?.();
+    expect(timers.setTimeout).toHaveBeenCalledTimes(1);
+    receive?.({ type: 'resync_required' });
+    await Promise.resolve();
+    await Promise.resolve();
+    retryCallback?.();
+    await Promise.resolve();
+
+    expect(timers.clearTimeout).toHaveBeenCalledWith(7);
+    expect(client.snapshotAll).toHaveBeenCalledTimes(2);
+    expect(client.openEvents).toHaveBeenCalledTimes(2);
+    connection.stop();
+  });
 });

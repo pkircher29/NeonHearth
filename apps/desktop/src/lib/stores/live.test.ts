@@ -117,4 +117,10 @@ describe('reduceLiveMessage', () => {
     expect(result.coverage).toBe('complete');
     expect(result.aggregate).toEqual({ upload: 2_000_000, download: 1_000_000 });
   });
+
+  it('keeps protocol mix unavailable for canonical bandwidth samples', () => {
+    const result = reduceLiveMessage(initialLiveState, { type: 'event', data: bandwidth(1) });
+
+    expect(result.protocolMix).toBeNull();
+  });
 });

@@ -12,7 +12,7 @@ export interface PresenceChanged {
   evidence_observed_at: string;
   evidence_valid_until: string | null;
   trigger_arrival_at: string;
-  correction_of?: number | null;
+  correction_of: number | null;
 }
 
 export interface ByteCount { upload: number; download: number }

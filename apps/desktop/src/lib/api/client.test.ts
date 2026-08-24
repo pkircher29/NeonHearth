@@ -230,4 +230,26 @@ describe('createApiClient', () => {
 
     expect(onMessage).toHaveBeenCalledWith(message);
   });
+
+  it('requires the canonical correction_of key on presence events', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ticket: 'ticket', expires_in_seconds: 60 }), { status: 200 }));
+    class FakeWebSocket { onopen = null; onclose = null; onerror = null; onmessage: ((event: MessageEvent<string>) => void) | null = null; constructor(_: string) {} }
+    const onMessage = vi.fn();
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl, WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket });
+    const socket = await client.openEvents(0, onMessage, vi.fn()) as unknown as FakeWebSocket;
+    const data = {
+      transition_id: 1, device_id: validDevice.device_id, from: 'unknown', to: 'online', reason: 'observed',
+      occurred_at: '2026-08-23T00:00:00Z', trigger_source: 'sensor', trigger_kind: 'reply',
+      evidence_observed_at: '2026-08-23T00:00:00Z', evidence_valid_until: null, trigger_arrival_at: '2026-08-23T00:00:00Z', correction_of: null
+    };
+    const event = (presence: unknown) => ({ type: 'event', data: { sequence: 1, occurred_at: '2026-08-23T00:00:00Z', payload: { type: 'presence_changed', data: presence } } });
+    const { correction_of: _correctionOf, ...withoutCorrectionOf } = data;
+
+    socket.onmessage?.({ data: JSON.stringify(event(data)) } as MessageEvent<string>);
+    socket.onmessage?.({ data: JSON.stringify(event(withoutCorrectionOf)) } as MessageEvent<string>);
+    socket.onmessage?.({ data: JSON.stringify(event({ ...data, correction_of: -1 })) } as MessageEvent<string>);
+
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(onMessage).toHaveBeenCalledWith(event(data));
+  });
 });

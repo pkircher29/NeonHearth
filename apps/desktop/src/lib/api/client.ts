@@ -57,7 +57,7 @@ function isServerMessage(value: unknown): value is ServerMessage {
     && isDate(payload.data.occurred_at) && typeof payload.data.trigger_source === 'string'
     && payload.data.trigger_source.length > 0 && typeof payload.data.trigger_kind === 'string' && payload.data.trigger_kind.length > 0 && isDate(payload.data.evidence_observed_at)
     && (payload.data.evidence_valid_until === null || isDate(payload.data.evidence_valid_until))
-    && isDate(payload.data.trigger_arrival_at)
+    && isDate(payload.data.trigger_arrival_at) && Object.hasOwn(payload.data, 'correction_of')
     && (payload.data.correction_of === null || isSequence(payload.data.correction_of));
 }
 

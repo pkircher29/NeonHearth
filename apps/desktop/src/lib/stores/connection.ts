@@ -15,33 +15,41 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
   let stopped = true;
   let generation = 0;
   let retry = 0;
-  let hydrating = false;
-  let suppressSocketState = false;
+  let hydrationGeneration: number | undefined;
+  let pendingHydration = false;
   const publish = () => onState?.(state);
-  const closeSocket = () => { suppressSocketState = true; socket?.close(); socket = undefined; suppressSocketState = false; };
+  const isCurrent = (token: number) => !stopped && token === generation;
+  const cancelRetry = () => { if (retryTimer !== undefined) { timers.clearTimeout(retryTimer); retryTimer = undefined; } };
+  const closeSocket = () => { const closing = socket; socket = undefined; closing?.close(); };
 
   const hydrateAndOpen = async (token: number): Promise<void> => {
-    if (stopped || token !== generation || hydrating) return;
-    hydrating = true;
+    if (!isCurrent(token)) return;
+    if (hydrationGeneration !== undefined) { pendingHydration = true; return; }
+    hydrationGeneration = token;
     try {
       const snapshot = await client.snapshotAll();
-      if (stopped || token !== generation) return;
+      if (!isCurrent(token)) return;
       state = applySnapshot(state, snapshot);
       publish();
-      socket = await client.openEvents(state.sequence, handleMessage, handleSocketState);
-      if (stopped || token !== generation) { socket.close(); socket = undefined; return; }
+      const opened = await client.openEvents(state.sequence, handleMessage, (socketState) => handleSocketState(token, socketState));
+      if (!isCurrent(token)) { opened.close(); return; }
+      socket = opened;
       retry = 0;
+      cancelRetry();
     } catch {
-      scheduleReconnect();
-    } finally { hydrating = false; }
+      scheduleReconnect(token);
+    } finally {
+      hydrationGeneration = undefined;
+      if (pendingHydration) { pendingHydration = false; if (!stopped) void hydrateAndOpen(generation); }
+    }
   };
-  const resync = () => { if (stopped) return; generation += 1; closeSocket(); state = { ...state, connected: false }; publish(); void hydrateAndOpen(generation); };
+  const resync = () => { if (stopped) return; generation += 1; cancelRetry(); closeSocket(); state = { ...state, connected: false }; publish(); void hydrateAndOpen(generation); };
   const handleMessage = (message: ServerMessage) => { const next = reduceLiveMessage(state, message); state = next; publish(); if (next.needsResync) resync(); };
-  const handleSocketState = (socketState: 'open' | 'closed' | 'error') => { if (stopped || suppressSocketState) return; if (socketState === 'open') { state = { ...state, connected: true }; retry = 0; publish(); } else { state = { ...state, connected: false }; publish(); scheduleReconnect(); } };
-  const scheduleReconnect = () => { if (stopped || retryTimer !== undefined) return; const delay = Math.min(maxReconnectDelayMs, 250 * (2 ** retry)); retry += 1; retryTimer = timers.setTimeout(() => { retryTimer = undefined; void hydrateAndOpen(generation); }, delay); };
+  const handleSocketState = (token: number, socketState: 'open' | 'closed' | 'error') => { if (!isCurrent(token)) return; if (socketState === 'open') { state = { ...state, connected: true }; retry = 0; publish(); } else { state = { ...state, connected: false }; publish(); scheduleReconnect(token); } };
+  const scheduleReconnect = (token: number) => { if (!isCurrent(token) || retryTimer !== undefined) return; const delay = Math.min(maxReconnectDelayMs, 250 * (2 ** retry)); retry += 1; retryTimer = timers.setTimeout(() => { retryTimer = undefined; if (isCurrent(token)) void hydrateAndOpen(token); }, delay); };
   return {
     async start() { if (!stopped) return; stopped = false; generation += 1; retry = 0; await hydrateAndOpen(generation); },
-    stop() { stopped = true; generation += 1; if (retryTimer !== undefined) { timers.clearTimeout(retryTimer); retryTimer = undefined; } closeSocket(); state = { ...state, connected: false }; publish(); },
+    stop() { stopped = true; generation += 1; pendingHydration = false; cancelRetry(); closeSocket(); state = { ...state, connected: false }; publish(); },
     getState() { return state; }
   };
 }

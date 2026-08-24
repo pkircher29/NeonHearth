@@ -36,13 +36,6 @@ export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
 function placeholder(id: string, occurredAt: string): DeviceSnapshot {
   return { device_id: id, first_seen_at: occurredAt, last_seen_at: occurredAt, owner_name: null, owner_type: null, owner_confirmed: false, presence: { state: 'unknown', observed_at: null, source: null, kind: null }, evidence: null, identity: { available: false, classification: null, confidence: null }, bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null } };
 }
-function protocolMixFrom(frame: EventEnvelope['payload'] & { type: 'bandwidth_frame' }): ProtocolMix | null {
-  const counts: Record<string, number> = {};
-  for (const sample of frame.data.samples) { const protocol = (sample as unknown as { protocol?: unknown }).protocol; if (typeof protocol === 'string' && protocol.length > 0) counts[protocol] = (counts[protocol] ?? 0) + sample.upload_bytes_per_second + sample.download_bytes_per_second; }
-  const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
-  return total ? Object.fromEntries(Object.entries(counts).map(([protocol, value]) => [protocol, value / total * 100])) : null;
-}
-
 export function reduceLiveMessage(state: LiveState, message: ServerMessage): LiveState {
   if (state.needsResync) return state;
   if (message.type === 'resync_required') return { ...state, connected: false, needsResync: true };
@@ -68,7 +61,9 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
     }
     next.aggregate = { upload, download };
     next.throughput = [...next.throughput, { at: event.occurred_at, upload, download }].slice(-240);
-    next.protocolMix = protocolMixFrom(event.payload) ?? next.protocolMix;
+    // Rust's BandwidthSample intentionally has no protocol metadata, so this
+    // projection remains unavailable rather than inventing a protocol mix.
+    next.protocolMix = null;
   }
   return summarize(next);
 }
