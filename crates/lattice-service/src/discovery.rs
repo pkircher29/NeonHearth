@@ -18,6 +18,143 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+/// Service-owned policy for translating neighbor snapshots into durable presence facts.
+#[derive(Clone, Debug)]
+pub struct NeighborCoordinatorConfig {
+    pub poll_interval: chrono::Duration,
+    pub support_ttl: chrono::Duration,
+    pub tracker: lattice_sensor::neighbor::NeighborTrackerConfig,
+}
+impl Default for NeighborCoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: chrono::Duration::seconds(5),
+            support_ttl: chrono::Duration::seconds(4),
+            tracker: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NeighborCoordinatorError {
+    #[error("neighbor snapshot: {0}")]
+    Snapshot(#[from] lattice_sensor::neighbor::NeighborError),
+    #[error("discovery: {0}")]
+    Discovery(#[from] DiscoveryError),
+}
+
+/// Coordinates one injected snapshot source. Failed snapshots are deliberately inert.
+pub struct NeighborCoordinator<S> {
+    source: S,
+    bindings: BTreeMap<lattice_sensor::InterfaceId, u64>,
+    config: NeighborCoordinatorConfig,
+    tracker: lattice_sensor::neighbor::NeighborTracker,
+}
+impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S> {
+    pub fn new<I>(
+        source: S,
+        bindings: I,
+        config: NeighborCoordinatorConfig,
+    ) -> Result<Self, NeighborCoordinatorError>
+    where
+        I: IntoIterator<Item = (lattice_sensor::InterfaceId, u64)>,
+    {
+        let bindings = bindings.into_iter().collect::<BTreeMap<_, _>>();
+        if bindings.is_empty()
+            || config.poll_interval <= chrono::Duration::zero()
+            || config.support_ttl <= chrono::Duration::zero()
+        {
+            return Err(NeighborCoordinatorError::Snapshot(
+                lattice_sensor::neighbor::NeighborError::InvalidConfig,
+            ));
+        }
+        Ok(Self {
+            source,
+            bindings,
+            tracker: lattice_sensor::neighbor::NeighborTracker::new(config.tracker.clone())?,
+            config,
+        })
+    }
+    pub fn poll_interval(&self) -> chrono::Duration {
+        self.config.poll_interval
+    }
+    pub fn support_ttl(&self) -> chrono::Duration {
+        self.config.support_ttl
+    }
+    fn floor_second(t: DateTime<Utc>) -> DateTime<Utc> {
+        t - chrono::Duration::nanoseconds(i64::from(t.timestamp_subsec_nanos()))
+    }
+    pub async fn poll(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Option<Result<Vec<LinkPresenceObservation>, NeighborCoordinatorError>> {
+        let rows = match self.source.snapshot().await {
+            Ok(rows) => rows,
+            Err(_) => return None,
+        };
+        let observed_at = Self::floor_second(now);
+        let events = match self.tracker.observe(rows, observed_at) {
+            Ok(events) => events,
+            Err(error) => return Some(Err(error.into())),
+        };
+        let mut out = Vec::new();
+        for event in events {
+            let (device, kind) = match event {
+                lattice_sensor::neighbor::NeighborEvent::Appeared { device, .. }
+                | lattice_sensor::neighbor::NeighborEvent::Confirmed { device, .. } => (
+                    device,
+                    LinkPresenceKind::Present {
+                        valid_until: observed_at + self.config.support_ttl,
+                    },
+                ),
+                lattice_sensor::neighbor::NeighborEvent::Missed { device, .. } => {
+                    (device, LinkPresenceKind::Missed)
+                }
+                lattice_sensor::neighbor::NeighborEvent::Departed { .. } => continue,
+            };
+            let Some(source_id) = self.bindings.get(&device.interface()).copied() else {
+                continue;
+            };
+            out.push(LinkPresenceObservation {
+                source_id,
+                link_address: device.link_address(),
+                observed_at,
+                kind,
+            });
+        }
+        Some(Ok(out))
+    }
+    pub async fn poll_and_publish<F>(
+        &mut self,
+        pipeline: &mut PersistentDiscoveryPipeline,
+        now: DateTime<Utc>,
+        mut publish: F,
+    ) -> Result<Vec<DiscoveryPipelineOutcome>, NeighborCoordinatorError>
+    where
+        F: FnMut(EventPayload),
+    {
+        let Some(observations) = self.poll(now).await else {
+            return Ok(Vec::new());
+        };
+        let observations = observations?;
+        let mut outcomes = Vec::new();
+        for observation in observations {
+            let outcome = pipeline
+                .observe_link_presence_with_flow(observation, &[], 0, observation.observed_at)
+                .await?;
+            // The pipeline returns only after the SQLite transaction commits; publishing here
+            // therefore enforces durable-commit-before-event-publish.
+            if let DiscoveryPipelineOutcome::Committed(ref committed) = outcome
+                && let Some(payload) = committed.payload.clone()
+            {
+                publish(payload);
+            }
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DiscoveryObservation {
     pub source_id: u64,
