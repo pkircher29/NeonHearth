@@ -50,18 +50,12 @@ async fn main() -> Result<()> {
         .into_future();
     match startup {
         StartupResult::Worker(worker) => {
-            let mut worker = tokio::spawn(worker.run(shutdown_rx));
-            tokio::pin!(server);
-            let server_result = tokio::select! {
-                result = &mut server => result.map_err(anyhow::Error::from),
-                result = &mut worker => result.map(|_| ()).map_err(anyhow::Error::from),
-            };
-            let _ = shutdown_tx.send(true);
-            let _ = (&mut server).await;
-            if !worker.is_finished() {
-                let _ = worker.await;
-            }
-            server_result?;
+            lattice_service::runtime::supervise(
+                server,
+                Some(tokio::spawn(worker.run(shutdown_rx))),
+                shutdown_tx,
+            )
+            .await?;
         }
         StartupResult::Degraded => server.await?,
     }
