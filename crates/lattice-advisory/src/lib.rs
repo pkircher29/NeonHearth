@@ -373,8 +373,11 @@ fn validate_version(v: &VersionConstraint) -> Result<(), AdvisoryError> {
         Err(AdvisoryError::InvalidVersion)
     }
 }
+#[path = "match.rs"]
+mod advisory_match;
 pub mod feed;
 pub mod kev;
 pub mod nvd;
 pub mod transport;
 pub mod vendor;
+pub use advisory_match::*;
