@@ -137,18 +137,30 @@ async fn verified_undo_restores_the_saved_pre_enforcement_state() -> Result<(), 
         .login("owner", SecretString::new("fixture".into()))
         .await?;
     let actuator = W6PolicyActuator::new(connector);
-    assert!(!actuator.undo_available(device, RequestedAction::Quarantine));
+    assert!(
+        !actuator
+            .undo_available(device, RequestedAction::Quarantine)
+            .await
+    );
     assert_eq!(
         actuator.enforce(device, RequestedAction::Quarantine).await,
         EnforcementResult::Verified
     );
-    assert!(actuator.undo_available(device, RequestedAction::Quarantine));
+    assert!(
+        actuator
+            .undo_available(device, RequestedAction::Quarantine)
+            .await
+    );
     assert_eq!(
         actuator.undo(device, RequestedAction::Quarantine).await,
         EnforcementResult::Verified
     );
     assert!(!state.lock().unwrap().deny_internet);
-    assert!(!actuator.undo_available(device, RequestedAction::Quarantine));
+    assert!(
+        !actuator
+            .undo_available(device, RequestedAction::Quarantine)
+            .await
+    );
     Ok(())
 }
 
@@ -211,13 +223,21 @@ async fn verified_undo_survives_actuator_reconstruction() -> Result<(), Box<dyn 
         first.enforce(device, RequestedAction::Quarantine).await,
         EnforcementResult::Verified
     );
+    assert_eq!(
+        first.enforce(device, RequestedAction::PermanentBan).await,
+        EnforcementResult::Verified
+    );
 
     let mut restored_connector = Connector::new(Fixture(state.clone()));
     restored_connector
         .login("owner", SecretString::new("fixture".into()))
         .await?;
     let second = W6PolicyActuator::with_sqlite(restored_connector, pool);
-    assert!(second.undo_available(device, RequestedAction::Quarantine));
+    assert!(
+        second
+            .undo_available(device, RequestedAction::Quarantine)
+            .await
+    );
     assert_eq!(
         second.undo(device, RequestedAction::Quarantine).await,
         EnforcementResult::Verified
@@ -257,6 +277,11 @@ async fn corrupt_durable_prior_state_is_manual_required() -> Result<(), Box<dyn 
     assert_eq!(
         actuator.undo(device, RequestedAction::Quarantine).await,
         EnforcementResult::ManualRequired
+    );
+    assert!(
+        !actuator
+            .undo_available(device, RequestedAction::Quarantine)
+            .await
     );
     Ok(())
 }

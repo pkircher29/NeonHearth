@@ -14,7 +14,7 @@ impl W6PriorStateRepository {
     }
     pub async fn save(&self, device: DeviceId, state: &DeviceState) -> Result<()> {
         let json = serde_json::to_string(state)?;
-        sqlx::query("INSERT INTO w6_policy_prior_state(device_id,state_json) VALUES(?,?) ON CONFLICT(device_id) DO UPDATE SET state_json=excluded.state_json")
+        sqlx::query("INSERT INTO w6_policy_prior_state(device_id,state_json) VALUES(?,?) ON CONFLICT(device_id) DO NOTHING")
             .bind(device.to_string()).bind(json).execute(&self.pool).await?;
         Ok(())
     }

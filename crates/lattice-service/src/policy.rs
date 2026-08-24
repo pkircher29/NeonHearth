@@ -24,7 +24,7 @@ pub use lattice_domain::EnforcementStatus as EnforcementResult;
 #[async_trait]
 pub trait PolicyActuator: Send + Sync {
     async fn enforce(&self, device: DeviceId, action: RequestedAction) -> EnforcementResult;
-    fn undo_available(&self, _device: DeviceId, _action: RequestedAction) -> bool {
+    async fn undo_available(&self, _device: DeviceId, _action: RequestedAction) -> bool {
         false
     }
     async fn undo(&self, _device: DeviceId, _action: RequestedAction) -> EnforcementResult {
@@ -138,15 +138,20 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
             Err(_) => EnforcementResult::ManualRequired,
         }
     }
-    fn undo_available(&self, device: DeviceId, action: RequestedAction) -> bool {
+    async fn undo_available(&self, device: DeviceId, action: RequestedAction) -> bool {
         matches!(
             action,
             RequestedAction::Quarantine | RequestedAction::PermanentBan
-        ) && (self.durable.is_some()
-            || self
-                .previous
+        ) && (if let Some(durable) = &self.durable {
+            durable
+                .load(device)
+                .await
+                .is_ok_and(|state| state.is_some())
+        } else {
+            self.previous
                 .try_lock()
-                .is_ok_and(|saved| saved.contains_key(&device)))
+                .is_ok_and(|saved| saved.contains_key(&device))
+        })
     }
 }
 
@@ -333,7 +338,8 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             )
             && self
                 .actuator
-                .undo_available(p.device_id, evaluation.requested_action);
+                .undo_available(p.device_id, evaluation.requested_action)
+                .await;
         self.finish(p, evaluation, enforcement, undo_available, now)
             .await
     }
@@ -399,7 +405,10 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 RequestedAction::Quarantine | RequestedAction::PermanentBan
             )
         {
-            let can_undo = self.actuator.undo_available(d, prior.requested_action);
+            let can_undo = self
+                .actuator
+                .undo_available(d, prior.requested_action)
+                .await;
             let undo = if can_undo {
                 self.actuator.undo(d, prior.requested_action).await
             } else {

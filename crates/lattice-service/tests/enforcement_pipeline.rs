@@ -45,7 +45,7 @@ impl PolicyActuator for FakeActuator {
     async fn undo(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult {
         EnforcementResult::Verified
     }
-    fn undo_available(&self, _: DeviceId, _: RequestedAction) -> bool {
+    async fn undo_available(&self, _: DeviceId, _: RequestedAction) -> bool {
         true
     }
 }
