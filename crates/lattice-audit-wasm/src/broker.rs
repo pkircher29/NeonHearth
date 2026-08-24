@@ -111,6 +111,9 @@ impl Budget {
             .inner
             .lock()
             .map_err(|_| BrokerError::BudgetExhausted)?;
+        if Instant::now() >= b.deadline {
+            return Err(BrokerError::DeadlineExceeded);
+        }
         let bytes = u64::try_from(bytes).map_err(|_| BrokerError::BudgetExhausted)?;
         if bytes > b.max_bytes.saturating_sub(b.bytes) {
             return Err(BrokerError::BudgetExhausted);
@@ -206,6 +209,8 @@ pub struct BrokerResult {
 pub struct Broker {
     authorizer: Arc<dyn TargetAuthorizer>,
     exchange: Arc<dyn TargetBoundExchange>,
+    #[cfg(test)]
+    before_publication: Option<std::time::Duration>,
 }
 impl Broker {
     pub fn new(
@@ -215,6 +220,8 @@ impl Broker {
         Self {
             authorizer,
             exchange,
+            #[cfg(test)]
+            before_publication: None,
         }
     }
     pub async fn execute(&self, request: BrokerRequest) -> Result<BrokerResult, BrokerError> {
@@ -281,10 +288,19 @@ impl Broker {
         if request.cancellation.is_cancelled() {
             return Err(BrokerError::Cancelled);
         }
+        #[cfg(test)]
+        if let Some(delay) = self.before_publication {
+            tokio::time::sleep(delay).await;
+        }
         host.budget.charge_bytes(output.output.len())?;
-        // Cancellation observable before this explicit publication commit wins.
-        // Cancellation after the ready branch is selected is after commit.
-        tokio::select! { biased; _ = request.cancellation.cancelled() => return Err(BrokerError::Cancelled), _ = std::future::ready(()) => {} }
+        // Cancellation or the absolute deadline observable before this explicit
+        // publication commit wins. Events after the ready branch are after commit.
+        tokio::select! {
+            biased;
+            _ = request.cancellation.cancelled() => return Err(BrokerError::Cancelled),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => return Err(BrokerError::DeadlineExceeded),
+            _ = std::future::ready(()) => {}
+        }
         Ok(BrokerResult {
             target: request.target,
             approval_id: request.approval_id,
@@ -393,6 +409,13 @@ impl AuditHost for BrokerHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        AuditManifest, EvidenceSchema, EvidenceType, RollbackPlan, SideEffectProfile, TargetKind,
+        verify_manifest,
+    };
+    use ed25519_dalek::SigningKey;
+    use sha2::{Digest, Sha256};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
     fn budget() -> Budget {
@@ -468,5 +491,77 @@ mod tests {
         let budget = budget();
         budget.release(usize::MAX, usize::MAX);
         assert_eq!(snapshot(&budget), (0, 0));
+    }
+
+    struct Auth;
+    impl TargetAuthorizer for Auth {
+        fn authorize(
+            &self,
+            target: IpAddr,
+            interface: u32,
+            port: u16,
+        ) -> Result<AuthorizedTarget, TargetError> {
+            AuthorizedTarget::new(target, interface, port)
+        }
+    }
+    struct UnusedExchange;
+    #[async_trait]
+    impl TargetBoundExchange for UnusedExchange {
+        async fn exchange(
+            &self,
+            _: &AuthorizedTarget,
+            _: ExchangeRequest,
+        ) -> Result<ExchangeResponse, BrokerError> {
+            panic!("no exchange expected")
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_crossed_after_sandbox_result_prevents_broker_result_publication() {
+        let wasm = wat::parse_str(r#"(module (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#).unwrap();
+        let limits = Limits {
+            max_bytes: 64,
+            max_requests: 1,
+            max_time: Duration::from_secs(1),
+            max_fuel: 100_000,
+            max_memory_pages: 1,
+        };
+        let mut manifest = AuditManifest::new(
+            "deadline".into(),
+            1,
+            Sha256::digest(&wasm).into(),
+            TargetKind::NumericPrivateDevice,
+            BTreeSet::from([Capability::TcpExchange { port: 80 }]),
+            "test".into(),
+            SideEffectProfile::ReadOnly,
+            RollbackPlan {
+                required: false,
+                description: "none".into(),
+            },
+            EvidenceSchema {
+                fields: BTreeMap::from([("out".into(), EvidenceType::Bytes)]),
+            },
+            limits.clone(),
+        )
+        .unwrap();
+        let key = SigningKey::from_bytes(&[4; 32]);
+        manifest.sign(&key).unwrap();
+        let module = verify_manifest(&manifest, &wasm, &key.verifying_key()).unwrap();
+        let mut broker = Broker::new(Arc::new(Auth), Arc::new(UnusedExchange));
+        broker.before_publication = Some(Duration::from_millis(1_050));
+        let result = broker
+            .execute(BrokerRequest {
+                module,
+                input: vec![],
+                target: "192.168.1.2".parse().unwrap(),
+                interface: 7,
+                port: 80,
+                capability: Capability::TcpExchange { port: 80 },
+                approval_id: Uuid::new_v4(),
+                limits,
+                cancellation: CancellationToken::new(),
+            })
+            .await;
+        assert!(matches!(result, Err(BrokerError::DeadlineExceeded)));
     }
 }
