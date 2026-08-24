@@ -84,6 +84,8 @@ async fn rejects_ambient_wasi_and_imported_memory_or_table() {
         r#"(module (import "wasi_snapshot_preview1" "fd_write" (func)) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,
         r#"(module (import "env" "memory" (memory 1)) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,
         r#"(module (import "env" "table" (table 1 funcref)) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,
+        r#"(module (import "env" "memory" (memory 65536 65536)) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,
+        r#"(module (import "env" "table" (table 100000 funcref)) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,
     ] {
         assert!(matches!(
             Sandbox::new(verified(&wasm(source), limits())).await,
@@ -107,6 +109,7 @@ async fn rejects_malformed_start_and_bad_abi() {
         r#"(module (memory (export "memory") 1) (func (export "run") (param i32) (result i64) i64.const 0))"#,
         r#"(module (memory 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,
         r#"(module (import "audit" "deterministic" (func)) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,
+        r#"(module (import "audit" "deterministic" (memory 1)) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,
     ] {
         assert_eq!(
             Sandbox::new(verified(&wasm(source), limits()))

@@ -273,18 +273,16 @@ fn validate_static_limits(wasm: &[u8], limits: &Limits) -> Result<(), AuditError
             Payload::StartSection { .. } => return Err(AuditError::InvalidAbi),
             Payload::ImportSection(section) => {
                 for import in section {
-                    match import.map_err(|_| AuditError::InvalidModule)?.ty {
-                        TypeRef::Memory(_) => {
-                            memories = memories
-                                .checked_add(1)
-                                .ok_or(AuditError::MemoryLimitExceeded)?
+                    let import = import.map_err(|_| AuditError::InvalidModule)?;
+                    if import.module == "audit" && import.name == "deterministic" {
+                        if !matches!(import.ty, TypeRef::Func(_)) {
+                            return Err(AuditError::InvalidAbi);
                         }
-                        TypeRef::Table(_) => {
-                            tables = tables
-                                .checked_add(1)
-                                .ok_or(AuditError::TableLimitExceeded)?
-                        }
-                        _ => {}
+                    } else {
+                        return Err(AuditError::ForbiddenImport(format!(
+                            "{}::{}",
+                            import.module, import.name
+                        )));
                     }
                 }
             }
