@@ -7,7 +7,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use wasmparser::{Parser, Payload};
+use wasmparser::{Parser, Payload, TypeRef};
 use wasmtime::{Config, Engine, ExternType, Linker, Module, ResourceLimiter, Store, Trap};
 
 const WASM_PAGE_SIZE: u64 = 65_536;
@@ -143,11 +143,11 @@ impl Sandbox {
         config.consume_fuel(true);
         config.async_support(true);
         config.epoch_interruption(true);
+        validate_static_limits(verified.wasm(), verified.limits())?;
         let engine = Engine::new(&config).map_err(|_| AuditError::InvalidModule)?;
         let module =
             Module::new(&engine, verified.wasm()).map_err(|_| AuditError::InvalidModule)?;
         validate_abi(&module)?;
-        validate_static_limits(verified.wasm(), verified.limits())?;
         Ok(Self {
             engine,
             module,
@@ -167,6 +167,21 @@ impl Sandbox {
         // Tokio's mutex is not poisonable. The guard covers the epoch ticker's
         // entire lifetime, and max_time begins only after this admission.
         let _execution = self.execution.lock().await;
+        let ticker = EpochTicker::start(self.engine.clone(), self.limits.max_time);
+        let result =
+            tokio::time::timeout(self.limits.max_time, self.execute_inner(input, host)).await;
+        drop(ticker);
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(AuditError::TimedOut),
+        }
+    }
+
+    async fn execute_inner<H: AuditHost>(
+        &self,
+        input: &[u8],
+        host: &H,
+    ) -> Result<AuditResult, AuditError> {
         let max_memory = page_bytes(self.limits.max_memory_pages)?;
         let mut store = Store::new(
             &self.engine,
@@ -230,17 +245,10 @@ impl Sandbox {
         let run = instance
             .get_typed_func::<(i32, i32), i64>(&mut store, "run")
             .map_err(|_| AuditError::InvalidAbi)?;
-        let ticker = EpochTicker::start(self.engine.clone(), self.limits.max_time);
-        let result = tokio::time::timeout(
-            self.limits.max_time,
-            run.call_async(&mut store, (0, input.len() as i32)),
-        )
-        .await;
-        drop(ticker);
-        let packed = match result {
-            Err(_) => return Err(AuditError::TimedOut),
-            Ok(result) => result.map_err(|error| map_error(&store, &error))?,
-        };
+        let packed = run
+            .call_async(&mut store, (0, input.len() as i32))
+            .await
+            .map_err(|error| map_error(&store, &error))?;
         let ptr = (packed >> 32) as u64;
         let len = packed as u32 as u64;
         if len > self.limits.max_bytes {
@@ -263,6 +271,23 @@ fn validate_static_limits(wasm: &[u8], limits: &Limits) -> Result<(), AuditError
     for payload in Parser::new(0).parse_all(wasm) {
         match payload.map_err(|_| AuditError::InvalidModule)? {
             Payload::StartSection { .. } => return Err(AuditError::InvalidAbi),
+            Payload::ImportSection(section) => {
+                for import in section {
+                    match import.map_err(|_| AuditError::InvalidModule)?.ty {
+                        TypeRef::Memory(_) => {
+                            memories = memories
+                                .checked_add(1)
+                                .ok_or(AuditError::MemoryLimitExceeded)?
+                        }
+                        TypeRef::Table(_) => {
+                            tables = tables
+                                .checked_add(1)
+                                .ok_or(AuditError::TableLimitExceeded)?
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Payload::MemorySection(section) => {
                 for memory in section {
                     memories = memories

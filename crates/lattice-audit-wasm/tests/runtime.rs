@@ -3,7 +3,10 @@ use lattice_audit_wasm::*;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -263,10 +266,17 @@ impl AuditHost for SleepingHost {
     }
 }
 
-struct NeverReadyHost;
+struct HostFutureDrop(Arc<AtomicBool>);
+impl Drop for HostFutureDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+struct NeverReadyHost(Arc<AtomicBool>);
 #[async_trait::async_trait]
 impl AuditHost for NeverReadyHost {
     async fn deterministic(&self) -> u32 {
+        let _cancelled = HostFutureDrop(Arc::clone(&self.0));
         tokio::time::sleep(Duration::from_secs(10)).await;
         0
     }
@@ -278,12 +288,17 @@ async fn host_await_is_cancelled_at_max_time_and_releases_the_sandbox() {
         r#"(module (import "audit" "deterministic" (func $d (result i32))) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) call $d drop local.get 0 i64.extend_i32_u i64.const 32 i64.shl local.get 1 i64.extend_i32_u i64.or))"#,
     );
     let sandbox = Sandbox::new(verified(&module, limits())).await.unwrap();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let started = tokio::time::Instant::now();
     assert_eq!(
-        sandbox.execute(b"x", &NeverReadyHost).await.unwrap_err(),
+        sandbox
+            .execute(b"x", &NeverReadyHost(Arc::clone(&cancelled)))
+            .await
+            .unwrap_err(),
         AuditError::TimedOut
     );
     assert!(started.elapsed() < Duration::from_millis(1_500));
+    assert!(cancelled.load(Ordering::Acquire));
     assert_eq!(
         sandbox.execute(b"ok", &Host(1)).await.unwrap().output,
         b"ok"
