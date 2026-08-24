@@ -34,6 +34,7 @@ pub struct PolicyRepository {
 pub struct ActuationAttempt {
     pub policy_version: u32,
     pub action: RequestedAction,
+    pub decision: Option<PolicyChanged>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,17 +52,21 @@ impl PolicyRepository {
         &self,
         device_id: DeviceId,
     ) -> anyhow::Result<Option<ActuationAttempt>> {
-        let row: Option<(i64, String)> = sqlx::query_as(
-            "SELECT policy_version, action_json FROM policy_actuation_journal WHERE device_id=?",
+        let row: Option<(i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT policy_version, action_json, decision_json FROM policy_actuation_journal WHERE device_id=?",
         )
         .bind(device_id.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(policy_version, action_json)| {
+        row.map(|(policy_version, action_json, decision_json)| {
             Ok(ActuationAttempt {
                 policy_version: u32::try_from(policy_version)
                     .context("invalid journal policy version")?,
                 action: decode(&action_json, "journal action")?,
+                decision: decision_json
+                    .as_deref()
+                    .map(|v| decode(v, "journal decision"))
+                    .transpose()?,
             })
         })
         .transpose()
@@ -76,6 +81,18 @@ impl PolicyRepository {
         action: RequestedAction,
         now: DateTime<Utc>,
     ) -> anyhow::Result<ActuationReservation> {
+        self.reserve_actuation_with_decision(device_id, policy_version, action, now, None)
+            .await
+    }
+
+    pub async fn reserve_actuation_with_decision(
+        &self,
+        device_id: DeviceId,
+        policy_version: u32,
+        action: RequestedAction,
+        now: DateTime<Utc>,
+        decision: Option<&PolicyChanged>,
+    ) -> anyhow::Result<ActuationReservation> {
         let encoded = encode(&action)?;
         let mut tx = self.pool.begin().await?;
         if let Some(existing) = self.actuation_attempt_in(&mut tx, device_id).await? {
@@ -86,11 +103,12 @@ impl PolicyRepository {
             tx.commit().await?;
             return Ok(ActuationReservation::Existing);
         }
-        sqlx::query("INSERT INTO policy_actuation_journal(device_id, policy_version, action_json, reserved_at) VALUES(?,?,?,?)")
+        sqlx::query("INSERT INTO policy_actuation_journal(device_id, policy_version, action_json, reserved_at, decision_json) VALUES(?,?,?,?,?)")
             .bind(device_id.to_string())
             .bind(i64::from(policy_version))
             .bind(encoded)
             .bind(now.to_rfc3339())
+            .bind(decision.map(encode).transpose()?)
             .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(ActuationReservation::Reserved)
@@ -117,17 +135,21 @@ impl PolicyRepository {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         device_id: DeviceId,
     ) -> anyhow::Result<Option<ActuationAttempt>> {
-        let row: Option<(i64, String)> = sqlx::query_as(
-            "SELECT policy_version, action_json FROM policy_actuation_journal WHERE device_id=?",
+        let row: Option<(i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT policy_version, action_json, decision_json FROM policy_actuation_journal WHERE device_id=?",
         )
         .bind(device_id.to_string())
         .fetch_optional(&mut **tx)
         .await?;
-        row.map(|(policy_version, action_json)| {
+        row.map(|(policy_version, action_json, decision_json)| {
             Ok(ActuationAttempt {
                 policy_version: u32::try_from(policy_version)
                     .context("invalid journal policy version")?,
                 action: decode(&action_json, "journal action")?,
+                decision: decision_json
+                    .as_deref()
+                    .map(|v| decode(v, "journal decision"))
+                    .transpose()?,
             })
         })
         .transpose()

@@ -431,6 +431,81 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 return self.finish(p, evaluation, undo, available, now).await;
             }
         }
+        // A pending journal belongs to an exact older decision.  Reconcile it
+        // before attempting a newer action: overwriting it would either replay
+        // an irreversible mutation or lose the event needed to explain it.
+        if let Some(old) = self.repo.actuation_attempt(p.device_id).await?
+            && (old.policy_version != evaluation.policy_version
+                || old.action != evaluation.requested_action)
+        {
+            match self.actuator.reconcile(p.device_id, old.action).await {
+                ActuationReconciliation::ProvenNotApplied => {
+                    self.repo
+                        .clear_actuation_attempt(p.device_id, old.policy_version, old.action)
+                        .await?;
+                }
+                ActuationReconciliation::VerifiedApplied => {
+                    if let Some(ref event) = old.decision {
+                        self.publish_exact(event, Some(&old), now).await?;
+                        // PermanentBan is stronger than Quarantine.  Never
+                        // claim a downgrade merely by applying the weaker
+                        // control over it: first drive the durable restore
+                        // state machine (or surface durable owner guidance if
+                        // restoration is unavailable).
+                        if old.action == RequestedAction::PermanentBan
+                            && evaluation.requested_action == RequestedAction::Quarantine
+                        {
+                            self.repo
+                                .schedule_release_retry(p.device_id, old.action, now)
+                                .await?;
+                            return self
+                                .finish(
+                                    p,
+                                    evaluation,
+                                    EnforcementResult::ManualRequired,
+                                    false,
+                                    now,
+                                )
+                                .await;
+                        }
+                    } else {
+                        // Legacy entries lack the causality data required to
+                        // publish safely. Retire only if a prior ack proves it.
+                        let acknowledged = previously_published.as_ref().is_some_and(|last| {
+                            last.enforcement_result == EnforcementResult::Verified
+                                && last.policy_version == old.policy_version
+                                && last.requested_action == old.action
+                        });
+                        if acknowledged {
+                            self.repo
+                                .clear_actuation_attempt(
+                                    p.device_id,
+                                    old.policy_version,
+                                    old.action,
+                                )
+                                .await?;
+                        } else {
+                            return self
+                                .finish(
+                                    p,
+                                    evaluation,
+                                    EnforcementResult::ManualRequired,
+                                    false,
+                                    now,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                ActuationReconciliation::Indeterminate
+                | ActuationReconciliation::ManualRequired
+                | ActuationReconciliation::Failed => {
+                    return self
+                        .finish(p, evaluation, EnforcementResult::ManualRequired, false, now)
+                        .await;
+                }
+            }
+        }
         let prior_matches = |result: EnforcementResult| {
             previously_published.as_ref().is_some_and(|last| {
                 last.evaluation == evaluation
@@ -461,11 +536,12 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             // physical mutation, not merely for its event publication.
             match self
                 .repo
-                .reserve_actuation(
+                .reserve_actuation_with_decision(
                     p.device_id,
                     evaluation.policy_version,
                     evaluation.requested_action,
                     now,
+                    Some(&self.policy_event(&p, evaluation, EnforcementResult::Verified, false)),
                 )
                 .await?
             {
@@ -493,11 +569,17 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                             )
                             .await?;
                         self.repo
-                            .reserve_actuation(
+                            .reserve_actuation_with_decision(
                                 p.device_id,
                                 evaluation.policy_version,
                                 evaluation.requested_action,
                                 now,
+                                Some(&self.policy_event(
+                                    &p,
+                                    evaluation,
+                                    EnforcementResult::Verified,
+                                    false,
+                                )),
                             )
                             .await?;
                         self.actuator
@@ -549,54 +631,8 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         undo_available: bool,
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
-        let fingerprint = serde_json::to_string(&(
-            evaluation,
-            evidence_summary(&p),
-            enforcement,
-            undo_available,
-        ))?;
-        if self
-            .repo
-            .prepare_decision_publication(p.device_id, &fingerprint)
-            .await?
-        {
-            let event = PolicyChanged {
-                device_id: p.device_id,
-                policy_version: evaluation.policy_version,
-                evaluation,
-                requested_action: evaluation.requested_action,
-                evidence_summary: evidence_summary(&p),
-                enforcement_result: enforcement,
-                undo_available,
-            };
-            if let Some(bus) = &self.events {
-                bus.publish(now, EventPayload::PolicyChanged(event.clone()))
-                    .await;
-            }
-            let attempt = if enforcement == EnforcementResult::Verified
-                && matches!(
-                    evaluation.requested_action,
-                    RequestedAction::Quarantine | RequestedAction::PermanentBan
-                ) {
-                self.repo
-                    .actuation_attempt(p.device_id)
-                    .await?
-                    .filter(|attempt| {
-                        attempt.policy_version == evaluation.policy_version
-                            && attempt.action == evaluation.requested_action
-                    })
-            } else {
-                None
-            };
-            self.repo
-                .mark_decision_published_and_clear_attempt(
-                    p.device_id,
-                    &fingerprint,
-                    &event,
-                    attempt.as_ref(),
-                )
-                .await?;
-        }
+        let event = self.policy_event(&p, evaluation, enforcement, undo_available);
+        self.publish_exact(&event, None, now).await?;
         Ok(AuditedDecision {
             evaluation,
             reason: evaluation.reason,
@@ -606,6 +642,68 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             enforcement,
             undo_available,
         })
+    }
+    fn policy_event(
+        &self,
+        p: &DevicePolicy,
+        evaluation: Evaluation,
+        enforcement: EnforcementResult,
+        undo_available: bool,
+    ) -> PolicyChanged {
+        PolicyChanged {
+            device_id: p.device_id,
+            policy_version: evaluation.policy_version,
+            evaluation,
+            requested_action: evaluation.requested_action,
+            evidence_summary: evidence_summary(p),
+            enforcement_result: enforcement,
+            undo_available,
+        }
+    }
+    async fn publish_exact(
+        &self,
+        event: &PolicyChanged,
+        attempt: Option<&lattice_store::ActuationAttempt>,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let fingerprint = serde_json::to_string(event)?;
+        if self
+            .repo
+            .prepare_decision_publication(event.device_id, &fingerprint)
+            .await?
+        {
+            if let Some(bus) = &self.events {
+                bus.publish(now, EventPayload::PolicyChanged(event.clone()))
+                    .await;
+            }
+            let matching_attempt = if attempt.is_some() {
+                attempt.cloned()
+            } else if event.enforcement_result == EnforcementResult::Verified
+                && matches!(
+                    event.requested_action,
+                    RequestedAction::Quarantine | RequestedAction::PermanentBan
+                )
+            {
+                self.repo
+                    .actuation_attempt(event.device_id)
+                    .await?
+                    .filter(|attempt| {
+                        attempt.policy_version == event.policy_version
+                            && attempt.action == event.requested_action
+                    })
+            } else {
+                None
+            };
+            self.repo
+                .mark_decision_published_and_clear_attempt(
+                    event.device_id,
+                    &fingerprint,
+                    event,
+                    matching_attempt.as_ref(),
+                )
+                .await?;
+        }
+        Ok(())
     }
     pub async fn approve(
         &self,
