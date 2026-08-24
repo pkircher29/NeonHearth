@@ -15,9 +15,18 @@ use lattice_service::{
         DiscoverySource, DiscoverySources, NeighborCoordinator, NeighborCoordinatorConfig,
         NeighborInterfaceBinding, PersistentDiscoveryPipeline, neighbor_discovery_sources,
     },
+    runtime::run_loop_with_clock,
 };
 use lattice_store::{M2StateRepository, connect_memory};
-use std::{collections::VecDeque, net::IpAddr, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    net::IpAddr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+use tokio::sync::{oneshot, watch};
 
 const TOKEN: &str = "owner-token-0123456789abcdefghijkl";
 
@@ -26,6 +35,39 @@ struct QueuedSource(Mutex<VecDeque<Result<Vec<NeighborRow>, NeighborError>>>);
 impl NeighborSnapshotSource for QueuedSource {
     async fn snapshot(&self) -> Result<Vec<NeighborRow>, NeighborError> {
         self.0.lock().unwrap().pop_front().unwrap_or(Ok(vec![]))
+    }
+}
+
+struct CountingSource {
+    queue: Mutex<VecDeque<Result<Vec<NeighborRow>, NeighborError>>>,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl NeighborSnapshotSource for CountingSource {
+    async fn snapshot(&self) -> Result<Vec<NeighborRow>, NeighborError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.queue.lock().unwrap().pop_front().unwrap_or(Ok(vec![]))
+    }
+}
+
+struct PendingSource {
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    drops: Arc<AtomicUsize>,
+}
+struct PendingGuard(Arc<AtomicUsize>);
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+#[async_trait]
+impl NeighborSnapshotSource for PendingSource {
+    async fn snapshot(&self) -> Result<Vec<NeighborRow>, NeighborError> {
+        let _guard = PendingGuard(self.drops.clone());
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        std::future::pending().await
     }
 }
 fn mac(n: u8) -> LinkAddress {
@@ -89,6 +131,35 @@ async fn coordinator(
         pool,
     )
 }
+
+async fn runtime_coordinator<S: NeighborSnapshotSource>(
+    source: S,
+) -> (NeighborCoordinator<S>, M2StateRepository, AppState) {
+    let pool = connect_memory().await.unwrap();
+    let repo = M2StateRepository::new(pool);
+    let bindings = vec![binding(7)];
+    let pipeline = PersistentDiscoveryPipeline::open(
+        repo.clone(),
+        neighbor_discovery_sources(&bindings).unwrap(),
+        ids(),
+        Default::default(),
+        16,
+        16,
+    )
+    .await
+    .unwrap();
+    let state = AppState::new(TOKEN, repo.clone()).unwrap();
+    let cfg = NeighborCoordinatorConfig {
+        poll_interval: Duration::seconds(5),
+        support_ttl: Duration::seconds(4),
+        tracker: NeighborTrackerConfig::default(),
+    };
+    (
+        NeighborCoordinator::new(source, pipeline, state.clone(), bindings, cfg).unwrap(),
+        repo,
+        state,
+    )
+}
 fn binding(interface: u32) -> NeighborInterfaceBinding {
     NeighborInterfaceBinding::for_interface(InterfaceId::new(interface)).unwrap()
 }
@@ -111,6 +182,136 @@ async fn assert_rejects_source_parity(sources: DiscoverySources) {
         )
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn runtime_loop_ticks_on_schedule_and_recovers_real_coordinator() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let source = CountingSource {
+        queue: Mutex::new(
+            vec![
+                Ok(vec![row(7, 1)]),
+                Ok(vec![row(7, 1)]),
+                Err(NeighborError::Transport),
+                Ok(vec![row(7, 1)]),
+            ]
+            .into(),
+        ),
+        calls: calls.clone(),
+    };
+    let (coordinator, repo, state) = runtime_coordinator(source).await;
+    tokio::time::pause();
+    let (shutdown, rx) = watch::channel(false);
+    let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock_ticks = Arc::new(AtomicUsize::new(0));
+    let ticks = clock_ticks.clone();
+    let task = tokio::spawn(async move {
+        let mut coordinator = coordinator;
+        let mut rx = rx;
+        run_loop_with_clock(&mut coordinator, &mut rx, move || {
+            base + Duration::seconds((ticks.fetch_add(1, Ordering::SeqCst) * 5) as i64)
+        })
+        .await;
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    tokio::time::resume();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(repo.list_device_snapshots(8, None).await.unwrap().len(), 1);
+    tokio::time::pause();
+    assert!(
+        matches!(state.events().resume_after(0).await, Resume::Events(ref xs) if xs.is_empty())
+    );
+    tokio::time::advance(std::time::Duration::from_millis(3999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::time::resume();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        repo.list_device_snapshots(8, None).await.unwrap()[0]
+            .presence
+            .as_ref()
+            .unwrap()
+            .to_state,
+        PresenceState::Quiet
+    );
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    tokio::time::resume();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(state.service_status().await, "degraded");
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    tokio::time::resume();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(state.service_status().await, "ready");
+    let events = match state.events().resume_after(0).await {
+        Resume::Events(xs) => xs,
+        _ => panic!(),
+    };
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::ServiceStatus(_)))
+            .count(),
+        2
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.payload, EventPayload::BandwidthFrame(_)))
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn runtime_loop_pre_signal_drop_and_pending_snapshot_shutdown_are_prompt() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (mut coordinator, _, _) = runtime_coordinator(CountingSource {
+        queue: Mutex::new(VecDeque::new()),
+        calls: calls.clone(),
+    })
+    .await;
+    tokio::time::pause();
+    let (_shutdown, mut rx) = watch::channel(true);
+    run_loop_with_clock(&mut coordinator, &mut rx, Utc::now).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    tokio::time::resume();
+    let (mut coordinator, _, _) = runtime_coordinator(CountingSource {
+        queue: Mutex::new(VecDeque::new()),
+        calls: calls.clone(),
+    })
+    .await;
+    tokio::time::pause();
+    let (shutdown, mut rx) = watch::channel(false);
+    drop(shutdown);
+    run_loop_with_clock(&mut coordinator, &mut rx, Utc::now).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let drops = Arc::new(AtomicUsize::new(0));
+    tokio::time::resume();
+    let (coordinator, _, _) = runtime_coordinator(PendingSource {
+        entered: Mutex::new(Some(entered_tx)),
+        drops: drops.clone(),
+    })
+    .await;
+    tokio::time::pause();
+    let (shutdown, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut coordinator = coordinator;
+        let mut rx = rx;
+        run_loop_with_clock(&mut coordinator, &mut rx, Utc::now).await;
+    });
+    entered_rx.await.unwrap();
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
