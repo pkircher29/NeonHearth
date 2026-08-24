@@ -44,12 +44,12 @@ describe('createApiClient', () => {
       if (url.endsWith('/inventory')) return new Response(JSON.stringify(inventory), { status: 200 });
       if (url.endsWith('/health')) return new Response(JSON.stringify({ health: 'healthy', confidence: 0.5 }), { status: 200 });
       if (url.includes('/cameras?')) return new Response(JSON.stringify({ items: [summary], next_after: null }), { status: 200 });
-      if (url.endsWith(id)) return new Response(JSON.stringify({ ...summary, inventory, streams: [] }), { status: 200 });
+      if (url.endsWith(id)) return new Response(JSON.stringify({ ...summary, inventory, streams: [{ stream_id: stream }] }), { status: 200 });
       return new Response(JSON.stringify({ items: [summary], next_after: null }), { status: 200 });
     });
     const client = createApiClient({ baseUrl: 'https://collector.example/base', serviceToken: 'secret', fetchImpl });
     await expect(client.cameras({ limit: 1, after: id })).resolves.toMatchObject({ items: [summary] });
-    await expect(client.camera(id)).resolves.toMatchObject({ inventory });
+    await expect(client.camera(id)).resolves.toMatchObject({ inventory, streams: [{ stream_id: stream }] });
     await expect(client.cameraHealth(id)).resolves.toEqual({ health: 'healthy', confidence: 0.5 });
     await expect(client.cameraInventory(id)).resolves.toEqual(inventory);
     await expect(client.cameraSnapshot(id, stream)).resolves.toBeInstanceOf(Blob);
@@ -77,7 +77,7 @@ describe('createApiClient', () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith('/inventory')) return new Response(JSON.stringify(inventory(128)), { status: 200 });
-      return new Response(JSON.stringify({ ...summary, inventory: inventory(128) }), { status: 200 });
+      return new Response(JSON.stringify({ ...summary, inventory: inventory(128), streams: [] }), { status: 200 });
     });
     const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
     await expect(client.camera(id)).resolves.toMatchObject({ camera_id: id });
@@ -86,11 +86,14 @@ describe('createApiClient', () => {
       await expect(client.camera(invalid)).rejects.toThrow('Invalid camera id');
     }
     for (const malformed of [
-      { ...summary, confidence: -0.01, inventory: inventory(128) },
-      { ...summary, confidence: 1.01, inventory: inventory(128) },
-      { ...summary, classification: 'invented', inventory: inventory(128) },
-      { ...summary, health: 'invented', inventory: inventory(128) },
-      { ...summary, inventory: inventory(129) },
+      { ...summary, confidence: -0.01, inventory: inventory(128), streams: [] },
+      { ...summary, confidence: 1.01, inventory: inventory(128), streams: [] },
+      { ...summary, classification: 'invented', inventory: inventory(128), streams: [] },
+      { ...summary, health: 'invented', inventory: inventory(128), streams: [] },
+      { ...summary, inventory: inventory(129), streams: [] },
+      { ...summary, inventory: inventory(128), streams: Array.from({ length: 65 }, () => ({ stream_id: id })) },
+      { ...summary, inventory: inventory(128), streams: [{ stream_id: 'not-an-id' }] },
+      { ...summary, inventory: inventory(128), streams: [{ stream_id: id, source_ref: 'rtsp://secret.invalid' }] },
     ]) {
       const bad = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 })) });
       await expect(bad.camera(id)).rejects.toThrow('Invalid camera response');
