@@ -341,6 +341,132 @@ async fn snapshot_fails_closed_for_legacy_pending_row_without_exact_decision() -
 }
 
 #[tokio::test]
+async fn snapshot_prefers_newer_exact_pending_over_older_published_decision() -> anyhow::Result<()>
+{
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(Utc::now())
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(Utc::now()).await?;
+    let devices = [
+        (
+            OwnerDecision::Approved,
+            Protection::SafetyDevice,
+            RequestedAction::None,
+            EnforcementStatus::Verified,
+            true,
+            OwnerDecision::Quarantined,
+            Protection::Router,
+            RequestedAction::Quarantine,
+            EnforcementStatus::Failed,
+            false,
+        ),
+        (
+            OwnerDecision::Quarantined,
+            Protection::Router,
+            RequestedAction::Quarantine,
+            EnforcementStatus::Failed,
+            false,
+            OwnerDecision::Approved,
+            Protection::SafetyDevice,
+            RequestedAction::None,
+            EnforcementStatus::Verified,
+            true,
+        ),
+    ];
+    for (
+        index,
+        (
+            old_owner,
+            old_protection,
+            old_action,
+            old_result,
+            old_undo,
+            new_owner,
+            new_protection,
+            new_action,
+            new_result,
+            new_undo,
+        ),
+    ) in devices.into_iter().enumerate()
+    {
+        let device = lattice_domain::DeviceId::new();
+        let observed = format!("2026-01-01T00:00:0{index}Z");
+        sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_confirmed) VALUES(?,?,?,?)")
+            .bind(device.to_string()).bind(&observed).bind(&observed).bind((old_owner == OwnerDecision::Approved) as i64).execute(&pool).await?;
+        repo.enroll(device).await?;
+        repo.set_owner_decision(device, old_owner).await?;
+        repo.set_protection(device, old_protection).await?;
+        let old = PolicyChanged {
+            device_id: device,
+            policy_version: 10,
+            evaluation: Evaluation {
+                policy_version: 10,
+                reason: PolicyReason::OwnerApproved,
+                requested_action: old_action,
+                deadline: None,
+                warning: None,
+            },
+            requested_action: old_action,
+            evidence_summary: "old".into(),
+            enforcement_result: old_result,
+            undo_available: old_undo,
+        };
+        let old_fingerprint = serde_json::to_string(&old)?;
+        repo.mark_decision_published(device, &old_fingerprint, &old)
+            .await?;
+        repo.set_owner_decision(device, new_owner).await?;
+        repo.set_protection(device, new_protection).await?;
+        let new = PolicyChanged {
+            device_id: device,
+            policy_version: 11,
+            evaluation: Evaluation {
+                policy_version: 11,
+                reason: if new_action == RequestedAction::None {
+                    PolicyReason::OwnerApproved
+                } else {
+                    PolicyReason::OwnerQuarantined
+                },
+                requested_action: new_action,
+                deadline: None,
+                warning: None,
+            },
+            requested_action: new_action,
+            evidence_summary: "new".into(),
+            enforcement_result: new_result,
+            undo_available: new_undo,
+        };
+        let new_fingerprint = serde_json::to_string(&new)?;
+        assert!(
+            repo.prepare_exact_decision_publication(device, &new_fingerprint, &new)
+                .await?
+        );
+    }
+    let response = app(AppState::new(TOKEN, M2StateRepository::new(pool)).unwrap())
+        .oneshot(authorized_state("/api/v1/state"))
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let policies: Vec<_> = body(response).await["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["policy"].clone())
+        .collect();
+    assert_eq!(policies.len(), 2);
+    assert!(policies.iter().all(|p| p["delivery_pending"] == true));
+    assert!(policies.iter().any(|p| p["enforcement_result"] == "failed"
+        && p["evaluation"]["requested_action"] == "quarantine"));
+    assert!(
+        policies
+            .iter()
+            .any(|p| p["enforcement_result"] == "verified"
+                && p["evaluation"]["requested_action"] == "none")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn snapshot_projects_safe_evidence_latest_unknown_presence_and_latest_bandwidth() {
     let pool = connect_memory().await.unwrap();
     let id = "018f47a0-9b5c-7a22-8a33-112233445511";

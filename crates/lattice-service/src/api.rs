@@ -127,17 +127,17 @@ pub async fn state(
     for device in devices {
         let policy_projection = match (
             policy.load(device.device_id).await,
-            policy.published_decision(device.device_id).await,
             policy.pending_decision_value(device.device_id).await,
+            policy.published_decision(device.device_id).await,
         ) {
-            (Ok(Some(policy_row)), Ok(Some(value)), Ok(_)) => {
-                Some(PolicyProjection::from((policy_row, value)))
-            }
-            (Ok(Some(policy_row)), Ok(None), Ok(Some(PendingDecision::Exact(value)))) => {
+            (Ok(Some(policy_row)), Ok(Some(PendingDecision::Exact(value))), _) => {
                 Some(PolicyProjection::pending_exact(policy_row, value))
             }
-            (Ok(Some(policy_row)), Ok(None), Ok(Some(PendingDecision::Legacy))) => {
+            (Ok(Some(policy_row)), Ok(Some(PendingDecision::Legacy)), _) => {
                 Some(PolicyProjection::pending_legacy(policy_row))
+            }
+            (Ok(Some(policy_row)), Ok(None), Ok(Some(value))) => {
+                Some(PolicyProjection::from((policy_row, value)))
             }
             (Ok(_), Ok(None), Ok(None)) => None,
             _ => return Err(StatusCode::SERVICE_UNAVAILABLE),
