@@ -17,7 +17,33 @@ describe('createLiveConnection', () => {
     expect(client.openEvents).toHaveBeenCalledWith(4, expect.any(Function), expect.any(Function));
     connection.stop();
     expect(connection.getState().connected).toBe(false);
-    expect(states).toContain('4:true');
+    expect(states).toContain('4:false');
+  });
+
+  it('keeps a hydrated snapshot disconnected until the websocket opens', async () => {
+    let onState: ((state: 'open' | 'closed' | 'error') => void) | undefined;
+    const client = clientStub({ openEvents: vi.fn(async (_sequence, _onMessage, callback) => {
+      onState = callback;
+      return { close: vi.fn() } as unknown as WebSocket;
+    }) });
+    const connection = createLiveConnection({ client });
+
+    await connection.start();
+    expect(connection.getState().connected).toBe(false);
+    onState?.('open');
+    expect(connection.getState().connected).toBe(true);
+    connection.stop();
+  });
+
+  it('marks a failed websocket attempt disconnected before retrying', async () => {
+    const timers = { setTimeout: vi.fn(() => 1), clearTimeout: vi.fn() };
+    const client = clientStub({ openEvents: vi.fn(async () => { throw new Error('ticket rejected'); }) });
+    const connection = createLiveConnection({ client, timers });
+
+    await connection.start();
+    expect(connection.getState().connected).toBe(false);
+    expect(timers.setTimeout).toHaveBeenCalledTimes(1);
+    connection.stop();
   });
 
   it('resyncs after a server resync request without replaying commands', async () => {

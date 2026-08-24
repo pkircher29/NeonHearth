@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { EventEnvelope } from '../api/types';
-import { applySnapshot, bandwidthTier, initialLiveState, reduceLiveMessage } from './live';
+import { applySnapshot, bandwidthTier, initialLiveState, reduceLiveMessage, topDevices } from './live';
 
 const serviceStatus = (sequence: number, state = 'ready'): EventEnvelope => ({
   sequence,
@@ -81,7 +81,7 @@ describe('reduceLiveMessage', () => {
     expect(reduceLiveMessage(latched, { type: 'resync_required' })).toBe(latched);
     expect(applySnapshot(latched, { sequence: 7, devices: [], next_after: null, service_status: 'ready' })).toMatchObject({
       sequence: 7,
-      connected: true,
+      connected: false,
       needsResync: false,
       serviceStatus: 'ready'
     });
@@ -123,4 +123,19 @@ describe('reduceLiveMessage', () => {
 
     expect(result.protocolMix).toBeNull();
   });
+
+  it('excludes devices without available bandwidth from top devices', () => {
+    const snapshot = applySnapshot(initialLiveState, {
+      sequence: 1, next_after: null, service_status: 'ready', devices: [
+        { ...resultDevice('unavailable'), bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null } },
+        { ...resultDevice('available'), bandwidth: { available: true, upload: 1, download: 2, coverage: 'complete', observed_at: '2026-08-23T00:00:00Z' } }
+      ]
+    });
+    expect(topDevices(snapshot)).toHaveLength(1);
+    expect(topDevices(snapshot)[0]?.device_id).toBe('available');
+  });
 });
+
+function resultDevice(device_id: string) {
+  return { device_id, first_seen_at: '2026-08-23T00:00:00Z', last_seen_at: '2026-08-23T00:00:00Z', owner_name: null, owner_type: null, owner_confirmed: false, presence: { state: 'unknown' as const, observed_at: null, source: null, kind: null }, evidence: null, identity: { available: false, classification: null, confidence: null } };
+}

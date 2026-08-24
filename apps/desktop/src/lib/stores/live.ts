@@ -29,7 +29,9 @@ export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
   const devices: Record<string, DeviceSnapshot> = {};
   const deviceOrder: string[] = [];
   for (const device of snapshot.devices) { if (!(device.device_id in devices)) deviceOrder.push(device.device_id); devices[device.device_id] = device; }
-  const next = { sequence: snapshot.sequence, connected: true, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: [], timeline: [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: 0, download: 0 }, protocolMix: null };
+  // A snapshot is a trustworthy baseline, but it is not evidence that the
+  // event socket is open. The connection orchestrator marks it live on open.
+  const next = { sequence: snapshot.sequence, connected: false, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: [], timeline: [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: 0, download: 0 }, protocolMix: null };
   return summarize(next);
 }
 
@@ -69,4 +71,4 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
 }
 
 export function bandwidthTier(totalBps: number): 'blue' | 'cyan' | 'gold' | 'pink' { const megabits = totalBps / 1_000_000; return megabits < 1 ? 'blue' : megabits <= 10 ? 'cyan' : megabits <= 30 ? 'gold' : 'pink'; }
-export function topDevices(state: LiveState, limit = 5): DeviceSnapshot[] { return state.deviceOrder.map((id) => state.devices[id]).filter((device): device is DeviceSnapshot => Boolean(device)).sort((a, b) => (b.bandwidth.upload ?? 0) + (b.bandwidth.download ?? 0) - (a.bandwidth.upload ?? 0) - (a.bandwidth.download ?? 0)).slice(0, limit); }
+export function topDevices(state: LiveState, limit = 5): DeviceSnapshot[] { return state.deviceOrder.map((id) => state.devices[id]).filter((device): device is DeviceSnapshot => Boolean(device) && device.bandwidth.available).sort((a, b) => (b.bandwidth.upload ?? 0) + (b.bandwidth.download ?? 0) - (a.bandwidth.upload ?? 0) - (a.bandwidth.download ?? 0)).slice(0, limit); }

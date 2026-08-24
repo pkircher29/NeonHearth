@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { createApiClient } from './lib/api/client';
-  import { applySnapshot, initialLiveState, reduceLiveMessage, type LiveState } from './lib/stores/live';
+  import { initialLiveState, type LiveState } from './lib/stores/live';
+  import { createLiveConnection } from './lib/stores/connection';
   import CollectorStatus, { type CollectorState } from './lib/components/CollectorStatus.svelte';
   import PulseView from './lib/components/PulseView.svelte';
   import DevicesView from './lib/components/DevicesView.svelte';
@@ -16,17 +17,12 @@
     return `${event.data.payload.data.samples.length} samples received`;
   }
   onMount(() => {
-    let socket: WebSocket | undefined; let active = true;
+    let active = true;
     const client = createApiClient({ baseUrl: window.location.origin, serviceToken: '' });
-    async function connect() {
-      try {
-        await client.health(); if (!active) return; collectorState = 'ready';
-        const snapshot = await client.snapshotAll(); if (!active) return;
-        liveState = applySnapshot(initialLiveState, snapshot);
-        try { socket = await client.openEvents(snapshot.sequence, (message) => { if (active) liveState = reduceLiveMessage(liveState, message); }, (state) => { if (active && state === 'error') collectorState = 'offline'; }); } catch { /* Unpaired builds can still show the honest snapshot state. */ }
-      } catch { if (active) collectorState = 'offline'; }
-    }
-    void connect(); return () => { active = false; socket?.close(); };
+    const connection = createLiveConnection({ client, onState: (state) => { if (active) liveState = state; } });
+    void client.health().then(() => { if (active) collectorState = 'ready'; }).catch(() => { if (active) collectorState = 'offline'; });
+    void connection.start();
+    return () => { active = false; connection.stop(); };
   });
 </script>
 <svelte:head><title>NeonHearth — {view}</title></svelte:head>
