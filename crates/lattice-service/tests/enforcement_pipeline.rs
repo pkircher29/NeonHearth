@@ -747,3 +747,43 @@ async fn manual_required_enforcement_retries_on_a_bounded_schedule_not_each_swee
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     Ok(())
 }
+
+#[tokio::test]
+async fn unacknowledged_outbox_is_republished_after_publish_before_ack_crash() -> anyhow::Result<()>
+{
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let policy = repo.enroll(device).await?;
+    let evaluation =
+        lattice_policy::PolicyEngine::new(policy.first_seen_at).evaluate(&policy, at(60));
+    let fingerprint = serde_json::to_string(&(
+        evaluation,
+        "policy facts evaluated",
+        EnforcementResult::NotRequested,
+        false,
+    ))?;
+    repo.prepare_decision_publication(device, &fingerprint)
+        .await?;
+    let bus = EventBus::new(8, 8);
+    bus.publish(
+        at(60),
+        lattice_domain::EventPayload::ServiceStatus(lattice_domain::ServiceStatus {
+            state: "crash-window".into(),
+            detail: "published but not acknowledged".into(),
+        }),
+    )
+    .await;
+    PolicyCoordinator::with_actuator(repo.clone(), Some(bus.clone()), FakeActuator::default())
+        .evaluate(policy, at(60))
+        .await?;
+    assert_eq!(bus.current_sequence().await, 2);
+    assert!(!repo.pending_decision(device).await?);
+    Ok(())
+}
