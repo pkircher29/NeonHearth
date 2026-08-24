@@ -213,6 +213,53 @@ describe('reduceLiveMessage', () => {
     expect(reduceLiveMessage(released, { type: 'event', data: presence(4) }).devices[id]?.presence.state).toBe('online');
   });
 
+  it.each(['quarantine', 'permanent_ban'] as const)('derives blocked effective presence from a contradictory %s snapshot', (requested_action) => {
+    const id = '0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b';
+    const snapshot = {
+      sequence: 1,
+      devices: [{
+        ...resultDevice(id),
+        presence: { state: 'online' as const, observed_at: '2026-08-23T00:00:00Z', source: 'sensor', kind: 'reply' },
+        policy: {
+          owner_decision: 'quarantined' as const,
+          protection: 'collector' as const,
+          evaluation: { policy_version: 1, reason: 'owner_quarantined' as const, requested_action, deadline: null, warning: null },
+          enforcement_result: 'verified' as const,
+          undo_available: true,
+          delivery_pending: false
+        }
+      }],
+      next_after: null,
+      service_status: 'ready' as const
+    };
+
+    const hydrated = applySnapshot(initialLiveState, snapshot);
+    expect(hydrated.devices[id]?.presence.state).toBe('blocked');
+    const contradictory = reduceLiveMessage(hydrated, { type: 'event', data: presence(2) });
+    expect(contradictory.devices[id]?.presence.state).toBe('blocked');
+    const released = reduceLiveMessage(contradictory, {
+      type: 'event',
+      data: {
+        sequence: 3,
+        occurred_at: '2026-08-23T00:03:00Z',
+        payload: {
+          type: 'policy_changed',
+          data: {
+            device_id: id,
+            policy_version: 2,
+            evaluation: { policy_version: 2, reason: 'owner_approved', requested_action: 'none', deadline: null, warning: null },
+            requested_action: 'none',
+            evidence_summary: 'owner approved',
+            enforcement_result: 'verified',
+            undo_available: false
+          }
+        }
+      }
+    });
+    expect(released.devices[id]?.presence.state).toBe('unknown');
+    expect(reduceLiveMessage(released, { type: 'event', data: presence(4) }).devices[id]?.presence.state).toBe('online');
+  });
+
   it('hydrates durable policy state from a resync snapshot', () => {
     const device = {
       ...resultDevice('018f47a0-9b5c-7a22-8a33-112233445599'),

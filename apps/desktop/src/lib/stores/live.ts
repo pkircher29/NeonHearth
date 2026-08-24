@@ -28,6 +28,11 @@ export interface LiveState {
 
 export const initialLiveState: LiveState = { sequence: 0, connected: false, needsResync: false, serviceStatus: 'unknown', devices: {}, deviceOrder: [], throughput: [], timeline: [], coverage: 'unavailable', aggregate: { upload: 0, download: 0 }, protocolMix: null, policies: {} };
 
+function hasVerifiedBlock(policy: DeviceSnapshot['policy']): boolean {
+  return policy?.enforcement_result === 'verified'
+    && (policy.evaluation.requested_action === 'quarantine' || policy.evaluation.requested_action === 'permanent_ban');
+}
+
 function summarize(state: LiveState): LiveState {
   const bandwidth = Object.values(state.devices).map((device) => device.bandwidth).filter((value) => value.available);
   const coverages = new Set(bandwidth.map((value) => value.coverage).filter((value): value is Coverage => value !== null));
@@ -40,7 +45,9 @@ export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
   const policies: Record<string, GuardPolicy> = {};
   for (const device of snapshot.devices) {
     if (!(device.device_id in devices)) deviceOrder.push(device.device_id);
-    devices[device.device_id] = device;
+    devices[device.device_id] = hasVerifiedBlock(device.policy)
+      ? { ...device, presence: { ...device.presence, state: 'blocked', source: 'policy', kind: 'enforcement_blocked' } }
+      : device;
     if (device.policy) policies[device.device_id] = {
       device_id: device.device_id,
       evaluation: device.policy.evaluation,
