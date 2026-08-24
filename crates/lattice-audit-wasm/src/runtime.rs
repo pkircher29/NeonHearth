@@ -72,6 +72,7 @@ struct StoreState<'a, H: AuditHost> {
     requests: u32,
     max_requests: u32,
     max_bytes: u64,
+    bytes: u64,
     failure: Option<ExecutionFailure>,
 }
 
@@ -164,7 +165,7 @@ impl Sandbox {
         let limits = verified.limits().clone();
         Self::new_with_limits(verified, &limits).await
     }
-    pub async fn new_with_limits(
+    pub(crate) async fn new_with_limits(
         verified: VerifiedManifest,
         limits: &Limits,
     ) -> Result<Self, AuditError> {
@@ -235,6 +236,7 @@ impl Sandbox {
                 requests: 0,
                 max_requests: self.limits.max_requests,
                 max_bytes: self.limits.max_bytes,
+                bytes: input.len() as u64,
                 failure: None,
             },
         );
@@ -302,10 +304,12 @@ impl Sandbox {
                             caller.data_mut().failure = Some(ExecutionFailure::InvalidAbi);
                             return Err(anyhow::anyhow!("exchange bounds"));
                         }
-                        if req_len
+                        let exchange_bytes = req_len
                             .checked_add(out_cap)
-                            .is_none_or(|n| n as u64 > caller.data().max_bytes)
-                        {
+                            .and_then(|n| u64::try_from(n).ok());
+                        if exchange_bytes.is_none_or(|n| {
+                            n > caller.data().max_bytes.saturating_sub(caller.data().bytes)
+                        }) {
                             caller.data_mut().failure = Some(ExecutionFailure::Bytes);
                             return Err(anyhow::anyhow!("exchange byte budget"));
                         }
@@ -316,6 +320,7 @@ impl Sandbox {
                                 return Err(anyhow::anyhow!("request limit"));
                             }
                             data.requests += 1;
+                            data.bytes += exchange_bytes.expect("validated exchange byte count");
                         }
                         let request = memory.data(&caller)[req_ptr..req_ptr + req_len].to_vec();
                         let host = caller.data().host;
@@ -331,6 +336,7 @@ impl Sandbox {
                                 return Err(anyhow::anyhow!("exchange rejected"));
                             }
                         };
+                        caller.data_mut().bytes -= (out_cap - response.len()) as u64;
                         memory
                             .write(&mut caller, out_ptr, &response)
                             .map_err(|_| anyhow::anyhow!("exchange write"))?;
@@ -365,6 +371,9 @@ impl Sandbox {
         let len = packed as u32 as u64;
         if len > self.limits.max_bytes {
             return Err(AuditError::OutputLimitExceeded);
+        }
+        if len > store.data().max_bytes.saturating_sub(store.data().bytes) {
+            return Err(AuditError::BudgetExhausted);
         }
         let end = ptr.checked_add(len).ok_or(AuditError::InvalidAbi)?;
         let data = memory.data(&store);

@@ -110,6 +110,41 @@ async fn exchange_import_consumes_guest_request_and_writes_only_the_declared_out
         b"pong"
     );
 }
+
+#[tokio::test]
+async fn two_exchange_imports_exceed_a_one_request_ceiling() {
+    let module = wasm(
+        r#"(module
+      (import "audit" "exchange" (func $x (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1) (data (i32.const 16) "ping")
+      (func (export "run") (param i32 i32) (result i64)
+        i32.const 16 i32.const 4 i32.const 32 i32.const 4 call $x drop
+        i32.const 16 i32.const 4 i32.const 32 i32.const 4 call $x drop i64.const 0))"#,
+    );
+    let mut one = limits();
+    one.max_requests = 1;
+    let sandbox = Sandbox::new(verified(&module, one)).await.unwrap();
+    assert_eq!(
+        sandbox.execute(&[], &ExchangeHost).await.unwrap_err(),
+        AuditError::RequestLimitExceeded
+    );
+}
+
+#[tokio::test]
+async fn exchange_rejects_negative_lengths_and_caps_before_host_allocation() {
+    for source in [
+        r#"(module (import "audit" "exchange" (func $x (param i32 i32 i32 i32) (result i32))) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i32.const 0 i32.const -1 i32.const 0 i32.const 1 call $x drop i64.const 0))"#,
+        r#"(module (import "audit" "exchange" (func $x (param i32 i32 i32 i32) (result i32))) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i32.const 0 i32.const 1 i32.const 0 i32.const -1 call $x drop i64.const 0))"#,
+    ] {
+        let sandbox = Sandbox::new(verified(&wasm(source), limits()))
+            .await
+            .unwrap();
+        assert_eq!(
+            sandbox.execute(&[], &ExchangeHost).await.unwrap_err(),
+            AuditError::InvalidAbi
+        );
+    }
+}
 #[tokio::test]
 async fn exchange_rejects_guest_pointer_and_response_capacity_out_of_bounds() {
     for source in [

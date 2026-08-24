@@ -454,19 +454,7 @@ impl AuditManifest {
                 "invalid evidence schema".into(),
             ));
         }
-        if !valid_limits(&limits)
-        /*if limits.max_bytes == 0
-        || limits.max_bytes > MAX_WASM_BYTES
-        || limits.max_requests == 0
-        || limits.max_requests > MAX_REQUESTS
-        || limits.max_time.is_zero()
-        || limits.max_time.subsec_nanos() != 0
-        || limits.max_time.as_secs() > MAX_TIME_SECS
-        || limits.max_fuel == 0
-        || limits.max_fuel > MAX_FUEL
-        || limits.max_memory_pages == 0
-        || limits.max_memory_pages > MAX_MEMORY_PAGES*/
-        {
+        if !valid_limits(&limits) {
             return Err(AuditError::InvalidManifest("invalid limits".into()));
         }
         Ok(Self {

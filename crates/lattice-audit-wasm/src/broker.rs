@@ -128,9 +128,13 @@ struct Reservation<'a> {
     committed: bool,
 }
 impl Reservation<'_> {
-    fn commit(mut self, actual: usize) {
+    fn commit(mut self, actual: usize) -> Result<(), BrokerError> {
+        if actual > self.response_cap {
+            return Err(BrokerError::BudgetExhausted);
+        }
         self.budget.refund(self.response_cap, actual);
         self.committed = true;
+        Ok(())
     }
 }
 impl Drop for Reservation<'_> {
@@ -211,9 +215,6 @@ impl Broker {
         {
             return Err(BrokerError::CapabilityDenied);
         }
-        let target = self
-            .authorizer
-            .authorize(request.target, request.interface, request.port)?;
         let limits = intersect_limits(request.module.limits(), &request.limits);
         if limits.max_bytes == 0
             || limits.max_requests == 0
@@ -229,12 +230,19 @@ impl Broker {
         if request.cancellation.is_cancelled() {
             return Err(BrokerError::Cancelled);
         }
+        let target = self
+            .authorizer
+            .authorize(request.target, request.interface, request.port)?;
+        if Instant::now() >= deadline {
+            return Err(BrokerError::DeadlineExceeded);
+        }
         let sandbox = Sandbox::new_with_limits(request.module, &limits).await?;
         if Instant::now() >= deadline {
             return Err(BrokerError::DeadlineExceeded);
         }
         let budget = Budget::new(&limits, deadline);
         budget.charge_bytes(request.input.len())?;
+        let target_error = Arc::new(Mutex::new(None));
         let host = BrokerHost {
             target,
             capability: request.capability,
@@ -243,8 +251,9 @@ impl Broker {
             budget,
             deadline,
             cancellation: request.cancellation.clone(),
+            target_error: Arc::clone(&target_error),
         };
-        let output = tokio::select! { _=request.cancellation.cancelled()=>return Err(BrokerError::Cancelled), value=tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), sandbox.execute(&request.input,&host))=>match value { Ok(Ok(value))=>value, Ok(Err(AuditError::TimedOut))=>return Err(BrokerError::DeadlineExceeded), Ok(Err(AuditError::Cancelled))=>return Err(BrokerError::Cancelled), Ok(Err(AuditError::BudgetExhausted|AuditError::RequestLimitExceeded))=>return Err(BrokerError::BudgetExhausted), Ok(Err(AuditError::HostRejected))=>return Err(BrokerError::ExchangeFailed), Ok(Err(error))=>return Err(BrokerError::Sandbox(error)), Err(_)=>return Err(BrokerError::DeadlineExceeded) } };
+        let output = tokio::select! { biased; _=request.cancellation.cancelled()=>return Err(BrokerError::Cancelled), value=tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), sandbox.execute(&request.input,&host))=>match value { Ok(Ok(value))=>value, Ok(Err(AuditError::TimedOut))=>return Err(BrokerError::DeadlineExceeded), Ok(Err(AuditError::Cancelled))=>return Err(BrokerError::Cancelled), Ok(Err(AuditError::BudgetExhausted|AuditError::RequestLimitExceeded))=>return Err(BrokerError::BudgetExhausted), Ok(Err(AuditError::HostRejected))=> { if let Some(error) = target_error.lock().map_err(|_| BrokerError::Target(TargetError::Rejected))?.take() { return Err(BrokerError::Target(error)); } return Err(BrokerError::ExchangeFailed); }, Ok(Err(error))=>return Err(BrokerError::Sandbox(error)), Err(_)=>return Err(BrokerError::DeadlineExceeded) } };
         if request.cancellation.is_cancelled() {
             return Err(BrokerError::Cancelled);
         }
@@ -286,6 +295,7 @@ struct BrokerHost {
     budget: Budget,
     deadline: Instant,
     cancellation: CancellationToken,
+    target_error: Arc<Mutex<Option<TargetError>>>,
 }
 #[async_trait]
 impl AuditHost for BrokerHost {
@@ -311,15 +321,23 @@ impl AuditHost for BrokerHost {
                     BrokerError::BudgetExhausted => AuditHostError::BudgetExhausted,
                     _ => AuditHostError::ExchangeFailed,
                 })?;
-        let refreshed = self
-            .authorizer
-            .authorize(
-                self.target.target(),
-                self.target.interface(),
-                self.target.port(),
-            )
-            .map_err(|_| AuditHostError::Denied)?;
+        let refreshed = match self.authorizer.authorize(
+            self.target.target(),
+            self.target.interface(),
+            self.target.port(),
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                if let Ok(mut slot) = self.target_error.lock() {
+                    *slot = Some(error);
+                }
+                return Err(AuditHostError::Denied);
+            }
+        };
         if refreshed != self.target {
+            if let Ok(mut slot) = self.target_error.lock() {
+                *slot = Some(TargetError::Rejected);
+            }
             return Err(AuditHostError::Denied);
         }
         let call = self.exchange.exchange(
@@ -336,7 +354,83 @@ impl AuditHost for BrokerHost {
         if response.bytes.len() > response_cap {
             return Err(AuditHostError::ExchangeFailed);
         }
-        reservation.commit(response.bytes.len());
+        reservation
+            .commit(response.bytes.len())
+            .map_err(|_| AuditHostError::BudgetExhausted)?;
         Ok(response.bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn budget() -> Budget {
+        Budget::new(
+            &Limits {
+                max_bytes: 20,
+                max_requests: 2,
+                max_time: Duration::from_secs(1),
+                max_fuel: 1,
+                max_memory_pages: 1,
+            },
+            Instant::now() + Duration::from_secs(1),
+        )
+    }
+    fn snapshot(budget: &Budget) -> (u32, u64) {
+        let state = budget.inner.lock().unwrap();
+        (state.requests, state.bytes)
+    }
+
+    #[test]
+    fn reservation_rolls_back_every_uncommitted_failure_path() {
+        let budget = budget();
+        for _failure in [
+            "reauth",
+            "changed-auth",
+            "exchange",
+            "cancel",
+            "timeout",
+            "oversized",
+        ] {
+            let reservation = budget.reserve(4, 8).unwrap();
+            assert_eq!(snapshot(&budget), (1, 12));
+            drop(reservation);
+            assert_eq!(snapshot(&budget), (0, 0));
+        }
+    }
+
+    #[test]
+    fn successful_commit_retains_request_and_actual_response_exactly() {
+        let budget = budget();
+        budget.reserve(4, 8).unwrap().commit(3).unwrap();
+        assert_eq!(snapshot(&budget), (1, 7));
+    }
+
+    #[test]
+    fn oversized_commit_refuses_underflow_and_rolls_back() {
+        let budget = budget();
+        assert!(matches!(
+            budget.reserve(4, 8).unwrap().commit(9),
+            Err(BrokerError::BudgetExhausted)
+        ));
+        assert_eq!(snapshot(&budget), (0, 0));
+    }
+
+    #[test]
+    fn poisoned_budget_fails_closed_without_panicking() {
+        let budget = Arc::new(budget());
+        let other = Arc::clone(&budget);
+        let _ = std::thread::spawn(move || {
+            let _guard = other.inner.lock().unwrap();
+            panic!("poison for test");
+        })
+        .join();
+        assert!(matches!(
+            budget.reserve(1, 1),
+            Err(BrokerError::BudgetExhausted)
+        ));
+        budget.charge_bytes(1).unwrap_err();
     }
 }
