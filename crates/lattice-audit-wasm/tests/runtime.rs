@@ -43,8 +43,9 @@ fn wasm(source: &str) -> Vec<u8> {
     wat::parse_str(source).unwrap()
 }
 struct Host(u32);
+#[async_trait::async_trait]
 impl AuditHost for Host {
-    fn deterministic(&self) -> u32 {
+    async fn deterministic(&self) -> u32 {
         self.0
     }
 }
@@ -91,6 +92,10 @@ async fn rejects_ambient_wasi_and_imported_memory_or_table() {
 async fn rejects_malformed_start_and_bad_abi() {
     assert!(matches!(
         Sandbox::new(verified(b"not wasm", limits())).await,
+        Err(AuditError::InvalidModule)
+    ));
+    assert!(matches!(
+        Sandbox::new(verified(b"\0asm\x01\0\0\0\x05\x80", limits())).await,
         Err(AuditError::InvalidModule)
     ));
     for source in [
@@ -165,7 +170,7 @@ async fn memory_and_table_declarations_and_growth_fail_closed() {
             Sandbox::new(verified(&wasm(source), limits()))
                 .await
                 .unwrap_err(),
-            AuditError::MemoryLimitExceeded
+            AuditError::TableLimitExceeded
         );
     }
     let grow_table = wasm(
@@ -174,7 +179,25 @@ async fn memory_and_table_declarations_and_growth_fail_closed() {
     let sandbox = Sandbox::new(verified(&grow_table, limits())).await.unwrap();
     assert_eq!(
         sandbox.execute(&[], &Host(0)).await.unwrap_err(),
-        AuditError::MemoryLimitExceeded
+        AuditError::TableLimitExceeded
+    );
+    let extra_memory = wasm(
+        r#"(module (memory (export "memory") 1) (memory 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,
+    );
+    assert_eq!(
+        Sandbox::new(verified(&extra_memory, limits()))
+            .await
+            .unwrap_err(),
+        AuditError::InvalidAbi
+    );
+    let extra_tables = wasm(
+        r#"(module (table 1 funcref) (table 1 funcref) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,
+    );
+    assert_eq!(
+        Sandbox::new(verified(&extra_tables, limits()))
+            .await
+            .unwrap_err(),
+        AuditError::TableLimitExceeded
     );
 }
 #[tokio::test]
@@ -232,11 +255,39 @@ async fn epoch_deadline_enforces_max_time_without_leaking_into_the_next_executio
 }
 
 struct SleepingHost;
+#[async_trait::async_trait]
 impl AuditHost for SleepingHost {
-    fn deterministic(&self) -> u32 {
-        std::thread::sleep(Duration::from_millis(250));
+    async fn deterministic(&self) -> u32 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
         1
     }
+}
+
+struct NeverReadyHost;
+#[async_trait::async_trait]
+impl AuditHost for NeverReadyHost {
+    async fn deterministic(&self) -> u32 {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        0
+    }
+}
+
+#[tokio::test]
+async fn host_await_is_cancelled_at_max_time_and_releases_the_sandbox() {
+    let module = wasm(
+        r#"(module (import "audit" "deterministic" (func $d (result i32))) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) call $d drop local.get 0 i64.extend_i32_u i64.const 32 i64.shl local.get 1 i64.extend_i32_u i64.or))"#,
+    );
+    let sandbox = Sandbox::new(verified(&module, limits())).await.unwrap();
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        sandbox.execute(b"x", &NeverReadyHost).await.unwrap_err(),
+        AuditError::TimedOut
+    );
+    assert!(started.elapsed() < Duration::from_millis(1_500));
+    assert_eq!(
+        sandbox.execute(b"ok", &Host(1)).await.unwrap().output,
+        b"ok"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -247,7 +298,7 @@ async fn same_sandbox_admission_isolated_from_another_calls_epoch_ticker() {
         r#"(module
           (import "audit" "deterministic" (func $d (result i32)))
           (memory (export "memory") 1)
-          (func (export "run") (param i32 i32) (result i64) (local $remaining i32)
+          (func (export "run") (param i32 i32) (result i64)
             local.get 1 i32.eqz
             if
               loop $forever
@@ -255,11 +306,6 @@ async fn same_sandbox_admission_isolated_from_another_calls_epoch_ticker() {
               end
             end
             call $d drop
-            i32.const 300000000 local.set $remaining
-            loop $spin
-              local.get $remaining i32.const 1 i32.sub local.tee $remaining
-              br_if $spin
-            end
             local.get 0 i64.extend_i32_u i64.const 32 i64.shl
             local.get 1 i64.extend_i32_u i64.or))"#,
     );

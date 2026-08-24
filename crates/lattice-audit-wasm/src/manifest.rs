@@ -93,6 +93,8 @@ pub enum AuditError {
     TimedOut,
     #[error("wasm memory limit exceeded")]
     MemoryLimitExceeded,
+    #[error("wasm table limit exceeded")]
+    TableLimitExceeded,
     #[error("wasm output limit exceeded")]
     OutputLimitExceeded,
     #[error("wasm trap")]
