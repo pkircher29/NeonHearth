@@ -132,6 +132,12 @@ export interface Health {
   status: string;
   api_version: string;
 }
+export interface CameraSummary { camera_id: string; classification: string; confidence: number; health: string; observed_at: string }
+export interface CameraList { items: CameraSummary[]; next_after: string | null }
+export interface CameraDetail extends CameraSummary { inventory: CameraInventoryProjection | null }
+export interface CameraHealth { health: string; confidence: number }
+export interface CameraInventoryProjection { manufacturer: string | null; model: string | null; firmware: string | null; serial: string | null; capabilities: string[]; health: string }
+export interface CameraSessionResponse { session_id: string }
 
 export interface EventTicket {
   ticket: string;

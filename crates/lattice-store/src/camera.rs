@@ -116,6 +116,37 @@ impl CameraRepository {
         .transpose()
     }
 
+    pub async fn list_cameras(
+        &self,
+        limit: usize,
+        after: Option<CameraId>,
+    ) -> Result<Vec<CameraRecord>, CameraStoreError> {
+        if !(1..=256).contains(&limit) {
+            return Err(CameraStoreError::Invalid);
+        }
+        let rows: Vec<(String, String, f64, String, String)> = sqlx::query_as(
+            "SELECT camera_id, classification, confidence, health, observed_at FROM cameras ORDER BY camera_id LIMIT ?"
+        ).bind(i64::try_from(limit + 1).map_err(|_| CameraStoreError::Invalid)?).fetch_all(&self.pool).await.map_err(map_sqlx)?;
+        let mut out = Vec::new();
+        for (raw_id, classification, confidence, health, observed_at) in rows {
+            let id = decode_camera_id(&raw_id)?;
+            if after.is_some_and(|cursor| id <= cursor) {
+                continue;
+            }
+            out.push(CameraRecord {
+                id,
+                classification: decode_classification(&classification)?,
+                confidence: decode_confidence(confidence)?,
+                health: decode_camera_health(&health)?,
+                observed_at: decode_time(&observed_at)?,
+            });
+            if out.len() == limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn insert_evidence(
         &self,
         camera_id: CameraId,

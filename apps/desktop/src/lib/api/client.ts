@@ -1,4 +1,4 @@
-import type { Bandwidth, BandwidthFrame, DeviceSnapshot, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
+import type { Bandwidth, BandwidthFrame, CameraDetail, CameraHealth, CameraInventoryProjection, CameraList, CameraSessionResponse, DeviceSnapshot, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
@@ -24,6 +24,12 @@ export interface ApiClient {
     onMessage: (message: ServerMessage) => void,
     onState: (state: ConnectionState) => void
   ): Promise<WebSocket>;
+  cameras(options?: { limit?: number; after?: string }): Promise<CameraList>;
+  camera(id: string): Promise<CameraDetail>;
+  cameraInventory(id: string): Promise<CameraInventoryProjection | null>;
+  cameraSnapshot(id: string, streamId?: string): Promise<Blob>;
+  startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse>;
+  closeCameraSession(sessionId: string): Promise<void>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -91,6 +97,7 @@ const isDate = (value: unknown): value is string => {
 const isConfidence = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
 const isBytes = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const isDeviceId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+const isOpaqueId = isDeviceId;
 
 function isPresence(value: unknown): value is Presence {
   if (!isRecord(value) || !presenceStates.has(String(value.state))) return false;
@@ -168,6 +175,12 @@ function isSnapshot(value: unknown): value is Snapshot {
     && value.devices.every(isDeviceSnapshot) && (value.next_after === null || isDeviceId(value.next_after))
     && typeof value.service_status === 'string';
 }
+function isCameraSummary(value: unknown): value is import('./types').CameraSummary { return isRecord(value) && isOpaqueId(value.camera_id) && typeof value.classification === 'string' && isConfidence(value.confidence) && typeof value.health === 'string' && isDate(value.observed_at); }
+function isCameraList(value: unknown): value is CameraList { return isRecord(value) && Array.isArray(value.items) && value.items.every(isCameraSummary) && (value.next_after === null || isOpaqueId(value.next_after)); }
+function isInventory(value: unknown): value is CameraInventoryProjection { return isRecord(value) && ['manufacturer','model','firmware','serial'].every(k => value[k] === null || typeof value[k] === 'string') && Array.isArray(value.capabilities) && value.capabilities.every(v => typeof v === 'string') && typeof value.health === 'string'; }
+function isCameraDetail(value: unknown): value is CameraDetail { return isCameraSummary(value) && Object.hasOwn(value, 'inventory') && (((value as unknown as Record<string, unknown>).inventory === null) || isInventory((value as unknown as Record<string, unknown>).inventory)); }
+function isCameraHealth(value: unknown): value is CameraHealth { return isRecord(value) && typeof value.health === 'string' && isConfidence(value.confidence); }
+function isSession(value: unknown): value is CameraSessionResponse { return isRecord(value) && isOpaqueId(value.session_id); }
 
 function isEventTicket(value: unknown): value is EventTicket {
   return isRecord(value) && typeof value.ticket === 'string' && value.ticket.length > 0 && isSequence(value.expires_in_seconds);
@@ -261,5 +274,12 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
       return socket;
   }
 
-  return { health, snapshot, snapshotAll, issueEventTicket, openEvents };
+  async function cameras(options: { limit?: number; after?: string } = {}): Promise<CameraList> { if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 256)) throw new Error('Invalid camera page'); if (options.after !== undefined && !isOpaqueId(options.after)) throw new Error('Invalid camera page'); const p=new URLSearchParams(); if(options.limit!==undefined)p.set('limit',String(options.limit)); if(options.after)p.set('after',options.after); const v=await request(`/api/v1/cameras${p.toString()?`?${p}`:''}`,authorized('GET')); if(!isCameraList(v))throw new Error('Invalid camera response'); return v; }
+  async function camera(id: string): Promise<CameraDetail> { if(!isOpaqueId(id))throw new Error('Invalid camera id'); const v=await request(`/api/v1/cameras/${id}`,authorized('GET')); if(!isCameraDetail(v))throw new Error('Invalid camera response'); return v; }
+  async function cameraInventory(id: string): Promise<CameraInventoryProjection|null> { if(!isOpaqueId(id))throw new Error('Invalid camera id'); const v=await request(`/api/v1/cameras/${id}/inventory`,authorized('GET')); if(v!==null&&!isInventory(v))throw new Error('Invalid camera inventory'); return v as CameraInventoryProjection|null; }
+  async function cameraSnapshot(id: string, streamId?: string): Promise<Blob> { if(!isOpaqueId(id)||(streamId!==undefined&&!isOpaqueId(streamId)))throw new Error('Invalid camera id'); const response=await fetchImpl(apiUrl(`/api/v1/cameras/${id}/snapshot${streamId?`?stream_id=${streamId}`:''}`),authorized('GET')); if(!response.ok)throw new Error(`Request failed with status ${response.status}`); return response.blob(); }
+  async function startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse> { if(!isOpaqueId(id)||!isOpaqueId(streamId))throw new Error('Invalid camera session id'); const v=await request(`/api/v1/cameras/${id}/sessions`,{...authorized('POST'),headers:{Authorization:`Bearer ${serviceToken}`,'content-type':'application/json'},body:JSON.stringify({stream_id:streamId})}); if(!isSession(v))throw new Error('Invalid camera session'); return v; }
+  async function closeCameraSession(sessionId: string): Promise<void> { if(!isOpaqueId(sessionId))throw new Error('Invalid camera session id'); const response=await fetchImpl(apiUrl(`/api/v1/camera-sessions/${sessionId}`),{method:'DELETE',headers:{Authorization:`Bearer ${serviceToken}`}}); if(!response.ok)throw new Error(`Request failed with status ${response.status}`); }
+
+  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession };
 }

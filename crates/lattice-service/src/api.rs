@@ -17,6 +17,146 @@ pub struct Health {
     pub api_version: &'static str,
 }
 #[derive(Serialize, ToSchema)]
+pub struct CameraSummary {
+    pub camera_id: String,
+    pub classification: String,
+    pub confidence: f32,
+    pub health: String,
+    pub observed_at: DateTime<Utc>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct CameraDetail {
+    pub camera_id: String,
+    pub classification: String,
+    pub confidence: f32,
+    pub health: String,
+    pub observed_at: DateTime<Utc>,
+    pub inventory: Option<CameraInventoryProjection>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct CameraHealth {
+    pub health: String,
+    pub confidence: f32,
+}
+#[derive(Serialize, ToSchema)]
+pub struct CameraInventoryProjection {
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub firmware: Option<String>,
+    pub serial: Option<String>,
+    pub capabilities: Vec<String>,
+    pub health: String,
+}
+#[derive(Serialize, ToSchema)]
+pub struct CameraSessionResponse {
+    pub session_id: String,
+}
+#[derive(Deserialize)]
+pub struct CameraQuery {
+    pub limit: Option<usize>,
+    pub after: Option<lattice_camera::CameraId>,
+}
+
+pub async fn cameras(
+    _: Authorized,
+    State(state): State<AppState>,
+    query: Result<Query<CameraQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Query(query) = query.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let limit = query.limit.unwrap_or(128);
+    if !(1..=256).contains(&limit) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let repo = lattice_store::CameraRepository::new(state.state_repository().pool().clone());
+    let rows = repo
+        .list_cameras(limit, query.after)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let items = rows
+        .into_iter()
+        .map(|r| CameraSummary {
+            camera_id: r.id.to_string(),
+            classification: format!("{:?}", r.classification).to_lowercase(),
+            confidence: r.confidence.get(),
+            health: format!("{:?}", r.health).to_lowercase(),
+            observed_at: r.observed_at,
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(
+        serde_json::json!({"items": items, "next_after": items.last().map(|x| x.camera_id.clone())}),
+    ))
+}
+pub async fn camera(
+    _: Authorized,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<CameraDetail>, StatusCode> {
+    let id = uuid::Uuid::parse_str(&id)
+        .map(lattice_camera::CameraId::from_uuid)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let repo = lattice_store::CameraRepository::new(state.state_repository().pool().clone());
+    let r = repo
+        .load_camera(id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(CameraDetail {
+        camera_id: r.id.to_string(),
+        classification: format!("{:?}", r.classification).to_lowercase(),
+        confidence: r.confidence.get(),
+        health: format!("{:?}", r.health).to_lowercase(),
+        observed_at: r.observed_at,
+        inventory: None,
+    }))
+}
+pub async fn camera_health(
+    _: Authorized,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<CameraHealth>, StatusCode> {
+    let id = uuid::Uuid::parse_str(&id)
+        .map(lattice_camera::CameraId::from_uuid)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let repo = lattice_store::CameraRepository::new(state.state_repository().pool().clone());
+    let r = repo
+        .load_camera(id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(CameraHealth {
+        health: format!("{:?}", r.health).to_lowercase(),
+        confidence: r.confidence.get(),
+    }))
+}
+pub async fn camera_inventory(
+    _: Authorized,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Option<CameraInventoryProjection>>, StatusCode> {
+    let id = uuid::Uuid::parse_str(&id)
+        .map(lattice_camera::CameraId::from_uuid)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let repo = lattice_store::CameraRepository::new(state.state_repository().pool().clone());
+    let r = repo
+        .load_inventory(id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok(Json(r.map(|x| {
+        CameraInventoryProjection {
+            manufacturer: x.manufacturer.map(|v| v.as_str().to_owned()),
+            model: x.model.map(|v| v.as_str().to_owned()),
+            firmware: x.firmware.map(|v| v.as_str().to_owned()),
+            serial: x.serial.map(|v| v.as_str().to_owned()),
+            capabilities: x
+                .capabilities
+                .into_iter()
+                .map(|v| v.as_str().to_owned())
+                .collect(),
+            health: format!("{:?}", x.health).to_lowercase(),
+        }
+    })))
+}
+#[derive(Serialize, ToSchema)]
 pub struct Snapshot {
     pub sequence: u64,
     pub devices: Vec<DeviceSnapshot>,
