@@ -1,6 +1,7 @@
 use crate::transport::{
-    Clock, FeedRequest, FeedResponse, FeedTransport, KEV_URL, MAX_AGGREGATE_RECORDS, MAX_PAGES,
-    MAX_RESULTS_PER_PAGE, NVD_URL, SystemClock, TransportError,
+    Clock, DEFAULT_NVD_RESULTS_PER_PAGE, FeedRequest, FeedResponse, FeedTransport, KEV_URL,
+    MAX_AGGREGATE_RECORDS, MAX_PAGE_SIZE_REDUCTIONS, MAX_PAGES, MAX_RESULTS_PER_PAGE, NVD_URL,
+    SystemClock, TransportError,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
@@ -87,44 +88,60 @@ impl<T: FeedTransport> NvdFeed<T> {
         let mut all = Vec::new();
         let mut first_response = None;
         let mut first_expiry = None;
+        let mut results_per_page = DEFAULT_NVD_RESULTS_PER_PAGE;
         for page in 0..MAX_PAGES {
-            let uncached = FeedRequest::nvd(start, MAX_RESULTS_PER_PAGE, window.start, window.end)
-                .map_err(FeedError::Transport)?;
-            let key = uncached.url.clone();
-            let cached = self.cache.lock().expect("cache lock").get(&key).cloned();
-            let request = if let Some(cached) = &cached {
-                uncached
-                    .with_validators(
-                        cached.result.response.etag.clone(),
-                        cached.result.response.last_modified.clone(),
-                    )
-                    .map_err(FeedError::Transport)?
-            } else {
-                uncached
-            };
-            let response = match self.transport.get(request).await {
-                Ok(response) if response.status == 304 => {
-                    let Some(cached) = cached else {
-                        return Err(FeedError::Unavailable(TransportError::Unavailable));
-                    };
-                    if cached.result.cache_expires_at < self.clock.now() {
-                        return Err(FeedError::Unavailable(TransportError::Unavailable));
+            let mut reductions = 0;
+            let (key, response) = loop {
+                let uncached = FeedRequest::nvd(start, results_per_page, window.start, window.end)
+                    .map_err(FeedError::Transport)?;
+                let key = uncached.url.clone();
+                let cached = self.cache.lock().expect("cache lock").get(&key).cloned();
+                let request = if let Some(cached) = &cached {
+                    uncached
+                        .with_validators(
+                            cached.result.response.etag.clone(),
+                            cached.result.response.last_modified.clone(),
+                        )
+                        .map_err(FeedError::Transport)?
+                } else {
+                    uncached
+                };
+                let response = match self.transport.get(request).await {
+                    Ok(response) if response.status == 304 => {
+                        let Some(cached) = cached else {
+                            return Err(FeedError::Unavailable(TransportError::Unavailable));
+                        };
+                        if cached.result.cache_expires_at < self.clock.now() {
+                            return Err(FeedError::Unavailable(TransportError::Unavailable));
+                        }
+                        let mut merged = cached.result.response;
+                        if response.etag.is_some() {
+                            merged.etag = response.etag;
+                        }
+                        if response.last_modified.is_some() {
+                            merged.last_modified = response.last_modified;
+                        }
+                        merged
                     }
-                    let mut merged = cached.result.response;
-                    if response.etag.is_some() {
-                        merged.etag = response.etag;
+                    Ok(response) if response.status == 200 => response,
+                    Ok(response) => {
+                        return self.stale_or_unavailable(
+                            &key,
+                            TransportError::HttpStatus(response.status),
+                        );
                     }
-                    if response.last_modified.is_some() {
-                        merged.last_modified = response.last_modified;
+                    Err(TransportError::Oversized)
+                        if cached.is_none()
+                            && results_per_page > 1
+                            && reductions < MAX_PAGE_SIZE_REDUCTIONS =>
+                    {
+                        results_per_page = (results_per_page / 2).max(1);
+                        reductions += 1;
+                        continue;
                     }
-                    merged
-                }
-                Ok(response) if response.status == 200 => response,
-                Ok(response) => {
-                    return self
-                        .stale_or_unavailable(&key, TransportError::HttpStatus(response.status));
-                }
-                Err(error) => return self.stale_or_unavailable(&key, error),
+                    Err(error) => return self.stale_or_unavailable(&key, error),
+                };
+                break (key, response);
             };
             let (meta_start, page_size, total, records) = match parse_nvd(&response.body) {
                 Ok(parsed) => parsed,

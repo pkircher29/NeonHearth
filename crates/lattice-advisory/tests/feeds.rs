@@ -2,9 +2,9 @@ use chrono::{Duration, TimeZone, Utc};
 use lattice_advisory::{
     feed::{CisaKevFeed, FeedError, ModifiedWindow, NvdFeed},
     transport::{
-        Clock, FeedRequest, FixtureReply, FixtureTransport, KEV_URL, MAX_AGGREGATE_RECORDS,
-        MAX_PAGES, MAX_RESPONSE_BYTES, MAX_RESULTS_PER_PAGE, NVD_URL, TransportError,
-        is_public_feed_address,
+        Clock, DEFAULT_NVD_RESULTS_PER_PAGE, FeedRequest, FixtureReply, FixtureTransport, KEV_URL,
+        MAX_AGGREGATE_RECORDS, MAX_PAGE_SIZE_REDUCTIONS, MAX_PAGES, MAX_RESPONSE_BYTES,
+        MAX_RESULTS_PER_PAGE, NVD_URL, TransportError, is_public_feed_address,
     },
 };
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,41 @@ fn nvd_requests_have_canonical_url_encoded_incremental_query_and_bounded_window(
     assert_eq!(request.results_per_page, MAX_RESULTS_PER_PAGE);
     assert!(FeedRequest::nvd(0, 1, at(0), at(0) + Duration::days(121)).is_err());
     assert!(FeedRequest::nvd(0, 1, at(2), at(1)).is_err());
+}
+
+#[tokio::test]
+async fn nvd_retries_oversized_page_with_halved_size_and_negotiates_following_pages() {
+    let transport = FixtureTransport::queued([
+        Err(TransportError::Oversized),
+        Ok(FixtureReply::json(nvd_page(0, 2, 1))),
+        Ok(FixtureReply::json(nvd_page(1, 2, 1))),
+    ]);
+    let feed = NvdFeed::new(transport.clone());
+    let result = feed
+        .sync(ModifiedWindow::new(at(0), at(1)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(result.records.len(), 2);
+    let requests = transport.requests();
+    assert!(
+        requests[0]
+            .url
+            .contains(&format!("resultsPerPage={DEFAULT_NVD_RESULTS_PER_PAGE}"))
+    );
+    assert!(requests[1].url.contains("resultsPerPage=500"));
+    assert!(requests[2].url.contains("startIndex=1&resultsPerPage=500"));
+}
+
+#[tokio::test]
+async fn nvd_minimum_size_oversized_is_typed_unavailable_without_looping() {
+    let feed = NvdFeed::new(FixtureTransport::queued(std::iter::repeat_n(
+        Err(TransportError::Oversized),
+        MAX_PAGE_SIZE_REDUCTIONS + 2,
+    )));
+    assert!(matches!(
+        feed.sync(ModifiedWindow::new(at(0), at(1)).unwrap()).await,
+        Err(FeedError::Unavailable(TransportError::Oversized))
+    ));
 }
 
 #[tokio::test]

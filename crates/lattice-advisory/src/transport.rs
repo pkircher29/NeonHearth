@@ -13,6 +13,8 @@ pub const KEV_URL: &str =
     "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RESULTS_PER_PAGE: usize = 2_000;
+pub const DEFAULT_NVD_RESULTS_PER_PAGE: usize = 1_000;
+pub const MAX_PAGE_SIZE_REDUCTIONS: usize = 10;
 pub const MAX_PAGES: usize = 128;
 pub const MAX_AGGREGATE_RECORDS: usize = 256_000;
 const MAX_VALIDATOR_BYTES: usize = 1024;
