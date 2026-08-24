@@ -1,5 +1,10 @@
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE policy_install_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    baseline_started_at TEXT NOT NULL
+);
+
 CREATE TABLE device_policy (
     device_id TEXT PRIMARY KEY REFERENCES devices(device_id) ON DELETE CASCADE,
     baseline_exempt INTEGER NOT NULL CHECK (baseline_exempt IN (0, 1)),

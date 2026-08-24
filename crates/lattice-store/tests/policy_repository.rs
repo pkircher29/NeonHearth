@@ -1,5 +1,7 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use lattice_domain::{DeviceId, Identification, OwnerDecision, Protection, RiskSignal};
+use lattice_domain::{
+    DeviceId, EvidenceFamily, Identification, OwnerDecision, Protection, RiskSignal,
+};
 use lattice_store::{InstallRepository, PolicyRepository, connect_memory};
 
 fn at(hours: i64) -> DateTime<Utc> {
@@ -26,6 +28,8 @@ async fn enrollment_uses_the_immutable_install_baseline_once() -> anyhow::Result
     let install = InstallRepository::new(pool.clone());
     install.initialize(at(0)).await?;
     let repo = PolicyRepository::new(pool.clone());
+    assert_eq!(repo.mark_successful_service_start(at(0)).await?, at(0));
+    assert_eq!(repo.mark_successful_service_start(at(500)).await?, at(0));
 
     let inside = DeviceId::new();
     insert_device(&pool, inside, at(47) + Duration::minutes(59)).await?;
@@ -54,6 +58,7 @@ async fn lifecycle_facts_round_trip_and_extension_is_single_use() -> anyhow::Res
         .initialize(at(0))
         .await?;
     let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
     let id = DeviceId::new();
     insert_device(&pool, id, at(60)).await?;
     repo.enroll(id).await?;
@@ -62,7 +67,11 @@ async fn lifecycle_facts_round_trip_and_extension_is_single_use() -> anyhow::Res
         id,
         Identification::Automatic {
             confidence_basis_points: 9_100,
-            evidence_families: 3,
+            evidence_families: vec![
+                EvidenceFamily::LinkLayer,
+                EvidenceFamily::Naming,
+                EvidenceFamily::Service,
+            ],
         },
     )
     .await?;
@@ -78,6 +87,7 @@ async fn lifecycle_facts_round_trip_and_extension_is_single_use() -> anyhow::Res
     repo.set_protection(id, Protection::AdministratorPhone)
         .await?;
 
+    assert!(repo.extend_once(id, at(100)).await.is_err());
     assert!(repo.extend_once(id, at(240)).await?);
     assert!(!repo.extend_once(id, at(300)).await?);
 
@@ -86,7 +96,11 @@ async fn lifecycle_facts_round_trip_and_extension_is_single_use() -> anyhow::Res
         loaded.identification,
         Identification::Automatic {
             confidence_basis_points: 9_100,
-            evidence_families: 3
+            evidence_families: vec![
+                EvidenceFamily::LinkLayer,
+                EvidenceFamily::Naming,
+                EvidenceFamily::Service,
+            ]
         }
     );
     assert_eq!(loaded.owner_decision, OwnerDecision::Pending);
@@ -111,6 +125,10 @@ async fn missing_install_or_device_fails_without_creating_orphan_policy() -> any
 
     let id = DeviceId::new();
     insert_device(&pool, id, at(1)).await?;
+    assert!(repo.enroll(id).await.is_err());
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
     assert!(repo.enroll(id).await.is_err());
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM device_policy")
         .fetch_one(&pool)

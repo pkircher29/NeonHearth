@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use lattice_domain::DeviceId;
+use lattice_domain::{DeviceId, EvidenceFamily};
 use lattice_policy::{
     DeadlineKind, DeadlineWarning, DevicePolicy, Evaluation, Identification, OwnerDecision,
     PolicyEngine, PolicyReason, Protection, RequestedAction, RiskSignal,
@@ -80,7 +80,7 @@ fn automatic_identity_requires_threshold_and_two_families_then_uses_first_seen_p
     let mut candidate = device(60);
     candidate.identification = Identification::Automatic {
         confidence_basis_points: 8_500,
-        evidence_families: 2,
+        evidence_families: vec![EvidenceFamily::LinkLayer, EvidenceFamily::Service],
     };
 
     let pending = engine.evaluate(&candidate, at(84));
@@ -89,7 +89,11 @@ fn automatic_identity_requires_threshold_and_two_families_then_uses_first_seen_p
 
     candidate.identification = Identification::Automatic {
         confidence_basis_points: 8_499,
-        evidence_families: 8,
+        evidence_families: vec![
+            EvidenceFamily::LinkLayer,
+            EvidenceFamily::Addressing,
+            EvidenceFamily::Naming,
+        ],
     };
     assert_eq!(
         engine.evaluate(&candidate, at(108)),
@@ -98,7 +102,21 @@ fn automatic_identity_requires_threshold_and_two_families_then_uses_first_seen_p
 
     candidate.identification = Identification::Automatic {
         confidence_basis_points: 9_999,
-        evidence_families: 1,
+        evidence_families: vec![EvidenceFamily::Service],
+    };
+    assert_eq!(
+        engine.evaluate(&candidate, at(108)),
+        Evaluation::quarantine(PolicyReason::UnknownDeadlineExpired)
+    );
+}
+
+#[test]
+fn duplicate_family_claims_do_not_buy_the_automatic_window() {
+    let engine = PolicyEngine::new(at(0));
+    let mut candidate = device(60);
+    candidate.identification = Identification::Automatic {
+        confidence_basis_points: 9_900,
+        evidence_families: vec![EvidenceFamily::Service, EvidenceFamily::Service],
     };
     assert_eq!(
         engine.evaluate(&candidate, at(108)),

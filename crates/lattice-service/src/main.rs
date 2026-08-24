@@ -3,7 +3,7 @@ use chrono::Utc;
 use lattice_service::runtime::StartupResult;
 use lattice_service::{AppState, app};
 use lattice_service::{Platform, platform_paths};
-use lattice_store::{InstallRepository, M2StateRepository};
+use lattice_store::{InstallRepository, M2StateRepository, PolicyRepository};
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 #[tokio::main]
@@ -45,6 +45,10 @@ async fn main() -> Result<()> {
     #[cfg(not(unix))]
     let terminate = ();
     let listener = TcpListener::bind("127.0.0.1:58120").await?;
+    PolicyRepository::new(pool.clone())
+        .mark_successful_service_start(Utc::now())
+        .await
+        .context("initialize first successful service baseline")?;
     let server = axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal(
             terminate,

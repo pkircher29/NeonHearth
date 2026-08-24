@@ -2,15 +2,15 @@
 
 use chrono::{DateTime, Duration, Utc};
 pub use lattice_domain::{
-    Deadline, DeadlineKind, DeadlineWarning, DevicePolicy, Evaluation, Identification,
-    OwnerDecision, PolicyReason, Protection, RequestedAction, RiskSignal,
+    AUTOMATIC_IDENTITY_THRESHOLD_BPS, AUTOMATIC_POLICY_DEADLINE_HOURS, Deadline, DeadlineKind,
+    DeadlineWarning, DevicePolicy, Evaluation, Identification, OwnerDecision, PolicyReason,
+    Protection, RequestedAction, RiskSignal, UNKNOWN_POLICY_DEADLINE_HOURS,
 };
 
 pub const POLICY_VERSION: u32 = 1;
 pub const BASELINE_WINDOW: Duration = Duration::hours(48);
-pub const UNKNOWN_DEADLINE: Duration = Duration::hours(48);
-pub const AUTOMATIC_DEADLINE: Duration = Duration::days(7);
-pub const AUTOMATIC_IDENTITY_THRESHOLD_BPS: u16 = 8_500;
+pub const UNKNOWN_DEADLINE: Duration = Duration::hours(UNKNOWN_POLICY_DEADLINE_HOURS);
+pub const AUTOMATIC_DEADLINE: Duration = Duration::hours(AUTOMATIC_POLICY_DEADLINE_HOURS);
 pub const DANGER_THRESHOLD_BPS: u16 = 9_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,13 +69,21 @@ impl PolicyEngine {
             return Evaluation::visible(PolicyReason::BaselineExempt);
         }
 
-        let (kind, original_due, expired_reason) = if matches!(
-            device.identification,
+        let automatically_identified = match &device.identification {
             Identification::Automatic {
                 confidence_basis_points: AUTOMATIC_IDENTITY_THRESHOLD_BPS..,
-                evidence_families: 2..
+                evidence_families,
+            } => {
+                evidence_families
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    >= 2
             }
-        ) {
+            Identification::Unknown | Identification::Automatic { .. } => false,
+        };
+        let (kind, original_due, expired_reason) = if automatically_identified {
             (
                 DeadlineKind::Automatic7Days,
                 device.first_seen_at + AUTOMATIC_DEADLINE,

@@ -3,16 +3,27 @@ use chrono::{Duration, TimeZone, Utc};
 use lattice_domain::{DeviceId, EvidenceFact, EvidenceFamily, RequestedAction};
 use lattice_event_bus::EventBus;
 use lattice_intelligence::presence::PresenceEvidenceKind;
+use lattice_sensor::{
+    InterfaceId,
+    neighbor::{
+        LinkAddress, NeighborError, NeighborReachability, NeighborRow, NeighborSnapshotSource,
+        NeighborTrackerConfig,
+    },
+};
 use lattice_service::{
+    AppState,
     discovery::{
-        DiscoveryObservation, DiscoveryPipelineOutcome, DiscoverySources,
-        PersistentDiscoveryPipeline,
+        DiscoveryObservation, DiscoveryPipelineOutcome, DiscoverySources, NeighborCoordinator,
+        NeighborCoordinatorConfig, NeighborInterfaceBinding, PersistentDiscoveryPipeline,
+        neighbor_discovery_sources,
     },
     policy::{EnforcementResult, PolicyActuator, PolicyCoordinator},
 };
 use lattice_store::{InstallRepository, M2StateRepository, PolicyRepository, connect_path};
+use std::collections::VecDeque;
+use std::net::IpAddr;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use tempfile::tempdir;
@@ -29,6 +40,24 @@ impl PolicyActuator for FakeActuator {
         self.0.fetch_add(1, Ordering::SeqCst);
         EnforcementResult::Verified
     }
+}
+
+struct QueuedSource(Mutex<VecDeque<Result<Vec<NeighborRow>, NeighborError>>>);
+#[async_trait]
+impl NeighborSnapshotSource for QueuedSource {
+    async fn snapshot(&self) -> Result<Vec<NeighborRow>, NeighborError> {
+        self.0.lock().unwrap().pop_front().unwrap_or(Ok(vec![]))
+    }
+}
+
+fn neighbor_row(last_octet: u8) -> NeighborRow {
+    NeighborRow::new(
+        InterfaceId::new(7),
+        IpAddr::V4(format!("192.168.7.{last_octet}").parse().unwrap()),
+        LinkAddress::try_from([2, 0, 0, 0, 0, last_octet]).unwrap(),
+        NeighborReachability::Reachable,
+    )
+    .unwrap()
 }
 
 fn observation(t: chrono::DateTime<Utc>) -> DiscoveryObservation {
@@ -122,6 +151,119 @@ async fn identical_policy_changed_is_deduplicated_across_coordinator_restart() -
     assert_eq!(bus.current_sequence().await, 1);
     restarted.enroll_and_evaluate(device, at(102)).await?;
     assert_eq!(bus.current_sequence().await, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn injected_neighbor_policy_failure_recovers_from_duplicate_without_replaying_discovery_events()
+-> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let pool = connect_path(&dir.path().join("neighbor-policy-recovery.db")).await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let policy_repo = PolicyRepository::new(pool.clone());
+    policy_repo.mark_successful_service_start(at(0)).await?;
+    let state_repo = M2StateRepository::new(pool.clone());
+    let state = AppState::new("owner-token-0123456789abcdefghijkl", state_repo.clone())?;
+    let binding = NeighborInterfaceBinding::for_interface(InterfaceId::new(7))?;
+    let first = DeviceId::parse("018f47a0-9b5c-7a22-8a33-112233445501")?;
+    let second = DeviceId::parse("018f47a0-9b5c-7a22-8a33-112233445502")?;
+    let pipeline = PersistentDiscoveryPipeline::open(
+        state_repo,
+        neighbor_discovery_sources(&[binding])?,
+        [first, second].into_iter(),
+        Default::default(),
+        16,
+        16,
+    )
+    .await?;
+    let rows = vec![neighbor_row(1), neighbor_row(2)];
+    let actuator = FakeActuator::default();
+    let policy = PolicyCoordinator::with_actuator(
+        policy_repo.clone(),
+        Some(state.events().clone()),
+        actuator.clone(),
+    );
+    let config = NeighborCoordinatorConfig {
+        poll_interval: Duration::seconds(5),
+        support_ttl: Duration::seconds(4),
+        tracker: NeighborTrackerConfig::default(),
+    };
+    let mut coordinator = NeighborCoordinator::with_policy(
+        QueuedSource(Mutex::new(VecDeque::from([Ok(rows.clone()), Ok(rows)]))),
+        pipeline,
+        state.clone(),
+        [binding],
+        config,
+        policy,
+    )?;
+
+    sqlx::query(
+        "CREATE TRIGGER injected_policy_failure BEFORE INSERT ON device_policy
+         BEGIN SELECT RAISE(ABORT, 'injected policy failure'); END",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(&format!(
+        "CREATE TRIGGER injected_second_discovery_failure BEFORE INSERT ON devices
+         WHEN NEW.device_id='{}'
+         BEGIN SELECT RAISE(ABORT, 'injected discovery failure'); END",
+        second
+    ))
+    .execute(&pool)
+    .await?;
+
+    assert!(coordinator.cycle(at(60)).await.is_err());
+    assert!(policy_repo.load(first).await?.is_none());
+    let sequence_before_recovery = state.events().current_sequence().await;
+    sqlx::query("DROP TRIGGER injected_policy_failure")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DROP TRIGGER injected_second_discovery_failure")
+        .execute(&pool)
+        .await?;
+
+    let recovered = coordinator.cycle(at(60)).await?;
+    assert!(matches!(
+        recovered.outcomes(),
+        [
+            DiscoveryPipelineOutcome::Duplicate(_),
+            DiscoveryPipelineOutcome::Committed(_)
+        ]
+    ));
+    assert!(policy_repo.load(first).await?.is_some());
+    assert_eq!(actuator.0.load(Ordering::SeqCst), 0);
+
+    let lattice_event_bus::Resume::Events(events) =
+        state.events().resume_after(sequence_before_recovery).await
+    else {
+        panic!("replay should remain available")
+    };
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.payload,
+                lattice_domain::EventPayload::PresenceChanged(change)
+                    if change.device_id == first
+            ))
+            .count(),
+        0,
+        "duplicate recovery must not replay a discovery event"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.payload,
+                lattice_domain::EventPayload::PolicyChanged(change)
+                    if change.device_id == first
+            ))
+            .count(),
+        1,
+        "recovery should publish the missing policy decision exactly once"
+    );
     Ok(())
 }
 
