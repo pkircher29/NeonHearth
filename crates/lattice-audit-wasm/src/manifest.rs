@@ -53,6 +53,7 @@ pub enum SideEffectProfile {
     FirmwareWrite,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackPlan {
     pub required: bool,
     pub description: String,
@@ -64,11 +65,73 @@ pub enum EvidenceType {
     Boolean,
     Bytes,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct EvidenceSchema {
     pub fields: BTreeMap<String, EvidenceType>,
 }
+
+impl<'de> Deserialize<'de> for EvidenceSchema {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = EvidenceSchema;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("evidence schema object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "fields" || fields.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "unknown or duplicate evidence schema field",
+                        ));
+                    }
+                    struct Fields(BTreeMap<String, EvidenceType>);
+                    impl<'de> Deserialize<'de> for Fields {
+                        fn deserialize<D: serde::Deserializer<'de>>(
+                            d: D,
+                        ) -> Result<Self, D::Error> {
+                            d.deserialize_map(FieldsVisitor).map(Fields)
+                        }
+                    }
+                    struct FieldsVisitor;
+                    impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+                        type Value = BTreeMap<String, EvidenceType>;
+                        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                            f.write_str("evidence fields map")
+                        }
+                        fn visit_map<M: serde::de::MapAccess<'de>>(
+                            self,
+                            mut m: M,
+                        ) -> Result<Self::Value, M::Error> {
+                            let mut out = BTreeMap::new();
+                            while let Some(k) = m.next_key::<String>()? {
+                                let v = m.next_value()?;
+                                if out.insert(k, v).is_some() {
+                                    return Err(serde::de::Error::custom(
+                                        "duplicate evidence field",
+                                    ));
+                                }
+                            }
+                            Ok(out)
+                        }
+                    }
+                    fields = Some(map.next_value::<Fields>()?.0);
+                }
+                let fields = fields.ok_or_else(|| serde::de::Error::custom("missing fields"))?;
+                Ok(EvidenceSchema { fields })
+            }
+        }
+        let schema = d.deserialize_map(Visitor)?;
+        // serde_json's map access preserves duplicate keys only when we insert via a visitor.
+        Ok(schema)
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     pub max_bytes: u64,
     pub max_requests: u32,
@@ -104,7 +167,7 @@ impl<'de> Deserialize<'de> for AuditManifest {
             version: u16,
             sha256: [u8; 32],
             target_kind: TargetKind,
-            capabilities: BTreeSet<Capability>,
+            capabilities: Vec<Capability>,
             expected_behavior: String,
             side_effects: SideEffectProfile,
             rollback: RollbackPlan,
@@ -117,12 +180,18 @@ impl<'de> Deserialize<'de> for AuditManifest {
             .signature
             .try_into()
             .map_err(|_| serde::de::Error::custom("signature must contain exactly 64 bytes"))?;
+        let mut capabilities = BTreeSet::new();
+        for capability in w.capabilities {
+            if !capabilities.insert(capability) {
+                return Err(serde::de::Error::custom("duplicate capability"));
+            }
+        }
         AuditManifest::from_parts(
             w.module_id,
             w.version,
             w.sha256,
             w.target_kind,
-            w.capabilities,
+            capabilities,
             w.expected_behavior,
             w.side_effects,
             w.rollback,
@@ -189,7 +258,12 @@ impl AuditManifest {
         }
         if expected_behavior.trim().is_empty()
             || expected_behavior.len() > MAX_TEXT
+            || rollback.description.trim().is_empty()
             || rollback.description.len() > MAX_TEXT
+            || expected_behavior.trim() != expected_behavior
+            || rollback.description.trim() != rollback.description
+            || expected_behavior.chars().any(char::is_control)
+            || rollback.description.chars().any(char::is_control)
         {
             return Err(AuditError::InvalidManifest("invalid text".into()));
         }
@@ -227,6 +301,7 @@ impl AuditManifest {
             || limits.max_requests == 0
             || limits.max_requests > MAX_REQUESTS
             || limits.max_time.is_zero()
+            || limits.max_time.subsec_nanos() != 0
             || limits.max_time.as_secs() > MAX_TIME_SECS
             || limits.max_fuel == 0
             || limits.max_fuel > MAX_FUEL

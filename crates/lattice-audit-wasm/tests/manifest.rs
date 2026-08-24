@@ -125,3 +125,51 @@ fn serde_rejects_unknown_and_invalid_values() {
     value["version"] = json!(0);
     assert!(serde_json::from_value::<AuditManifest>(value).is_err());
 }
+
+#[test]
+fn rejects_subsecond_limits_and_duplicate_or_nested_unknown_fields() {
+    let (m, _) = signed(b"module");
+    let mut value = serde_json::to_value(&m).unwrap();
+    value["limits"]["max_time"] = json!("not used");
+    // serde_json serializes Duration through the seconds adapter as a number.
+    value["limits"]["max_time"] = json!(2.5);
+    assert!(serde_json::from_value::<AuditManifest>(value).is_err());
+
+    let raw = serde_json::to_string(&m).unwrap();
+    let start = raw.find(r#""capabilities":["#).unwrap() + r#""capabilities":["#.len();
+    let end = raw[start..].find(']').unwrap() + start;
+    let item = &raw[start..end];
+    let duplicate_capabilities = format!("{}{},{}{}", &raw[..start], item, item, &raw[end..]);
+    assert!(serde_json::from_str::<AuditManifest>(&duplicate_capabilities).is_err());
+
+    let mut value = serde_json::to_value(&m).unwrap();
+    value["rollback"]["extra"] = json!(true);
+    assert!(serde_json::from_value::<AuditManifest>(value).is_err());
+    let mut value = serde_json::to_value(&m).unwrap();
+    value["evidence_schema"]["extra"] = json!(true);
+    assert!(serde_json::from_value::<AuditManifest>(value).is_err());
+    let mut value = serde_json::to_value(&m).unwrap();
+    value["limits"]["extra"] = json!(true);
+    assert!(serde_json::from_value::<AuditManifest>(value).is_err());
+}
+
+#[test]
+fn rejects_duplicate_evidence_keys_and_noncanonical_text() {
+    let (m, _) = signed(b"module");
+    let raw = serde_json::to_string(&m).unwrap();
+    let duplicate = raw.replace(
+        r#""fields":{"status":"Text"}"#,
+        r#""fields":{"status":"Text","status":"Text"}"#,
+    );
+    assert!(serde_json::from_str::<AuditManifest>(&duplicate).is_err());
+
+    for field in ["expected_behavior", "rollback"] {
+        let mut value = serde_json::to_value(&m).unwrap();
+        if field == "expected_behavior" {
+            value[field] = json!(" read ");
+        } else {
+            value[field]["description"] = json!(" none ");
+        }
+        assert!(serde_json::from_value::<AuditManifest>(value).is_err());
+    }
+}
