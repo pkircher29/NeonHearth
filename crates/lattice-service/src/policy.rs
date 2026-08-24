@@ -52,7 +52,6 @@ pub struct PolicyCoordinator<A = ManualRequiredActuator> {
     repo: PolicyRepository,
     events: Option<EventBus>,
     actuator: Arc<A>,
-    last: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<DeviceId, Evaluation>>>,
 }
 
 impl PolicyCoordinator<ManualRequiredActuator> {
@@ -66,7 +65,6 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             repo,
             events,
             actuator: Arc::new(actuator),
-            last: Default::default(),
         }
     }
     pub async fn enroll_and_evaluate(
@@ -97,7 +95,15 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 .enforce(p.device_id, evaluation.requested_action)
                 .await
         };
-        let changed = self.last.lock().await.insert(p.device_id, evaluation) != Some(evaluation);
+        let fingerprint = serde_json::to_string(&(
+            evaluation,
+            evidence_summary(&p),
+            evaluation.requested_action,
+        ))?;
+        let changed = self
+            .repo
+            .record_decision_fingerprint(p.device_id, &fingerprint)
+            .await?;
         if changed && let Some(bus) = &self.events {
             bus.publish(
                 now,
@@ -158,6 +164,9 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
     ) -> anyhow::Result<AuditedDecision> {
         self.repo.extend_once(d, until).await?;
         self.evaluate(self.repo.load(d).await?.unwrap(), now).await
+    }
+    pub async fn needs_recovery(&self, device: DeviceId) -> anyhow::Result<bool> {
+        Ok(self.repo.load(device).await?.is_none())
     }
 }
 

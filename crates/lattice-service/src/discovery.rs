@@ -141,16 +141,18 @@ impl NeighborCycle {
 }
 
 /// Coordinates one injected snapshot source. Failed snapshots are deliberately inert.
-pub struct NeighborCoordinator<S> {
+pub struct NeighborCoordinator<S, A = crate::policy::ManualRequiredActuator> {
     source: S,
     bindings: BTreeMap<lattice_sensor::InterfaceId, u64>,
     config: NeighborCoordinatorConfig,
     tracker: lattice_sensor::neighbor::NeighborTracker,
     pipeline: PersistentDiscoveryPipeline,
     state: AppState,
-    policy: crate::policy::PolicyCoordinator,
+    policy: crate::policy::PolicyCoordinator<A>,
 }
-impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S> {
+impl<S: lattice_sensor::neighbor::NeighborSnapshotSource>
+    NeighborCoordinator<S, crate::policy::ManualRequiredActuator>
+{
     pub fn new<I>(
         source: S,
         pipeline: PersistentDiscoveryPipeline,
@@ -177,19 +179,60 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
                 lattice_sensor::neighbor::NeighborError::InvalidConfig,
             ));
         }
-        let bindings = bindings
-            .into_iter()
-            .map(|binding| (binding.interface(), binding.source_id()))
-            .collect::<BTreeMap<_, _>>();
         let policy_repo = lattice_store::PolicyRepository::new(pipeline.state.pool().clone());
         let policy_events = state.events().clone();
+        Self::with_policy(
+            source,
+            pipeline,
+            state,
+            bindings,
+            config,
+            crate::policy::PolicyCoordinator::new(policy_repo, Some(policy_events)),
+        )
+    }
+}
+impl<
+    S: lattice_sensor::neighbor::NeighborSnapshotSource,
+    A: crate::policy::PolicyActuator + 'static,
+> NeighborCoordinator<S, A>
+{
+    pub fn with_policy<I>(
+        source: S,
+        pipeline: PersistentDiscoveryPipeline,
+        state: AppState,
+        bindings: I,
+        config: NeighborCoordinatorConfig,
+        policy: crate::policy::PolicyCoordinator<A>,
+    ) -> Result<Self, NeighborCoordinatorError>
+    where
+        I: IntoIterator<Item = NeighborInterfaceBinding>,
+    {
+        let bindings: Vec<_> = bindings.into_iter().collect();
+        validate_neighbor_bindings(&bindings)?;
+        let expected_sources = neighbor_discovery_sources(&bindings)?;
+        if pipeline.source_fingerprint() != expected_sources.fingerprint() {
+            return Err(NeighborCoordinatorError::Discovery(
+                DiscoveryError::InvalidSource,
+            ));
+        }
+        if config.poll_interval <= chrono::Duration::zero()
+            || config.support_ttl <= chrono::Duration::zero()
+            || config.support_ttl >= config.poll_interval
+        {
+            return Err(NeighborCoordinatorError::Snapshot(
+                lattice_sensor::neighbor::NeighborError::InvalidConfig,
+            ));
+        }
         Ok(Self {
             source,
-            bindings,
+            bindings: bindings
+                .into_iter()
+                .map(|binding| (binding.interface(), binding.source_id()))
+                .collect(),
             tracker: lattice_sensor::neighbor::NeighborTracker::new(config.tracker.clone())?,
             pipeline,
             state,
-            policy: crate::policy::PolicyCoordinator::new(policy_repo, Some(policy_events)),
+            policy,
             config,
         })
     }
@@ -309,6 +352,17 @@ impl<S: lattice_sensor::neighbor::NeighborSnapshotSource> NeighborCoordinator<S>
                         .publish(payload_occurred_at(&payload, observed_at), payload)
                         .await;
                 }
+            } else if let DiscoveryPipelineOutcome::Duplicate(ref duplicate) = outcome
+                && let Ok(summary) =
+                    serde_json::from_slice::<serde_json::Value>(&duplicate.result_summary)
+                && let Some(device) = summary.get("device_id").and_then(serde_json::Value::as_str)
+                && let Ok(device) = DeviceId::parse(device)
+                && self.policy.needs_recovery(device).await.unwrap_or(false)
+                && let Err(error) = self.policy.enroll_and_evaluate(device, observed_at).await
+            {
+                tracing::warn!(
+                    "policy recovery degraded after duplicate durable discovery: {error}"
+                );
             }
             outcomes.push(outcome);
         }

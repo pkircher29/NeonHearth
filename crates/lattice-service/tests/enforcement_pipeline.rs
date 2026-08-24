@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{Duration, TimeZone, Utc};
 use lattice_domain::{DeviceId, EvidenceFact, EvidenceFamily, RequestedAction};
+use lattice_event_bus::EventBus;
 use lattice_intelligence::presence::PresenceEvidenceKind;
 use lattice_service::{
     discovery::{
@@ -94,5 +95,32 @@ async fn committed_discovery_enrollment_is_post_commit_and_unknown_expires_after
     assert_eq!(expired.requested_action, RequestedAction::Quarantine);
     assert_eq!(expired.enforcement, EnforcementResult::Verified);
     assert_eq!(actuator.0.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn identical_policy_changed_is_deduplicated_across_coordinator_restart() -> anyhow::Result<()>
+{
+    let dir = tempdir()?;
+    let pool = connect_path(&dir.path().join("dedup.db")).await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let bus = EventBus::new(8, 8);
+    let first =
+        PolicyCoordinator::with_actuator(repo.clone(), Some(bus.clone()), FakeActuator::default());
+    first.enroll_and_evaluate(device, at(84)).await?;
+    assert_eq!(bus.current_sequence().await, 1);
+    let restarted =
+        PolicyCoordinator::with_actuator(repo, Some(bus.clone()), FakeActuator::default());
+    restarted.enroll_and_evaluate(device, at(84)).await?;
+    assert_eq!(bus.current_sequence().await, 1);
+    restarted.enroll_and_evaluate(device, at(102)).await?;
+    assert_eq!(bus.current_sequence().await, 2);
     Ok(())
 }
