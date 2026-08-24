@@ -335,6 +335,21 @@ pub fn verify_manifest(
     wasm: &[u8],
     key: &VerifyingKey,
 ) -> Result<VerifiedManifest, AuditError> {
+    // Re-run structural validation here because callers may have obtained a mutable
+    // pre-verification manifest from a builder; no unchecked value may become verified.
+    AuditManifest::from_parts(
+        manifest.module_id.clone(),
+        manifest.version,
+        manifest.sha256,
+        manifest.target_kind.clone(),
+        manifest.capabilities.clone(),
+        manifest.expected_behavior.clone(),
+        manifest.side_effects.clone(),
+        manifest.rollback.clone(),
+        manifest.evidence_schema.clone(),
+        manifest.limits.clone(),
+        manifest.signature,
+    )?;
     if wasm.len() as u64 > MAX_WASM_BYTES {
         return Err(AuditError::WasmTooLarge);
     }
