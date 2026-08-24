@@ -383,14 +383,7 @@ async fn binding_ids_are_derived_stable_and_source_parity_is_exact() {
             .unwrap()
             .fingerprint()
     );
-    assert!(
-        neighbor_discovery_sources(
-            &(1..=65)
-                .map(binding)
-                .collect::<Vec<_>>(),
-        )
-        .is_err()
-    );
+    assert!(neighbor_discovery_sources(&(1..=65).map(binding).collect::<Vec<_>>(),).is_err());
 }
 
 #[tokio::test]
