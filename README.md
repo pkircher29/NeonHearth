@@ -21,3 +21,5 @@ The W6 adapter is fixture-verified but intentionally not enabled in the main
 runtime until an owner-authorized, sanitized compatibility capture identifies
 the real interface. Cameras/security assessment, Home Twin, Network Doctor,
 Tailscale access, and production installers follow in M4–M7.
+
+Camera fixture and real-host acceptance gate: [M4 camera evidence](docs/protocols/m4-camera-evidence.md).
