@@ -119,6 +119,35 @@ async fn snapshot_uses_current_event_watermark() {
 }
 
 #[tokio::test]
+async fn snapshot_projects_empty_device_into_typed_unavailable_fields() {
+    let pool = connect_memory().await.unwrap();
+    let id = "018f47a0-9b5c-7a22-8a33-112233445599";
+    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed) VALUES(?,?,?,?,?,?)")
+        .bind(id).bind("2026-01-01T00:00:00Z").bind("2026-01-01T00:00:01Z").bind("Alice").bind("laptop").bind(1i64)
+        .execute(&pool).await.unwrap();
+    let response = app(AppState::new(TOKEN, M2StateRepository::new(pool)).unwrap())
+        .oneshot(
+            Request::get("/api/v1/state")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body(response).await["devices"][0],
+        serde_json::json!({
+            "device_id":id,"first_seen_at":"2026-01-01T00:00:00Z","last_seen_at":"2026-01-01T00:00:01Z",
+            "owner_name":"Alice","owner_type":"laptop","owner_confirmed":true,
+            "presence":{"state":"unknown","observed_at":null,"source":null,"kind":null},"evidence":null,
+            "identity":{"available":false,"classification":null,"confidence":null},
+            "bandwidth":{"available":false,"upload":null,"download":null,"coverage":null,"observed_at":null}
+        })
+    );
+}
+
+#[tokio::test]
 async fn event_ticket_requires_bearer_and_is_a_uuid() {
     for authorization in [None, Some("Bearer wrong")] {
         let mut request = Request::post("/api/v1/events/ticket");

@@ -1,4 +1,4 @@
-import type { EventTicket, Health, ServerMessage, Snapshot } from './types';
+import type { Bandwidth, DeviceSnapshot, Evidence, EventTicket, Health, Identity, Presence, ServerMessage, Snapshot } from './types';
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
@@ -52,8 +52,49 @@ function isHealth(value: unknown): value is Health {
   return isRecord(value) && typeof value.status === 'string' && typeof value.api_version === 'string';
 }
 
+const presenceStates = new Set(['online', 'quiet', 'offline', 'blocked', 'unknown']);
+const evidenceFamilies = new Set(['link_layer', 'addressing', 'naming', 'service', 'cryptographic', 'router_hint', 'owner']);
+const coverages = new Set(['complete', 'router-reported', 'local-only', 'estimated']);
+const isDate = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+const isConfidence = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+const isBytes = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+const isDeviceId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+
+function isPresence(value: unknown): value is Presence {
+  if (!isRecord(value) || !presenceStates.has(String(value.state))) return false;
+  const fields = [value.observed_at, value.source, value.kind];
+  if (value.state === 'unknown') return fields.every((field) => field === null);
+  return fields.every((field) => typeof field === 'string' && field.length > 0);
+}
+function isEvidence(value: unknown): value is Evidence {
+  return isRecord(value) && typeof value.family === 'string' && evidenceFamilies.has(value.family)
+    && typeof value.source === 'string' && value.source.length > 0 && isConfidence(value.confidence)
+    && isDate(value.observed_at) && (value.expires_at === null || isDate(value.expires_at));
+}
+function isIdentity(value: unknown): value is Identity {
+  if (!isRecord(value) || typeof value.available !== 'boolean') return false;
+  if (!value.available) return value.classification === null && value.confidence === null;
+  return typeof value.classification === 'string' && value.classification.length > 0 && isConfidence(value.confidence);
+}
+function isBandwidth(value: unknown): value is Bandwidth {
+  if (!isRecord(value) || typeof value.available !== 'boolean') return false;
+  const fields = [value.upload, value.download, value.coverage, value.observed_at];
+  if (!value.available) return fields.every((field) => field === null);
+  return isBytes(value.upload) && isBytes(value.download) && typeof value.coverage === 'string'
+    && coverages.has(value.coverage) && isDate(value.observed_at);
+}
+function isDeviceSnapshot(value: unknown): value is DeviceSnapshot {
+  return isRecord(value) && isDeviceId(value.device_id) && isDate(value.first_seen_at) && isDate(value.last_seen_at)
+    && (value.owner_name === null || typeof value.owner_name === 'string')
+    && (value.owner_type === null || typeof value.owner_type === 'string') && typeof value.owner_confirmed === 'boolean'
+    && isPresence(value.presence) && (value.evidence === null || isEvidence(value.evidence))
+    && isIdentity(value.identity) && isBandwidth(value.bandwidth);
+}
+
 function isSnapshot(value: unknown): value is Snapshot {
-  return isRecord(value) && isSequence(value.sequence) && Array.isArray(value.devices) && (value.next_after === null || typeof value.next_after === 'string') && typeof value.service_status === 'string';
+  return isRecord(value) && isSequence(value.sequence) && Array.isArray(value.devices)
+    && value.devices.every(isDeviceSnapshot) && (value.next_after === null || isDeviceId(value.next_after))
+    && typeof value.service_status === 'string';
 }
 
 function isEventTicket(value: unknown): value is EventTicket {

@@ -3,6 +3,32 @@ import { describe, expect, it, vi } from 'vitest';
 import { createApiClient, isSequence } from './client';
 
 describe('createApiClient', () => {
+  const validDevice = {
+    device_id: '018f47a0-9b5c-7a22-8a33-112233445599', first_seen_at: '2026-01-01T00:00:00Z', last_seen_at: '2026-01-01T00:00:01Z',
+    owner_name: null, owner_type: null, owner_confirmed: false,
+    presence: { state: 'unknown', observed_at: null, source: null, kind: null }, evidence: null,
+    identity: { available: false, classification: null, confidence: null },
+    bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null }
+  };
+
+  it('accepts a fully typed snapshot and rejects malformed nested projections', async () => {
+    const snapshot = { sequence: 1, devices: [validDevice], next_after: null, service_status: 'ready' };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+    await expect(client.snapshot()).resolves.toEqual(snapshot);
+    for (const mutate of [
+      (d: any) => { d.bandwidth = { ...d.bandwidth, available: false, upload: 0 }; },
+      (d: any) => { d.identity = { available: false, classification: 'router', confidence: null }; },
+      (d: any) => { d.presence = { state: 'unknown', observed_at: 'bad', source: null, kind: null }; },
+      (d: any) => { d.evidence = { family: 'link_layer', source: 'mdns', confidence: 2, observed_at: 'now', expires_at: null }; }
+    ]) {
+      const malformed = structuredClone(snapshot);
+      mutate(malformed.devices[0]);
+      const badFetch = vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 }));
+      await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: badFetch }).snapshot()).rejects.toThrow('Invalid snapshot response');
+    }
+  });
+
   it('accepts only nonnegative safe integer sequences', () => {
     expect(isSequence(0)).toBe(true);
     expect(isSequence(Number.MAX_SAFE_INTEGER)).toBe(true);
