@@ -2,6 +2,7 @@ pub mod api;
 mod auth;
 pub mod cameras;
 pub mod discovery;
+pub mod home;
 pub mod platform;
 pub mod policy;
 pub mod runtime;
@@ -13,7 +14,7 @@ use axum::{
     extract::{Query, State, WebSocketUpgrade, rejection::QueryRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 pub use platform::{Platform, PlatformPaths, platform_paths};
 use serde::Deserialize;
@@ -30,6 +31,18 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/v1/devices/{device_id}/advisories",
             get(api::device_advisories),
+        )
+        .route("/api/v1/home", get(home::home_snapshot))
+        .route("/api/v1/home/plan", put(home::save_plan_route))
+        .route(
+            "/api/v1/home/placements/{device_id}",
+            put(home::upsert_placement_route).delete(home::delete_placement_route),
+        )
+        .route(
+            "/api/v1/home/draft",
+            get(home::get_draft_route)
+                .put(home::put_draft_route)
+                .delete(home::delete_draft_route),
         )
         .route("/api/v1/policy/action", post(api::policy_action))
         .route("/api/v1/events/ticket", post(api::event_ticket))

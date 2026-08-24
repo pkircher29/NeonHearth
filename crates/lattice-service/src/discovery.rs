@@ -441,6 +441,7 @@ fn payload_occurred_at(payload: &EventPayload, fallback: DateTime<Utc>) -> DateT
         EventPayload::BandwidthFrame(frame) => frame.emitted_at,
         EventPayload::ServiceStatus(_) => fallback,
         EventPayload::PolicyChanged(_) => fallback,
+        EventPayload::HomeChanged(_) => fallback,
     }
 }
 
