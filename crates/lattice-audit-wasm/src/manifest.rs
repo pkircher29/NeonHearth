@@ -18,6 +18,61 @@ const MAX_TIME_SECS: u64 = 300;
 const MAX_FUEL: u64 = 10_000_000_000;
 const MAX_MEMORY_PAGES: u32 = 1024;
 
+fn bounded_string<'de, D: serde::Deserializer<'de>>(d: D, max: usize) -> Result<String, D::Error> {
+    struct V(usize);
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("bounded string")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<String, E> {
+            if v.len() > self.0 {
+                return Err(E::custom("string exceeds maximum length"));
+            }
+            Ok(v.to_owned())
+        }
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<String, E> {
+            if v.len() > self.0 {
+                return Err(E::custom("string exceeds maximum length"));
+            }
+            Ok(v)
+        }
+    }
+    d.deserialize_string(V(max))
+}
+
+fn bounded_signature<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = [u8; 64];
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("exactly 64 signature bytes")
+        }
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<[u8; 64], E> {
+            v.try_into()
+                .map_err(|_| E::custom("signature must contain exactly 64 bytes"))
+        }
+        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<[u8; 64], E> {
+            self.visit_bytes(&v)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<[u8; 64], A::Error> {
+            let mut out = [0u8; 64];
+            for slot in &mut out {
+                *slot = a.next_element()?.ok_or_else(|| {
+                    serde::de::Error::custom("signature must contain exactly 64 bytes")
+                })?;
+            }
+            if a.next_element::<u8>()?.is_some() {
+                return Err(serde::de::Error::custom(
+                    "signature must contain exactly 64 bytes",
+                ));
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_bytes(V)
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuditError {
     #[error("invalid manifest: {0}")]
@@ -109,6 +164,15 @@ impl<'de> Deserialize<'de> for EvidenceSchema {
                         ) -> Result<Self::Value, M::Error> {
                             let mut out = BTreeMap::new();
                             while let Some(k) = m.next_key::<String>()? {
+                                if k.is_empty()
+                                    || k.len() > 128
+                                    || k.trim() != k
+                                    || k.chars().any(char::is_control)
+                                {
+                                    return Err(serde::de::Error::custom(
+                                        "invalid evidence field key",
+                                    ));
+                                }
                                 let v = m.next_value()?;
                                 if out.insert(k, v).is_some() {
                                     return Err(serde::de::Error::custom(
@@ -163,25 +227,71 @@ impl<'de> Deserialize<'de> for AuditManifest {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
+            #[serde(deserialize_with = "deserialize_module_id")]
             module_id: String,
             version: u16,
             sha256: [u8; 32],
             target_kind: TargetKind,
-            capabilities: Vec<Capability>,
-            expected_behavior: String,
+            capabilities: BoundedCapabilities,
+            expected_behavior: BoundedText,
             side_effects: SideEffectProfile,
-            rollback: RollbackPlan,
+            rollback: BoundedRollback,
             evidence_schema: EvidenceSchema,
             limits: Limits,
-            signature: Vec<u8>,
+            #[serde(deserialize_with = "bounded_signature")]
+            signature: [u8; 64],
+        }
+        #[derive(Deserialize)]
+        struct BoundedText(#[serde(deserialize_with = "deserialize_max_text")] String);
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BoundedRollback {
+            required: bool,
+            #[serde(deserialize_with = "deserialize_max_text")]
+            description: String,
+        }
+        struct BoundedCapabilities(Vec<Capability>);
+        impl<'de> Deserialize<'de> for BoundedCapabilities {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct V;
+                impl<'de> serde::de::Visitor<'de> for V {
+                    type Value = BoundedCapabilities;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("at most 16 capabilities")
+                    }
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                        self,
+                        mut a: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        let mut out = Vec::with_capacity(MAX_CAPABILITIES);
+                        while let Some(c) = a.next_element()? {
+                            if out.len() == MAX_CAPABILITIES {
+                                return Err(serde::de::Error::custom("too many capabilities"));
+                            }
+                            out.push(c);
+                        }
+                        Ok(BoundedCapabilities(out))
+                    }
+                }
+                d.deserialize_seq(V)
+            }
+        }
+        fn deserialize_max_text<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<String, D::Error> {
+            bounded_string(d, MAX_TEXT)
+        }
+        fn deserialize_module_id<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<String, D::Error> {
+            bounded_string(d, 128)
         }
         let w = Wire::deserialize(d)?;
-        let signature: [u8; 64] = w
-            .signature
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("signature must contain exactly 64 bytes"))?;
         let mut capabilities = BTreeSet::new();
-        for capability in w.capabilities {
+        if w.capabilities.0.len() > MAX_CAPABILITIES {
+            return Err(serde::de::Error::custom("too many capabilities"));
+        }
+        for capability in w.capabilities.0 {
             if !capabilities.insert(capability) {
                 return Err(serde::de::Error::custom("duplicate capability"));
             }
@@ -192,12 +302,15 @@ impl<'de> Deserialize<'de> for AuditManifest {
             w.sha256,
             w.target_kind,
             capabilities,
-            w.expected_behavior,
+            w.expected_behavior.0,
             w.side_effects,
-            w.rollback,
+            RollbackPlan {
+                required: w.rollback.required,
+                description: w.rollback.description,
+            },
             w.evidence_schema,
             w.limits,
-            signature,
+            w.signature,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -287,10 +400,9 @@ impl AuditManifest {
         }
         if evidence_schema.fields.is_empty()
             || evidence_schema.fields.len() > MAX_FIELDS
-            || evidence_schema
-                .fields
-                .keys()
-                .any(|k| k.is_empty() || k.len() > 128)
+            || evidence_schema.fields.keys().any(|k| {
+                k.is_empty() || k.len() > 128 || k.trim() != k || k.chars().any(char::is_control)
+            })
         {
             return Err(AuditError::InvalidManifest(
                 "invalid evidence schema".into(),
