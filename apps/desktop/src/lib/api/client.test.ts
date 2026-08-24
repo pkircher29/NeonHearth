@@ -18,8 +18,12 @@ describe('createApiClient', () => {
     await expect(client.snapshot()).resolves.toEqual(snapshot);
     for (const mutate of [
       (d: any) => { d.bandwidth = { ...d.bandwidth, available: false, upload: 0 }; },
+      (d: any) => { d.bandwidth = { available: true, upload: 1, download: null, coverage: 'complete', observed_at: 'now' }; },
+      (d: any) => { d.bandwidth = { available: true, upload: Number.MAX_SAFE_INTEGER + 1, download: 0, coverage: 'complete', observed_at: 'now' }; },
       (d: any) => { d.identity = { available: false, classification: 'router', confidence: null }; },
+      (d: any) => { d.identity = { available: true, classification: null, confidence: 0.5 }; },
       (d: any) => { d.presence = { state: 'unknown', observed_at: 'bad', source: null, kind: null }; },
+      (d: any) => { d.presence = { state: 'online', observed_at: null, source: null, kind: null }; },
       (d: any) => { d.evidence = { family: 'link_layer', source: 'mdns', confidence: 2, observed_at: 'now', expires_at: null }; }
     ]) {
       const malformed = structuredClone(snapshot);
@@ -27,6 +31,30 @@ describe('createApiClient', () => {
       const badFetch = vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 }));
       await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: badFetch }).snapshot()).rejects.toThrow('Invalid snapshot response');
     }
+    for (const mutate of [
+      (value: any) => { value.devices[0].device_id = 'not-a-device-id'; },
+      (value: any) => { value.devices[0].evidence = { family: 'not-a-family', source: 'mdns', confidence: 0.5, observed_at: 'now', expires_at: null }; },
+      (value: any) => { value.next_after = 'not-a-device-id'; }
+    ]) {
+      const malformed = structuredClone(snapshot);
+      mutate(malformed);
+      const badFetch = vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 }));
+      await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: badFetch }).snapshot()).rejects.toThrow('Invalid snapshot response');
+    }
+  });
+
+  it('accepts an unknown presence transition only with complete provenance', async () => {
+    const transitioned: any = structuredClone(validDevice);
+    transitioned.presence = {
+      state: 'unknown',
+      observed_at: '2026-01-01T00:00:02Z',
+      source: 'sensor-impairment',
+      kind: 'contradiction'
+    };
+    const snapshot = { sequence: 1, devices: [transitioned], next_after: null, service_status: 'ready' };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200 }));
+
+    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl }).snapshot()).resolves.toEqual(snapshot);
   });
 
   it('accepts only nonnegative safe integer sequences', () => {

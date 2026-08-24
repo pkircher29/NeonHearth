@@ -63,8 +63,9 @@ const isDeviceId = (value: unknown): value is string => typeof value === 'string
 function isPresence(value: unknown): value is Presence {
   if (!isRecord(value) || !presenceStates.has(String(value.state))) return false;
   const fields = [value.observed_at, value.source, value.kind];
-  if (value.state === 'unknown') return fields.every((field) => field === null);
-  return fields.every((field) => typeof field === 'string' && field.length > 0);
+  const noTransition = fields.every((field) => field === null);
+  const transition = fields.every((field) => typeof field === 'string' && field.length > 0);
+  return noTransition ? value.state === 'unknown' : transition;
 }
 function isEvidence(value: unknown): value is Evidence {
   return isRecord(value) && typeof value.family === 'string' && evidenceFamilies.has(value.family)
