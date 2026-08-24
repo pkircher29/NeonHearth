@@ -1,5 +1,6 @@
 //! Persistence interfaces and implementations for NeonHearth.
 
+mod camera;
 mod checkpoint;
 mod flow;
 mod install;
@@ -7,6 +8,7 @@ mod policy;
 mod w6;
 
 use anyhow::Context;
+pub use camera::*;
 pub use checkpoint::*;
 pub use flow::{CompactionPolicy, FlowIngestor, FlowRepository, FlowStoreError};
 use fs2::FileExt;

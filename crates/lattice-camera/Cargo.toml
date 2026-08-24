@@ -9,6 +9,10 @@ serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+async-trait.workspace = true
+secrecy.workspace = true
+quick-xml.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

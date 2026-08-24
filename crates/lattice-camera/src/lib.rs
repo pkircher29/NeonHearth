@@ -12,6 +12,10 @@ pub use detection::{
     CameraCandidate, CameraClassification, CameraEvidence, CameraEvidenceFamily, CameraHealth,
     DetectionError, classify_candidate,
 };
+pub use onvif::{
+    BoundedSerial, CameraInventory, InventoryLimits, OnvifAction, OnvifCredential, OnvifError,
+    OnvifTransport, StreamId, StreamSecretSink, StreamSourceRef, TargetAddress, inventory,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct CameraId(Uuid);
