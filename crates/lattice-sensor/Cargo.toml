@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 lattice-domain = { path = "../lattice-domain" }
+lattice-camera = { path = "../lattice-camera" }
 pnet_datalink.workspace = true
 thiserror.workspace = true
 chrono.workspace = true

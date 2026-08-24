@@ -4,9 +4,14 @@ use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
 
-mod detection;
+pub mod detection;
 mod media;
 mod onvif;
+
+pub use detection::{
+    CameraCandidate, CameraClassification, CameraEvidence, CameraEvidenceFamily, CameraHealth,
+    DetectionError, classify_candidate,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct CameraId(Uuid);

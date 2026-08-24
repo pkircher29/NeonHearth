@@ -12,6 +12,7 @@ use pnet_datalink::interfaces;
 use thiserror::Error;
 
 pub mod active;
+pub mod camera_detection;
 pub mod flow;
 pub mod live;
 pub mod neighbor;
