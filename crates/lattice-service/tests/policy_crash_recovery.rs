@@ -58,6 +58,7 @@ impl PolicyActuator for VerifiedCounter {
 struct W6Fixture {
     state: Arc<std::sync::Mutex<DeviceState>>,
     applies: Arc<AtomicUsize>,
+    restores: Arc<AtomicUsize>,
 }
 #[async_trait]
 impl Transport for W6Fixture {
@@ -94,6 +95,11 @@ impl Transport for W6Fixture {
             }
             _ => unreachable!("only policy capabilities are exposed"),
         }
+        Ok(())
+    }
+    async fn restore(&mut self, previous: DeviceState) -> Result<(), lattice_w6::Error> {
+        self.restores.fetch_add(1, Ordering::SeqCst);
+        *self.state.lock().unwrap() = previous;
         Ok(())
     }
 }
@@ -154,6 +160,7 @@ async fn w6_crash_window(action: RequestedAction, publish_before_ack: bool) -> a
             filter_entries: 0,
         })),
         applies: Arc::new(AtomicUsize::new(0)),
+        restores: Arc::new(AtomicUsize::new(0)),
     };
     let event = PolicyChanged {
         device_id: device,
@@ -231,6 +238,117 @@ async fn w6_crash_window(action: RequestedAction, publish_before_ack: bool) -> a
     );
     assert_eq!(reason, evaluation.reason);
     Ok(())
+}
+
+async fn w6_verified_crash_then_immediate_approve(action: RequestedAction) -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let presence = M2StateRepository::new(pool.clone());
+    let device = DeviceId::new();
+    sqlx::query(
+        "INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_confirmed) VALUES(?,?,?,0)",
+    )
+    .bind(device.to_string())
+    .bind(at(60).to_rfc3339())
+    .bind(at(60).to_rfc3339())
+    .execute(&pool)
+    .await?;
+    repo.enroll(device).await?;
+    let evaluation = match action {
+        RequestedAction::Quarantine => {
+            repo.set_owner_decision(device, lattice_domain::OwnerDecision::Quarantined)
+                .await?;
+            Evaluation::quarantine(PolicyReason::OwnerQuarantined)
+        }
+        RequestedAction::PermanentBan => {
+            repo.set_owner_decision(device, lattice_domain::OwnerDecision::Rejected)
+                .await?;
+            Evaluation::ban(PolicyReason::OwnerRejected)
+        }
+        _ => unreachable!(),
+    };
+    let fixture = W6Fixture {
+        state: Arc::new(std::sync::Mutex::new(DeviceState {
+            disconnect_now: false,
+            deny_wifi_association: false,
+            deny_internet: false,
+            deny_lan: false,
+            persistent_filter: false,
+            filter_entries: 0,
+        })),
+        applies: Arc::new(AtomicUsize::new(0)),
+        restores: Arc::new(AtomicUsize::new(0)),
+    };
+    let event = PolicyChanged {
+        device_id: device,
+        policy_version: evaluation.policy_version,
+        evaluation,
+        requested_action: action,
+        evidence_summary: "policy facts evaluated".into(),
+        enforcement_result: EnforcementResult::Verified,
+        undo_available: false,
+    };
+    repo.reserve_actuation_with_decision(
+        device,
+        evaluation.policy_version,
+        action,
+        at(60),
+        Some(&event),
+    )
+    .await?;
+    let first = W6PolicyActuator::with_sqlite(w6_connector(fixture.clone()).await, pool.clone());
+    assert_eq!(
+        first.enforce(device, action).await,
+        EnforcementResult::Verified
+    );
+    assert_eq!(repo.published_decision(device).await?, None);
+
+    let events = EventBus::new(16, 16);
+    let restarted = PolicyCoordinator::with_actuator_and_state(
+        repo.clone(),
+        Some(events.clone()),
+        W6PolicyActuator::with_sqlite(w6_connector(fixture.clone()).await, pool),
+        presence.clone(),
+    );
+    let approved = restarted.approve(device, at(61)).await?;
+
+    assert_eq!(approved.enforcement, EnforcementResult::Verified);
+    assert_eq!(approved.requested_action, RequestedAction::None);
+    assert_eq!(fixture.applies.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.restores.load(Ordering::SeqCst), 1);
+    assert!(repo.actuation_attempt(device).await?.is_none());
+    assert_eq!(repo.release_retry_action(device).await?, None);
+    assert!(!restarted.control_blocks(device).await?);
+    assert_eq!(
+        *fixture.state.lock().unwrap(),
+        DeviceState {
+            disconnect_now: false,
+            deny_wifi_association: false,
+            deny_internet: false,
+            deny_lan: false,
+            persistent_filter: false,
+            filter_entries: 0,
+        }
+    );
+    let lattice_event_bus::Resume::Events(published) = events.resume_after(0).await else {
+        panic!("event bus must retain events")
+    };
+    assert!(
+        published
+            .iter()
+            .any(|record| record.payload == EventPayload::PolicyChanged(event.clone()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn immediate_approval_recovers_verified_unacknowledged_w6_mutations() -> anyhow::Result<()> {
+    w6_verified_crash_then_immediate_approve(RequestedAction::Quarantine).await?;
+    w6_verified_crash_then_immediate_approve(RequestedAction::PermanentBan).await
 }
 
 #[tokio::test]

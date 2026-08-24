@@ -734,6 +734,59 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
         let prior = self.repo.published_decision(d).await?;
+        // A router mutation may be durably verified while its policy event is
+        // still only in the journal.  Approval must reconcile that exact
+        // action before it can make the policy look harmless: otherwise an
+        // owner approval can return NotRequested while the router remains
+        // blocked.
+        if let Some(attempt) = self.repo.actuation_attempt(d).await?
+            && !prior.as_ref().is_some_and(|published| {
+                published.enforcement_result == EnforcementResult::Verified
+                    && published.policy_version == attempt.policy_version
+                    && published.requested_action == attempt.action
+            })
+        {
+            match self.actuator.reconcile(d, attempt.action).await {
+                ActuationReconciliation::VerifiedApplied => {
+                    let Some(recovered) = attempt.decision.clone() else {
+                        return self
+                            .approve_pending_release(
+                                d,
+                                attempt.action,
+                                EnforcementResult::ManualRequired,
+                                now,
+                            )
+                            .await;
+                    };
+                    self.publish_exact(&recovered, Some(&attempt), now).await?;
+                    if let Some(presence) = &self.presence {
+                        presence.record_verified_block(d, now).await?;
+                    }
+                    return self.approve_verified_action(d, attempt.action, now).await;
+                }
+                ActuationReconciliation::ProvenNotApplied => {
+                    self.repo
+                        .clear_actuation_attempt(d, attempt.policy_version, attempt.action)
+                        .await?;
+                }
+                ActuationReconciliation::Indeterminate
+                | ActuationReconciliation::ManualRequired => {
+                    return self
+                        .approve_pending_release(
+                            d,
+                            attempt.action,
+                            EnforcementResult::ManualRequired,
+                            now,
+                        )
+                        .await;
+                }
+                ActuationReconciliation::Failed => {
+                    return self
+                        .approve_pending_release(d, attempt.action, EnforcementResult::Failed, now)
+                        .await;
+                }
+            }
+        }
         if let Some(prior) = prior
             && prior.enforcement_result == EnforcementResult::Verified
             && matches!(
@@ -741,42 +794,8 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                 RequestedAction::Quarantine | RequestedAction::PermanentBan
             )
         {
-            self.repo
-                .set_owner_decision_and_schedule_release_retry(
-                    d,
-                    OwnerDecision::Approved,
-                    prior.requested_action,
-                    now,
-                )
-                .await?;
-            let p = self.repo.load(d).await?.context("policy disappeared")?;
-            let can_undo = self
-                .actuator
-                .undo_available(d, prior.requested_action)
-                .await;
-            let undo = if can_undo {
-                self.actuator.undo(d, prior.requested_action).await
-            } else {
-                EnforcementResult::ManualRequired
-            };
-            if undo == EnforcementResult::Verified {
-                if let Some(presence) = &self.presence {
-                    presence.record_verified_unblock(d, now).await?;
-                }
-                self.repo.clear_release_retry(d).await?;
-            } else {
-                self.repo
-                    .schedule_release_retry(d, prior.requested_action, now)
-                    .await?;
-            }
             return self
-                .finish(
-                    p.clone(),
-                    evaluate_policy(&p, now),
-                    undo,
-                    can_undo && undo != EnforcementResult::Verified,
-                    now,
-                )
+                .approve_verified_action(d, prior.requested_action, now)
                 .await;
         }
         self.repo
@@ -784,6 +803,59 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             .await?;
         let p = self.repo.load(d).await?.context("policy disappeared")?;
         self.evaluate(p, now).await
+    }
+    async fn approve_verified_action(
+        &self,
+        d: DeviceId,
+        action: RequestedAction,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<AuditedDecision> {
+        self.repo
+            .set_owner_decision_and_schedule_release_retry(d, OwnerDecision::Approved, action, now)
+            .await?;
+        let p = self.repo.load(d).await?.context("policy disappeared")?;
+        let can_undo = self.actuator.undo_available(d, action).await;
+        let undo = if can_undo {
+            self.actuator.undo(d, action).await
+        } else {
+            EnforcementResult::ManualRequired
+        };
+        if undo == EnforcementResult::Verified {
+            if let Some(presence) = &self.presence {
+                presence.record_verified_unblock(d, now).await?;
+            }
+            self.repo.clear_release_retry(d).await?;
+        } else {
+            self.repo.schedule_release_retry(d, action, now).await?;
+        }
+        self.finish(
+            p.clone(),
+            evaluate_policy(&p, now),
+            undo,
+            can_undo && undo != EnforcementResult::Verified,
+            now,
+        )
+        .await
+    }
+    async fn approve_pending_release(
+        &self,
+        d: DeviceId,
+        action: RequestedAction,
+        outcome: EnforcementResult,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<AuditedDecision> {
+        self.repo
+            .set_owner_decision_and_schedule_release_retry(d, OwnerDecision::Approved, action, now)
+            .await?;
+        let p = self.repo.load(d).await?.context("policy disappeared")?;
+        self.finish(
+            p.clone(),
+            evaluate_policy(&p, now),
+            outcome,
+            self.actuator.undo_available(d, action).await,
+            now,
+        )
+        .await
     }
     pub async fn reject(&self, d: DeviceId, now: DateTime<Utc>) -> anyhow::Result<AuditedDecision> {
         self.set_owner_decision_after_release_guard(d, OwnerDecision::Rejected, now)
