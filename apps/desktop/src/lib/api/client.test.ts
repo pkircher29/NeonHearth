@@ -3,13 +3,15 @@ import { describe, expect, it, vi } from 'vitest';
 import { createApiClient, isSequence } from './client';
 
 describe('createApiClient', () => {
-  it('authorizes only same-origin canonical camera media requests', () => {
+  it('authorizes only same-origin canonical playlist or segment media requests', () => {
     const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret' });
     const xhr = { setRequestHeader: vi.fn() } as unknown as XMLHttpRequest;
-    expect(client.authorizeCameraMediaXhr(xhr, 'https://collector.example/api/v1/camera-sessions/018f47a0-9b5c-7a22-8a33-112233445500/playlist.m3u8')).toBe(true);
+    expect(client.authorizeCameraMediaXhr(xhr, 'https://collector.example/api/v1/camera-sessions/018f47a0-9b5c-7a22-8a33-112233445500/playlist.m3u8')).toBeUndefined();
     expect(xhr.setRequestHeader).toHaveBeenCalledWith('Authorization', 'Bearer secret');
-    expect(client.authorizeCameraMediaXhr(xhr, 'https://elsewhere.invalid/api/v1/camera-sessions/018f47a0-9b5c-7a22-8a33-112233445500/playlist.m3u8')).toBe(false);
-    expect(client.authorizeCameraMediaXhr(xhr, 'https://collector.example/api/v1/cameras/018f47a0-9b5c-7a22-8a33-112233445500')).toBe(false);
+    expect(client.authorizeCameraMediaXhr(xhr, 'https://collector.example/api/v1/camera-sessions/018f47a0-9b5c-7a22-8a33-112233445500/segments/00001.ts')).toBeUndefined();
+    for (const unsafe of ['https://elsewhere.invalid/api/v1/camera-sessions/018f47a0-9b5c-7a22-8a33-112233445500/playlist.m3u8', 'https://collector.example/api/v1/camera-sessions/018f47a0-9b5c-7a22-8a33-112233445500/segments/%2e%2e', 'https://collector.example/api/v1/camera-sessions/018f47a0-9b5c-7a22-8a33-112233445500/playlist.m3u8?x=1', 'https://user:secret@collector.example/api/v1/camera-sessions/018f47a0-9b5c-7a22-8a33-112233445500/playlist.m3u8']) {
+      expect(() => client.authorizeCameraMediaXhr(xhr, unsafe)).toThrow('Camera media request rejected');
+    }
   });
   const validDevice = {
     device_id: '018f47a0-9b5c-7a22-8a33-112233445599', first_seen_at: '2026-01-01T00:00:00Z', last_seen_at: '2026-01-01T00:00:01Z',

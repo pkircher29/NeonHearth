@@ -31,7 +31,7 @@ export interface ApiClient {
   cameraSnapshot(id: string, streamId?: string): Promise<Blob>;
   startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse>;
   closeCameraSession(sessionId: string): Promise<void>;
-  authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): boolean;
+  authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -289,10 +289,10 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
   async function cameraSnapshot(id: string, streamId?: string): Promise<Blob> { if(!isOpaqueId(id)||(streamId!==undefined&&!isOpaqueId(streamId)))throw new Error('Invalid camera id'); const response=await fetchImpl(apiUrl(`/api/v1/cameras/${id}/snapshot${streamId?`?stream_id=${encodeURIComponent(streamId)}`:''}`),authorized('GET')); if(!response.ok)throw new Error(`Request failed with status ${response.status}`); if(response.headers.get('content-type')?.split(';')[0] !== 'image/jpeg') throw new Error('Invalid camera snapshot media type'); const blob=await response.blob(); if(blob.size > 8*1024*1024) throw new Error('Camera snapshot exceeds safety bound'); return blob; }
   async function startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse> { if(!isOpaqueId(id)||!isOpaqueId(streamId))throw new Error('Invalid camera session id'); const v=await request(`/api/v1/cameras/${id}/sessions`,{...authorized('POST'),headers:{Authorization:`Bearer ${serviceToken}`,'content-type':'application/json'},body:JSON.stringify({stream_id:streamId})}); if(!isSession(v))throw new Error('Invalid camera session'); return v; }
   async function closeCameraSession(sessionId: string): Promise<void> { if(!isSessionId(sessionId))throw new Error('Invalid camera session id'); const response=await fetchImpl(apiUrl(`/api/v1/camera-sessions/${sessionId}`),{method:'DELETE',headers:{Authorization:`Bearer ${serviceToken}`}}); if(!response.ok)throw new Error(`Request failed with status ${response.status}`); }
-  function authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): boolean {
+  function authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): void {
     const target = new URL(url, baseUrl); const origin = new URL(baseUrl).origin;
-    if (target.origin !== origin || !/^\/api\/v1\/camera-sessions\/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/(?:playlist\.m3u8|[^/?#]+)$/.test(target.pathname)) return false;
-    xhr.setRequestHeader('Authorization', `Bearer ${serviceToken}`); return true;
+    if (target.origin !== origin || target.username || target.password || target.search || target.hash || target.pathname.includes('%') || !/^\/api\/v1\/camera-sessions\/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/(?:playlist\.m3u8|segments\/[A-Za-z0-9_.-]{1,255})$/.test(target.pathname)) throw new Error('Camera media request rejected');
+    xhr.setRequestHeader('Authorization', `Bearer ${serviceToken}`);
   }
 
   return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr };
