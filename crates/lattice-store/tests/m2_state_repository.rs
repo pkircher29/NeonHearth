@@ -128,7 +128,7 @@ async fn link_layer_identity_lookup_survives_reopen_and_migration_is_indexed() -
         sqlx::query_scalar::<_, i64>("SELECT schema_version FROM install_state WHERE singleton=1")
             .fetch_one(&pool)
             .await?,
-        15
+        16
     );
     let indexes: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_index_list('evidence')")
         .fetch_all(&pool)
@@ -596,12 +596,12 @@ async fn migration_sets_current_version_and_enforces_m2_foreign_keys_and_indexes
     let install = lattice_store::InstallRepository::new(pool.clone())
         .initialize(time(0))
         .await?;
-    assert_eq!(install.schema_version, 15);
+    assert_eq!(install.schema_version, 16);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT schema_version FROM install_state WHERE singleton=1")
             .fetch_one(&pool)
             .await?,
-        15
+        16
     );
     let indexes: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_index_list('evidence')")
         .fetch_all(&pool)

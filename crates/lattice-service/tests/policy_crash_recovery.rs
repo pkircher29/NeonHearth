@@ -190,7 +190,7 @@ async fn w6_crash_window(action: RequestedAction, publish_before_ack: bool) -> a
     if publish_before_ack {
         let fingerprint = serde_json::to_string(&event)?;
         assert!(
-            repo.prepare_decision_publication(device, &fingerprint)
+            repo.prepare_exact_decision_publication(device, &fingerprint, &event)
                 .await?
         );
         events

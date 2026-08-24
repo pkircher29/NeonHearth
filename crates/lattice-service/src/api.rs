@@ -6,7 +6,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use lattice_domain::{Coverage, DeviceId, EvidenceFamily, OwnerDecision, PresenceState};
-use lattice_store::{PolicyRepository, StoredDeviceSnapshot};
+use lattice_store::{PendingDecision, PolicyRepository, StoredDeviceSnapshot};
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::time::Instant;
@@ -128,15 +128,18 @@ pub async fn state(
         let policy_projection = match (
             policy.load(device.device_id).await,
             policy.published_decision(device.device_id).await,
-            policy.pending_decision(device.device_id).await,
+            policy.pending_decision_value(device.device_id).await,
         ) {
             (Ok(Some(policy_row)), Ok(Some(value)), Ok(_)) => {
                 Some(PolicyProjection::from((policy_row, value)))
             }
-            (Ok(Some(policy_row)), Ok(None), Ok(true)) => {
-                Some(PolicyProjection::pending(policy_row))
+            (Ok(Some(policy_row)), Ok(None), Ok(Some(PendingDecision::Exact(value)))) => {
+                Some(PolicyProjection::pending_exact(policy_row, value))
             }
-            (Ok(_), Ok(None), Ok(false)) => None,
+            (Ok(Some(policy_row)), Ok(None), Ok(Some(PendingDecision::Legacy))) => {
+                Some(PolicyProjection::pending_legacy(policy_row))
+            }
+            (Ok(_), Ok(None), Ok(None)) => None,
             _ => return Err(StatusCode::SERVICE_UNAVAILABLE),
         };
         mapped.push(map_device(device, policy_projection));
@@ -195,7 +198,21 @@ impl From<(lattice_domain::DevicePolicy, lattice_domain::PolicyChanged)> for Pol
     }
 }
 impl PolicyProjection {
-    fn pending(policy: lattice_domain::DevicePolicy) -> Self {
+    fn pending_exact(
+        policy: lattice_domain::DevicePolicy,
+        decision: lattice_domain::PolicyChanged,
+    ) -> Self {
+        Self {
+            owner_decision: policy.owner_decision,
+            protection: policy.protection,
+            evaluation: decision.evaluation,
+            enforcement_result: decision.enforcement_result,
+            undo_available: decision.undo_available,
+            delivery_pending: true,
+        }
+    }
+
+    fn pending_legacy(policy: lattice_domain::DevicePolicy) -> Self {
         let evaluation =
             lattice_policy::PolicyEngine::new(policy.first_seen_at).evaluate(&policy, Utc::now());
         Self {
@@ -203,10 +220,9 @@ impl PolicyProjection {
             protection: policy.protection,
             evaluation,
             enforcement_result: lattice_domain::EnforcementStatus::ManualRequired,
-            undo_available: matches!(
-                policy.owner_decision,
-                OwnerDecision::Approved | OwnerDecision::Quarantined
-            ),
+            // A legacy row has no exact event. Never imply that enforcement
+            // completed or that a reversible owner action still exists.
+            undo_available: false,
             delivery_pending: true,
         }
     }

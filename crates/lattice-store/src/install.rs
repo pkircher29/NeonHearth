@@ -44,7 +44,7 @@ impl InstallRepository {
         }
         let install_id = Uuid::now_v7();
         sqlx::query(
-            "INSERT OR IGNORE INTO install_state (singleton, install_id, first_run_at, schema_version) VALUES (1, ?, ?, 15)",
+            "INSERT OR IGNORE INTO install_state (singleton, install_id, first_run_at, schema_version) VALUES (1, ?, ?, 16)",
         )
         .bind(install_id.to_string())
         .bind(now.to_rfc3339())

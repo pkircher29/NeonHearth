@@ -1,8 +1,9 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use lattice_domain::{
-    DeviceId, EvidenceFamily, Identification, OwnerDecision, Protection, RiskSignal,
+    DeviceId, EnforcementStatus, Evaluation, EvidenceFamily, Identification, OwnerDecision,
+    PolicyChanged, PolicyReason, Protection, RequestedAction, RiskSignal,
 };
-use lattice_store::{InstallRepository, PolicyRepository, connect_memory};
+use lattice_store::{InstallRepository, PendingDecision, PolicyRepository, connect_memory};
 
 fn at(hours: i64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 23, 0, 0, 0).unwrap() + Duration::hours(hours)
@@ -134,5 +135,48 @@ async fn missing_install_or_device_fails_without_creating_orphan_policy() -> any
         .fetch_one(&pool)
         .await?;
     assert_eq!(count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn exact_pending_decision_upgrades_matching_legacy_row_and_checks_fingerprint()
+-> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let id = DeviceId::new();
+    insert_device(&pool, id, at(60)).await?;
+    repo.enroll(id).await?;
+    let decision = PolicyChanged {
+        device_id: id,
+        policy_version: 1,
+        evaluation: Evaluation::visible(PolicyReason::OwnerApproved),
+        requested_action: RequestedAction::None,
+        evidence_summary: "test decision".into(),
+        enforcement_result: EnforcementStatus::Verified,
+        undo_available: true,
+    };
+    let fingerprint = serde_json::to_string(&decision)?;
+    assert!(repo.prepare_decision_publication(id, &fingerprint).await?);
+    assert_eq!(
+        repo.pending_decision_value(id).await?,
+        Some(PendingDecision::Legacy)
+    );
+    assert!(
+        repo.prepare_exact_decision_publication(id, &fingerprint, &decision)
+            .await?
+    );
+    assert_eq!(
+        repo.pending_decision_value(id).await?,
+        Some(PendingDecision::Exact(decision.clone()))
+    );
+    assert!(
+        repo.prepare_exact_decision_publication(id, "wrong-fingerprint", &decision)
+            .await
+            .is_err()
+    );
     Ok(())
 }

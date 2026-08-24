@@ -598,14 +598,18 @@ async fn pending_outbox_decision_is_republished_and_acknowledged_after_restart()
     let policy = repo.enroll(device).await?;
     let evaluation =
         lattice_policy::PolicyEngine::new(policy.first_seen_at).evaluate(&policy, at(60));
-    let fingerprint = serde_json::to_string(&(
+    let event = lattice_domain::PolicyChanged {
+        device_id: device,
+        policy_version: evaluation.policy_version,
         evaluation,
-        "policy facts evaluated",
-        EnforcementResult::NotRequested,
-        false,
-    ))?;
+        requested_action: evaluation.requested_action,
+        evidence_summary: "policy facts evaluated".into(),
+        enforcement_result: EnforcementResult::NotRequested,
+        undo_available: false,
+    };
+    let fingerprint = serde_json::to_string(&event)?;
     assert!(
-        repo.prepare_decision_publication(device, &fingerprint)
+        repo.prepare_exact_decision_publication(device, &fingerprint, &event)
             .await?
     );
     let bus = EventBus::new(8, 8);
@@ -871,13 +875,17 @@ async fn unacknowledged_outbox_is_republished_after_publish_before_ack_crash() -
     let policy = repo.enroll(device).await?;
     let evaluation =
         lattice_policy::PolicyEngine::new(policy.first_seen_at).evaluate(&policy, at(60));
-    let fingerprint = serde_json::to_string(&(
+    let event = lattice_domain::PolicyChanged {
+        device_id: device,
+        policy_version: evaluation.policy_version,
         evaluation,
-        "policy facts evaluated",
-        EnforcementResult::NotRequested,
-        false,
-    ))?;
-    repo.prepare_decision_publication(device, &fingerprint)
+        requested_action: evaluation.requested_action,
+        evidence_summary: "policy facts evaluated".into(),
+        enforcement_result: EnforcementResult::NotRequested,
+        undo_available: false,
+    };
+    let fingerprint = serde_json::to_string(&event)?;
+    repo.prepare_exact_decision_publication(device, &fingerprint, &event)
         .await?;
     let bus = EventBus::new(8, 8);
     bus.publish(

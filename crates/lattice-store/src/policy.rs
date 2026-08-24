@@ -43,6 +43,15 @@ pub enum ActuationReservation {
     Existing,
 }
 
+/// A pending publication either has its exact event or predates durable event
+/// storage. Legacy rows are intentionally distinguishable so callers can
+/// project them fail-closed rather than manufacturing a successful result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingDecision {
+    Exact(PolicyChanged),
+    Legacy,
+}
+
 impl PolicyRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -308,6 +317,34 @@ impl PolicyRepository {
         device_id: DeviceId,
         fingerprint: &str,
     ) -> anyhow::Result<bool> {
+        self.prepare_decision_publication_inner(device_id, fingerprint, None)
+            .await
+    }
+
+    /// Durably prepares an exact policy event for publication. The fingerprint
+    /// is verified against the stored JSON so a pending snapshot can never
+    /// combine one event's identity with another event's decision.
+    pub async fn prepare_exact_decision_publication(
+        &self,
+        device_id: DeviceId,
+        fingerprint: &str,
+        decision: &PolicyChanged,
+    ) -> anyhow::Result<bool> {
+        let encoded = encode(decision)?;
+        ensure!(
+            fingerprint == encoded,
+            "policy decision fingerprint does not match exact decision"
+        );
+        self.prepare_decision_publication_inner(device_id, fingerprint, Some(encoded))
+            .await
+    }
+
+    async fn prepare_decision_publication_inner(
+        &self,
+        device_id: DeviceId,
+        fingerprint: &str,
+        decision_json: Option<String>,
+    ) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
         let published: Option<String> =
             sqlx::query_scalar("SELECT decision_fingerprint FROM device_policy WHERE device_id=?")
@@ -324,8 +361,8 @@ impl PolicyRepository {
             .execute(&mut *tx)
             .await?;
         let result = sqlx::query(
-            "INSERT OR IGNORE INTO policy_outbox(device_id, fingerprint, created_at)
-             SELECT ?, ?, ?
+            "INSERT OR IGNORE INTO policy_outbox(device_id, fingerprint, created_at, decision_json)
+             SELECT ?, ?, ?, ?
              WHERE EXISTS (
                  SELECT 1 FROM device_policy
                  WHERE device_id=? AND (decision_fingerprint IS NULL OR decision_fingerprint<>?)
@@ -334,6 +371,7 @@ impl PolicyRepository {
         .bind(device_id.to_string())
         .bind(fingerprint)
         .bind(Utc::now().to_rfc3339())
+        .bind(decision_json.as_deref())
         .bind(device_id.to_string())
         .bind(fingerprint)
         .execute(&mut *tx)
@@ -345,6 +383,30 @@ impl PolicyRepository {
         .bind(fingerprint)
         .fetch_one(&mut *tx)
         .await?;
+        if let Some(decision_json) = decision_json {
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT decision_json FROM policy_outbox WHERE device_id=? AND fingerprint=?",
+            )
+            .bind(device_id.to_string())
+            .bind(fingerprint)
+            .fetch_one(&mut *tx)
+            .await?;
+            if let Some(stored) = stored {
+                ensure!(
+                    stored == decision_json,
+                    "pending policy decision differs for matching fingerprint"
+                );
+            } else {
+                sqlx::query(
+                    "UPDATE policy_outbox SET decision_json=? WHERE device_id=? AND fingerprint=? AND decision_json IS NULL",
+                )
+                .bind(&decision_json)
+                .bind(device_id.to_string())
+                .bind(fingerprint)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         tx.commit().await?;
         Ok(result.rows_affected() == 1 || pending == 1)
     }
@@ -426,6 +488,36 @@ impl PolicyRepository {
                 .fetch_one(&self.pool)
                 .await?;
         Ok(pending != 0)
+    }
+
+    /// Loads the exact pending event if available. A NULL value only occurs
+    /// for rows created before migration 16 or via the legacy wrapper.
+    pub async fn pending_decision_value(
+        &self,
+        device_id: DeviceId,
+    ) -> anyhow::Result<Option<PendingDecision>> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT fingerprint, decision_json FROM policy_outbox WHERE device_id=?",
+        )
+        .bind(device_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((fingerprint, decision_json)) = row else {
+            return Ok(None);
+        };
+        let Some(decision_json) = decision_json else {
+            return Ok(Some(PendingDecision::Legacy));
+        };
+        let decision: PolicyChanged = decode(&decision_json, "pending policy decision")?;
+        ensure!(
+            encode(&decision)? == fingerprint,
+            "pending policy decision fingerprint does not match exact decision"
+        );
+        ensure!(
+            decision.device_id == device_id,
+            "pending policy decision device does not match outbox device"
+        );
+        Ok(Some(PendingDecision::Exact(decision)))
     }
 
     pub async fn enforcement_retry_due(

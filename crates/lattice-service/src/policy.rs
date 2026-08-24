@@ -691,7 +691,7 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         let fingerprint = serde_json::to_string(event)?;
         if self
             .repo
-            .prepare_decision_publication(event.device_id, &fingerprint)
+            .prepare_exact_decision_publication(event.device_id, &fingerprint, event)
             .await?
         {
             if let Some(bus) = &self.events {

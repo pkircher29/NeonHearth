@@ -5,14 +5,17 @@ use axum::{
 };
 use chrono::Utc;
 use http_body_util::BodyExt;
-use lattice_domain::{EventPayload, ServiceStatus};
+use lattice_domain::{
+    EnforcementStatus, Evaluation, EventPayload, OwnerDecision, PolicyChanged, PolicyReason,
+    Protection, RequestedAction, ServiceStatus,
+};
 use lattice_event_bus::Resume;
 use lattice_sensor::InterfaceInventory;
 use lattice_service::{
     AppState, ServiceRuntimeStatus, app,
     runtime::{StartupResult, build_from_inventory},
 };
-use lattice_store::{M2StateRepository, connect_memory};
+use lattice_store::{InstallRepository, M2StateRepository, PolicyRepository, connect_memory};
 use tower::ServiceExt;
 const TOKEN: &str = "owner-token-0123456789abcdefghijkl";
 async fn test_state() -> AppState {
@@ -172,6 +175,169 @@ async fn snapshot_projects_empty_device_into_typed_unavailable_fields() {
             "bandwidth":{"available":false,"upload":null,"download":null,"coverage":null,"observed_at":null}
         })
     );
+}
+
+#[tokio::test]
+async fn snapshot_projects_exact_pending_verified_release_decision() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(Utc::now())
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(Utc::now()).await?;
+    let device = lattice_domain::DeviceId::new();
+    let observed = "2026-01-01T00:00:00Z";
+    sqlx::query(
+        "INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_confirmed) VALUES(?,?,?,?)",
+    )
+    .bind(device.to_string())
+    .bind(observed)
+    .bind(observed)
+    .bind(1i64)
+    .execute(&pool)
+    .await?;
+    repo.enroll(device).await?;
+    repo.set_owner_decision(device, OwnerDecision::Approved)
+        .await?;
+    repo.set_protection(device, Protection::SafetyDevice)
+        .await?;
+    let decision = PolicyChanged {
+        device_id: device,
+        policy_version: 41,
+        evaluation: Evaluation {
+            policy_version: 41,
+            reason: PolicyReason::OwnerApproved,
+            requested_action: RequestedAction::None,
+            deadline: None,
+            warning: None,
+        },
+        requested_action: RequestedAction::None,
+        evidence_summary: "verified release".into(),
+        enforcement_result: EnforcementStatus::Verified,
+        undo_available: true,
+    };
+    let fingerprint = serde_json::to_string(&decision)?;
+    assert!(
+        repo.prepare_exact_decision_publication(device, &fingerprint, &decision)
+            .await?
+    );
+
+    let response = app(AppState::new(TOKEN, M2StateRepository::new(pool)).unwrap())
+        .oneshot(authorized_state("/api/v1/state"))
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body(response).await["devices"][0]["policy"],
+        serde_json::json!({
+            "owner_decision":"approved", "protection":"safety_device",
+            "evaluation": decision.evaluation,
+            "enforcement_result":"verified", "undo_available":true,
+            "delivery_pending":true
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_projects_exact_pending_failed_quarantine_decision() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(Utc::now())
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(Utc::now()).await?;
+    let device = lattice_domain::DeviceId::new();
+    let observed = "2026-01-01T00:00:00Z";
+    sqlx::query(
+        "INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_confirmed) VALUES(?,?,?,?)",
+    )
+    .bind(device.to_string())
+    .bind(observed)
+    .bind(observed)
+    .bind(0i64)
+    .execute(&pool)
+    .await?;
+    repo.enroll(device).await?;
+    repo.set_owner_decision(device, OwnerDecision::Quarantined)
+        .await?;
+    repo.set_protection(device, Protection::Router).await?;
+    let decision = PolicyChanged {
+        device_id: device,
+        policy_version: 42,
+        evaluation: Evaluation {
+            policy_version: 42,
+            reason: PolicyReason::OwnerQuarantined,
+            requested_action: RequestedAction::Quarantine,
+            deadline: None,
+            warning: None,
+        },
+        requested_action: RequestedAction::Quarantine,
+        evidence_summary: "failed quarantine".into(),
+        enforcement_result: EnforcementStatus::Failed,
+        undo_available: false,
+    };
+    let fingerprint = serde_json::to_string(&decision)?;
+    assert!(
+        repo.prepare_exact_decision_publication(device, &fingerprint, &decision)
+            .await?
+    );
+
+    let response = app(AppState::new(TOKEN, M2StateRepository::new(pool)).unwrap())
+        .oneshot(authorized_state("/api/v1/state"))
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body(response).await["devices"][0]["policy"],
+        serde_json::json!({
+            "owner_decision":"quarantined", "protection":"router",
+            "evaluation": decision.evaluation,
+            "enforcement_result":"failed", "undo_available":false,
+            "delivery_pending":true
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_fails_closed_for_legacy_pending_row_without_exact_decision() -> anyhow::Result<()>
+{
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(Utc::now())
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(Utc::now()).await?;
+    let device = lattice_domain::DeviceId::new();
+    let observed = "2026-01-01T00:00:00Z";
+    sqlx::query(
+        "INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_confirmed) VALUES(?,?,?,?)",
+    )
+    .bind(device.to_string())
+    .bind(observed)
+    .bind(observed)
+    .bind(0i64)
+    .execute(&pool)
+    .await?;
+    repo.enroll(device).await?;
+    repo.set_owner_decision(device, OwnerDecision::Quarantined)
+        .await?;
+    repo.set_protection(device, Protection::Router).await?;
+    assert!(
+        repo.prepare_decision_publication(device, "legacy-fingerprint-without-decision")
+            .await?
+    );
+
+    let response = app(AppState::new(TOKEN, M2StateRepository::new(pool)).unwrap())
+        .oneshot(authorized_state("/api/v1/state"))
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let policy = &body(response).await["devices"][0]["policy"];
+    assert_eq!(policy["owner_decision"], "quarantined");
+    assert_eq!(policy["protection"], "router");
+    assert_eq!(policy["enforcement_result"], "manual_required");
+    assert_eq!(policy["undo_available"], false);
+    assert_eq!(policy["delivery_pending"], true);
+    Ok(())
 }
 
 #[tokio::test]
