@@ -1,5 +1,4 @@
 use crate::{AuditError, Limits, VerifiedManifest};
-use std::time::Duration;
 use wasmtime::{Config, Engine, ExternType, Linker, Module, ResourceLimiter, Store};
 
 pub trait AuditHost: Send + Sync {
@@ -24,6 +23,7 @@ pub struct Sandbox {
 struct StoreState<'a, H: AuditHost> {
     host: &'a H,
     limiter: LimitsState,
+    requests: u32,
 }
 struct LimitsState {
     max_memory: usize,
@@ -58,12 +58,12 @@ impl Sandbox {
         config.consume_fuel(true);
         config.epoch_interruption(true);
         let engine = Engine::new(&config).map_err(|_| AuditError::Trap)?;
-        let module = Module::new(&engine, verified.wasm())
-            .map_err(|e| AuditError::ForbiddenImport(e.to_string()))?;
+        let module =
+            Module::new(&engine, verified.wasm()).map_err(|_| AuditError::InvalidModule)?;
         for import in module.imports() {
             let allowed = import.module() == "audit"
                 && import.name() == "deterministic"
-                && matches!(import.ty(), ExternType::Func(_));
+                && matches!(import.ty(), ExternType::Func(ref f) if f.params().len() == 0 && f.results().len() == 1 && f.results().next().is_some_and(|v| matches!(v, wasmtime::ValType::I32)));
             if !allowed {
                 return Err(AuditError::ForbiddenImport(format!(
                     "{}::{}",
@@ -71,6 +71,16 @@ impl Sandbox {
                     import.name()
                 )));
             }
+        }
+        let run = module
+            .exports()
+            .find(|e| e.name() == "run")
+            .ok_or(AuditError::InvalidAbi)?;
+        let memory = module.exports().find(|e| e.name() == "memory");
+        if !matches!(run.ty(), ExternType::Func(ref f) if f.params().len()==2 && f.params().all(|v| matches!(v, wasmtime::ValType::I32)) && f.results().len()==1 && f.results().next().is_some_and(|v| matches!(v, wasmtime::ValType::I64)))
+            || memory.is_none()
+        {
+            return Err(AuditError::InvalidAbi);
         }
         Ok(Self {
             engine,
@@ -81,7 +91,7 @@ impl Sandbox {
 
     pub async fn execute<H: AuditHost>(
         &self,
-        _input: &[u8],
+        input: &[u8],
         host: &H,
     ) -> Result<AuditResult, AuditError> {
         let mut store = Store::new(
@@ -92,6 +102,7 @@ impl Sandbox {
                     max_memory: self.limits.max_memory_pages as usize * 65536,
                     memory: 0,
                 },
+                requests: 0,
             },
         );
         store.limiter(|s| &mut s.limiter);
@@ -99,44 +110,59 @@ impl Sandbox {
             .set_fuel(self.limits.max_fuel)
             .map_err(|_| AuditError::Trap)?;
         store.set_epoch_deadline(1);
-        let engine = self.engine.clone();
-        let _ticker = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            engine.increment_epoch();
-        });
+        if input.len() as u64 > self.limits.max_bytes {
+            return Err(AuditError::InputLimitExceeded);
+        }
         let mut linker = Linker::new(&self.engine);
         linker
             .func_wrap(
                 "audit",
                 "deterministic",
-                |caller: wasmtime::Caller<'_, StoreState<'_, H>>| {
-                    let _ = caller.data().host.deterministic();
+                |mut caller: wasmtime::Caller<'_, StoreState<'_, H>>| -> i32 {
+                    caller.data_mut().requests += 1;
+                    caller.data().host.deterministic();
+                    0
                 },
             )
             .map_err(|_| AuditError::Trap)?;
-        let instance = linker.instantiate(&mut store, &self.module).map_err(|e| {
-            if e.to_string().contains("memory") {
-                AuditError::MemoryLimitExceeded
+        let instance = linker
+            .instantiate(&mut store, &self.module)
+            .map_err(|_| AuditError::Trap)?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or(AuditError::InvalidAbi)?;
+        if input.len() > memory.data_size(&store) {
+            return Err(AuditError::MemoryLimitExceeded);
+        }
+        memory
+            .write(&mut store, 0, input)
+            .map_err(|_| AuditError::MemoryLimitExceeded)?;
+        let run = instance
+            .get_typed_func::<(i32, i32), i64>(&mut store, "run")
+            .map_err(|_| AuditError::InvalidAbi)?;
+        let packed = run.call(&mut store, (0, input.len() as i32)).map_err(|_| {
+            if store.get_fuel().unwrap_or(1) == 0 {
+                AuditError::FuelExhausted
             } else {
                 AuditError::Trap
             }
         })?;
-        if let Some(run) = instance.get_func(&mut store, "run") {
-            run.call(&mut store, &[], &mut []).map_err(|e| {
-                let s = e.to_string();
-                if s.contains("fuel") {
-                    AuditError::FuelExhausted
-                } else if s.contains("memory") {
-                    AuditError::MemoryLimitExceeded
-                } else {
-                    AuditError::TimedOut
-                }
-            })?;
+        if store.data().requests > self.limits.max_requests {
+            return Err(AuditError::RequestLimitExceeded);
         }
-        let output = host.deterministic();
-        if output.len() as u64 > self.limits.max_bytes {
+        let ptr = (packed >> 32) as u64;
+        let len = (packed as u32) as u64;
+        let end = ptr
+            .checked_add(len)
+            .ok_or(AuditError::OutputLimitExceeded)?;
+        if len > self.limits.max_bytes {
             return Err(AuditError::OutputLimitExceeded);
         }
+        let data = memory.data(&store);
+        if end > data.len() as u64 {
+            return Err(AuditError::Trap);
+        }
+        let output = data[ptr as usize..end as usize].to_vec();
         Ok(AuditResult { output })
     }
 }

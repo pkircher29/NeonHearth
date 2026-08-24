@@ -97,6 +97,14 @@ pub enum AuditError {
     OutputLimitExceeded,
     #[error("wasm trap")]
     Trap,
+    #[error("invalid wasm module")]
+    InvalidModule,
+    #[error("invalid wasm ABI")]
+    InvalidAbi,
+    #[error("input limit exceeded")]
+    InputLimitExceeded,
+    #[error("request limit exceeded")]
+    RequestLimitExceeded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
