@@ -326,4 +326,36 @@ async fn fixture_pipeline_projects_only_sanitized_camera_data_and_reaps_idle_med
             .iter()
             .all(|entry| entry.kill_requested && entry.awaited)
     );
+
+    let reopened = app
+        .clone()
+        .oneshot(
+            auth(Request::post(format!("/api/v1/cameras/{camera}/sessions")))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"stream_id": stream}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened.status(), StatusCode::CREATED);
+    let reopened_body = reopened.into_body().collect().await.unwrap().to_bytes();
+    let reopened_session =
+        serde_json::from_slice::<serde_json::Value>(&reopened_body).unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let closed = app
+        .oneshot(
+            auth(Request::delete(format!(
+                "/api/v1/camera-sessions/{reopened_session}"
+            )))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed.status(), StatusCode::NO_CONTENT);
+    assert_eq!(manager.active_count().await, 0);
 }
