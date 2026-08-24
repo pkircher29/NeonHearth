@@ -5,8 +5,8 @@ use axum::{
     http::StatusCode,
 };
 use chrono::{DateTime, Utc};
-use lattice_domain::{Coverage, DeviceId, EvidenceFamily, PresenceState};
-use lattice_store::StoredDeviceSnapshot;
+use lattice_domain::{Coverage, DeviceId, EvidenceFamily, OwnerDecision, PresenceState};
+use lattice_store::{PolicyRepository, StoredDeviceSnapshot};
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::time::Instant;
@@ -35,6 +35,15 @@ pub struct DeviceSnapshot {
     pub evidence: Option<Evidence>,
     pub identity: Identity,
     pub bandwidth: Bandwidth,
+    pub policy: Option<PolicyProjection>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct PolicyProjection {
+    pub owner_decision: OwnerDecision,
+    pub protection: lattice_domain::Protection,
+    pub evaluation: lattice_domain::Evaluation,
+    pub enforcement_result: lattice_domain::EnforcementStatus,
+    pub undo_available: bool,
 }
 #[derive(Serialize, ToSchema)]
 pub struct Presence {
@@ -112,9 +121,19 @@ pub async fn state(
     let next_after = (devices.len() == limit)
         .then(|| devices.last().map(|d| d.device_id))
         .flatten();
+    let policy = PolicyRepository::new(state.state_repository().pool().clone());
+    let mut mapped = Vec::with_capacity(devices.len());
+    for device in devices {
+        let policy_projection = match policy.load(device.device_id).await {
+            Ok(Some(value)) => lattice_service_policy_projection(&policy, value, Utc::now()).await.ok(),
+            Ok(None) => None,
+            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        mapped.push(map_device(device, policy_projection));
+    }
     Ok(Json(Snapshot {
         sequence,
-        devices: devices.into_iter().map(map_device).collect(),
+        devices: mapped,
         next_after,
         service_status: state.service_status().await,
     }))
@@ -151,7 +170,21 @@ mod tests {
         assert_eq!(state.events().current_sequence().await, 1);
     }
 }
-fn map_device(d: StoredDeviceSnapshot) -> DeviceSnapshot {
+async fn lattice_service_policy_projection(
+    _: &PolicyRepository,
+    policy: lattice_domain::DevicePolicy,
+    now: DateTime<Utc>,
+) -> anyhow::Result<PolicyProjection> {
+    let evaluation = lattice_policy::PolicyEngine::new(policy.first_seen_at).evaluate(&policy, now);
+    Ok(PolicyProjection {
+        owner_decision: policy.owner_decision,
+        protection: policy.protection,
+        evaluation,
+        enforcement_result: lattice_domain::EnforcementStatus::NotRequested,
+        undo_available: matches!(policy.owner_decision, OwnerDecision::Approved | OwnerDecision::Quarantined),
+    })
+}
+fn map_device(d: StoredDeviceSnapshot, policy: Option<PolicyProjection>) -> DeviceSnapshot {
     DeviceSnapshot {
         device_id: d.device_id,
         first_seen_at: d.first_seen_at,
@@ -201,7 +234,49 @@ fn map_device(d: StoredDeviceSnapshot) -> DeviceSnapshot {
                 observed_at: Some(b.observed_at),
             },
         ),
+        policy,
     }
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerAction {
+    Approve,
+    Reject,
+    Quarantine,
+    ExtendOnce { until: DateTime<Utc> },
+}
+#[derive(Deserialize, ToSchema)]
+pub struct PolicyActionRequest {
+    pub device_id: DeviceId,
+    pub action: OwnerAction,
+}
+#[derive(Serialize, ToSchema)]
+pub struct PolicyActionResponse {
+    pub evaluation: lattice_domain::Evaluation,
+    pub enforcement_result: lattice_domain::EnforcementStatus,
+}
+#[utoipa::path(post, path = "/api/v1/policy/action", security(("bearer_auth" = [])), request_body = PolicyActionRequest, responses((status = 200, body = PolicyActionResponse), (status = 400), (status = 401), (status = 503)))]
+pub async fn policy_action(
+    _: Authorized,
+    State(state): State<AppState>,
+    Json(request): Json<PolicyActionRequest>,
+) -> Result<Json<PolicyActionResponse>, StatusCode> {
+    let coordinator = crate::policy::PolicyCoordinator::new(
+        PolicyRepository::new(state.state_repository().pool().clone()),
+        Some(state.events().clone()),
+    );
+    let now = Utc::now();
+    let result = match request.action {
+        OwnerAction::Approve => coordinator.approve(request.device_id, now).await,
+        OwnerAction::Reject => coordinator.reject(request.device_id, now).await,
+        OwnerAction::Quarantine => coordinator.quarantine(request.device_id, now).await,
+        OwnerAction::ExtendOnce { until } => coordinator.extend_once(request.device_id, until, now).await,
+    }.map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(PolicyActionResponse {
+        evaluation: result.evaluation,
+        enforcement_result: result.enforcement,
+    }))
 }
 #[utoipa::path(post, path = "/api/v1/events/ticket", security(("bearer_auth" = [])), responses((status = 200, body = EventTicket), (status = 401), (status = 429)))]
 pub async fn event_ticket(
@@ -218,7 +293,7 @@ pub async fn event_ticket(
     }))
 }
 #[derive(OpenApi)]
-#[openapi(paths(health, state, event_ticket), components(schemas(Health, Snapshot, DeviceSnapshot, Presence, Evidence, Identity, Bandwidth, EventTicket)), modifiers(&SecurityAddon))]
+#[openapi(paths(health, state, policy_action, event_ticket), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction)), modifiers(&SecurityAddon))]
 pub struct ApiDoc;
 struct SecurityAddon;
 impl Modify for SecurityAddon {

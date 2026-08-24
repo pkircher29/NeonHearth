@@ -168,6 +168,7 @@ async fn snapshot_projects_empty_device_into_typed_unavailable_fields() {
             "owner_name":"Alice","owner_type":"laptop","owner_confirmed":true,
             "presence":{"state":"unknown","observed_at":null,"source":null,"kind":null},"evidence":null,
             "identity":{"available":false,"classification":null,"confidence":null},
+            "policy":null,
             "bandwidth":{"available":false,"upload":null,"download":null,"coverage":null,"observed_at":null}
         })
     );

@@ -158,17 +158,39 @@ impl PolicyRepository {
         .transpose()
     }
 
-    /// Atomically records the last externally published decision fingerprint.
-    /// Returns true only when a new typed event must be emitted.
-    pub async fn record_decision_fingerprint(
+    /// Returns the durable policy projection for every enrolled device. Runtime
+    /// maintenance uses this rather than waiting for another discovery event.
+    pub async fn list(&self) -> anyhow::Result<Vec<DevicePolicy>> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT device_id FROM device_policy ORDER BY device_id")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut policies = Vec::with_capacity(ids.len());
+        for id in ids {
+            let id = DeviceId::parse(&id).context("invalid persisted policy device id")?;
+            if let Some(policy) = self.load(id).await? {
+                policies.push(policy);
+            }
+        }
+        Ok(policies)
+    }
+
+    /// Durably reserves a policy event before its in-memory publication. A
+    /// restart can retry an unacknowledged reservation, so no decision is
+    /// deduplicated before it has been published.
+    pub async fn reserve_decision_publication(
         &self,
         device_id: DeviceId,
         fingerprint: &str,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE device_policy SET decision_fingerprint=?, updated_at=?
-             WHERE device_id=? AND (decision_fingerprint IS NULL OR decision_fingerprint<>?)",
+            "INSERT OR IGNORE INTO policy_outbox(device_id, fingerprint, created_at)
+             SELECT ?, ?, ?
+             WHERE EXISTS (
+                 SELECT 1 FROM device_policy
+                 WHERE device_id=? AND (decision_fingerprint IS NULL OR decision_fingerprint<>?)
+             )",
         )
+        .bind(device_id.to_string())
         .bind(fingerprint)
         .bind(Utc::now().to_rfc3339())
         .bind(device_id.to_string())
@@ -176,6 +198,32 @@ impl PolicyRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Acknowledge only after the event bus accepted publication. Keeping the
+    /// final fingerprint preserves restart deduplication while the outbox
+    /// preserves retryability across a crash before this acknowledgement.
+    pub async fn mark_decision_published(
+        &self,
+        device_id: DeviceId,
+        fingerprint: &str,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE device_policy SET decision_fingerprint=?, updated_at=? WHERE device_id=?",
+        )
+        .bind(fingerprint)
+        .bind(Utc::now().to_rfc3339())
+        .bind(device_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM policy_outbox WHERE device_id=? AND fingerprint=?")
+            .bind(device_id.to_string())
+            .bind(fingerprint)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn set_identification(

@@ -19,7 +19,7 @@ use lattice_service::{
     },
     policy::{EnforcementResult, PolicyActuator, PolicyCoordinator},
 };
-use lattice_store::{InstallRepository, M2StateRepository, PolicyRepository, connect_path};
+use lattice_store::{InstallRepository, M2StateRepository, PolicyRepository, connect_memory, connect_path};
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::{
@@ -288,5 +288,27 @@ async fn changed_enforcement_result_emits_a_new_typed_policy_event() -> anyhow::
         PolicyCoordinator::with_actuator(repo, Some(bus.clone()), FakeActuator::default());
     verified.reject(device, at(60)).await?;
     assert_eq!(bus.current_sequence().await, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_sweep_evaluates_persisted_policies_without_new_discovery() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone()).initialize(at(0)).await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(&pool).await?;
+    let actuator = FakeActuator::default();
+    let coordinator = PolicyCoordinator::with_actuator(repo.clone(), None, actuator.clone());
+    coordinator.enroll_and_evaluate(device, at(60)).await?;
+
+    let decisions = coordinator.sweep(at(108)).await?;
+
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].requested_action, RequestedAction::Quarantine);
+    assert_eq!(decisions[0].enforcement, EnforcementResult::Verified);
+    assert_eq!(actuator.0.load(Ordering::SeqCst), 1);
     Ok(())
 }

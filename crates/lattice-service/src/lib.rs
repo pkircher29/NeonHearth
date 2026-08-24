@@ -20,6 +20,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(api::health))
         .route("/api/v1/state", get(api::state))
+        .route("/api/v1/policy/action", post(api::policy_action))
         .route("/api/v1/events/ticket", post(api::event_ticket))
         .route("/api/v1/events", get(events_socket))
         .route("/api/v1/openapi.json", get(api::openapi))

@@ -267,6 +267,16 @@ impl<
             }
         };
         let observed_at = Self::floor_second(now);
+        // A quiet network still needs policy progress: deadline warnings and
+        // expiry actions are driven by the durable clock, not new sightings.
+        if self.policy.enabled().await.unwrap_or(false)
+            && let Err(error) = self.policy.sweep(observed_at).await
+        {
+            tracing::warn!("policy runtime sweep degraded: {error}");
+            self.state
+                .transition_service_status(ServiceRuntimeStatus::Degraded, observed_at)
+                .await;
+        }
         let rows = rows
             .into_iter()
             .filter(|row| self.bindings.contains_key(&row.interface()))
@@ -330,7 +340,11 @@ impl<
                 if self.policy.enabled().await.unwrap_or(false)
                     && let Err(error) = self
                         .policy
-                        .enroll_and_evaluate(committed.result.device_id, observed_at)
+                        .enroll_identification_and_evaluate(
+                            committed.result.device_id,
+                            committed.result.identification.as_ref(),
+                            observed_at,
+                        )
                         .await
                 {
                     tracing::warn!(

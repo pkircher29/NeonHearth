@@ -1,6 +1,7 @@
 use chrono::{TimeZone, Utc};
 use lattice_domain::{
-    Coverage, DeviceId, EventEnvelope, EventPayload, PresenceChanged, PresenceState, ServiceStatus,
+    Coverage, DeviceId, EnforcementStatus, Evaluation, EventEnvelope, EventPayload, PolicyChanged,
+    PolicyReason, PresenceChanged, PresenceState, RequestedAction, ServiceStatus,
 };
 
 #[test]
@@ -84,4 +85,29 @@ fn public_event_contract_serializes_stable_names() {
     );
     assert_eq!(DeviceId::parse(&device_id.to_string()).unwrap(), device_id);
     assert!(DeviceId::parse("not-a-uuid").is_err());
+}
+
+#[test]
+fn policy_event_contract_serializes_stable_names() {
+    let device_id = DeviceId::parse("018f47a0-9b5c-7a22-8a33-112233445566").unwrap();
+    let payload = EventPayload::PolicyChanged(PolicyChanged {
+        device_id,
+        policy_version: 1,
+        evaluation: Evaluation::quarantine(PolicyReason::UnknownDeadlineExpired),
+        requested_action: RequestedAction::Quarantine,
+        evidence_summary: "policy facts evaluated".into(),
+        enforcement_result: EnforcementStatus::Verified,
+        undo_available: false,
+    });
+    assert_eq!(serde_json::to_value(&payload).unwrap(), serde_json::json!({
+        "type": "policy_changed", "data": {
+            "device_id": "018f47a0-9b5c-7a22-8a33-112233445566",
+            "policy_version": 1,
+            "evaluation": {"policy_version": 1, "reason": "unknown_deadline_expired", "requested_action": "quarantine", "deadline": null, "warning": null},
+            "requested_action": "quarantine",
+            "evidence_summary": "policy facts evaluated",
+            "enforcement_result": "verified",
+            "undo_available": false
+        }
+    }));
 }
