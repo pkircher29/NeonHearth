@@ -186,15 +186,26 @@ pub fn classify_candidate(
     now: DateTime<Utc>,
 ) -> Result<CameraCandidate, DetectionError> {
     let mut evidence = Vec::new();
-    let mut seen = BTreeSet::new();
     for item in inputs {
         if item.expires_at.is_some_and(|expiry| expiry <= now) {
             continue;
         }
-        if seen.insert((item.family, item.source.clone(), item.fact.clone()))
-            && evidence.len() < MAX_EVIDENCE
-        {
+        if let Some(index) = evidence.iter().position(|selected: &CameraEvidence| {
+            (selected.family, &selected.source, &selected.fact)
+                == (item.family, &item.source, &item.fact)
+        }) {
+            if selected_before(&evidence[index], &item) {
+                evidence[index] = item;
+            }
+        } else if evidence.len() < MAX_EVIDENCE {
             evidence.push(item);
+        } else if let Some((worst, _)) = evidence
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| selection_order(left, right))
+            && selected_before(&evidence[worst], &item)
+        {
+            evidence[worst] = item;
         }
     }
     evidence.sort_by(|a, b| (a.family, &a.source, &a.fact).cmp(&(b.family, &b.source, &b.fact)));
@@ -254,4 +265,33 @@ pub fn classify_candidate(
         evidence,
         health: CameraHealth::Unknown,
     })
+}
+
+fn selected_before(left: &CameraEvidence, right: &CameraEvidence) -> bool {
+    selection_order(left, right).is_lt()
+}
+
+fn selection_order(left: &CameraEvidence, right: &CameraEvidence) -> std::cmp::Ordering {
+    evidence_priority(left)
+        .cmp(&evidence_priority(right))
+        .then_with(|| left.confidence.get().total_cmp(&right.confidence.get()))
+        .then_with(|| left.observed_at.cmp(&right.observed_at))
+        .then_with(|| left.expires_at.cmp(&right.expires_at))
+        .then_with(|| {
+            (right.family, &right.source, &right.fact)
+                .cmp(&(left.family, &left.source, &left.fact))
+        })
+}
+
+fn evidence_priority(evidence: &CameraEvidence) -> u8 {
+    if evidence.fact == "camera_contradiction" {
+        2
+    } else if evidence.family == CameraEvidenceFamily::Onvif
+        && evidence.fact == "onvif_camera_profile"
+        && evidence.confidence.get() >= 0.8
+    {
+        1
+    } else {
+        0
+    }
 }

@@ -316,3 +316,49 @@ fn exact_expiry_capacity_ordering_and_onvif_confidence_are_deterministic() {
     assert_eq!(capped.evidence.len(), 64);
     assert!(capped.evidence.windows(2).all(|pair| pair[0].source() <= pair[1].source()));
 }
+
+#[test]
+fn capacity_and_duplicate_selection_are_independent_of_input_order() {
+    let id = CameraId::from_uuid(Uuid::nil());
+    let now = Utc::now();
+    let mut inputs: Vec<_> = (0..64)
+        .map(|number| CameraEvidence::new(
+            CameraEvidenceFamily::Service,
+            format!("weak-{number:02}"),
+            "camera_service",
+            0.2,
+            now,
+            None,
+        ).unwrap())
+        .collect();
+    inputs.push(CameraEvidence::new(
+        CameraEvidenceFamily::Onvif,
+        "late-strong",
+        "onvif_camera_profile",
+        0.9,
+        now,
+        None,
+    ).unwrap());
+    inputs.push(CameraEvidence::new(
+        CameraEvidenceFamily::Onvif,
+        "late-contradiction",
+        "camera_contradiction",
+        1.0,
+        now,
+        None,
+    ).unwrap());
+    let forward = classify_candidate(id, inputs.clone(), now).unwrap();
+    inputs.reverse();
+    let reversed = classify_candidate(id, inputs, now).unwrap();
+    assert_eq!(forward, reversed);
+    assert_eq!(forward.classification, CameraClassification::Unknown);
+    assert!(forward.evidence.iter().any(|item| item.fact() == "onvif_camera_profile"));
+    assert!(forward.evidence.iter().any(|item| item.fact() == "camera_contradiction"));
+
+    let older = CameraEvidence::new(CameraEvidenceFamily::Rtsp, "same", "rtsp_camera", 0.4, now - Duration::seconds(1), None).unwrap();
+    let stronger = CameraEvidence::new(CameraEvidenceFamily::Rtsp, "same", "rtsp_camera", 0.9, now, None).unwrap();
+    let selected = classify_candidate(id, [older.clone(), stronger.clone()], now).unwrap();
+    let reversed_selected = classify_candidate(id, [stronger, older], now).unwrap();
+    assert_eq!(selected, reversed_selected);
+    assert_eq!(selected.evidence[0].confidence().get(), 0.9);
+}

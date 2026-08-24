@@ -3,7 +3,7 @@ use lattice_camera::CameraEvidenceFamily;
 use lattice_sensor::{
     Address, Interface, InterfaceClass, InterfaceId, InterfaceInventory, InterfaceOverride,
     TargetApproval, TargetGuard, TargetGuardError,
-    camera_detection::camera_evidence_from_observation,
+    camera_detection::{CameraObservationError, camera_evidence_from_observation},
 };
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -53,7 +53,8 @@ fn adapter_rejects_public_and_cross_interface_targets_before_evidence() {
                 1.0,
                 Utc::now()
             ),
-            Err(TargetGuardError::TargetNotPrivate) | Err(TargetGuardError::OutsideApprovedPrefix)
+            Err(CameraObservationError::Target(TargetGuardError::TargetNotPrivate))
+                | Err(CameraObservationError::Target(TargetGuardError::OutsideApprovedPrefix))
         ));
     }
     assert!(matches!(
@@ -67,7 +68,7 @@ fn adapter_rejects_public_and_cross_interface_targets_before_evidence() {
             1.0,
             Utc::now()
         ),
-        Err(TargetGuardError::InterfaceNotEligible)
+        Err(CameraObservationError::Target(TargetGuardError::InterfaceNotEligible))
     ));
     assert!(matches!(
         camera_evidence_from_observation(
@@ -80,6 +81,23 @@ fn adapter_rejects_public_and_cross_interface_targets_before_evidence() {
             1.0,
             Utc::now()
         ),
-        Err(TargetGuardError::OutsideApprovedPrefix)
+        Err(CameraObservationError::Target(TargetGuardError::OutsideApprovedPrefix))
+    ));
+}
+
+#[test]
+fn adapter_reports_invalid_evidence_without_forging_target_rejection() {
+    assert!(matches!(
+        camera_evidence_from_observation(
+            &guard(),
+            InterfaceId::new(1),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 4)),
+            CameraEvidenceFamily::Http,
+            "fixture",
+            "https://secret.invalid",
+            0.5,
+            Utc::now(),
+        ),
+        Err(CameraObservationError::InvalidEvidence)
     ));
 }
