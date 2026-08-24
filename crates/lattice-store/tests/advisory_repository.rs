@@ -187,6 +187,16 @@ async fn failed_fetches_are_stale_and_url_contract_is_strict() -> anyhow::Result
         .unwrap_err(),
         AdvisoryStoreError::Invalid
     );
+    for bad in [
+        "https://services.nvd.nist.gov:443/rest/json/cves/2.0",
+        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json?x=1",
+        "https://services.nvd.nist.gov/rest/json/cves/2.0?x=1",
+    ] {
+        assert_eq!(
+            FeedFetch::new(AdvisorySource::Nvd, bad.into(), at(10), at(20)).unwrap_err(),
+            AdvisoryStoreError::Invalid
+        );
+    }
     assert!(
         FeedFetch::new(
             AdvisorySource::Vendor,

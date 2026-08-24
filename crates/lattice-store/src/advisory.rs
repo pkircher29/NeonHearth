@@ -103,16 +103,20 @@ impl FeedFetch {
             AdvisorySource::Nvd => {
                 parsed.host_str() == Some("services.nvd.nist.gov")
                     && parsed.path() == "/rest/json/cves/2.0"
+                    && nvd_query_valid(&parsed)
             }
             AdvisorySource::CisaKev => {
                 parsed.host_str() == Some("www.cisa.gov")
                     && parsed.path()
                         == "/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+                    && parsed.query().is_none()
             }
             AdvisorySource::Vendor => true,
         };
         if self.cache_expires_at < self.retrieved_at
             || parsed.scheme() != "https"
+            || parsed.port().is_some()
+            || explicit_port(&self.source_url)
             || parsed.username() != ""
             || parsed.password().is_some()
             || parsed.fragment().is_some()
@@ -289,9 +293,6 @@ fn decode_row(r: SqliteRow, now: &str) -> Result<DeviceAdvisory, AdvisoryStoreEr
         return Err(AdvisoryStoreError::Corrupt);
     }
     let effective = decode_freshness(&effective)?;
-    if advisory.input().freshness != Freshness::Fresh && effective == Freshness::Fresh {
-        return Err(AdvisoryStoreError::Corrupt);
-    }
     let matching = AdvisoryMatch::from_persisted(
         decode_label(&label_v)?,
         serde_json::from_str::<Vec<MatchedField>>(&fields)
@@ -300,12 +301,18 @@ fn decode_row(r: SqliteRow, now: &str) -> Result<DeviceAdvisory, AdvisoryStoreEr
         decode_confidence(&match_conf)?,
     )
     .map_err(|_| AdvisoryStoreError::Corrupt)?;
-    let freshness = if advisory.input().freshness == Freshness::FutureDated {
-        Freshness::FutureDated
-    } else if advisory.input().freshness == Freshness::Stale || expires.as_str() < now {
-        Freshness::Stale
-    } else {
-        Freshness::Fresh
+    let freshness = match (advisory.input().freshness, effective) {
+        (Freshness::FutureDated, Freshness::FutureDated) => Freshness::FutureDated,
+        (Freshness::Stale, Freshness::Stale) => Freshness::Stale,
+        (Freshness::Fresh, Freshness::Fresh) => {
+            if expires.as_str() < now {
+                Freshness::Stale
+            } else {
+                Freshness::Fresh
+            }
+        }
+        (Freshness::Fresh, Freshness::Stale) => Freshness::Stale,
+        _ => return Err(AdvisoryStoreError::Corrupt),
     };
     Ok(DeviceAdvisory {
         advisory_id: decode_id(&id)?,
@@ -392,6 +399,35 @@ impl Fields {
 fn valid_optional(v: &Option<String>) -> bool {
     v.as_ref()
         .is_none_or(|x| !x.is_empty() && x.len() <= 512 && !x.chars().any(char::is_control))
+}
+fn nvd_query_valid(url: &url::Url) -> bool {
+    let Some(query) = url.query() else {
+        return true;
+    };
+    let allowed = [
+        "startIndex",
+        "resultsPerPage",
+        "lastModStartDate",
+        "lastModEndDate",
+    ];
+    let pairs: Vec<_> = url.query_pairs().collect();
+    !pairs.is_empty()
+        && pairs
+            .iter()
+            .all(|(key, value)| allowed.contains(&key.as_ref()) && !value.is_empty())
+        && pairs
+            .iter()
+            .all(|(key, _)| pairs.iter().filter(|(other, _)| other == key).count() == 1)
+        && url.as_str().contains(query)
+}
+fn explicit_port(raw: &str) -> bool {
+    let authority = raw
+        .strip_prefix("https://")
+        .and_then(|value| value.split('/').next())
+        .unwrap_or_default();
+    authority
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.bytes().all(|byte| byte.is_ascii_digit()))
 }
 fn time(v: DateTime<Utc>) -> Result<String, AdvisoryStoreError> {
     let s = v.to_rfc3339_opts(SecondsFormat::Nanos, true);
