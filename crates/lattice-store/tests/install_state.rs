@@ -36,7 +36,7 @@ async fn concurrent_connects_serialize_first_migration() -> anyhow::Result<()> {
         let sequences: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_sequence")
             .fetch_one(pool)
             .await?;
-        assert_eq!(migrations.0, 13);
+        assert_eq!(migrations.0, 14);
         assert_eq!(sequences.0, 1);
     }
     Ok(())
@@ -64,10 +64,10 @@ async fn initialize_preserves_original_first_run_time_and_install_id() -> anyhow
     let repeated = repository.initialize(later).await?;
 
     assert_eq!(initial.first_run_at, first);
-    assert_eq!(initial.schema_version, 13);
+    assert_eq!(initial.schema_version, 14);
     assert_eq!(initial.install_id, repeated.install_id);
     assert_eq!(initial.first_run_at, repeated.first_run_at);
-    assert_eq!(repeated.schema_version, 13);
+    assert_eq!(repeated.schema_version, 14);
     Ok(())
 }
 

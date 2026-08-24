@@ -17,7 +17,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{path::PathBuf, str::FromStr, time::Duration};
-pub use w6::W6PriorStateRepository;
+pub use w6::{W6Attempt, W6PriorStateRepository};
 
 pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(url)

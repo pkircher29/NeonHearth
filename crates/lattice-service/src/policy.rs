@@ -104,12 +104,24 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
             Err(_) => return EnforcementResult::ManualRequired,
         };
         if let Some(durable) = &self.durable
-            && durable.save(_device, &prepared.previous).await.is_err()
+            && durable
+                .begin_attempt(_device, action, &prepared.previous)
+                .await
+                .is_err()
         {
             return EnforcementResult::Failed;
         }
         match connector.apply_prepared(prepared).await {
             Ok(report) if report.verification == Verification::Verified => {
+                if let Some(durable) = &self.durable {
+                    let after = match connector.read_state().await {
+                        Ok(after) => after,
+                        Err(_) => return EnforcementResult::Failed,
+                    };
+                    if durable.mark_verified(_device, &after).await.is_err() {
+                        return EnforcementResult::Failed;
+                    }
+                }
                 if self.durable.is_none()
                     && let Some(previous) = report.previous
                 {
@@ -139,24 +151,35 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
         device: DeviceId,
         action: RequestedAction,
     ) -> ActuationReconciliation {
-        let request = match action {
+        match action {
             RequestedAction::Quarantine => RequestedQuarantine::DenyInternet,
             RequestedAction::PermanentBan => RequestedQuarantine::PersistentFilter,
             _ => return ActuationReconciliation::ManualRequired,
         };
-        let previous = if let Some(durable) = &self.durable {
-            match durable.load(device).await {
+        let attempt = if let Some(durable) = &self.durable {
+            match durable.load_attempt(device).await {
                 Ok(state) => state,
                 Err(_) => return ActuationReconciliation::Indeterminate,
             }
         } else {
-            self.previous.lock().await.get(&device).cloned()
+            self.previous
+                .lock()
+                .await
+                .get(&device)
+                .cloned()
+                .map(|state| lattice_store::W6Attempt {
+                    restore: state.clone(),
+                    action,
+                    prepared_before: state,
+                    verified_after: None,
+                })
         };
-        // No captured pre-mutation state proves this actuator never reached its
-        // mutation preparation point (the coordinator journal is written first).
-        let Some(previous) = previous else {
+        let Some(attempt) = attempt else {
             return ActuationReconciliation::ProvenNotApplied;
         };
+        if attempt.action != action {
+            return ActuationReconciliation::Indeterminate;
+        }
         let mut connector = self.connector.lock().await;
         if connector.discovery_status() != DiscoveryStatus::Trusted {
             return ActuationReconciliation::ManualRequired;
@@ -168,19 +191,15 @@ impl<T: Transport + 'static> PolicyActuator for W6PolicyActuator<T> {
             }
             Err(_) => return ActuationReconciliation::ManualRequired,
         };
-        let applied = match request {
-            RequestedQuarantine::DenyInternet => current.deny_internet && !previous.deny_internet,
-            RequestedQuarantine::PersistentFilter => {
-                current.persistent_filter
-                    && previous.filter_entries.checked_add(1) == Some(current.filter_entries)
-            }
-            _ => false,
-        };
-        if applied {
-            return ActuationReconciliation::VerifiedApplied;
-        }
-        if current == previous {
+        if current == attempt.prepared_before && attempt.verified_after.is_none() {
             return ActuationReconciliation::ProvenNotApplied;
+        }
+        if attempt
+            .verified_after
+            .as_ref()
+            .is_some_and(|after| after == &current)
+        {
+            return ActuationReconciliation::VerifiedApplied;
         }
         ActuationReconciliation::Indeterminate
     }
