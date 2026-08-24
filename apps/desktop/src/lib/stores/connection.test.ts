@@ -90,4 +90,28 @@ describe('createLiveConnection', () => {
     expect(client.openEvents).toHaveBeenCalledTimes(2);
     connection.stop();
   });
+
+  it('closes an errored stream before a retry opens its replacement', async () => {
+    let fail: (() => void) | undefined;
+    let retryCallback: (() => void) | undefined;
+    const firstClose = vi.fn();
+    const timers = { setTimeout: vi.fn((callback: () => void) => { retryCallback = callback; return 9; }), clearTimeout: vi.fn() };
+    const client = clientStub({
+      openEvents: vi.fn(async (_sequence, _onMessage, onState) => {
+        fail = () => onState('error');
+        return { close: firstClose } as unknown as WebSocket;
+      })
+    });
+    const connection = createLiveConnection({ client, timers });
+
+    await connection.start();
+    fail?.();
+    retryCallback?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(firstClose).toHaveBeenCalledTimes(1);
+    expect(client.openEvents).toHaveBeenCalledTimes(2);
+    connection.stop();
+  });
 });

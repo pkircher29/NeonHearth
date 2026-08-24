@@ -15,12 +15,13 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
   let stopped = true;
   let generation = 0;
   let retry = 0;
+  let socketEpoch = 0;
   let hydrationGeneration: number | undefined;
   let pendingHydration = false;
   const publish = () => onState?.(state);
   const isCurrent = (token: number) => !stopped && token === generation;
   const cancelRetry = () => { if (retryTimer !== undefined) { timers.clearTimeout(retryTimer); retryTimer = undefined; } };
-  const closeSocket = () => { const closing = socket; socket = undefined; closing?.close(); };
+  const closeSocket = () => { socketEpoch += 1; const closing = socket; socket = undefined; closing?.close(); };
 
   const hydrateAndOpen = async (token: number): Promise<void> => {
     if (!isCurrent(token)) return;
@@ -31,8 +32,9 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
       if (!isCurrent(token)) return;
       state = applySnapshot(state, snapshot);
       publish();
-      const opened = await client.openEvents(state.sequence, handleMessage, (socketState) => handleSocketState(token, socketState));
-      if (!isCurrent(token)) { opened.close(); return; }
+      const epoch = ++socketEpoch;
+      const opened = await client.openEvents(state.sequence, handleMessage, (socketState) => handleSocketState(token, epoch, socketState));
+      if (!isCurrent(token) || epoch !== socketEpoch) { opened.close(); return; }
       socket = opened;
       retry = 0;
       cancelRetry();
@@ -45,7 +47,7 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
   };
   const resync = () => { if (stopped) return; generation += 1; cancelRetry(); closeSocket(); state = { ...state, connected: false }; publish(); void hydrateAndOpen(generation); };
   const handleMessage = (message: ServerMessage) => { const next = reduceLiveMessage(state, message); state = next; publish(); if (next.needsResync) resync(); };
-  const handleSocketState = (token: number, socketState: 'open' | 'closed' | 'error') => { if (!isCurrent(token)) return; if (socketState === 'open') { state = { ...state, connected: true }; retry = 0; publish(); } else { state = { ...state, connected: false }; publish(); scheduleReconnect(token); } };
+  const handleSocketState = (token: number, epoch: number, socketState: 'open' | 'closed' | 'error') => { if (!isCurrent(token) || epoch !== socketEpoch) return; if (socketState === 'open') { state = { ...state, connected: true }; retry = 0; publish(); } else { const closing = socket; socket = undefined; socketEpoch += 1; closing?.close(); state = { ...state, connected: false }; publish(); scheduleReconnect(token); } };
   const scheduleReconnect = (token: number) => { if (!isCurrent(token) || retryTimer !== undefined) return; const delay = Math.min(maxReconnectDelayMs, 250 * (2 ** retry)); retry += 1; retryTimer = timers.setTimeout(() => { retryTimer = undefined; if (isCurrent(token)) void hydrateAndOpen(token); }, delay); };
   return {
     async start() { if (!stopped) return; stopped = false; generation += 1; retry = 0; await hydrateAndOpen(generation); },
