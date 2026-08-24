@@ -8,9 +8,11 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.app.json",
-    "test": "vitest"
+    "test": "vitest --exclude 'e2e/**'",
+    "test:e2e": "playwright test --config=e2e/playwright.config.ts"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.1",
     "@sveltejs/vite-plugin-svelte": "^7.2.0",
     "@testing-library/svelte": "^5.4.2",
     "@tsconfig/svelte": "^5.0.8",
