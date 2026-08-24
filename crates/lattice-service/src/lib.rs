@@ -2,6 +2,7 @@ pub mod api;
 mod auth;
 pub mod cameras;
 pub mod discovery;
+pub mod doctor;
 pub mod home;
 pub mod platform;
 pub mod policy;
@@ -21,6 +22,13 @@ use serde::Deserialize;
 pub use state::{AppState, InvalidServiceToken, ServiceRuntimeStatus};
 pub use vault::{CredentialRef, FakeVault, KeyringVault, Vault, VaultCapability, VaultError};
 pub fn app(state: AppState) -> Router {
+    let doctor = doctor::DoctorState::for_service(&state);
+    app_with_doctor(state, doctor)
+}
+
+/// Like [`app`], but with an explicitly assembled Doctor state — the seam
+/// tests use to inject fake probe/repair transports and clocks.
+pub fn app_with_doctor(state: AppState, doctor: doctor::DoctorState) -> Router {
     Router::new()
         .route("/api/v1/health", get(api::health))
         .route("/api/v1/state", get(api::state))
@@ -68,6 +76,7 @@ pub fn app(state: AppState) -> Router {
             delete(cameras::close_session_route),
         )
         .route("/api/v1/openapi.json", get(api::openapi))
+        .merge(doctor::routes(doctor))
         .with_state(state)
 }
 

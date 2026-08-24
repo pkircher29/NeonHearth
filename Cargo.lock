@@ -2053,6 +2053,7 @@ dependencies = [
  "keyring",
  "lattice-advisory",
  "lattice-camera",
+ "lattice-doctor",
  "lattice-domain",
  "lattice-event-bus",
  "lattice-intelligence",

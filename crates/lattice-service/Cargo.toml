@@ -13,6 +13,7 @@ lattice-advisory = { path = "../lattice-advisory" }
 futures-util.workspace = true
 getrandom.workspace = true
 chrono.workspace = true
+lattice-doctor = { path = "../lattice-doctor" }
 lattice-event-bus = { path = "../lattice-event-bus" }
 lattice-domain = { path = "../lattice-domain" }
 lattice-intelligence = { path = "../lattice-intelligence" }
