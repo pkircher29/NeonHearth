@@ -55,7 +55,7 @@ describe('reduceLiveMessage', () => {
     expect(reduceLiveMessage(latched, { type: 'event', data: serviceStatus(5, 'ready') })).toBe(latched);
     expect(reduceLiveMessage(latched, { type: 'event', data: serviceStatus(7, 'degraded') })).toBe(latched);
     expect(reduceLiveMessage(latched, { type: 'resync_required' })).toBe(latched);
-    expect(applySnapshot(latched, { sequence: 7, devices: [], service_status: 'ready' })).toEqual({
+    expect(applySnapshot(latched, { sequence: 7, devices: [], next_after: null, service_status: 'ready' })).toEqual({
       sequence: 7,
       connected: true,
       needsResync: false,

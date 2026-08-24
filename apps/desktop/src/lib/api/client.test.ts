@@ -57,7 +57,7 @@ describe('createApiClient', () => {
   it('rejects malformed health, snapshot, and ticket responses', async () => {
     const responses = [
       new Response(JSON.stringify({ status: 42, api_version: 'v1' }), { status: 200 }),
-      new Response(JSON.stringify({ sequence: 1.5, devices: [], service_status: 'ready' }), { status: 200 }),
+      new Response(JSON.stringify({ sequence: 1.5, devices: [], next_after: null, service_status: 'ready' }), { status: 200 }),
       new Response(JSON.stringify({ ticket: '', expires_in_seconds: Number.MAX_SAFE_INTEGER + 1 }), { status: 200 })
     ];
     const fetchImpl = vi.fn(async () => responses.shift()!);

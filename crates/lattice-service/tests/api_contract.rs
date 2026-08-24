@@ -7,8 +7,16 @@ use chrono::Utc;
 use http_body_util::BodyExt;
 use lattice_domain::{EventPayload, ServiceStatus};
 use lattice_service::{AppState, app};
+use lattice_store::{M2StateRepository, connect_memory};
 use tower::ServiceExt;
 const TOKEN: &str = "owner-token-0123456789abcdefghijkl";
+async fn test_state() -> AppState {
+    AppState::new(
+        TOKEN,
+        M2StateRepository::new(connect_memory().await.unwrap()),
+    )
+    .unwrap()
+}
 
 async fn body(response: Response) -> serde_json::Value {
     serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
@@ -16,7 +24,7 @@ async fn body(response: Response) -> serde_json::Value {
 
 #[tokio::test]
 async fn health_is_public_and_reports_v1() {
-    let response = app(AppState::new(TOKEN).expect("valid token"))
+    let response = app(test_state().await)
         .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -42,7 +50,7 @@ async fn snapshot_requires_exact_bearer_token() {
         if let Some(auth) = auth {
             request = request.header("authorization", auth);
         }
-        let response = app(AppState::new(TOKEN).expect("valid token"))
+        let response = app(test_state().await)
             .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -63,16 +71,13 @@ async fn snapshot_requires_exact_bearer_token() {
         "authorization",
         "Bearer owner-token-0123456789abcdefghijkl".parse().unwrap(),
     );
-    let response = app(AppState::new(TOKEN).expect("valid token"))
-        .oneshot(duplicate)
-        .await
-        .unwrap();
+    let response = app(test_state().await).oneshot(duplicate).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         response.headers().get("www-authenticate").unwrap(),
         "Bearer"
     );
-    let response = app(AppState::new(TOKEN).expect("valid token"))
+    let response = app(test_state().await)
         .oneshot(
             Request::get("/api/v1/state")
                 .header("authorization", format!("Bearer {TOKEN}"))
@@ -84,13 +89,13 @@ async fn snapshot_requires_exact_bearer_token() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         body(response).await,
-        serde_json::json!({"sequence":0,"devices":[],"service_status":"ready"})
+        serde_json::json!({"sequence":0,"devices":[],"next_after":null,"service_status":"ready"})
     );
 }
 
 #[tokio::test]
 async fn snapshot_uses_current_event_watermark() {
-    let state = AppState::new(TOKEN).expect("valid token");
+    let state = test_state().await;
     state
         .events()
         .publish(
@@ -120,14 +125,14 @@ async fn event_ticket_requires_bearer_and_is_a_uuid() {
         if let Some(authorization) = authorization {
             request = request.header("authorization", authorization);
         }
-        let response = app(AppState::new(TOKEN).expect("valid token"))
+        let response = app(test_state().await)
             .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    let response = app(AppState::new(TOKEN).expect("valid token"))
+    let response = app(test_state().await)
         .oneshot(
             Request::post("/api/v1/events/ticket")
                 .header("authorization", format!("Bearer {TOKEN}"))
@@ -145,7 +150,7 @@ async fn event_ticket_requires_bearer_and_is_a_uuid() {
 
 #[tokio::test]
 async fn event_ticket_limit_is_rate_limited() {
-    let app = app(AppState::new(TOKEN).expect("valid token"));
+    let app = app(test_state().await);
     for _ in 0..64 {
         let response = app
             .clone()
@@ -182,7 +187,7 @@ async fn event_ticket_limit_is_rate_limited() {
 
 #[tokio::test]
 async fn openapi_describes_public_and_protected_routes() {
-    let response = app(AppState::new(TOKEN).expect("valid token"))
+    let response = app(test_state().await)
         .oneshot(
             Request::get("/api/v1/openapi.json")
                 .body(Body::empty())
@@ -215,8 +220,8 @@ async fn openapi_describes_public_and_protected_routes() {
     );
 }
 
-#[test]
-fn service_token_configuration_is_validated() {
+#[tokio::test]
+async fn service_token_configuration_is_validated() {
     for token in [
         "",
         " ",
@@ -225,7 +230,13 @@ fn service_token_configuration_is_validated() {
         "trailing________________________________ ",
         "ümlaut________________________________",
     ] {
-        assert!(AppState::new(token).is_err());
+        assert!(
+            AppState::new(
+                token,
+                M2StateRepository::new(connect_memory().await.unwrap())
+            )
+            .is_err()
+        );
     }
-    assert!(AppState::new(TOKEN).is_ok());
+    assert!(test_state().await.events().current_sequence().await == 0);
 }

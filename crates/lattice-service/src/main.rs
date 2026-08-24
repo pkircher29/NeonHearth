@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use lattice_service::{AppState, app};
 use lattice_service::{Platform, platform_paths};
-use lattice_store::InstallRepository;
+use lattice_store::{InstallRepository, M2StateRepository};
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 #[tokio::main]
@@ -40,9 +40,12 @@ async fn main() -> Result<()> {
     #[cfg(not(unix))]
     let terminate = ();
     let listener = TcpListener::bind("127.0.0.1:58120").await?;
-    axum::serve(listener, app(AppState::new(token)?))
-        .with_graceful_shutdown(shutdown_signal(terminate))
-        .await?;
+    axum::serve(
+        listener,
+        app(AppState::new(token, M2StateRepository::new(pool.clone()))?),
+    )
+    .with_graceful_shutdown(shutdown_signal(terminate))
+    .await?;
     drop(pool);
     Ok(())
 }

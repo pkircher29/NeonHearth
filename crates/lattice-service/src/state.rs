@@ -1,4 +1,5 @@
 use lattice_event_bus::EventBus;
+use lattice_store::M2StateRepository;
 use secrecy::{ExposeSecret, SecretString};
 use std::{collections::HashMap, fmt, sync::Arc};
 use subtle::ConstantTimeEq;
@@ -25,10 +26,14 @@ impl std::error::Error for InvalidServiceToken {}
 pub struct AppState {
     token: SecretString,
     events: EventBus,
+    state_repository: M2StateRepository,
     event_tickets: Arc<Mutex<HashMap<String, Instant>>>,
 }
 impl AppState {
-    pub fn new(token: impl Into<String>) -> Result<Self, InvalidServiceToken> {
+    pub fn new(
+        token: impl Into<String>,
+        state_repository: M2StateRepository,
+    ) -> Result<Self, InvalidServiceToken> {
         let token = token.into();
         if token.len() < 32
             || !token
@@ -40,11 +45,15 @@ impl AppState {
         Ok(Self {
             token: SecretString::from(token),
             events: EventBus::new(4096, 1024),
+            state_repository,
             event_tickets: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     pub fn events(&self) -> &EventBus {
         &self.events
+    }
+    pub(crate) fn state_repository(&self) -> &M2StateRepository {
+        &self.state_repository
     }
     pub(crate) fn token_matches(&self, supplied: &str) -> bool {
         supplied
@@ -77,13 +86,18 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lattice_store::{M2StateRepository, connect_memory};
     use tokio::time::{Duration, Instant};
 
     const TOKEN: &str = "owner-token-0123456789abcdefghijkl";
 
     #[tokio::test]
     async fn event_ticket_is_bounded_one_time_and_expires() {
-        let state = AppState::new(TOKEN).expect("valid token");
+        let state = AppState::new(
+            TOKEN,
+            M2StateRepository::new(connect_memory().await.unwrap()),
+        )
+        .expect("valid token");
         let now = Instant::now();
         let tickets: Vec<_> = (0..MAX_OUTSTANDING_EVENT_TICKETS)
             .map(|_| state.issue_event_ticket(now))

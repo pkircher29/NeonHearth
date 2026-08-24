@@ -28,9 +28,15 @@ export type ServerMessage =
 
 export interface Snapshot {
   sequence: number;
-  devices: unknown[];
+  devices: DeviceSnapshot[];
+  next_after: string | null;
   service_status: string;
 }
+export interface DeviceSnapshot { device_id: string; first_seen_at: string; last_seen_at: string; owner_name: string | null; owner_type: string | null; owner_confirmed: boolean; presence: Presence; evidence: Evidence | null; identity: Identity; bandwidth: Bandwidth; }
+export interface Presence { state: PresenceState; observed_at: string | null; source: string | null; kind: string | null; }
+export interface Evidence { family: string; source: string; confidence: number; observed_at: string; expires_at: string | null; }
+export interface Identity { available: boolean; classification: string | null; confidence: number | null; }
+export interface Bandwidth { available: boolean; upload: number | null; download: number | null; coverage: string | null; observed_at: string | null; }
 
 export interface Health {
   status: string;

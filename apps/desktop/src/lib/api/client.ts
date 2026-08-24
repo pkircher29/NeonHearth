@@ -53,7 +53,7 @@ function isHealth(value: unknown): value is Health {
 }
 
 function isSnapshot(value: unknown): value is Snapshot {
-  return isRecord(value) && isSequence(value.sequence) && Array.isArray(value.devices) && typeof value.service_status === 'string';
+  return isRecord(value) && isSequence(value.sequence) && Array.isArray(value.devices) && (value.next_after === null || typeof value.next_after === 'string') && typeof value.service_status === 'string';
 }
 
 function isEventTicket(value: unknown): value is EventTicket {

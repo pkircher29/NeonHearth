@@ -6,11 +6,19 @@ use lattice_domain::{EventPayload, ServiceStatus};
 use lattice_event_bus::EventBus;
 use lattice_service::ws::{ServerMessage, resume_messages};
 use lattice_service::{AppState, app};
+use lattice_store::{M2StateRepository, connect_memory};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tower::ServiceExt;
 
 const TOKEN: &str = "owner-token-0123456789abcdefghijkl";
+async fn test_state() -> AppState {
+    AppState::new(
+        TOKEN,
+        M2StateRepository::new(connect_memory().await.unwrap()),
+    )
+    .unwrap()
+}
 
 async fn issue_ticket(state: &AppState) -> String {
     let response = app(state.clone())
@@ -71,7 +79,7 @@ async fn resume_returns_events_after_cursor_in_order_and_empty_at_head() {
 
 #[tokio::test]
 async fn websocket_streams_events_and_consumes_ticket_once() {
-    let state = AppState::new(TOKEN).unwrap();
+    let state = test_state().await;
     let address = start_server(state.clone()).await;
     let ticket = issue_ticket(&state).await;
     let (mut socket, _) = connect_async(format!("{address}?ticket={ticket}&after_sequence=0"))
@@ -107,7 +115,7 @@ async fn websocket_streams_events_and_consumes_ticket_once() {
 
 #[tokio::test]
 async fn websocket_stale_cursor_receives_resync_required() {
-    let state = AppState::new(TOKEN).unwrap();
+    let state = test_state().await;
     for _ in 0..4097 {
         state.events().publish(Utc::now(), payload()).await;
     }
@@ -130,7 +138,7 @@ async fn websocket_stale_cursor_receives_resync_required() {
 
 #[tokio::test]
 async fn websocket_rejects_unsolicited_text_with_unsupported_close_code() {
-    let state = AppState::new(TOKEN).unwrap();
+    let state = test_state().await;
     let address = start_server(state.clone()).await;
     let ticket = issue_ticket(&state).await;
     let (mut socket, _) = connect_async(format!("{address}?ticket={ticket}&after_sequence=0"))
