@@ -173,3 +173,152 @@ fn rejects_duplicate_evidence_keys_and_noncanonical_text() {
         assert!(serde_json::from_value::<AuditManifest>(value).is_err());
     }
 }
+
+#[test]
+fn programmatic_subsecond_and_noncanonical_evidence_are_rejected() {
+    let (mut manifest, key) = signed(b"module");
+    manifest.limits.max_time = Duration::new(2, 1);
+    manifest.sign(&key).unwrap();
+    assert!(matches!(
+        verify_manifest(&manifest, b"module", &key.verifying_key()),
+        Err(AuditError::InvalidManifest(_))
+    ));
+
+    for name in [" status", "status ", "status\n"] {
+        let mut manifest = unsigned(b"module");
+        manifest.evidence_schema.fields.clear();
+        manifest
+            .evidence_schema
+            .fields
+            .insert(name.into(), EvidenceType::Text);
+        manifest.sign(&key).unwrap();
+        assert!(matches!(
+            verify_manifest(&manifest, b"module", &key.verifying_key()),
+            Err(AuditError::InvalidManifest(_))
+        ));
+    }
+}
+
+#[test]
+fn canonical_order_is_independent_of_collection_insertion_order() {
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let mut left = unsigned(b"module");
+    left.capabilities = [
+        Capability::TlsMetadata { port: 443 },
+        Capability::TcpExchange { port: 80 },
+    ]
+    .into_iter()
+    .collect();
+    left.evidence_schema.fields = [
+        ("zeta".into(), EvidenceType::Boolean),
+        ("alpha".into(), EvidenceType::Text),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut right = unsigned(b"module");
+    right.capabilities = [
+        Capability::TcpExchange { port: 80 },
+        Capability::TlsMetadata { port: 443 },
+    ]
+    .into_iter()
+    .collect();
+    right.evidence_schema.fields = [
+        ("alpha".into(), EvidenceType::Text),
+        ("zeta".into(), EvidenceType::Boolean),
+    ]
+    .into_iter()
+    .collect();
+
+    left.sign(&key).unwrap();
+    right.sign(&key).unwrap();
+    assert_eq!(left.canonical_bytes(), right.canonical_bytes());
+    assert_eq!(left.signature, right.signature);
+}
+
+fn assert_signed_mutation_rejected(mutate: impl FnOnce(&mut AuditManifest)) {
+    let (mut manifest, key) = signed(b"module");
+    mutate(&mut manifest);
+    assert!(verify_manifest(&manifest, b"module", &key.verifying_key()).is_err());
+}
+
+#[test]
+fn every_mutable_signed_field_is_authenticated_or_revalidated() {
+    assert_signed_mutation_rejected(|m| m.module_id = "net.other".into());
+    assert_signed_mutation_rejected(|m| m.version = 2);
+    assert_signed_mutation_rejected(|m| m.sha256[0] ^= 1);
+    assert_signed_mutation_rejected(|m| {
+        m.capabilities = [Capability::HttpExchange { port: 443 }]
+            .into_iter()
+            .collect();
+    });
+    assert_signed_mutation_rejected(|m| m.expected_behavior = "read other metadata".into());
+    assert_signed_mutation_rejected(|m| m.side_effects = SideEffectProfile::Persistent);
+    assert_signed_mutation_rejected(|m| m.rollback.description = "different".into());
+    assert_signed_mutation_rejected(|m| {
+        m.evidence_schema
+            .fields
+            .insert("extra".into(), EvidenceType::Integer);
+    });
+    assert_signed_mutation_rejected(|m| m.limits.max_bytes += 1);
+    assert_signed_mutation_rejected(|m| m.limits.max_requests += 1);
+    assert_signed_mutation_rejected(|m| m.limits.max_time += Duration::from_secs(1));
+    assert_signed_mutation_rejected(|m| m.limits.max_fuel += 1);
+    assert_signed_mutation_rejected(|m| m.limits.max_memory_pages += 1);
+    assert_signed_mutation_rejected(|m| m.signature[0] ^= 1);
+}
+
+#[test]
+fn malformed_signature_lengths_and_cross_domain_signatures_are_rejected() {
+    let (manifest, key) = signed(b"module");
+    for len in [63, 65] {
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        value["signature"] = json!(vec![0u8; len]);
+        assert!(serde_json::from_value::<AuditManifest>(value).is_err());
+    }
+
+    let mut wrong_domain = manifest.clone();
+    let canonical = wrong_domain.canonical_bytes();
+    let prefix = b"NeonHearth/lattice-audit-wasm/manifest/v1\0";
+    wrong_domain.signature =
+        ed25519_dalek::Signer::sign(&key, &canonical[prefix.len()..]).to_bytes();
+    assert!(matches!(
+        verify_manifest(&wrong_domain, b"module", &key.verifying_key()),
+        Err(AuditError::InvalidSignature)
+    ));
+}
+
+fn assert_resigned_limit_rejected(mutate: impl FnOnce(&mut Limits)) {
+    let (mut manifest, key) = signed(b"module");
+    mutate(&mut manifest.limits);
+    manifest.sign(&key).unwrap();
+    assert!(matches!(
+        verify_manifest(&manifest, b"module", &key.verifying_key()),
+        Err(AuditError::InvalidManifest(_))
+    ));
+}
+
+#[test]
+fn every_limit_accepts_its_exact_ceiling_and_rejects_zero_or_ceiling_plus_one() {
+    let (mut manifest, key) = signed(b"module");
+    manifest.limits = Limits {
+        max_bytes: 16 * 1024 * 1024,
+        max_requests: 1024,
+        max_time: Duration::from_secs(300),
+        max_fuel: 10_000_000_000,
+        max_memory_pages: 1024,
+    };
+    manifest.sign(&key).unwrap();
+    assert!(verify_manifest(&manifest, b"module", &key.verifying_key()).is_ok());
+
+    assert_resigned_limit_rejected(|v| v.max_bytes = 0);
+    assert_resigned_limit_rejected(|v| v.max_bytes = 16 * 1024 * 1024 + 1);
+    assert_resigned_limit_rejected(|v| v.max_requests = 0);
+    assert_resigned_limit_rejected(|v| v.max_requests = 1025);
+    assert_resigned_limit_rejected(|v| v.max_time = Duration::ZERO);
+    assert_resigned_limit_rejected(|v| v.max_time = Duration::from_secs(301));
+    assert_resigned_limit_rejected(|v| v.max_fuel = 0);
+    assert_resigned_limit_rejected(|v| v.max_fuel = 10_000_000_001);
+    assert_resigned_limit_rejected(|v| v.max_memory_pages = 0);
+    assert_resigned_limit_rejected(|v| v.max_memory_pages = 1025);
+}

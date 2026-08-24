@@ -164,6 +164,11 @@ impl<'de> Deserialize<'de> for EvidenceSchema {
                         ) -> Result<Self::Value, M::Error> {
                             let mut out = BTreeMap::new();
                             while let Some(k) = m.next_key::<String>()? {
+                                if out.len() == MAX_FIELDS {
+                                    return Err(serde::de::Error::custom(
+                                        "too many evidence fields",
+                                    ));
+                                }
                                 if k.is_empty()
                                     || k.len() > 128
                                     || k.trim() != k
