@@ -112,6 +112,16 @@ mod tests {
             Err(AdvisoryError::InvalidFreshness)
         ));
     }
+
+    #[test]
+    fn opaque_equal_range_bounds_are_accepted() {
+        let mut value = input();
+        value.firmware = VersionConstraint::Range {
+            min: "vendor-format".into(),
+            max: "vendor-format".into(),
+        };
+        assert!(NormalizedAdvisory::new(value).is_ok());
+    }
 }
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -340,7 +350,7 @@ fn validate_version(v: &VersionConstraint) -> Result<(), AdvisoryError> {
     let ok = match v {
         VersionConstraint::Any => true,
         VersionConstraint::Exact(s) | VersionConstraint::LessThan(s) => valid(s),
-        VersionConstraint::Range { min, max } => valid(min) && valid(max) && min != max,
+        VersionConstraint::Range { min, max } => valid(min) && valid(max),
     };
     if ok {
         Ok(())
