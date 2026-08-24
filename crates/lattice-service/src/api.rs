@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::fmt;
 use tokio::time::Instant;
-use utoipa::{Modify, OpenApi, ToSchema};
+use utoipa::{Modify, OpenApi, PartialSchema, ToSchema};
 #[derive(Serialize, ToSchema)]
 pub struct Health {
     pub status: &'static str,
@@ -19,8 +19,10 @@ pub struct Health {
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraSummary {
+    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
     pub camera_id: String,
     pub classification: String,
+    #[schema(minimum = 0, maximum = 1)]
     pub confidence: f32,
     pub health: String,
     pub observed_at: DateTime<Utc>,
@@ -28,12 +30,14 @@ pub struct CameraSummary {
 #[derive(Serialize, ToSchema)]
 pub struct CameraList {
     pub items: Vec<CameraSummary>,
+    #[schema(value_type = Option<String>, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
     pub next_after: Option<String>,
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraDetail {
     pub camera_id: String,
     pub classification: String,
+    #[schema(minimum = 0, maximum = 1)]
     pub confidence: f32,
     pub health: String,
     pub observed_at: DateTime<Utc>,
@@ -46,10 +50,15 @@ pub struct CameraHealth {
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraInventoryProjection {
+    #[schema(max_length = 256)]
     pub manufacturer: Option<String>,
+    #[schema(max_length = 256)]
     pub model: Option<String>,
+    #[schema(max_length = 256)]
     pub firmware: Option<String>,
+    #[schema(max_length = 256)]
     pub serial: Option<String>,
+    #[schema(max_items = 32)]
     pub capabilities: Vec<String>,
     pub health: String,
 }
@@ -76,6 +85,10 @@ impl CameraInventoryProjection {
             health: self.health.clone(),
         }
     }
+
+    pub fn to_redacted_export_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&self.redacted_for_export())
+    }
 }
 
 impl fmt::Debug for CameraInventoryProjection {
@@ -94,7 +107,7 @@ impl fmt::Debug for CameraInventoryProjection {
 
 impl From<lattice_store::CameraInventoryRecord> for CameraInventoryProjection {
     fn from(value: lattice_store::CameraInventoryRecord) -> Self {
-        Self {
+        let inventory = Self {
             manufacturer: value.manufacturer.map(|value| value.as_str().to_owned()),
             model: value.model.map(|value| value.as_str().to_owned()),
             firmware: value.firmware.map(|value| value.as_str().to_owned()),
@@ -105,25 +118,44 @@ impl From<lattice_store::CameraInventoryRecord> for CameraInventoryProjection {
                 .map(|value| value.as_str().to_owned())
                 .collect(),
             health: format!("{:?}", value.health).to_lowercase(),
-        }
+        };
+        tracing::debug!(inventory = ?inventory, "projected camera inventory for owner response");
+        inventory
     }
 }
 #[derive(Serialize, ToSchema)]
 pub struct CameraSessionResponse {
+    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
     pub session_id: String,
 }
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CameraSessionRequest {
+    #[schema(value_type = String, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
     pub stream_id: String,
 }
+pub struct BinaryMedia;
+
+impl PartialSchema for BinaryMedia {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::Type::String)
+            .format(Some(utoipa::openapi::SchemaFormat::KnownFormat(
+                utoipa::openapi::KnownFormat::Binary,
+            )))
+            .into()
+    }
+}
+
+impl ToSchema for BinaryMedia {}
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CameraQuery {
     pub limit: Option<usize>,
     pub after: Option<lattice_camera::CameraId>,
 }
 
-#[utoipa::path(get, path = "/api/v1/cameras", params(("limit" = Option<usize>, Query), ("after" = Option<String>, Query)), responses((status = 200, body = CameraList), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/cameras", params(("limit" = Option<usize>, Query, minimum = 1, maximum = 256), ("after" = Option<String>, Query, format = Uuid, min_length = 36, max_length = 36, pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[1-7][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")), responses((status = 200, body = CameraList), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
 pub async fn cameras(
     _: Authorized,
     State(state): State<AppState>,
@@ -552,7 +584,7 @@ pub async fn event_ticket(
     }))
 }
 #[derive(OpenApi)]
-#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse)), modifiers(&SecurityAddon))]
+#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse, BinaryMedia)), modifiers(&SecurityAddon))]
 pub struct ApiDoc;
 struct SecurityAddon;
 impl Modify for SecurityAddon {

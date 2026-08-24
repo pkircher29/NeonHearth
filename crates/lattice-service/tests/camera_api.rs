@@ -130,6 +130,47 @@ async fn openapi_truthfully_documents_camera_and_media_routes() {
     ] {
         assert!(doc["paths"].get(path).is_some(), "missing {path}");
     }
+    for path in [
+        "/api/v1/cameras/{id}/snapshot",
+        "/api/v1/camera-sessions/{id}/segments/{segment}",
+    ] {
+        let content = &doc["paths"][path]["get"]["responses"]["200"]["content"];
+        let media = if path.contains("segments") {
+            "video/mp2t"
+        } else {
+            "image/jpeg"
+        };
+        let schema = &content[media]["schema"];
+        let resolved = schema["$ref"]
+            .as_str()
+            .map(|reference| {
+                let name = reference.rsplit('/').next().unwrap();
+                &doc["components"]["schemas"][name]
+            })
+            .unwrap_or(schema);
+        assert_eq!(resolved["type"], "string");
+        assert_eq!(resolved["format"], "binary");
+    }
+    let camera = &doc["components"]["schemas"]["CameraSummary"];
+    assert_eq!(camera["properties"]["camera_id"]["format"], "uuid");
+    assert_eq!(camera["properties"]["camera_id"]["minLength"], 36);
+    assert_eq!(camera["properties"]["confidence"]["minimum"], 0.0);
+    assert_eq!(camera["properties"]["confidence"]["maximum"], 1.0);
+    let inventory = &doc["components"]["schemas"]["CameraInventoryProjection"];
+    assert_eq!(inventory["properties"]["serial"]["maxLength"], 256);
+    assert_eq!(inventory["properties"]["capabilities"]["maxItems"], 32);
+    let session_request =
+        &doc["components"]["schemas"]["CameraSessionRequest"]["properties"]["stream_id"];
+    assert_eq!(session_request["format"], "uuid");
+    assert_eq!(session_request["minLength"], 36);
+    let after = list["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|parameter| parameter["name"] == "after")
+        .unwrap();
+    assert_eq!(after["schema"]["format"], "uuid");
+    assert_eq!(after["schema"]["minLength"], 36);
 }
 
 #[test]
@@ -148,7 +189,8 @@ fn owner_inventory_serial_is_bounded_but_export_and_debug_are_redacted() {
             .contains("OWNER-SERIAL-42")
     );
     assert!(
-        !serde_json::to_string(&inventory.redacted_for_export())
+        !inventory
+            .to_redacted_export_json()
             .unwrap()
             .contains("OWNER-SERIAL-42")
     );
@@ -196,6 +238,17 @@ async fn camera_routes_authenticate_before_rejecting_malformed_inputs() {
             StatusCode::UNAUTHORIZED
         );
     }
+}
+
+#[tokio::test]
+async fn camera_query_rejects_unknown_fields_after_authentication() {
+    let (router, _) = fixture().await;
+    assert_eq!(
+        response(&router, "/api/v1/cameras?unexpected=value".into())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test]
