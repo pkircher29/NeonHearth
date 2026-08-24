@@ -2,6 +2,7 @@ mod api;
 mod auth;
 pub mod discovery;
 pub mod platform;
+pub mod policy;
 pub mod runtime;
 mod state;
 pub mod ws;

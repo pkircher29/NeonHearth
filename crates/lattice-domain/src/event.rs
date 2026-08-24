@@ -1,3 +1,4 @@
+use crate::policy::{Evaluation, RequestedAction};
 use crate::{ByteCount, Coverage, DeviceId, PresenceChanged};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,16 @@ pub enum EventPayload {
     PresenceChanged(PresenceChanged),
     ServiceStatus(ServiceStatus),
     BandwidthFrame(BandwidthFrame),
+    PolicyChanged(PolicyChanged),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct PolicyChanged {
+    pub device_id: DeviceId,
+    pub policy_version: u32,
+    pub evaluation: Evaluation,
+    pub requested_action: RequestedAction,
+    pub evidence_summary: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
