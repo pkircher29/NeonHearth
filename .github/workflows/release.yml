@@ -88,6 +88,7 @@ jobs:
         run: |
           dotnet tool install --global wix --version 5.0.2
           wix extension add -g WixToolset.Util.wixext/5.0.2
+          wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
           wix --version
 
       # The bindpath MUST be absolute: the <Files> wildcard harvest resolves a
@@ -129,13 +130,49 @@ jobs:
           if ($jsCount -lt 1) { throw 'MSI payload missing: UI JavaScript bundle' }
           Write-Host "UI bundle JS files: $jsCount"
 
-      - name: Compute SHA-256
+      # Burn bundle (.exe) chaining the MSI just built and validated above.
+      # Same absolute-bindpath rule as the MSI build.
+      - name: Build setup bundle (exe)
         shell: pwsh
         run: |
-          $msi = "NeonHearth-${{ steps.version.outputs.full }}-x64.msi"
-          $hash = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
-          "$hash  $msi" | Set-Content "$msi.sha256"
-          Get-Content "$msi.sha256"
+          wix build packaging\windows\Bundle.wxs `
+            -ext WixToolset.BootstrapperApplications.wixext `
+            -bindpath msi=${{ github.workspace }} `
+            -arch x64 `
+            -d MsiVersion=${{ steps.version.outputs.msi }} `
+            -d FullVersion=${{ steps.version.outputs.full }} `
+            -wx `
+            -o NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe
+          if (-not (Test-Path "NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe")) { throw 'Bundle exe was not produced' }
+
+      # Validation without installing: extract the bundle's attached
+      # container and require the embedded payload to be byte-identical to
+      # the MSI. (A compressed bundle's /layout is a no-op copy, so this is
+      # the real check. wix burn extract silently no-ops with WIX8503 unless
+      # the output and intermediate folders already exist.)
+      - name: Validate bundle payload (burn extract)
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'burn-extract'
+          $tmp = Join-Path $env:RUNNER_TEMP 'burn-tmp'
+          New-Item -ItemType Directory -Force $out, $tmp | Out-Null
+          wix burn extract "NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe" -o $out -intermediateFolder $tmp
+          $payloads = @(Get-ChildItem -File $out)
+          if ($payloads.Count -lt 1) { throw 'burn extract produced no payloads' }
+          $msiHash = (Get-FileHash "NeonHearth-${{ steps.version.outputs.full }}-x64.msi" -Algorithm SHA256).Hash
+          $match = $payloads | Where-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash -eq $msiHash }
+          if (-not $match) { throw 'no extracted bundle payload matches the built MSI (SHA-256)' }
+          Write-Host "embedded MSI verified byte-identical: $($match.Name)"
+
+      - name: Compute SHA-256s
+        shell: pwsh
+        run: |
+          foreach ($f in @("NeonHearth-${{ steps.version.outputs.full }}-x64.msi",
+                           "NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe")) {
+            $hash = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            "$hash  $f" | Set-Content "$f.sha256"
+            Get-Content "$f.sha256"
+          }
 
       - uses: actions/upload-artifact@v7
         with:
@@ -143,6 +180,8 @@ jobs:
           path: |
             NeonHearth-${{ steps.version.outputs.full }}-x64.msi
             NeonHearth-${{ steps.version.outputs.full }}-x64.msi.sha256
+            NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe
+            NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe.sha256
           if-no-files-found: error
 
   linux-packages:
@@ -262,10 +301,11 @@ jobs:
         id: assets
         run: |
           mkdir -p release-assets
-          find artifacts -type f \( -name '*.msi' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
+          find artifacts -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
           cd release-assets
           ls -la
           [ -n "$(ls *.msi 2>/dev/null)" ] || { echo 'no MSI artifact' >&2; exit 1; }
+          [ -n "$(ls *.exe 2>/dev/null)" ] || { echo 'no setup exe artifact' >&2; exit 1; }
           [ -n "$(ls *.deb 2>/dev/null)" ] || { echo 'no deb artifact' >&2; exit 1; }
           [ -n "$(ls *.rpm 2>/dev/null)" ] || { echo 'no rpm artifact' >&2; exit 1; }
           sha256sum * > SHA256SUMS
@@ -282,7 +322,8 @@ jobs:
             **Pre-release: unsigned, not clean-machine tested.**
 
             These installer artifacts are built and payload-validated in CI
-            (MSI administrative extract, deb/rpm content listing), but:
+            (MSI administrative extract, setup-exe bundle extraction, deb/rpm
+            content listing), but:
 
             - Nothing is code-signed (RLS7 untouched); Windows SmartScreen and
               apt/rpm signature checks will flag them.

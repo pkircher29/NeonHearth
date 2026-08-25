@@ -1,27 +1,30 @@
 # Installer and packaging scaffolding (Stage 7: RLS4 / RLS5)
 
-Status date: 2026-08-24. This document separates, per the project honesty
-rule, what was **verified on the build machine** (Windows 11 Pro, the machine
-that produced this scaffolding) from what is **authored but unverified**.
-RLS4 and RLS5 remain UNCHECKED: nothing here is a substitute for building the
-actual installer artifacts and clean-machine acceptance.
+Status date: 2026-08-25. This document separates, per the project honesty
+rule, what is **verified** (and where: build machine vs CI) from what is
+**authored but unverified**. RLS4 and RLS5 remain UNCHECKED: installer
+artifacts now build and are payload-validated in CI, but no real
+install/uninstall has happened on any machine, clean or otherwise.
 
 ## What exists
 
 ```
 packaging/
   stage.ps1                       Windows staging: release service build + UI build -> dist/windows/
-  stage.sh                        Linux staging (same layout) -> dist/linux/   [authored, not executed]
+  stage.sh                        Linux staging (same layout) -> dist/linux/
   windows/
-    NeonHearth.wxs                WiX v4 installer definition (MSI, x64, perMachine)
+    NeonHearth.wxs                WiX installer definition (MSI, x64, perMachine) - requires WiX v5
+    Bundle.wxs                    Burn bundle: NeonHearth-Setup-<ver>-x64.exe chaining the MSI
     scripts/configure-service.ps1 Post-install: token, ACL, Npcap detect/limited mode, recovery
   linux/
     neonhearth.service            Hardened systemd unit
     neonhearth.sysusers.conf      sysusers.d fragment (dedicated `neonhearth` user)
     full-capture.conf.example     Drop-in raising AmbientCapabilities for future capture mode
-    nfpm.yaml                     nfpm config producing .deb and .rpm
+    nfpm.yaml                     nfpm config producing .deb and .rpm (version from NEONHEARTH_VERSION)
     scripts/{postinstall,preremove,postremove}.sh
   dist/                           Staging output (generated; not committed)
+.github/workflows/release.yml     Tagged-release pipeline (v* tags) building MSI + exe + deb + rpm
+                                  and publishing a GitHub pre-release with SHA256SUMS
 ```
 
 ## Ground truth the packaging is built on (verified by reading source and by running the binary)
@@ -84,46 +87,96 @@ packaging/
    - `stage.sh`: `bash -n` clean; the three Linux package scripts: `sh -n` clean.
    - `stage.ps1`, `configure-service.ps1`: PowerShell language parser reports zero errors.
 
-## Authored but NOT verified on this machine
+## Verified in CI (2026-08-25, tagged-release pipeline)
 
-- **`wix build` was not run.** No WiX/Inno/NSIS toolchain exists here
-  (`where wix|iscc|makensis` all empty), and the fallback failed:
-  `dotnet.exe` exists but has **no .NET SDK**, so
-  `dotnet tool install --global wix` fails with "No .NET SDKs were found".
-  Consequences: the `.wxs` is validated as XML only — WiX v4 schema
-  correctness, the `Files Include` wildcard harvesting, the
-  `util:ServiceConfig` recovery element, the `NT SERVICE\NeonHearth`
-  virtual-account `ServiceInstall`, and the deferred
-  `WixQuietExec64` custom action are all unproven until `wix build`
-  and a real install run.
-- **No MSI has been installed/uninstalled anywhere**, so service
-  registration, recovery settings, limited mode, and clean uninstall
-  (service removed, files removed, `%ProgramData%\NeonHearth` left with
-  `README-UNINSTALL.txt`) are design intent, not evidence.
-- **nfpm was not run** (no `nfpm` binary here; downloading one was out of
-  scope), so no `.deb`/`.rpm` exists and the contents mapping is untested.
-- **`stage.sh` has not been executed** (authored on Windows; syntax-checked only).
+The `v0.1.0-alpha.1` tag ran `.github/workflows/release.yml` to green
+(after one iteration; see the WIX8601 note below) and published a
+pre-release at https://github.com/pkircher29/NeonHearth/releases/tag/v0.1.0-alpha.1
+with `NeonHearth-0.1.0-alpha.1-x64.msi`, `neonhearth_0.1.0~alpha.1_amd64.deb`,
+`neonhearth-0.1.0~alpha.1-1.x86_64.rpm`, and `SHA256SUMS`.
+
+1. **`wix build` (WiX 5.0.2) builds the MSI**, locally and on
+   windows-latest. Two findings from actually running it:
+   - The `<Files>` wildcard-harvesting element **does not exist in WiX
+     4.x** (4.0.6 fails with WIX0005); WiX v5 is required and the pipeline
+     pins 5.0.2.
+   - The `-bindpath` **must be absolute**: `<Files>` resolves a relative
+     bindpath against the `.wxs` file's own directory and a miss is only a
+     warning (WIX8601), which shipped an MSI with an empty `ui\` tree on
+     the first tag run. The workflow now passes an absolute bindpath and
+     `-wx` (warnings-as-errors), and validates the payload by
+     `msiexec /a` administrative extract (exe, configure script, UI
+     bundle asserted present).
+2. **The Burn bundle (`Bundle.wxs`) builds** with
+   `WixToolset.BootstrapperApplications.wixext/5.0.2`, producing
+   `NeonHearth-Setup-<ver>-x64.exe` (WixStdBA hyperlinkLicense theme, no
+   license step). Validated without installing via `wix burn extract`: the
+   embedded payload is byte-identical (SHA-256) to the input MSI. Note
+   `/layout` is not a meaningful check for this bundle (compressed bundle
+   layout just copies the exe), and `wix burn extract` silently no-ops
+   with WIX8503 unless its output/intermediate folders already exist.
+3. **`stage.sh` executed end-to-end on ubuntu-latest** (its first real
+   execution) with no fixes needed beyond marking it executable in the git
+   index (it was committed 100644).
+4. **nfpm 2.47.0 produced the .deb and .rpm**, first exercised locally
+   (Windows nfpm binary against a dummy staged tree) and then in CI
+   against the real one. Payload paths verified by `dpkg-deb --contents`
+   and `rpm2cpio | cpio -t` (binary, unit, sysusers fragment, UI tree).
+   `version: ${NEONHEARTH_VERSION}` env expansion works; nfpm's semver
+   schema turns `0.1.0-alpha.1` into deb `0.1.0~alpha.1` and rpm
+   `0.1.0~alpha.1-1` as expected. Build inputs (Npcap SDK 1.13 zip, nfpm
+   deb) are downloaded pinned with SHA-256 verification.
+5. On hosted Windows runners (no Npcap installed) the workspace links
+   against the **Npcap SDK 1.13 import libraries** (`RUSTFLAGS=-L
+   <sdk>\Lib\x64`); `stage.ps1` now respects a caller-supplied
+   `RUSTFLAGS` and only prepends the dev machine's msys64 path when it
+   exists. Only `Packet.lib` (SDK) and `iphlpapi` (Windows SDK) are
+   needed (`pnet_datalink` link attributes).
+
+## Authored but NOT verified anywhere
+
+- **No MSI, setup exe, deb, or rpm has been installed/uninstalled on any
+  machine**, so service registration, recovery settings, limited mode,
+  token generation, and clean uninstall (service removed, files removed,
+  `%ProgramData%\NeonHearth` left with `README-UNINSTALL.txt`) are still
+  design intent, not evidence. The `util:ServiceConfig` element, the
+  `NT SERVICE\NeonHearth` virtual-account `ServiceInstall`, and the
+  deferred `WixQuietExec64` custom action compile, but only a real install
+  exercises them.
 - **The systemd unit has never started the service.** The hardening set
   (`ProtectSystem=strict`, `MemoryDenyWriteExecute`, `SystemCallFilter`,
   `RestrictAddressFamilies` etc.) is reasoned from source, not proven under
   systemd; keyring/secret-service interaction on Linux is a known
-  possible friction point to test.
-- MSI `UpgradeCode`/component GUIDs are freshly generated and become
-  contractual only once a first real release ships.
+  possible friction point to test. CI packages the unit but never runs it.
+- **Nothing is signed** (RLS7): SmartScreen will flag the exe/MSI and the
+  deb/rpm carry no repository signatures; releases are therefore marked
+  pre-release with that warning in the notes.
+- MSI `UpgradeCode`/component GUIDs and the bundle `UpgradeCode` are now
+  published in a (pre-)release and must be treated as contractual.
 
 ## Build commands (per platform)
 
-Windows (this repo, elevated not required for staging):
+The release workflow (`.github/workflows/release.yml`, on `v*` tags) runs
+all of the below; tag base version must equal the Cargo workspace version.
+
+Windows (this repo, elevated not required for staging; WiX v5 CLI via
+`dotnet tool install --global wix --version 5.0.2`):
 
 ```powershell
 pwsh -File packaging\stage.ps1              # build + stage into packaging\dist\windows
-# Requires WiX v4 CLI (needs a .NET SDK: dotnet tool install --global wix):
-wix extension add -g WixToolset.Util.wixext
+wix extension add -g WixToolset.Util.wixext/5.0.2
+wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
+# bindpaths MUST be absolute (see WIX8601 note above); -wx enforces it
 wix build packaging\windows\NeonHearth.wxs `
     -ext WixToolset.Util.wixext `
-    -bindpath dist=packaging\dist\windows `
-    -arch x64 `
-    -o packaging\dist\NeonHearth-0.1.0-x64.msi
+    -bindpath dist=$PWD\packaging\dist\windows `
+    -arch x64 -d MsiVersion=0.1.0 -wx `
+    -o NeonHearth-0.1.0-x64.msi
+wix build packaging\windows\Bundle.wxs `
+    -ext WixToolset.BootstrapperApplications.wixext `
+    -bindpath msi=$PWD `
+    -arch x64 -d MsiVersion=0.1.0 -d FullVersion=0.1.0 -wx `
+    -o NeonHearth-Setup-0.1.0-x64.exe
 ```
 
 Linux (from a systemd distro or WSL2 with the pinned toolchain):
@@ -131,6 +184,7 @@ Linux (from a systemd distro or WSL2 with the pinned toolchain):
 ```bash
 packaging/stage.sh                          # build + stage into packaging/dist/linux
 cd packaging/linux
+export NEONHEARTH_VERSION=0.1.0             # tag version without the leading v
 nfpm package --config nfpm.yaml --packager deb --target ../dist/
 nfpm package --config nfpm.yaml --packager rpm --target ../dist/
 ```
@@ -159,23 +213,23 @@ at install).
 
 ## What remains before RLS4 / RLS5 can be checked
 
-1. Run `wix build` on a machine with a .NET SDK; fix schema errors; produce the MSI.
-2. Install/upgrade/uninstall the MSI on a **clean Windows 11 x64 machine**,
-   both with and without Npcap, and record: service running under
-   `NT SERVICE\NeonHearth`, recovery settings present, loopback-only bind,
-   limited-mode notice without Npcap, state dir surviving uninstall.
-3. Run `stage.sh` + `nfpm` on Linux; install the `.deb` and `.rpm` on clean
-   machines; verify unit hardening doesn't break the service
-   (`systemd-analyze security neonhearth`), token generation, and
-   state survival on package removal.
-4. Signing (RLS7) and SBOM/provenance (RLS6) are separate items and untouched here.
+1. Install/upgrade/uninstall the MSI (and the setup exe wrapping it) on a
+   **clean Windows 11 x64 machine**, both with and without Npcap, and
+   record: service running under `NT SERVICE\NeonHearth`, recovery settings
+   present, loopback-only bind, limited-mode notice without Npcap, state
+   dir surviving uninstall.
+2. Install the `.deb` and `.rpm` on clean machines; verify unit hardening
+   doesn't break the service (`systemd-analyze security neonhearth`),
+   token generation, and state survival on package removal.
+3. Signing (RLS7) and SBOM/provenance (RLS6) are separate items and untouched here.
 
 Honest status lines for the evidence ledger:
 
-- RLS4: **not complete** — Windows installer definition + staged inputs exist
-  and the staged binary was smoke-verified locally; no MSI has been built
-  (no WiX toolchain/.NET SDK on the build machine) and no clean-machine
-  install has occurred.
-- RLS5: **not complete** — systemd unit, sysusers fragment, scripts, and
-  nfpm config authored with capabilities matched to actual code behavior;
-  nothing has been packaged or installed on any Linux machine.
+- RLS4: **not complete** — the MSI and setup-exe bundle now build and are
+  payload-validated in CI on every `v*` tag (administrative extract /
+  burn extract; published as pre-release assets with SHA-256s), but they
+  are unsigned and no install of either has occurred on any machine.
+- RLS5: **not complete** — deb and rpm now build in CI from the first real
+  `stage.sh` + nfpm execution with payload listings verified, but neither
+  package has been installed on any Linux machine and the systemd unit has
+  never run the service.
