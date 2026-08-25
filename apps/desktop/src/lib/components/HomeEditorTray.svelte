@@ -43,17 +43,18 @@
 </aside>
 
 <style>
-  .device-tray{padding:16px;border:1px solid #20424b;border-radius:10px;background:#0b1c26}
-  .device-tray h2{margin:0 0 10px;font:600 14px Arial;color:#e9fbfc}
-  .device-tray h3{margin:18px 0 8px;font:10px monospace;text-transform:uppercase;letter-spacing:.08em;color:#ffcd66}
+  .device-tray{padding:16px;border:1px solid var(--line);border-radius:var(--radius-card);background:var(--surface)}
+  .device-tray h2{margin:0 0 10px;font:600 14px var(--font-body);color:var(--ink)}
+  .device-tray h3{margin:18px 0 8px;font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.12em;color:var(--ember)}
   .tray-list{list-style:none;margin:0;padding:0;display:grid;gap:7px}
-  .tray-device{display:flex;gap:8px;align-items:center;width:100%;min-height:44px;padding:9px 11px;border:1px solid #28505a;border-radius:6px;background:#0e2430;color:#cce4e7;font:12px Arial;text-align:left;cursor:grab}
-  .tray-device span{color:#548cff}
-  .tray-device.arming{border-color:#63f3f0;color:#e9fbfc;box-shadow:inset 0 0 16px #63f3f014}
-  .tray-muted{margin:10px 0 0;color:#77959d;font-size:11px;line-height:1.5}
+  .tray-device{display:flex;gap:8px;align-items:center;width:100%;min-height:44px;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2);color:var(--ink);font:12.5px var(--font-body);text-align:left;cursor:grab}
+  .tray-device span{color:var(--ink-mute)}
+  .tray-device.arming{border-color:var(--ember);color:var(--ink)}
+  .tray-device.arming span{color:var(--ember)}
+  .tray-muted{margin:10px 0 0;color:var(--ink-mute);font-size:11.5px;line-height:1.5}
   .estimate-list{list-style:none;margin:0;padding:0;display:grid;gap:9px}
-  .estimate-list li{display:grid;gap:2px;padding:8px;border:1px dashed #28505a;border-radius:6px}
-  .estimate-list strong{font:600 12px Arial;color:#cce4e7}
-  .estimate-list span{color:#9bb7bb;font-size:11px}
-  .estimate-list em{color:#ffcd66;font:10px monospace;font-style:normal;text-transform:uppercase;letter-spacing:.06em}
+  .estimate-list li{display:grid;gap:2px;padding:8px;border:1px dashed var(--line);border-radius:8px}
+  .estimate-list strong{font:600 12.5px var(--font-body);color:var(--ink)}
+  .estimate-list span{color:var(--ink-mute);font-size:11.5px}
+  .estimate-list em{color:var(--ember);font:500 10px var(--font-mono);font-style:normal;text-transform:uppercase;letter-spacing:.06em}
 </style>

@@ -117,15 +117,15 @@
 <style>
   .home-view { display: grid; gap: 14px; align-content: start; }
   .home-topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
-  .home-tabs { display: flex; gap: 7px; }
-  .home-tabs button { min-height: 44px; padding: 9px 15px; border: 1px solid #28505a; border-radius: 5px; background: transparent; color: #cce4e7; font: 600 12px Arial; cursor: pointer; }
-  .home-tabs button[aria-selected='true'] { border-color: #63f3f0; color: #63f3f0; box-shadow: inset 0 0 14px #63f3f014; }
-  .home-selection { margin: 0; color: #9bb7bb; font: 11px monospace; }
-  .home-selection strong { color: #63f3f0; font-weight: 700; }
-  .home-banner { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px 14px; border: 1px solid #ffcd66; border-radius: 8px; background: #0b1c26; color: #cce4e7; font-size: 12px; }
-  .home-banner.error { border-color: #ff5c9b; color: #ffb4cc; }
-  .home-banner button { min-height: 38px; padding: 7px 12px; border: 1px solid #63f3f0; border-radius: 5px; background: transparent; color: #63f3f0; font: 600 12px Arial; cursor: pointer; }
-  .home-banner.error button { border-color: #ff5c9b; color: #ff5c9b; }
+  .home-tabs { display: flex; gap: 8px; }
+  .home-tabs button { min-height: 44px; padding: 9px 16px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--ink-mute); font: 500 13px var(--font-body); cursor: pointer; }
+  .home-tabs button[aria-selected='true'] { border-color: var(--ember); color: var(--ember); background: var(--surface); }
+  .home-selection { margin: 0; color: var(--ink-mute); font: 11px var(--font-mono); }
+  .home-selection strong { color: var(--ink); font-weight: 600; }
+  .home-banner { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px 14px; border: 1px solid var(--ember); border-radius: var(--radius-card); background: var(--surface); color: var(--ink); font-size: 12.5px; }
+  .home-banner.error { border-color: var(--alert); color: var(--alert-text); }
+  .home-banner button { min-height: 38px; padding: 7px 12px; border: 1px solid var(--ember); border-radius: 8px; background: transparent; color: var(--ember); font: 500 12.5px var(--font-body); cursor: pointer; }
+  .home-banner.error button { border-color: var(--alert); color: var(--alert-text); }
   .home-connecting { margin: 18px 0 0; }
   [role='tabpanel'][hidden] { display: none; }
 </style>

@@ -15,10 +15,10 @@
 
 <style>
   .floor-bar{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 12px}
-  .floor-tab{display:grid;gap:2px;min-height:44px;padding:8px 14px;border:1px solid #20424b;border-radius:6px;background:#0b1c26;color:#cce4e7;text-align:left;cursor:pointer}
-  .floor-tab.active{border-color:#63f3f0;box-shadow:inset 0 0 18px #63f3f014;color:#e9fbfc}
-  .floor-tab strong{font:600 13px Arial}
-  .floor-tab small{color:#77959d;font:10px monospace;text-transform:uppercase;letter-spacing:.06em}
-  .floor-add{min-height:44px;padding:8px 14px;border:1px dashed #28505a;border-radius:6px;background:transparent;color:#9bb7bb;font:600 12px Arial;cursor:pointer}
-  .floor-add:hover{border-color:#63f3f0;color:#63f3f0}
+  .floor-tab{display:grid;gap:2px;min-height:44px;padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);text-align:left;cursor:pointer}
+  .floor-tab.active{border-color:var(--ember);color:var(--ink)}
+  .floor-tab strong{font:600 13px var(--font-body)}
+  .floor-tab small{color:var(--ink-mute);font:400 10px var(--font-mono);text-transform:uppercase;letter-spacing:.06em}
+  .floor-add{min-height:44px;padding:8px 14px;border:1px dashed var(--line);border-radius:8px;background:transparent;color:var(--ink-mute);font:500 12.5px var(--font-body);cursor:pointer}
+  .floor-add:hover{border-color:var(--ember);color:var(--ember)}
 </style>

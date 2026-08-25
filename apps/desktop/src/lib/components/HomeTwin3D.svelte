@@ -538,15 +538,14 @@
 <style>
   .twin { position: relative; display: grid; gap: 10px; }
   .twin-toolbar { display: flex; flex-wrap: wrap; gap: 8px; }
-  .twin-toolbar button { border: 1px solid #28505a; border-radius: 5px; color: #e9fbfc; background: #0b1c26; min-height: 36px; padding: 0 11px; cursor: pointer; font-size: 12px; }
-  .twin-toolbar button[aria-pressed='true'] { border-color: #63f3f0; color: #63f3f0; }
-  .twin-toolbar button:focus-visible { outline: 3px solid #ffcd66; outline-offset: 3px; }
-  .twin-stage { min-height: 320px; border: 1px solid #17323d; border-radius: 7px; background: #081521; overflow: hidden; touch-action: none; }
-  .twin-stage:focus-visible { outline: 3px solid #ffcd66; outline-offset: 3px; }
+  .twin-toolbar button { border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--surface); min-height: 36px; padding: 0 12px; cursor: pointer; font: 500 12.5px var(--font-body); }
+  .twin-toolbar button[aria-pressed='true'] { border-color: var(--ember); color: var(--ember); }
+  .twin-stage { min-height: 320px; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--ground); overflow: hidden; touch-action: none; }
+  .twin-stage:focus-visible { outline: 2px solid var(--ember); outline-offset: 2px; }
   .twin-stage.stage-hidden { display: none; }
   .twin-stage canvas { display: block; width: 100%; height: 100%; }
-  .twin-fallback { border: 1px dashed #28505a; border-radius: 7px; padding: 18px; color: #9bb7bb; display: grid; gap: 6px; justify-items: start; }
-  .twin-fallback strong { color: #e9fbfc; }
+  .twin-fallback { border: 1px dashed var(--line); border-radius: var(--radius-card); padding: 18px; color: var(--ink-mute); display: grid; gap: 6px; justify-items: start; }
+  .twin-fallback strong { color: var(--ink); }
   .twin-fallback p { margin: 0; font-size: 12px; line-height: 1.5; }
   .visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 </style>

@@ -1,1 +1,104 @@
-.app-shell{min-height:100svh;display:grid;grid-template-columns:170px minmax(0,1fr) 260px;background:#061019;color:#e9fbfc}.rail{border-right:1px solid #17323d;padding:28px 16px;display:flex;flex-direction:column;gap:48px}.brand{display:flex;align-items:center;gap:9px;font:700 11px/1.05 Arial;letter-spacing:.11em}.brand-mark{color:#63f3f0;font-size:23px}.rail nav{display:grid;gap:7px}.rail button,.mobile-nav button{border:0;color:#78969e;background:none;text-align:left;padding:11px 10px;border-radius:8px;font:600 12px Arial;cursor:pointer;display:flex;align-items:center;gap:10px;min-height:44px}.rail button.active,.rail button:hover,.mobile-nav button.active{color:#e9fbfc;background:#102a35}.nav-icon{width:20px;text-align:center;color:#63f3f0;font-size:18px}.rail-foot{margin-top:auto;display:flex;align-items:center;gap:8px;color:#64838b;font:10px monospace;letter-spacing:.1em}.secure-icon{color:#63f3f0;font-size:22px}.app-shell main{min-width:0;padding:42px clamp(22px,4vw,62px);overflow:auto}.events-rail{border-left:1px solid #17323d;padding:43px 24px 20px;display:flex;flex-direction:column;gap:22px}.mobile-head,.mobile-nav{display:none}.kicker,.metric-label{color:#63f3f0;font:500 10px monospace;letter-spacing:.14em}.view-heading h1,.not-ready h1{margin:9px 0 8px;font:700 clamp(2.2rem,4vw,4rem)/.95 Arial;letter-spacing:-.06em}.muted{color:#77959d;line-height:1.45}.lung-panel{margin:26px 0;background:#0b1c26;border:1px solid #20424b;border-radius:12px;overflow:hidden}.lung-wrap{position:relative;min-height:270px;display:grid;place-items:center;background:radial-gradient(ellipse at center,#123641,transparent 63%)}.lung-wrap svg{width:min(100%,650px)}.lung-guide{fill:none;stroke:#21434a;stroke-dasharray:2 9}.lobe{fill:none;stroke:url(#lung-cyan);stroke-width:3;filter:drop-shadow(0 0 6px #63f3f0)}.lobe.right{stroke:url(#lung-gold)}.breath{fill:none;stroke:#d8ffff;stroke-width:1.5;stroke-dasharray:7 10}.core{fill:#e9fbfc}.particles circle{fill:#ffcd66}.particles circle:nth-child(even){fill:#ff5c9b}.lung-readout{position:absolute;text-align:center;bottom:19px}.lung-readout span{display:block;font:700 27px Arial}.lung-readout small{color:#77959d;font:10px monospace;text-transform:uppercase}.lung-caption{border-top:1px solid #20424b;padding:13px 18px;display:flex;gap:9px;align-items:center;font-size:12px}.status-dot{width:8px;height:8px;border:1px solid #ffcd66;border-radius:50%}.lung-caption .muted{margin-left:auto;font-size:11px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);border-block:1px solid #17323d}.metrics article{padding:17px 15px;border-right:1px solid #17323d;display:grid;gap:7px}.metrics strong{font:600 22px Arial}.metrics small,.metric-note{color:#77959d;font:11px monospace}.coverage{color:#ffcd66;font-size:15px!important}.section-title{display:flex;justify-content:space-between;align-items:center;margin-top:29px}.section-title h2{margin:0;font:600 16px Arial}.empty-state{display:flex;gap:15px;align-items:flex-start;padding:21px 0;border-bottom:1px solid #17323d}.empty-icon,.not-ready-mark{color:#548cff;font-size:30px}.empty-state p{margin:5px 0 0;font-size:12px}.event-quiet{border:1px solid #17323d;border-radius:8px;padding:20px;display:grid;gap:10px}.event-quiet>span{color:#63f3f0;font-size:28px}.event-quiet p{margin:0;font-size:12px}.live-pill{color:#63f3f0;font:10px monospace}.collector-status{margin-top:auto}.not-ready{max-width:530px;margin:15vh auto}.not-ready h1{font-size:clamp(2.6rem,5vw,5rem)}.search{display:block;margin:28px 0 14px;color:#77959d;font:10px monospace;text-transform:uppercase;letter-spacing:.1em}.search input{display:block;width:100%;margin-top:8px;border:1px solid #28505a;border-radius:6px;padding:13px;background:#0b1c26;color:#e9fbfc;font:14px Arial}.tabs{display:flex;gap:7px;margin-bottom:25px}.tabs button{min-height:44px;padding:0 15px;border:1px solid #28505a;border-radius:5px;color:#91adb2;background:none;cursor:pointer}.tabs button.active{color:#e9fbfc;border-color:#63f3f0}.device-table{display:grid;gap:11px}.device-card{display:grid;grid-template-columns:1.4fr auto;gap:13px;padding:17px;border:1px solid #20424b;border-radius:8px;background:#0b1c26}.device-name{display:flex;gap:12px}.device-symbol{color:#63f3f0;font-size:25px}.device-name strong,.device-name span{display:block}.device-name span{color:#77959d;font-size:12px;margin-top:4px}.confidence{align-self:start;padding:5px 8px;border:1px solid;border-radius:4px;font:10px monospace}.confidence.confirmed{color:#63f3f0}.confidence.likely{color:#ffcd66;border-style:dashed}.device-card p{margin:0;color:#9bb7bb;font-size:12px}.device-card p b{display:block;margin-bottom:3px;color:#64838b;font:10px monospace;text-transform:uppercase}@media(max-width:850px){.app-shell{display:block;padding-bottom:72px}.rail,.events-rail{display:none}.mobile-head{display:flex;justify-content:space-between;align-items:center;padding:17px 20px;border-bottom:1px solid #17323d}.app-shell main{padding:27px 19px}.mobile-nav{position:fixed;z-index:5;bottom:0;left:0;right:0;display:flex;justify-content:space-around;background:#0b1c26;border-top:1px solid #20424b;padding:6px 4px}.mobile-nav button{display:grid;place-items:center;gap:2px;padding:5px;min-height:55px;font-size:10px}.mobile-nav button span{font-size:18px}.lung-wrap{min-height:220px}.lung-caption{flex-wrap:wrap}.lung-caption .muted{width:100%;margin-left:17px}.metrics{grid-template-columns:1fr}.metrics article{border-right:0;border-bottom:1px solid #17323d}.device-card{grid-template-columns:1fr}}
+/* NeonHearth shared shell + view furniture (v2 "daylight hearth"). Tokens only. */
+
+/* ---- Shell: top tab bar, content, live-thread column ---- */
+.app-shell { min-height: 100svh; display: flex; flex-direction: column; background: var(--ground); color: var(--ink); --main-pad-x: clamp(22px, 4vw, 56px); --main-pad-y: 34px; }
+.topbar { display: flex; align-items: center; gap: clamp(14px, 3vw, 36px); padding: 10px clamp(16px, 3vw, 32px); background: var(--surface); box-shadow: var(--shadow); position: relative; z-index: 4; }
+.brand { display: flex; align-items: center; gap: 9px; font: 900 17px/1 var(--font-display); letter-spacing: 0.01em; color: var(--ink); }
+.brand-mark { color: var(--ember); font-size: 18px; }
+.topbar nav { display: flex; flex-wrap: wrap; gap: 4px; }
+.topbar nav button { border: 0; background: none; color: var(--ink-mute); padding: 9px 14px; border-radius: var(--radius-pill); font: 500 13.5px var(--font-body); cursor: pointer; display: flex; align-items: center; gap: 8px; min-height: 42px; }
+.topbar nav button:hover { background: var(--ground); color: var(--ink); }
+.topbar nav button.active { background: var(--surface-2); color: var(--ember); }
+.nav-icon { width: 18px; text-align: center; color: var(--ink-mute); font-size: 16px; }
+.topbar nav button.active .nav-icon { color: var(--ember); }
+.topbar-note { margin-left: auto; display: flex; align-items: center; gap: 7px; color: var(--ink-mute); font: 500 10px var(--font-mono); letter-spacing: 0.14em; text-transform: uppercase; }
+.secure-icon { color: var(--sage); font-size: 16px; }
+.app-body { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 300px; align-items: start; }
+.app-shell main { min-width: 0; padding: var(--main-pad-y) var(--main-pad-x); overflow: auto; }
+.events-rail { padding: var(--main-pad-y) 24px 24px; display: flex; flex-direction: column; gap: 18px; min-height: 100%; }
+.mobile-head, .mobile-nav { display: none; }
+
+/* Full-bleed hero: escapes main's padding so the view's primary surface
+   runs edge-to-edge, with white pill controls floating over it. */
+.hero-bleed { margin: calc(-1 * var(--main-pad-y)) calc(-1 * var(--main-pad-x)) 0; }
+
+/* ---- Type roles ---- */
+.kicker, .metric-label { color: var(--ink-mute); font: 500 var(--text-eyebrow)/1.4 var(--font-mono); letter-spacing: 0.12em; text-transform: uppercase; }
+.view-heading h1, .not-ready h1 { margin: 10px 0 8px; font: 600 var(--text-display)/1.15 var(--font-display); letter-spacing: -0.01em; color: var(--ink); }
+.muted { color: var(--ink-mute); line-height: 1.5; }
+
+/* ---- Floating white pill (single controls over a hero) ---- */
+.pill-control { border: 0; background: var(--surface); color: var(--ink); border-radius: var(--radius-pill); box-shadow: var(--shadow); min-height: 44px; padding: 0 18px; font: 500 13px var(--font-body); cursor: pointer; }
+.pill-control:hover { background: var(--surface-2); }
+
+/* ---- Presence: coals, in daylight. One language for every status dot. ---- */
+.presence-dot { display: inline-block; flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--ink-mute); }
+.presence-dot.online { background: var(--ember); box-shadow: var(--ember-glow); }
+.presence-dot.quiet { background: var(--ink-mute); }
+.presence-dot.offline { background: transparent; border: 2px solid var(--ink-mute); }
+.presence-dot.blocked { background: transparent; border: 2px solid var(--alert); }
+.presence-dot.unknown { background: transparent; border: 1px dashed var(--ink-mute); }
+
+/* ---- Pulse hearth hero chrome ---- */
+.lung-panel { position: relative; }
+.lung-wrap { position: relative; min-height: 300px; display: grid; place-items: center; background: var(--ground); }
+.lung-readout { position: relative; text-align: center; }
+.lung-readout span { display: block; font: 600 34px/1.1 var(--font-display); color: var(--ink); }
+.lung-wrap.unavailable .lung-readout span { color: var(--ink-mute); }
+.lung-readout small { color: var(--ink-mute); font: 400 10px var(--font-mono); letter-spacing: 0.12em; text-transform: uppercase; }
+.lung-caption { padding: 12px var(--main-pad-x) 0; display: flex; gap: 10px; align-items: center; font-size: 12.5px; }
+.lung-caption .muted { margin-left: auto; font-size: 11.5px; }
+
+/* ---- Sections, empty states, live thread ---- */
+.section-title { display: flex; justify-content: space-between; align-items: center; margin-top: 32px; }
+.section-title h2 { margin: 0; font: 600 var(--text-h2) var(--font-body); }
+.empty-state { display: flex; gap: 14px; align-items: flex-start; padding: 20px 0; border-bottom: 1px solid var(--line); }
+.empty-icon, .not-ready-mark { color: var(--ink-mute); font-size: 28px; }
+.empty-state p { margin: 5px 0 0; font-size: 12.5px; }
+.event-quiet { border-radius: var(--radius-card); background: var(--surface); box-shadow: var(--shadow); padding: 20px; display: grid; gap: 10px; }
+.event-quiet > span { color: var(--ink-mute); font-size: 26px; }
+.event-quiet p { margin: 0; font-size: 12.5px; }
+.live-pill { color: var(--ink-mute); font: 500 10px var(--font-mono); letter-spacing: 0.1em; display: inline-flex; align-items: center; gap: 7px; }
+.collector-status { margin-top: auto; }
+.not-ready { max-width: 560px; margin: 15vh auto; }
+.not-ready h1 { font-size: clamp(28px, 4vw, 40px); }
+
+/* ---- Search + segmented tabs ---- */
+.search { display: block; margin: 28px 0 14px; color: var(--ink-mute); font: 500 var(--text-eyebrow) var(--font-mono); text-transform: uppercase; letter-spacing: 0.12em; }
+.search input { display: block; width: 100%; margin-top: 8px; border: 0; border-radius: var(--radius-pill); padding: 13px 18px; background: var(--surface); box-shadow: var(--shadow); color: var(--ink); font: 14.5px var(--font-body); }
+.search input::placeholder { color: var(--ink-mute); opacity: 0.7; }
+.tabs { display: inline-flex; gap: 3px; margin-bottom: 24px; padding: 4px; background: var(--surface-2); border-radius: var(--radius-pill); }
+.tabs button { min-height: 38px; padding: 0 16px; border: 0; border-radius: var(--radius-pill); color: var(--ink-mute); background: none; font: 500 13px var(--font-body); cursor: pointer; }
+.tabs button.active { color: var(--ink); background: var(--surface); box-shadow: var(--shadow); }
+
+/* ---- Device cards ---- */
+.device-table { display: grid; gap: var(--gap-card); }
+.device-card { display: grid; grid-template-columns: 1.4fr auto; gap: 14px; padding: var(--pad-card); border-radius: var(--radius-card); background: var(--surface); box-shadow: var(--shadow); }
+.device-name { display: flex; gap: 12px; align-items: flex-start; }
+.device-name .presence-dot { margin-top: 5px; }
+.device-name strong, .device-name span { display: block; }
+.device-name strong { font: 600 15px var(--font-body); }
+.device-name span { color: var(--ink-mute); font-size: 12.5px; margin-top: 4px; }
+.confidence { align-self: start; padding: 5px 10px; border: 1px solid var(--line); border-radius: var(--radius-pill); font: 500 10px var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; }
+.confidence.confirmed { color: var(--sage-text); border-color: var(--sage); }
+.confidence.likely { color: var(--ink-mute); border-style: dashed; }
+.device-card p { margin: 0; color: var(--ink-mute); font-size: 12.5px; }
+.device-card p b { display: block; margin-bottom: 3px; color: var(--ink-mute); font: 500 10px var(--font-mono); letter-spacing: 0.12em; text-transform: uppercase; }
+
+/* ---- Phone layout ---- */
+@media (max-width: 850px) {
+  .app-shell { display: block; padding-bottom: 72px; --main-pad-x: 19px; --main-pad-y: 24px; }
+  .topbar, .events-rail { display: none; }
+  .app-body { display: block; }
+  .mobile-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; background: var(--surface); box-shadow: var(--shadow); position: relative; z-index: 4; }
+  .app-shell main { padding: var(--main-pad-y) var(--main-pad-x); }
+  .mobile-nav { position: fixed; z-index: 5; bottom: 0; left: 0; right: 0; display: flex; justify-content: space-around; background: var(--surface); box-shadow: 0 -2px 12px rgb(46 38 28 / 0.10); padding: 6px 4px; }
+  .mobile-nav button { border: 0; background: none; cursor: pointer; display: grid; place-items: center; gap: 2px; padding: 5px 10px; min-height: 55px; font: 500 10.5px var(--font-body); color: var(--ink-mute); border-radius: 12px; }
+  .mobile-nav button.active { color: var(--ember); background: var(--surface-2); }
+  .mobile-nav button span { font-size: 17px; color: var(--ink-mute); }
+  .mobile-nav button.active span { color: var(--ember); }
+  .lung-wrap { min-height: 230px; }
+  .lung-caption { flex-wrap: wrap; }
+  .lung-caption .muted { width: 100%; margin-left: 20px; }
+  .device-card { grid-template-columns: 1fr; }
+}
