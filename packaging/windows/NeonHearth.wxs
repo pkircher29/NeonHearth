@@ -7,10 +7,16 @@
     wix extension add -g WixToolset.Util.wixext/5.0.2
     wix build packaging\windows\NeonHearth.wxs ^
         -ext WixToolset.Util.wixext ^
-        -bindpath dist=packaging\dist\windows ^
+        -bindpath dist=%CD%\packaging\dist\windows ^
         -arch x64 ^
         -d MsiVersion=0.1.0 ^
+        -wx ^
         -o packaging\dist\NeonHearth-0.1.0-x64.msi
+
+  The bindpath MUST be an absolute path: the <Files> wildcard harvest below
+  resolves a relative bindpath against this .wxs file's directory, not the
+  working directory, and a miss is only warning WIX8601 (empty ui payload).
+  -wx promotes that warning to a build failure.
 
   REQUIRES WiX v5+ (pinned to 5.0.2 in .github/workflows/release.yml): the
   <Files> wildcard-harvesting element used for the UI bundle does not exist

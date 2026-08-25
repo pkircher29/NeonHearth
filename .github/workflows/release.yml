@@ -90,14 +90,19 @@ jobs:
           wix extension add -g WixToolset.Util.wixext/5.0.2
           wix --version
 
+      # The bindpath MUST be absolute: the <Files> wildcard harvest resolves a
+      # relative bindpath against the .wxs file's own directory (not the
+      # working directory), silently harvesting nothing (warning WIX8601).
+      # -wx turns that class of warning into a hard build failure.
       - name: Build MSI
         shell: pwsh
         run: |
           wix build packaging\windows\NeonHearth.wxs `
             -ext WixToolset.Util.wixext `
-            -bindpath dist=packaging\dist\windows `
+            -bindpath dist=${{ github.workspace }}\packaging\dist\windows `
             -arch x64 `
             -d MsiVersion=${{ steps.version.outputs.msi }} `
+            -wx `
             -o NeonHearth-${{ steps.version.outputs.full }}-x64.msi
           if (-not (Test-Path "NeonHearth-${{ steps.version.outputs.full }}-x64.msi")) { throw 'MSI was not produced' }
 
