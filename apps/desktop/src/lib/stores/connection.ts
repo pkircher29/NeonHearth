@@ -36,6 +36,7 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
       const opened = await client.openEvents(state.sequence, handleMessage, (socketState) => handleSocketState(token, epoch, socketState));
       if (!isCurrent(token) || epoch !== socketEpoch) { opened.close(); return; }
       socket = opened;
+      retry = 0;
       cancelRetry();
     } catch {
       scheduleReconnect(token);
