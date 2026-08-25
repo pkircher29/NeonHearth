@@ -83,8 +83,12 @@ $entries = [System.Collections.Generic.List[string]]::new()
 foreach ($e in $existing) { if ($e) { $entries.Add($e) } }
 
 if (-not ($entries | Where-Object { $_ -like 'LATTICE_SERVICE_TOKEN=*' })) {
-    $bytes = [byte[]]::new(48)
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    # The MSI custom action runs Windows PowerShell 5.1 (.NET Framework),
+    # where RandomNumberGenerator has no static Fill() — Create()/GetBytes()
+    # works on both 5.1 and 7+. (First real install failed exactly here.)
+    $bytes = New-Object byte[] 48
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
     $token = [Convert]::ToBase64String($bytes)   # 64 chars, > 32-char minimum
     $entries.Add("LATTICE_SERVICE_TOKEN=$token")
     Write-Log 'Generated new LATTICE_SERVICE_TOKEN (stored only in the service Environment registry value).'
