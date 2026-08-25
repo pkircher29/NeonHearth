@@ -1,0 +1,62 @@
+[package]
+name = "lattice-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+argon2 = "0.5"
+async-trait.workspace = true
+axum.workspace = true
+lattice-camera = { path = "../lattice-camera" }
+lattice-advisory = { path = "../lattice-advisory" }
+futures-util.workspace = true
+getrandom.workspace = true
+chrono.workspace = true
+lattice-doctor = { path = "../lattice-doctor" }
+lattice-event-bus = { path = "../lattice-event-bus" }
+lattice-domain = { path = "../lattice-domain" }
+lattice-intelligence = { path = "../lattice-intelligence" }
+lattice-policy = { path = "../lattice-policy" }
+lattice-store = { path = "../lattice-store" }
+lattice-sensor = { path = "../lattice-sensor" }
+lattice-w6 = { path = "../lattice-w6" }
+sha2.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+subtle.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "process"] }
+tracing-subscriber.workspace = true
+tracing.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+base64 = "0.22"
+md5-digest = { package = "md-5", version = "0.10" }
+percent-encoding = "2.3"
+url = "2.5"
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+keyring.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio-tungstenite = "0.29"
+tempfile = "3"
+sqlx.workspace = true
+
+[lib]
+path = "src/lib.rs"

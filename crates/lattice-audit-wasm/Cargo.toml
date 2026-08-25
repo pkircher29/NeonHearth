@@ -1,0 +1,22 @@
+[package]
+name = "lattice-audit-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+ed25519-dalek.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+wasmtime.workspace = true
+wasmparser.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+wat.workspace = true

@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lattice-domain",
+    "crates/lattice-camera",
+    "crates/lattice-store",
+    "crates/lattice-event-bus",
+    "crates/lattice-sensor",
+    "crates/lattice-intelligence",
+    "crates/lattice-policy",
+    "crates/lattice-service",
+    "crates/lattice-advisory",
+    "crates/lattice-audit-wasm",
+    "crates/lattice-w6",
+    "crates/lattice-doctor",
+    "tools/fixture-gen",
+    "tools/w6-fixture-recorder",
+]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+rtnetlink = "0.23"
+netlink-packet-route = "0.33"
+fs2 = "0.4"
+http = "1"
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid", "migrate"] }
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "net", "time", "test-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.2"
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+pnet_datalink = "0.35"
+windows-sys = "0.61"
+pcap-file = "2.0"
+hickory-proto = "0.25"
+quick-xml = "0.38"
+etherparse = "0.19"
+surge-ping = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+sha2 = "0.10"
+wasmtime = "27"
+wasmparser = "0.219"
+wat = "1"
+ed25519-dalek = { version = "3.0.0", default-features = false }
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+x509-parser = "0.18"
+async-snmp = "0.18"
+bytes = "1"
+zeroize = "1"
+getrandom = "0.3"
+socket2 = { version = "0.6", features = ["all"] }
+keyring = { version = "4.1.6", default-features = false, features = ["v1"] }

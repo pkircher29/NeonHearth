@@ -1,0 +1,43 @@
+[package]
+name = "lattice-sensor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lattice-domain = { path = "../lattice-domain" }
+lattice-camera = { path = "../lattice-camera" }
+pnet_datalink.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+serde.workspace = true
+pcap-file.workspace = true
+hickory-proto.workspace = true
+quick-xml.workspace = true
+etherparse.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+secrecy.workspace = true
+surge-ping.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+sha2.workspace = true
+x509-parser.workspace = true
+async-snmp.workspace = true
+bytes.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true
+socket2.workspace = true
+futures-util.workspace = true
+subtle.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = { workspace = true }
+netlink-packet-route = { workspace = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

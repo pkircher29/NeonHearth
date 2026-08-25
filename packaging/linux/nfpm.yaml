@@ -1,0 +1,68 @@
+# nfpm configuration producing NeonHearth .deb and .rpm packages.
+#
+# Run from packaging/linux/ on a Linux host AFTER packaging/stage.sh has
+# populated packaging/dist/linux/:
+#
+#   nfpm package --config nfpm.yaml --packager deb --target ../dist/
+#   nfpm package --config nfpm.yaml --packager rpm --target ../dist/
+#
+# STATUS / HONESTY: authored on the Windows build machine and validated as
+# YAML syntax only (PyYAML load). nfpm itself has not been run here (no nfpm
+# binary on this machine, and downloading one was out of scope), so the
+# contents mapping has not been exercised against a real nfpm version.
+
+name: neonhearth
+arch: amd64
+platform: linux
+version: 0.1.0
+section: net
+priority: optional
+maintainer: NeonHearth Project <pkircher@gmail.com>
+description: |
+  NeonHearth home-network collector service.
+  Discovers and monitors devices on owner-approved private subnets.
+  Serves a loopback-only API on 127.0.0.1:58120.
+vendor: NeonHearth Project
+homepage: https://github.com/pkircher29/NeonHearth
+license: AGPL-3.0-or-later
+
+contents:
+  # Service binary (built by packaging/stage.sh).
+  - src: ../dist/linux/bin/lattice-service
+    dst: /usr/libexec/neonhearth/lattice-service
+    file_info:
+      mode: 0755
+
+  # Hardened systemd unit.
+  - src: neonhearth.service
+    dst: /usr/lib/systemd/system/neonhearth.service
+    file_info:
+      mode: 0644
+
+  # Dedicated service user.
+  - src: neonhearth.sysusers.conf
+    dst: /usr/lib/sysusers.d/neonhearth.conf
+    file_info:
+      mode: 0644
+
+  # Full-capture drop-in shipped as documentation, not active configuration.
+  - src: full-capture.conf.example
+    dst: /usr/share/doc/neonhearth/full-capture.conf.example
+    file_info:
+      mode: 0644
+
+  # Desktop UI bundle (Vite build of apps/desktop staged by stage.sh).
+  # Installed as data; the service does not serve these over HTTP in this
+  # build (loopback API only).
+  - src: ../dist/linux/ui
+    dst: /usr/share/neonhearth/ui
+    type: tree
+
+scripts:
+  postinstall: scripts/postinstall.sh
+  preremove: scripts/preremove.sh
+  postremove: scripts/postremove.sh
+
+# Note on /var/lib/neonhearth: intentionally NOT a package path. The unit's
+# StateDirectory=neonhearth creates and owns it at service start, and package
+# removal therefore never deletes collected state (see postremove.sh).
