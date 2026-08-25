@@ -119,6 +119,7 @@ jobs:
           $required = @(
             'PFiles64\NeonHearth\lattice-service.exe',
             'PFiles64\NeonHearth\scripts\configure-service.ps1',
+            'PFiles64\NeonHearth\scripts\open-neonhearth.ps1',
             'PFiles64\NeonHearth\ui\index.html'
           )
           foreach ($rel in $required) {

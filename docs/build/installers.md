@@ -42,13 +42,24 @@ packaging/
   entry point: `lattice-service.exe --service` connects the Windows service
   dispatcher (`win_service.rs`); without the flag it is a plain console app.
   `ServiceInstall` passes `Arguments="--service"` accordingly.
-- The service serves the **loopback API only** — it does not serve the UI
-  bundle over HTTP in this build (no static file routes exist in
-  `lattice-service`). The Vite bundle from `apps/desktop` is installed as
-  data (`ui\` / `/usr/share/neonhearth/ui`) so the future desktop shell has
-  its assets; opening `ui/index.html` directly does not constitute a working
-  app because API calls need the bearer token (dev uses the Vite proxy in
-  `apps/desktop/vite.proxy-auth.ts`).
+- Since v0.1.0-alpha.5 the service **serves the installed UI bundle at
+  `http://127.0.0.1:58120/`** when its `LATTICE_UI_DIR` environment variable
+  points at the staged Vite bundle (`with_ui_assets` in
+  `crates/lattice-service/src/lib.rs`): `index.html` fallback for client
+  routes, correct MIME types, no directory listing, no traversal out of the
+  ui dir (integration-tested in `crates/lattice-service/tests/ui_assets.rs`).
+  Static assets need **no bearer** (they are public build output on a
+  loopback-only listener); every `/api/*` and `/ws` route keeps its existing
+  auth. Without `LATTICE_UI_DIR` the service is API-only exactly as before,
+  so the dev flow (Vite proxy in `apps/desktop/vite.proxy-auth.ts`) is
+  unchanged. `configure-service.ps1` writes
+  `LATTICE_UI_DIR=<INSTALLFOLDER>\ui` (derived from `$PSScriptRoot`) into
+  the service Environment registry value; the systemd unit sets
+  `Environment=LATTICE_UI_DIR=/usr/share/neonhearth/ui`.
+- The listener address is configurable via `LATTICE_BIND`
+  (default `127.0.0.1:58120`) so test instances can run beside an installed
+  service; **non-loopback IPs are refused at startup** (`parse_bind` in
+  `main.rs`), keeping the privilege boundary intact.
 - **Npcap on Windows is a load-time dependency, not a graceful runtime one.**
   Verified empirically: `objdump -p` on the built `lattice-service.exe`
   lists `packet.dll` in the import table (via `pnet_datalink`). Without
@@ -165,6 +176,74 @@ with `NeonHearth-0.1.0-alpha.1-x64.msi`, `neonhearth_0.1.0~alpha.1_amd64.deb`,
    `RUSTFLAGS` and only prepends the dev machine's msys64 path when it
    exists. Only `Packet.lib` (SDK) and `iphlpapi` (Windows SDK) are
    needed (`pnet_datalink` link attributes).
+
+## Verified on this machine (2026-08-25): UI serving, pairing, launcher (v0.1.0-alpha.5)
+
+The "installed but nothing to click" gap is closed by three pieces, all
+verified locally against a throwaway release-exe instance on
+`127.0.0.1:58121` (temp `LATTICE_STATE_BASE`, throwaway token — the live
+installed service on 58120 was never touched):
+
+1. **The service serves the dashboard.** With `LATTICE_UI_DIR` pointing at
+   the staged `ui\` bundle: `GET /` → 200 `text/html` (the app shell),
+   `GET /devices` → identical index (SPA fallback), the hashed
+   `assets/index-*.js` → 200 `text/javascript`, `GET /api/v1/state` without
+   a token → 401 + `WWW-Authenticate: Bearer`, with the token → 200, and a
+   `..%2f` traversal attempt returned the SPA index, not the sibling file.
+2. **The browser UI pairs locally via a URL fragment.** `App.svelte`
+   bootstraps its bearer token from `#token=<value>`
+   (`apps/desktop/src/lib/pairing.ts`): charset-validated
+   (`[A-Za-z0-9._-]`, the same alphabet the service enforces), persisted to
+   sessionStorage for reloads, and immediately stripped from the address
+   bar with `history.replaceState`. Fragments are never sent over the
+   network, and the listener is loopback-only regardless. With no fragment
+   and no stored token the client still sends `''` — the dev-proxy flow is
+   untouched. Vitest-covered (`pairing.test.ts`).
+3. **Start-menu "NeonHearth" shortcut.** The MSI authors a non-advertised
+   all-users shortcut to `powershell.exe -WindowStyle Hidden ... -File
+   open-neonhearth.ps1`, which reads the token (and optional
+   `LATTICE_BIND` port) from the service Environment registry value —
+   self-elevating with one UAC prompt when the read is denied — and opens
+   `http://127.0.0.1:58120/#token=<token>` through the non-elevated shell
+   (`explorer.exe`) so the browser does not inherit elevation.
+   `configure-service.ps1` also prints the pre-paired URL to the console at
+   install/configure time (console only, deliberately not into
+   `install-configure.log` — see the security notes below). The MSI build
+   with the new authoring (shortcut + `AllowSameVersionUpgrades`) was
+   verified locally with WiX 5.0.2 (`-wx` clean; Shortcut table and payload
+   confirmed via `msiexec /a` extract and `wix msi decompile`).
+
+**Upgrade authoring:** `MajorUpgrade` now sets
+`AllowSameVersionUpgrades="yes"`. This is required while releases are
+alpha-tagged: MSI `ProductVersion` carries only the numeric `0.1.0` for
+both `v0.1.0-alpha.4` and `v0.1.0-alpha.5`, and without the flag a
+same-version MSI is neither an upgrade nor a downgrade — Windows would
+install a second copy side by side. With it, running the alpha.5 installer
+over an alpha.4 install replaces it in place (service re-registered, token
+preserved because `configure-service.ps1` keeps an existing
+`LATTICE_SERVICE_TOKEN`).
+
+### Security notes (single-owner alpha posture)
+
+- **The pairing token lives in the service's `Environment` registry value**
+  (`HKLM\SYSTEM\CurrentControlSet\Services\NeonHearth`), readable by local
+  administrators. For the single-owner alpha this is accepted: anyone who
+  is an administrator on the box already owns the box. Future fix
+  direction: move the secret to DPAPI-protected storage or the OS
+  credential vault (the service already ships a `KeyringVault`
+  abstraction) and keep only a reference in the registry.
+- **The fragment-token handoff (`#token=...`) never crosses the network**:
+  URL fragments are not sent in HTTP requests, the listener is
+  loopback-only, and the UI strips the fragment from the address bar on
+  load (so it does not persist in browser history) and keeps the token in
+  sessionStorage (per-tab, cleared on browser exit). Residual exposure:
+  the token is briefly visible in the address bar and lands in the shell's
+  process-argument list while the launcher runs — both local-only, same
+  admin-owns-the-box argument as above.
+- `configure-service.ps1` prints the pre-paired URL **to the console only**;
+  it is deliberately kept out of `install-configure.log` because that log
+  lives under `%ProgramData%\NeonHearth`, which non-admin local users can
+  read.
 
 ## Authored but NOT verified anywhere
 

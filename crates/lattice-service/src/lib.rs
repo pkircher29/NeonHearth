@@ -28,6 +28,27 @@ pub fn app(state: AppState) -> Router {
     app_with_doctor(state, doctor)
 }
 
+/// Attach the built UI bundle (the Vite output the installer stages under
+/// `ui\`) as the router's fallback so the service serves the dashboard at `/`.
+///
+/// Contract (docs/architecture/privilege-boundary.md still holds):
+/// - Static assets are served WITHOUT bearer auth: the bundle is public build
+///   output, not a secret, and the listener is loopback-only. Every `/api/*`
+///   and `/ws` route keeps its existing auth untouched because routed paths
+///   never reach a fallback.
+/// - Unknown non-API paths fall back to `index.html` so client-side routes
+///   deep-link correctly (SPA behavior).
+/// - `ServeDir` percent-decodes and rejects `..` traversal, never renders
+///   directory listings, and sets Content-Type from the file extension.
+///
+/// Only called when `LATTICE_UI_DIR` is configured (main.rs); without it the
+/// service keeps its historical API-only surface and the Vite dev proxy flow
+/// is unchanged.
+pub fn with_ui_assets(router: Router, ui_dir: &std::path::Path) -> Router {
+    let index = tower_http::services::ServeFile::new(ui_dir.join("index.html"));
+    router.fallback_service(tower_http::services::ServeDir::new(ui_dir).fallback(index))
+}
+
 /// Like [`app`], but with an explicitly assembled Doctor state — the seam
 /// tests use to inject fake probe/repair transports and clocks.
 pub fn app_with_doctor(state: AppState, doctor: doctor::DoctorState) -> Router {

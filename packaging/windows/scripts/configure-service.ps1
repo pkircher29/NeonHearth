@@ -101,6 +101,18 @@ if (-not ($entries | Where-Object { $_ -like 'LATTICE_SERVICE_TOKEN=*' })) {
     Write-Log 'LATTICE_SERVICE_TOKEN already present; preserved.'
 }
 
+# The service hosts the installed UI bundle when LATTICE_UI_DIR points at it
+# (crates/lattice-service/src/main.rs). This script lives in
+# <INSTALLFOLDER>\scripts, so the bundle is the sibling ui\ directory —
+# derived from $PSScriptRoot instead of hardcoding Program Files so custom
+# install locations keep working.
+$uiDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'ui'
+$uiEntry = "LATTICE_UI_DIR=$uiDir"
+$uiIdx = -1
+for ($i = 0; $i -lt $entries.Count; $i++) { if ($entries[$i] -like 'LATTICE_UI_DIR=*') { $uiIdx = $i } }
+if ($uiIdx -ge 0) { $entries[$uiIdx] = $uiEntry } else { $entries.Add($uiEntry) }
+Write-Log "Service will serve the dashboard UI from $uiDir on http://127.0.0.1:58120/."
+
 if ($npcapDirPresent -and -not $npcapCompat) {
     # The loader resolves the Packet.dll load-time import through the service's
     # PATH; System32\Npcap is not on the default search path.
@@ -157,4 +169,17 @@ baseline cohort, and approvals survive a reinstall.
 To remove all NeonHearth data after uninstalling, delete this folder.
 "@
 Set-Content -Path (Join-Path $stateDir 'README-UNINSTALL.txt') -Value $uninstallNote
+
+# --- 7. Launch URL ----------------------------------------------------------
+# Print (console only) the pre-paired dashboard URL. Deliberately NOT written
+# through Write-Log: install-configure.log lives under %ProgramData% where
+# non-admin local users can read it, and the URL embeds the pairing token.
+# The Start-menu "NeonHearth" shortcut (open-neonhearth.ps1) reproduces this
+# URL on demand from the registry value.
+$tokenEntry = $entries | Where-Object { $_ -like 'LATTICE_SERVICE_TOKEN=*' } | Select-Object -First 1
+if ($tokenEntry) {
+    $tokenValue = $tokenEntry.Substring('LATTICE_SERVICE_TOKEN='.Length)
+    Write-Host "NeonHearth dashboard (pre-paired): http://127.0.0.1:58120/#token=$tokenValue"
+}
+Write-Log 'Dashboard URL printed to console (token kept out of this log); the Start-menu "NeonHearth" shortcut opens it any time.'
 Write-Log 'Configuration complete.'

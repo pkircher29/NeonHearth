@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { createApiClient } from './lib/api/client';
+  import { bootstrapServiceToken } from './lib/pairing';
   import { initialLiveState, type LiveState } from './lib/stores/live';
   import { createLiveConnection } from './lib/stores/connection';
   import CollectorStatus, { type CollectorState } from './lib/components/CollectorStatus.svelte';
@@ -23,7 +24,10 @@
   }
   onMount(() => {
     let active = true;
-    const client = createApiClient({ baseUrl: window.location.origin, serviceToken: '' }); cameraClient = client;
+    // Local pairing: the installed service serves this page itself and the
+    // launcher passes the bearer token in the URL fragment (never sent over
+    // the network); dev keeps '' and the Vite proxy injects the credential.
+    const client = createApiClient({ baseUrl: window.location.origin, serviceToken: bootstrapServiceToken(window) }); cameraClient = client;
     const connection = createLiveConnection({ client, onState: (state) => { if (active) liveState = state; } });
     void client.health().then(() => { if (active) collectorState = 'ready'; }).catch(() => { if (active) collectorState = 'offline'; });
     void connection.start();

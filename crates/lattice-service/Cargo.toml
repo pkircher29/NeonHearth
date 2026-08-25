@@ -29,6 +29,7 @@ serde_json.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "process"] }
+tower-http = { workspace = true, features = ["fs"] }
 tracing-subscriber.workspace = true
 tracing.workspace = true
 utoipa.workspace = true

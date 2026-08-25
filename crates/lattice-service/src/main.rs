@@ -93,6 +93,27 @@ pub(crate) fn resolve_state_paths() -> Result<PlatformPaths> {
     Ok(platform_paths(platform, base))
 }
 
+/// Default listener address; overridable with `LATTICE_BIND` (loopback only).
+const DEFAULT_BIND: &str = "127.0.0.1:58120";
+
+/// Parse and validate the listener address. `LATTICE_BIND` exists so test
+/// instances can run beside a live installed service (different port, same
+/// machine); it must never widen the privilege boundary, so any non-loopback
+/// IP is refused outright (docs/architecture/privilege-boundary.md: the API
+/// listens on loopback only).
+pub(crate) fn parse_bind(value: Option<&str>) -> Result<std::net::SocketAddr, String> {
+    let text = value.unwrap_or(DEFAULT_BIND);
+    let addr: std::net::SocketAddr = text
+        .parse()
+        .map_err(|error| format!("LATTICE_BIND {text:?} is not a valid socket address: {error}"))?;
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "LATTICE_BIND {text:?} is not a loopback address; the NeonHearth API is loopback-only"
+        ));
+    }
+    Ok(addr)
+}
+
 /// The single shared startup path: token, state directories, database,
 /// runtime worker, loopback listener, and supervised serve-until-shutdown.
 /// Both the console flow and the Windows service flow run exactly this, so
@@ -119,15 +140,30 @@ pub(crate) async fn serve(
     let state = AppState::new(token, M2StateRepository::new(pool.clone()))?;
     let startup =
         lattice_service::runtime::build(state.clone(), M2StateRepository::new(pool.clone())).await;
-    let listener = TcpListener::bind("127.0.0.1:58120")
+    let bind_var = std::env::var("LATTICE_BIND").ok();
+    let bind = parse_bind(bind_var.as_deref()).map_err(|message| anyhow::anyhow!(message))?;
+    let listener = TcpListener::bind(bind)
         .await
-        .context("bind loopback listener 127.0.0.1:58120")?;
+        .with_context(|| format!("bind loopback listener {bind}"))?;
     on_listening();
     PolicyRepository::new(pool.clone())
         .mark_successful_service_start(Utc::now())
         .await
         .context("initialize first successful service baseline")?;
-    let server = axum::serve(listener, app(state))
+    // Optional static UI hosting: when the installer (or an operator) points
+    // LATTICE_UI_DIR at the staged Vite bundle, the service serves the
+    // dashboard at "/" (no bearer needed for assets; API auth unchanged).
+    // Absent, the historical API-only behavior is preserved exactly.
+    let router = app(state);
+    let router = match std::env::var_os("LATTICE_UI_DIR") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            tracing::info!(ui_dir = %dir.display(), "serving UI bundle at /");
+            lattice_service::with_ui_assets(router, &dir)
+        }
+        None => router,
+    };
+    let server = axum::serve(listener, router)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
         .into_future();
     match startup {
@@ -207,6 +243,38 @@ mod tests {
         let error = parse_mode(args(&["--serivce"])).unwrap_err();
         assert!(error.contains("--serivce"), "{error}");
         assert!(parse_mode(args(&["--service", "extra"])).is_err());
+    }
+
+    #[test]
+    fn bind_defaults_to_loopback_58120() {
+        assert_eq!(parse_bind(None), Ok("127.0.0.1:58120".parse().unwrap()));
+    }
+
+    #[test]
+    fn bind_accepts_alternate_loopback_ports_and_ipv6_loopback() {
+        assert_eq!(
+            parse_bind(Some("127.0.0.1:58121")),
+            Ok("127.0.0.1:58121".parse().unwrap())
+        );
+        assert_eq!(
+            parse_bind(Some("[::1]:58121")),
+            Ok("[::1]:58121".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn bind_refuses_non_loopback_addresses() {
+        for bad in ["0.0.0.0:58120", "192.168.1.10:58120", "[::]:58120"] {
+            let error = parse_bind(Some(bad)).unwrap_err();
+            assert!(error.contains("loopback"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn bind_refuses_garbage() {
+        for bad in ["", "not-an-address", "127.0.0.1", "127.0.0.1:notaport"] {
+            assert!(parse_bind(Some(bad)).is_err(), "{bad} should be rejected");
+        }
     }
 
     #[test]
