@@ -8,9 +8,14 @@
 #   pwsh -File packaging\stage.ps1 [-SkipRust] [-SkipUi]
 #
 # Windows build environment quirks handled here (see docs/build/installers.md):
-#   - The workspace pins the stable channel and resolves to the windows-gnu
-#     toolchain on this host, so mingw64 gcc must be first on PATH.
-#   - Linking needs Npcap's Packet.lib import library; RUSTFLAGS supplies it.
+#   - On the dev machine the stable channel resolves to the windows-gnu
+#     toolchain, so mingw64 gcc must be first on PATH (prepended only when
+#     C:\msys64 exists; hosted CI runners use the MSVC toolchain and have no
+#     msys64).
+#   - Linking needs Npcap's Packet.lib import library. If the caller already
+#     set RUSTFLAGS (CI points it at an extracted Npcap SDK Lib\x64), it is
+#     respected; otherwise the dev-machine default (installed Npcap's
+#     System32\Npcap directory) is used.
 
 [CmdletBinding()]
 param(
@@ -26,8 +31,13 @@ $RepoRoot = Split-Path -Parent $PackagingRoot
 $DistRoot = Join-Path $PackagingRoot 'dist\windows'
 $Desktop = Join-Path $RepoRoot 'apps\desktop'
 
-$env:PATH = 'C:\msys64\mingw64\bin;' + $env:PATH
-$env:RUSTFLAGS = '-L C:\Windows\System32\Npcap'
+if (Test-Path 'C:\msys64\mingw64\bin') {
+    $env:PATH = 'C:\msys64\mingw64\bin;' + $env:PATH
+}
+if (-not $env:RUSTFLAGS) {
+    $env:RUSTFLAGS = '-L C:\Windows\System32\Npcap'
+}
+Write-Host "RUSTFLAGS: $env:RUSTFLAGS"
 
 if (-not $SkipRust) {
     Write-Host '== cargo build --release -p lattice-service =='

@@ -4,18 +4,26 @@
 
   Build (after running packaging\stage.ps1 to produce packaging\dist\windows):
 
-    wix extension add -g WixToolset.Util.wixext
+    wix extension add -g WixToolset.Util.wixext/5.0.2
     wix build packaging\windows\NeonHearth.wxs ^
         -ext WixToolset.Util.wixext ^
         -bindpath dist=packaging\dist\windows ^
         -arch x64 ^
+        -d MsiVersion=0.1.0 ^
         -o packaging\dist\NeonHearth-0.1.0-x64.msi
 
-  STATUS / HONESTY: this file has been validated as well-formed XML on the
-  build machine only. `wix build` has NOT been run on this machine: the wix
-  CLI is not installed and cannot be installed here because no .NET SDK is
-  present ("dotnet tool install -g wix" fails with "No .NET SDKs were
-  found"). Schema-level and MSI-level validation remain outstanding.
+  REQUIRES WiX v5+ (pinned to 5.0.2 in .github/workflows/release.yml): the
+  <Files> wildcard-harvesting element used for the UI bundle does not exist
+  in WiX 4.x (verified: wix 4.0.6 fails with WIX0005 on it; wix 5.0.2
+  builds this file cleanly).
+
+  MsiVersion must be a numeric x.y.z (MSI ProductVersion cannot carry a
+  semver prerelease suffix like -alpha.1; the release workflow strips it
+  and keeps the full version only in the output filename).
+
+  STATUS: `wix build` (5.0.2) of this file succeeds on the build machine and
+  the resulting MSI's file layout was verified via `msiexec /a` extraction.
+  A real install/uninstall on a clean machine has still not been performed.
 
   Reality this authoring is based on (verified in source):
   - The service binary is crates/lattice-service (main.rs). It requires the
@@ -39,9 +47,15 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
+  <!-- Numeric MSI version, overridable from the command line with
+       -d MsiVersion=x.y.z (the release workflow derives it from the tag). -->
+  <?ifndef MsiVersion ?>
+    <?define MsiVersion = "0.1.0" ?>
+  <?endif ?>
+
   <Package Name="NeonHearth"
            Manufacturer="NeonHearth Project"
-           Version="0.1.0"
+           Version="$(var.MsiVersion)"
            UpgradeCode="6f1f9d3e-52aa-4f3b-9b0a-3d2f4bfae8c1"
            Scope="perMachine"
            Compressed="yes">
