@@ -26,7 +26,7 @@ jobs:
       # backtraces useful at a fraction of the size.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The hosted image ships ~30GB of toolchains this job never uses; the
       # debug build of this workspace (wasmtime, cranelift, sqlx, ...) needs
@@ -68,7 +68,7 @@ jobs:
     name: cargo-deny (advisories, licenses, bans, sources)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@v2
@@ -85,9 +85,9 @@ jobs:
       run:
         working-directory: apps/desktop
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -114,7 +114,7 @@ jobs:
     name: SBOM (CycloneDX)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install libpcap
         run: sudo apt-get update && sudo apt-get install -y libpcap-dev
@@ -130,7 +130,7 @@ jobs:
       - name: Generate Rust SBOMs (CycloneDX JSON, one per crate)
         run: cargo cyclonedx --format json
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -150,7 +150,7 @@ jobs:
           find crates tools apps -name '*.cdx.json' -exec cp {} sbom-out/ \;
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-cyclonedx
           path: sbom-out/
