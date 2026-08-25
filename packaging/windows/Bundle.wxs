@@ -24,9 +24,12 @@
   NeonHearth-$(var.FullVersion)-x64.msi (same relative-bindpath hazard as
   the <Files> harvest in NeonHearth.wxs).
 
-  Versioning: MsiVersion is the numeric x.y.z (Bundle/@Version follows the
-  MSI ProductVersion); FullVersion is the complete tag version (may carry a
-  -prerelease suffix) and only selects the MSI filename.
+  Versioning: MsiVersion is the numeric x.y.z; FullVersion is the complete
+  tag version (may carry a -prerelease suffix) and selects the MSI filename
+  AND is the Bundle/@Version. Unlike MSI ProductVersion, Burn understands
+  semantic versions, so 0.1.0-alpha.5 correctly upgrades a registered
+  0.1.0-alpha.4 bundle (with the plain numeric version both alphas would
+  compare equal and the old bundle's ARP entry would linger).
 
   Validation without installing:
     wix burn extract NeonHearth-Setup-...-x64.exe -o <dir> -intermediateFolder <tmp>
@@ -54,7 +57,7 @@
 
   <Bundle Name="NeonHearth"
           Manufacturer="NeonHearth Project"
-          Version="$(var.MsiVersion)"
+          Version="$(var.FullVersion)"
           UpgradeCode="8c2a41d7-6b0e-4f5c-9d21-b4a7c3e9f102"
           Compressed="yes">
 
