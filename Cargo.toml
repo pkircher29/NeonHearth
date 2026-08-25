@@ -48,6 +48,7 @@ utoipa-axum = "0.2"
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 pnet_datalink = "0.35"
 windows-sys = "0.61"
+windows-service = "0.8"
 pcap-file = "2.0"
 hickory-proto = "0.25"
 quick-xml = "0.38"

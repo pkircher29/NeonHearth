@@ -89,7 +89,12 @@ if (-not ($entries | Where-Object { $_ -like 'LATTICE_SERVICE_TOKEN=*' })) {
     $bytes = New-Object byte[] 48
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-    $token = [Convert]::ToBase64String($bytes)   # 64 chars, > 32-char minimum
+    # URL-safe alphabet, NOT standard base64: AppState::new (state.rs) only
+    # accepts [A-Za-z0-9._-] tokens, and '+'/'/' from plain ToBase64String
+    # made the service reject its own installer-generated token (verified
+    # against a live service: "invalid service token configuration").
+    # 48 bytes -> exactly 64 chars, no '=' padding.
+    $token = [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_')
     $entries.Add("LATTICE_SERVICE_TOKEN=$token")
     Write-Log 'Generated new LATTICE_SERVICE_TOKEN (stored only in the service Environment registry value).'
 } else {

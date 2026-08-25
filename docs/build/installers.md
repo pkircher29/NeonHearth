@@ -38,7 +38,10 @@ packaging/
   would be dishonest surface. If a LAN/Tailscale listener is ever added,
   firewall authoring must be revisited then.
 - The service has **no built-in service-install mechanism**; MSI
-  `ServiceInstall` / systemd own registration.
+  `ServiceInstall` / systemd own registration. It DOES have a built-in SCM
+  entry point: `lattice-service.exe --service` connects the Windows service
+  dispatcher (`win_service.rs`); without the flag it is a plain console app.
+  `ServiceInstall` passes `Arguments="--service"` accordingly.
 - The service serves the **loopback API only** — it does not serve the UI
   bundle over HTTP in this build (no static file routes exist in
   `lattice-service`). The Vite bundle from `apps/desktop` is installed as
@@ -86,6 +89,36 @@ packaging/
    - `nfpm.yaml`: parsed by PyYAML (5 contents entries, 3 scripts).
    - `stage.sh`: `bash -n` clean; the three Linux package scripts: `sh -n` clean.
    - `stage.ps1`, `configure-service.ps1`: PowerShell language parser reports zero errors.
+
+## Verified on this machine (2026-08-25): real service start under the SCM
+
+The first real MSI installs on this (non-clean) machine surfaced two start
+blockers, both now fixed and re-verified against a live service:
+
+1. **The binary never spoke the SCM protocol.** `Start-Service NeonHearth`
+   timed out with System events 7009 ("timeout waiting for the service to
+   connect") + 7000: the exe was a plain console app with no
+   `StartServiceCtrlDispatcher`. Fix: `--service` flag →
+   `win_service.rs` dispatcher (StartPending → Running-after-bind →
+   StopPending → Stopped, Stop/Shutdown accepted, startup errors reported
+   as Stopped/1066 instead of hanging), and
+   `ServiceInstall Arguments="--service"` in `NeonHearth.wxs`.
+2. **The generated token used the wrong alphabet.** `configure-service.ps1`
+   wrote standard base64 (`+`, `/`), but `AppState::new` (state.rs) only
+   accepts `[A-Za-z0-9._-]` tokens ≥ 32 chars, so the service rejected its
+   own installer-generated token ("invalid service token configuration",
+   observed in `service.log`). Fix: URL-safe alphabet (`+`→`-`, `/`→`_`).
+
+Proof (throwaway `NeonHearthTest` service registered with `sc.exe create
+... binPath= '"<release exe>" --service' obj= LocalSystem`, token +
+`LATTICE_STATE_BASE` in the service-private `Environment` registry value,
+fully deleted afterwards): start reached RUNNING in **0.28 s**,
+`GET /api/v1/health` → 200, `sc.exe stop` showed STOP_PENDING and reached
+STOPPED with exit code 0 in **0.02 s**, `sc.exe delete` clean. Service-mode
+tracing goes to `<state dir>\service.log` (the SCM gives the process no
+console); the console dev flow is unchanged and was re-smoked (health 200,
+state dir layout intact). A clean-machine MSI acceptance run (RLS4) is
+still outstanding.
 
 ## Verified in CI (2026-08-25, tagged-release pipeline)
 

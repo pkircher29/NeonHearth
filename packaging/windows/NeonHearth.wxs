@@ -36,6 +36,11 @@
     LATTICE_SERVICE_TOKEN environment variable and binds 127.0.0.1:58120
     (loopback) only. It has NO built-in service install mechanism, so MSI
     ServiceInstall registers it.
+  - The binary only speaks the SCM protocol (StartServiceCtrlDispatcher via
+    win_service.rs) when launched with the service flag (Arguments below);
+    without it the exe is a plain console app. ServiceInstall therefore MUST
+    pass the flag: the first real installs omitted it and every start timed
+    out with SCM events 7009/7000 (no ServiceMain ever registered).
   - NO Windows Firewall rule is authored, deliberately: the listener is
     loopback-only and Windows Firewall does not filter loopback traffic.
     If a LAN listener is ever added, an inbound rule must be added then.
@@ -94,6 +99,10 @@
              Start=auto is the with-Npcap default; configure-service.ps1
              demotes it to demand when Npcap is absent (limited mode) and
              performs the actual start, so no ServiceControl Start here. -->
+        <!-- The Arguments flag selects the SCM dispatcher entry point in
+             the binary (win_service.rs). Without it the exe runs as a console
+             app, never calls StartServiceCtrlDispatcher, and the SCM start
+             times out (events 7009/7000, observed on the first installs). -->
         <ServiceInstall Id="NeonHearthService"
                         Name="NeonHearth"
                         DisplayName="NeonHearth Collector"
@@ -102,6 +111,7 @@
                         Start="auto"
                         ErrorControl="normal"
                         Account="NT SERVICE\NeonHearth"
+                        Arguments="--service"
                         Vital="yes">
           <!-- Restart-on-failure recovery (mirrored by sc.exe in
                configure-service.ps1 for resilience if this extension
