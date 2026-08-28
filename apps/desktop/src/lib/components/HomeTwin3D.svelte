@@ -538,7 +538,7 @@
 <style>
   .twin { position: relative; display: grid; gap: 10px; }
   .twin-toolbar { display: flex; flex-wrap: wrap; gap: 8px; }
-  .twin-toolbar button { border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--surface); min-height: 36px; padding: 0 12px; cursor: pointer; font: 500 12.5px var(--font-body); }
+  .twin-toolbar button { border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--panel); min-height: 36px; padding: 0 12px; cursor: pointer; font: 500 12.5px var(--font-body); }
   .twin-toolbar button[aria-pressed='true'] { border-color: var(--ember); color: var(--ember); }
   .twin-stage { min-height: 320px; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--ground); overflow: hidden; touch-action: none; }
   .twin-stage:focus-visible { outline: 2px solid var(--ember); outline-offset: 2px; }

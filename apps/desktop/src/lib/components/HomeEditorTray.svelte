@@ -43,7 +43,7 @@
 </aside>
 
 <style>
-  .device-tray{padding:16px;border:1px solid var(--line);border-radius:var(--radius-card);background:var(--surface)}
+  .device-tray{padding:16px;border:1px solid var(--line);border-radius:var(--radius-card);background:var(--panel)}
   .device-tray h2{margin:0 0 10px;font:600 14px var(--font-body);color:var(--ink)}
   .device-tray h3{margin:18px 0 8px;font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.12em;color:var(--ember)}
   .tray-list{list-style:none;margin:0;padding:0;display:grid;gap:7px}

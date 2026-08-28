@@ -1,14 +1,26 @@
-import type { ApiClient } from '../api/client';
+import { UnauthorizedError, type ApiClient } from '../api/client';
 import type { ServerMessage } from '../api/types';
 import { applySnapshot, initialLiveState, reduceLiveMessage, type LiveState } from './live';
 
 export interface SessionTimers { setTimeout: (callback: () => void, delay: number) => unknown; clearTimeout: (timer: unknown) => void }
-export interface LiveConnectionOptions { client: ApiClient; onState?: (state: LiveState) => void; timers?: SessionTimers; maxReconnectDelayMs?: number }
+export interface LiveConnectionOptions {
+  client: ApiClient;
+  onState?: (state: LiveState) => void;
+  /**
+   * The stored pairing was rejected (401 on the snapshot or event-ticket
+   * call). The connection has already stopped — no retry loop keeps running
+   * against a dead token. The owner of the UI should clear the stored token
+   * and render the re-pair action state.
+   */
+  onUnauthorized?: () => void;
+  timers?: SessionTimers;
+  maxReconnectDelayMs?: number;
+}
 export interface LiveConnection { start(): Promise<void>; stop(): void; getState(): LiveState }
 
 const defaultTimers: SessionTimers = { setTimeout: (callback, delay) => globalThis.setTimeout(callback, delay), clearTimeout: (timer) => globalThis.clearTimeout(timer as ReturnType<typeof setTimeout>) };
 
-export function createLiveConnection({ client, onState, timers = defaultTimers, maxReconnectDelayMs = 30_000 }: LiveConnectionOptions): LiveConnection {
+export function createLiveConnection({ client, onState, onUnauthorized, timers = defaultTimers, maxReconnectDelayMs = 30_000 }: LiveConnectionOptions): LiveConnection {
   let state = initialLiveState;
   let socket: WebSocket | undefined;
   let retryTimer: unknown;
@@ -38,8 +50,21 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
       socket = opened;
       retry = 0;
       cancelRetry();
-    } catch {
-      scheduleReconnect(token);
+    } catch (cause) {
+      if (cause instanceof UnauthorizedError) {
+        // A rejected token never heals by retrying: stop the loop entirely
+        // and hand the decision to the UI (clear pairing, ask to re-pair).
+        stopped = true;
+        generation += 1;
+        pendingHydration = false;
+        cancelRetry();
+        closeSocket();
+        state = { ...state, connected: false };
+        publish();
+        onUnauthorized?.();
+      } else {
+        scheduleReconnect(token);
+      }
     } finally {
       hydrationGeneration = undefined;
       if (pendingHydration) { pendingHydration = false; if (!stopped) void hydrateAndOpen(generation); }

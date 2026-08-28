@@ -1,86 +1,127 @@
-/* NeonHearth shared shell + view furniture (v2 "daylight hearth"). Tokens only. */
+/* NeonHearth shared shell + view furniture (v3 "glass, chrome, and fire"). Tokens only. */
 
-/* ---- Shell: top tab bar, content, live-thread column ---- */
-.app-shell { min-height: 100svh; display: flex; flex-direction: column; background: var(--ground); color: var(--ink); --main-pad-x: clamp(22px, 4vw, 56px); --main-pad-y: 34px; }
-.topbar { display: flex; align-items: center; gap: clamp(14px, 3vw, 36px); padding: 10px clamp(16px, 3vw, 32px); background: var(--surface); box-shadow: var(--shadow); position: relative; z-index: 4; }
-.brand { display: flex; align-items: center; gap: 9px; font: 900 17px/1 var(--font-display); letter-spacing: 0.01em; color: var(--ink); }
-.brand-mark { color: var(--ember); font-size: 18px; }
+/* Frosted glass: the blur that makes translucent panels read as glass.
+   (Fallbacks live in app.css: unsupported/reduced-transparency environments
+   swap the tokens to solid #15151D panels.) */
+.topbar, .mobile-head, .mobile-nav, .mobile-drawer, .pill-control, .hero-caption,
+.event-quiet, .device-card, .search input, .tabs, .not-ready,
+.stat-band, .top-devices, .guard-meter, .policy-card, .camera-card, .camera-console,
+.camera-state, .check-row, .finding-card, .banner, .home-banner, .floor-tab,
+.device-tray, .inspector, .editor-state, .twin-fallback {
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  /* Every sheet of glass catches light along its top edge and drops a deep
+     ambient shadow onto the void. */
+  border-top-color: var(--glass-edge);
+}
+
+/* ---- Shell: glass top bar over the aurora ---- */
+.app-shell { min-height: 100svh; display: flex; flex-direction: column; color: var(--ink); --main-pad-x: clamp(22px, 4vw, 56px); --main-pad-y: 34px; }
+.topbar { display: flex; align-items: center; gap: clamp(14px, 3vw, 36px); padding: 10px clamp(16px, 3vw, 32px); background: var(--panel); border-bottom: 1px solid var(--line); box-shadow: 0 14px 40px rgb(0 0 0 / 0.5), inset 0 1px 0 var(--glass-edge); position: relative; z-index: 4; }
+.brand { display: flex; align-items: center; gap: 9px; font: 700 18px/1 var(--font-display); letter-spacing: 0.02em; }
+/* The wordmark is machined metal: the chrome ramp clipped to the glyphs. */
+.brand > span:last-child { background: var(--chrome); -webkit-background-clip: text; background-clip: text; color: transparent; filter: drop-shadow(0 1px 0 rgb(0 0 0 / 0.6)); }
+.brand-mark { color: var(--fire-gold); font-size: 18px; text-shadow: 0 0 10px rgb(255 197 61 / 0.75), 0 0 22px rgb(255 109 59 / 0.5); }
 .topbar nav { display: flex; flex-wrap: wrap; gap: 4px; }
-.topbar nav button { border: 0; background: none; color: var(--ink-mute); padding: 9px 14px; border-radius: var(--radius-pill); font: 500 13.5px var(--font-body); cursor: pointer; display: flex; align-items: center; gap: 8px; min-height: 42px; }
-.topbar nav button:hover { background: var(--ground); color: var(--ink); }
-.topbar nav button.active { background: var(--surface-2); color: var(--ember); }
+.topbar nav button { position: relative; border: 0; background: none; color: var(--ink-mute); padding: 9px 14px; border-radius: 12px; font: 500 13.5px var(--font-body); cursor: pointer; display: flex; align-items: center; gap: 8px; min-height: 42px; }
+.topbar nav button:hover { background: var(--panel); color: var(--ink); }
+.topbar nav button.active { background: var(--panel-strong); color: var(--ink); box-shadow: inset 0 1px 0 var(--glass-edge); }
+.topbar nav button.active::after { content: ''; position: absolute; left: 12px; right: 12px; bottom: 4px; height: 2px; border-radius: 2px; background: var(--flame-ramp); box-shadow: 0 0 10px rgb(224 64 251 / 0.7), 0 0 4px rgb(255 197 61 / 0.7); }
 .nav-icon { width: 18px; text-align: center; color: var(--ink-mute); font-size: 16px; }
-.topbar nav button.active .nav-icon { color: var(--ember); }
+.topbar nav button.active .nav-icon { color: var(--fire-gold); }
 .topbar-note { margin-left: auto; display: flex; align-items: center; gap: 7px; color: var(--ink-mute); font: 500 10px var(--font-mono); letter-spacing: 0.14em; text-transform: uppercase; }
-.secure-icon { color: var(--sage); font-size: 16px; }
+.secure-icon { color: var(--safe); font-size: 16px; }
 .app-body { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 300px; align-items: start; }
 .app-shell main { min-width: 0; padding: var(--main-pad-y) var(--main-pad-x); overflow: auto; }
-.events-rail { padding: var(--main-pad-y) 24px 24px; display: flex; flex-direction: column; gap: 18px; min-height: 100%; }
+.events-rail { padding: var(--main-pad-y) 24px 24px; display: flex; flex-direction: column; gap: 18px; min-height: 100%; border-left: 1px solid var(--line); background: var(--panel); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur); box-shadow: -18px 0 48px rgb(0 0 0 / 0.4); }
 .mobile-head, .mobile-nav { display: none; }
 
 /* Full-bleed hero: escapes main's padding so the view's primary surface
-   runs edge-to-edge, with white pill controls floating over it. */
+   runs edge-to-edge over the aurora, with floating glass controls. */
 .hero-bleed { margin: calc(-1 * var(--main-pad-y)) calc(-1 * var(--main-pad-x)) 0; }
 
 /* ---- Type roles ---- */
 .kicker, .metric-label { color: var(--ink-mute); font: 500 var(--text-eyebrow)/1.4 var(--font-mono); letter-spacing: 0.12em; text-transform: uppercase; }
-.view-heading h1, .not-ready h1 { margin: 10px 0 8px; font: 600 var(--text-display)/1.15 var(--font-display); letter-spacing: -0.01em; color: var(--ink); }
+.view-heading h1, .not-ready h1 { margin: 10px 0 8px; font: 700 var(--text-display)/1.12 var(--font-display); letter-spacing: -0.015em; color: var(--ink); }
 .muted { color: var(--ink-mute); line-height: 1.5; }
 
-/* ---- Floating white pill (single controls over a hero) ---- */
-.pill-control { border: 0; background: var(--surface); color: var(--ink); border-radius: var(--radius-pill); box-shadow: var(--shadow); min-height: 44px; padding: 0 18px; font: 500 13px var(--font-body); cursor: pointer; }
-.pill-control:hover { background: var(--surface-2); }
+/* ---- Floating glass pill (single controls over a hero) ---- */
+.pill-control { border: 1px solid var(--line); border-top-color: var(--glass-edge); background: var(--panel); color: var(--ink); border-radius: var(--radius-pill); box-shadow: var(--shadow); min-height: 44px; padding: 0 18px; font: 500 13px var(--font-body); cursor: pointer; transition: background 160ms ease, border-color 160ms ease; }
+.pill-control:hover { background: var(--panel-strong); border-color: rgb(255 197 61 / 0.45); border-top-color: var(--glass-edge); }
 
-/* ---- Presence: coals, in daylight. One language for every status dot. ---- */
+/* ---- Presence: flames of all colors. One language for every status dot. ---- */
 .presence-dot { display: inline-block; flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--ink-mute); }
-.presence-dot.online { background: var(--ember); box-shadow: var(--ember-glow); }
-.presence-dot.quiet { background: var(--ink-mute); }
-.presence-dot.offline { background: transparent; border: 2px solid var(--ink-mute); }
+.presence-dot.online { background: radial-gradient(circle at 34% 28%, #FFF3D0, var(--fire-gold) 34%, var(--fire-orange) 78%); box-shadow: var(--ember-glow); animation: ember-live 2.6s ease-in-out infinite; }
+.presence-dot.quiet { background: radial-gradient(circle at 34% 28%, #C9B6FF, var(--fire-violet) 42%, var(--fire-blue) 84%); box-shadow: 0 0 10px 2px rgb(124 77 255 / 0.5); }
+@keyframes ember-live { 50% { box-shadow: 0 0 18px 4px rgb(255 109 59 / 0.8), 0 0 40px 9px rgb(255 197 61 / 0.34); } }
+.presence-dot.offline { background: transparent; border: 2px solid var(--line); }
 .presence-dot.blocked { background: transparent; border: 2px solid var(--alert); }
 .presence-dot.unknown { background: transparent; border: 1px dashed var(--ink-mute); }
+@media (prefers-reduced-motion: reduce) { .presence-dot.online { animation: none; box-shadow: var(--ember-glow); } }
 
 /* ---- Pulse hearth hero chrome ---- */
 .lung-panel { position: relative; }
-.lung-wrap { position: relative; min-height: 300px; display: grid; place-items: center; background: var(--ground); }
-.lung-readout { position: relative; text-align: center; }
-.lung-readout span { display: block; font: 600 34px/1.1 var(--font-display); color: var(--ink); }
-.lung-wrap.unavailable .lung-readout span { color: var(--ink-mute); }
-.lung-readout small { color: var(--ink-mute); font: 400 10px var(--font-mono); letter-spacing: 0.12em; text-transform: uppercase; }
+.lung-wrap { position: relative; min-height: 300px; display: grid; place-items: center; }
+/* The readout is a plaque of frosted glass laid over the fire: the flame blooms
+   through it as diffuse colour, and the smoked tint keeps white type at AA no
+   matter how bright the flame behind it burns. */
+.lung-readout {
+  position: relative; z-index: 1; text-align: center; padding: 18px clamp(24px, 3.4vw, 42px);
+  translate: 0 54px;
+  border: 1px solid var(--glass-line); border-top-color: var(--glass-edge);
+  border-radius: 22px;
+  background: linear-gradient(154deg, rgb(14 10 25 / 0.8), rgb(7 5 14 / 0.72));
+  backdrop-filter: blur(30px) saturate(1.8);
+  -webkit-backdrop-filter: blur(30px) saturate(1.8);
+  box-shadow: 0 24px 60px rgb(0 0 0 / 0.55), inset 0 1px 0 var(--glass-edge);
+}
+.lung-readout span { display: block; font: 700 clamp(40px, 5.2vw, 62px)/1.05 var(--font-display); letter-spacing: -0.02em; color: var(--ink); text-shadow: 0 2px 22px rgb(0 0 0 / 0.7); }
+/* No reading to show? The readout becomes machined chrome, never grey mush. */
+.lung-wrap.unavailable .lung-readout span { background: var(--chrome); -webkit-background-clip: text; background-clip: text; color: transparent; text-shadow: none; filter: drop-shadow(0 2px 10px rgb(0 0 0 / 0.8)); }
+.lung-readout small { display: block; margin-top: 8px; color: var(--ink-mute); font: 500 10.5px var(--font-mono); letter-spacing: 0.22em; text-transform: uppercase; }
 .lung-caption { padding: 12px var(--main-pad-x) 0; display: flex; gap: 10px; align-items: center; font-size: 12.5px; }
 .lung-caption .muted { margin-left: auto; font-size: 11.5px; }
 
 /* ---- Sections, empty states, live thread ---- */
 .section-title { display: flex; justify-content: space-between; align-items: center; margin-top: 32px; }
 .section-title h2 { margin: 0; font: 600 var(--text-h2) var(--font-body); }
-.empty-state { display: flex; gap: 14px; align-items: flex-start; padding: 20px 0; border-bottom: 1px solid var(--line); }
-.empty-icon, .not-ready-mark { color: var(--ink-mute); font-size: 28px; }
+.empty-state { display: flex; gap: 14px; align-items: flex-start; margin-top: 6px; padding: 20px var(--pad-card); border: 1px solid var(--line); border-top-color: var(--glass-edge); border-radius: var(--radius-card); background: var(--panel); box-shadow: var(--shadow); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur); }
+/* Even a nothing-to-show marker is lit: a violet ember, not a grey glyph. */
+.empty-icon, .not-ready-mark { color: var(--fire-violet); font-size: 28px; text-shadow: 0 0 14px rgb(124 77 255 / 0.85), 0 0 34px rgb(224 64 251 / 0.45); }
 .empty-state p { margin: 5px 0 0; font-size: 12.5px; }
-.event-quiet { border-radius: var(--radius-card); background: var(--surface); box-shadow: var(--shadow); padding: 20px; display: grid; gap: 10px; }
-.event-quiet > span { color: var(--ink-mute); font-size: 26px; }
+.event-quiet { position: relative; overflow: hidden; border: 1px solid var(--line); border-top-color: var(--glass-edge); border-radius: var(--radius-card); background: var(--panel); box-shadow: var(--shadow); padding: 20px; display: grid; gap: 10px; }
+/* The idle hearth of the quiet panel: a low blue-violet ember breathing slowly. */
+.event-quiet::before { content: ''; position: absolute; z-index: 0; left: 50%; bottom: -58px; width: 260px; height: 150px; translate: -50% 0; border-radius: 50%; background: radial-gradient(closest-side, rgb(124 77 255 / 0.55), rgb(61 90 254 / 0.28) 55%, transparent 100%); filter: blur(14px); animation: ember-idle 7s ease-in-out infinite; }
+.event-quiet > * { position: relative; z-index: 1; }
+.event-quiet > span { color: var(--fire-violet); font-size: 26px; text-shadow: 0 0 16px rgb(124 77 255 / 0.9), 0 0 36px rgb(224 64 251 / 0.4); }
+@keyframes ember-idle { 50% { transform: scale(1.14) translateY(-8px); opacity: 0.7; } }
+@media (prefers-reduced-motion: reduce) { .event-quiet::before { animation: none; } }
 .event-quiet p { margin: 0; font-size: 12.5px; }
 .live-pill { color: var(--ink-mute); font: 500 10px var(--font-mono); letter-spacing: 0.1em; display: inline-flex; align-items: center; gap: 7px; }
 .collector-status { margin-top: auto; }
-.not-ready { max-width: 560px; margin: 15vh auto; }
-.not-ready h1 { font-size: clamp(28px, 4vw, 40px); }
+.not-ready { position: relative; overflow: hidden; max-width: 560px; margin: 12vh auto; padding: var(--pad-card) clamp(24px, 4vw, 40px) 32px; border: 1px solid var(--line); border-top-color: var(--glass-edge); border-radius: var(--radius-card); background: var(--panel); box-shadow: var(--shadow); }
+.not-ready::before { content: ''; position: absolute; z-index: 0; left: 50%; bottom: -110px; width: 460px; height: 240px; translate: -50% 0; border-radius: 50%; background: radial-gradient(closest-side, rgb(224 64 251 / 0.34), rgb(124 77 255 / 0.24) 50%, transparent 100%); filter: blur(24px); animation: ember-idle 9s ease-in-out infinite; }
+.not-ready > * { position: relative; z-index: 1; }
+.not-ready h1 { font-size: clamp(26px, 3.6vw, 36px); }
 
 /* ---- Search + segmented tabs ---- */
 .search { display: block; margin: 28px 0 14px; color: var(--ink-mute); font: 500 var(--text-eyebrow) var(--font-mono); text-transform: uppercase; letter-spacing: 0.12em; }
-.search input { display: block; width: 100%; margin-top: 8px; border: 0; border-radius: var(--radius-pill); padding: 13px 18px; background: var(--surface); box-shadow: var(--shadow); color: var(--ink); font: 14.5px var(--font-body); }
+.search input { display: block; width: 100%; margin-top: 8px; border: 1px solid var(--line); border-radius: var(--radius-pill); padding: 13px 18px; background: var(--panel); box-shadow: var(--shadow); color: var(--ink); font: 14.5px var(--font-body); }
 .search input::placeholder { color: var(--ink-mute); opacity: 0.7; }
-.tabs { display: inline-flex; gap: 3px; margin-bottom: 24px; padding: 4px; background: var(--surface-2); border-radius: var(--radius-pill); }
+.tabs { display: inline-flex; gap: 3px; margin-bottom: 24px; padding: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-pill); }
 .tabs button { min-height: 38px; padding: 0 16px; border: 0; border-radius: var(--radius-pill); color: var(--ink-mute); background: none; font: 500 13px var(--font-body); cursor: pointer; }
-.tabs button.active { color: var(--ink); background: var(--surface); box-shadow: var(--shadow); }
+.tabs button.active { color: var(--ink); background: var(--surface-2); box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.18); }
 
 /* ---- Device cards ---- */
 .device-table { display: grid; gap: var(--gap-card); }
-.device-card { display: grid; grid-template-columns: 1.4fr auto; gap: 14px; padding: var(--pad-card); border-radius: var(--radius-card); background: var(--surface); box-shadow: var(--shadow); }
+.device-card { display: grid; grid-template-columns: 1.4fr auto; gap: 14px; padding: var(--pad-card); border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--panel); box-shadow: var(--shadow); }
 .device-name { display: flex; gap: 12px; align-items: flex-start; }
 .device-name .presence-dot { margin-top: 5px; }
 .device-name strong, .device-name span { display: block; }
 .device-name strong { font: 600 15px var(--font-body); }
 .device-name span { color: var(--ink-mute); font-size: 12.5px; margin-top: 4px; }
 .confidence { align-self: start; padding: 5px 10px; border: 1px solid var(--line); border-radius: var(--radius-pill); font: 500 10px var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; }
-.confidence.confirmed { color: var(--sage-text); border-color: var(--sage); }
+.confidence.confirmed { color: var(--safe-text); border-color: var(--safe); }
 .confidence.likely { color: var(--ink-mute); border-style: dashed; }
 .device-card p { margin: 0; color: var(--ink-mute); font-size: 12.5px; }
 .device-card p b { display: block; margin-bottom: 3px; color: var(--ink-mute); font: 500 10px var(--font-mono); letter-spacing: 0.12em; text-transform: uppercase; }
@@ -90,13 +131,14 @@
   .app-shell { display: block; padding-bottom: 72px; --main-pad-x: 19px; --main-pad-y: 24px; }
   .topbar, .events-rail { display: none; }
   .app-body { display: block; }
-  .mobile-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; background: var(--surface); box-shadow: var(--shadow); position: relative; z-index: 4; }
+  .mobile-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line); position: relative; z-index: 4; }
   .app-shell main { padding: var(--main-pad-y) var(--main-pad-x); }
-  .mobile-nav { position: fixed; z-index: 5; bottom: 0; left: 0; right: 0; display: flex; justify-content: space-around; background: var(--surface); box-shadow: 0 -2px 12px rgb(46 38 28 / 0.10); padding: 6px 4px; }
-  .mobile-nav button { border: 0; background: none; cursor: pointer; display: grid; place-items: center; gap: 2px; padding: 5px 10px; min-height: 55px; font: 500 10.5px var(--font-body); color: var(--ink-mute); border-radius: 12px; }
-  .mobile-nav button.active { color: var(--ember); background: var(--surface-2); }
+  .mobile-nav { position: fixed; z-index: 5; bottom: 0; left: 0; right: 0; display: flex; justify-content: space-around; background: var(--panel); border-top: 1px solid var(--line); padding: 6px 4px; }
+  .mobile-nav button { position: relative; border: 0; background: none; cursor: pointer; display: grid; place-items: center; gap: 2px; padding: 5px 10px; min-height: 55px; font: 500 10.5px var(--font-body); color: var(--ink-mute); border-radius: 12px; }
+  .mobile-nav button.active { color: var(--ink); background: var(--surface-2); }
+  .mobile-nav button.active::after { content: ''; position: absolute; left: 12px; right: 12px; bottom: 3px; height: 2px; border-radius: 2px; background: var(--flame-ramp); }
   .mobile-nav button span { font-size: 17px; color: var(--ink-mute); }
-  .mobile-nav button.active span { color: var(--ember); }
+  .mobile-nav button.active span { color: var(--fire-gold); }
   .lung-wrap { min-height: 230px; }
   .lung-caption { flex-wrap: wrap; }
   .lung-caption .muted { width: 100%; margin-left: 20px; }

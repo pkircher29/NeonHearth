@@ -90,7 +90,7 @@
 </aside>
 
 <style>
-  .inspector{display:grid;gap:11px;align-content:start;padding:16px;border:1px solid var(--line);border-radius:var(--radius-card);background:var(--surface)}
+  .inspector{display:grid;gap:11px;align-content:start;padding:16px;border:1px solid var(--line);border-radius:var(--radius-card);background:var(--panel)}
   .inspector header{display:flex;justify-content:space-between;align-items:center}
   .inspector-kicker{margin:0;color:var(--ink-mute);font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.12em}
   .inspector-close{width:28px;height:28px;border:1px solid var(--line);border-radius:6px;background:transparent;color:var(--ink-mute);cursor:pointer}
@@ -108,6 +108,6 @@
   .inspector button.quiet{min-height:30px;padding:4px 8px;font-weight:400}
   .inspector button.danger{border-color:var(--alert);color:var(--alert-text)}
   .inspector button:disabled{opacity:.4;cursor:not-allowed}
-  .confirmed-tag{margin:0;color:var(--sage-text);font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.06em}
+  .confirmed-tag{margin:0;color:var(--safe-text);font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.06em}
   .inspector-note{margin:0;color:var(--ink-mute);font-size:11.5px;line-height:1.5}
 </style>

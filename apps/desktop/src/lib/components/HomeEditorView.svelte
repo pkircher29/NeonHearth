@@ -481,7 +481,7 @@
   .editor-state{margin-top:28px;padding:18px;border:1px dashed var(--line);border-radius:var(--radius-card);color:var(--ink-mute);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   .editor-state.error{border-color:var(--alert);color:var(--alert-text)}
   .editor-state button{min-height:40px;padding:8px 14px;border:1px solid var(--ember);border-radius:8px;background:transparent;color:var(--ember);font:500 12.5px var(--font-body);cursor:pointer}
-  .banner{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:16px 0 0;padding:12px 14px;border-radius:var(--radius-card);border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:12.5px}
+  .banner{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:16px 0 0;padding:12px 14px;border-radius:var(--radius-card);border:1px solid var(--line);background:var(--panel);color:var(--ink);font-size:12.5px}
   .banner strong{color:var(--ink)}
   .banner button{min-height:38px;padding:7px 12px;border:1px solid var(--ember);border-radius:8px;background:transparent;color:var(--ember);font:500 12.5px var(--font-body);cursor:pointer}
   .banner button.quiet{border-color:var(--line);color:var(--ink-mute)}
@@ -496,8 +496,8 @@
   .editor-toolbar{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;margin:22px 0 0}
   .tool-palette{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
   .tool-palette button{min-height:44px;padding:9px 14px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--ink);font:500 12.5px var(--font-body);cursor:pointer}
-  .tool-palette button.active{border-color:var(--ember);color:var(--ember);background:var(--surface)}
-  .tool-palette button.finish{border-color:var(--ember);color:var(--ink);background:var(--ember)}
+  .tool-palette button.active{border-color:var(--ember);color:var(--ember);background:var(--panel)}
+  .tool-palette button.finish{border-color:transparent;color:var(--ink);background:var(--fire-edge-bg)}
   .tool-palette button.quiet{border-color:var(--line);color:var(--ink-mute)}
   .tool-palette button:disabled{opacity:.4;cursor:not-allowed}
   .opening-kind{display:flex;gap:7px;align-items:center;color:var(--ink-mute);font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.1em}
@@ -506,8 +506,8 @@
   .history-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
   .history-actions button{min-height:44px;padding:9px 14px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--ink);font:500 12.5px var(--font-body);cursor:pointer}
   .history-actions button:disabled{opacity:.4;cursor:not-allowed}
-  .history-actions button.save{border-color:var(--ember);background:var(--ember);color:var(--ink);font-weight:600}
-  .history-actions button.save:hover:not(:disabled){background:var(--ember);border-color:var(--ember)}
+  .history-actions button.save{border-color:transparent;background:var(--fire-edge-bg);color:var(--ink);font-weight:600;box-shadow:var(--shadow)}
+  .history-actions button.save:hover:not(:disabled){background:var(--fire-edge-bg);filter:brightness(1.18)}
   .autosave{color:var(--ink-mute);font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.1em}
   .editor-body{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:16px;align-items:start;margin-top:4px}
   .canvas-frame{overflow:auto;border:1px solid var(--line);border-radius:var(--radius-card);background:var(--ground)}
@@ -523,7 +523,7 @@
   .wall.selected{stroke:var(--ember)}
   .wall-opening{stroke-width:6;stroke-linecap:butt;pointer-events:none}
   .wall-opening.door{stroke:var(--ember)}
-  .wall-opening.window{stroke:var(--sage)}
+  .wall-opening.window{stroke:var(--safe)}
   .wall-opening.stair{stroke:var(--ink-mute);stroke-dasharray:4 3}
   .dimension{fill:var(--ember);font:500 12px var(--font-mono);text-anchor:middle;pointer-events:none}
   .placement{cursor:pointer}

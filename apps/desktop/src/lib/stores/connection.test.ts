@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { ApiClient } from '../api/client';
+import { UnauthorizedError, type ApiClient } from '../api/client';
 import { createLiveConnection } from './connection';
 
 const clientStub = (overrides: Partial<ApiClient> = {}) => ({
@@ -33,6 +33,31 @@ describe('createLiveConnection', () => {
     onState?.('open');
     expect(connection.getState().connected).toBe(true);
     connection.stop();
+  });
+
+  it('reports a rejected pairing once and never retries against the dead token', async () => {
+    const timers = { setTimeout: vi.fn(() => 1), clearTimeout: vi.fn() };
+    const onUnauthorized = vi.fn();
+    const client = clientStub({ snapshotAll: vi.fn(async () => { throw new UnauthorizedError(); }) });
+    const connection = createLiveConnection({ client, timers, onUnauthorized });
+
+    await connection.start();
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    expect(connection.getState().connected).toBe(false);
+    // No reconnect loop: a 401 cannot heal without a new pairing.
+    expect(timers.setTimeout).not.toHaveBeenCalled();
+    expect(client.snapshotAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a rejected event ticket (websocket auth) as an expired pairing too', async () => {
+    const timers = { setTimeout: vi.fn(() => 1), clearTimeout: vi.fn() };
+    const onUnauthorized = vi.fn();
+    const client = clientStub({ openEvents: vi.fn(async () => { throw new UnauthorizedError(); }) });
+    const connection = createLiveConnection({ client, timers, onUnauthorized });
+
+    await connection.start();
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    expect(timers.setTimeout).not.toHaveBeenCalled();
   });
 
   it('marks a failed websocket attempt disconnected before retrying', async () => {

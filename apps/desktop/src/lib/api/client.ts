@@ -540,11 +540,25 @@ function isDoctorApproval(value: unknown): value is DoctorApproval {
     && isApprovalIdToken(value.approval_id) && isDate(value.expires_at);
 }
 
+/**
+ * The service rejected the bearer token (HTTP 401). This is the typed signal
+ * the connection layer uses to distinguish "this window's pairing expired"
+ * (recoverable only by re-pairing) from transient network failures that
+ * deserve a retry loop.
+ */
+export class UnauthorizedError extends Error {
+  constructor() {
+    super('Pairing rejected with status 401');
+    this.name = 'UnauthorizedError';
+  }
+}
+
 export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebSocketImpl = WebSocket }: ApiClientOptions): ApiClient {
   const apiUrl = (path: string) => new URL(path, baseUrl).toString();
 
   async function request(path: string, init?: RequestInit): Promise<unknown> {
     const response = await fetchImpl(apiUrl(path), init);
+    if (response.status === 401) throw new UnauthorizedError();
     if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
     return response.json() as Promise<unknown>;
   }

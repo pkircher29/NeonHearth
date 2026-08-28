@@ -28,7 +28,22 @@ export interface PairingWindow {
   sessionStorage: {
     getItem(key: string): string | null;
     setItem(key: string, value: string): void;
+    removeItem(key: string): void;
   };
+}
+
+/**
+ * Forget the stored pairing token. Called when the service rejects the token
+ * (401): keeping a dead credential around would make every reload retry a
+ * pairing that can only be renewed through the Start-menu launcher. A fresh
+ * `#token=` fragment on the next launch pairs normally again.
+ */
+export function clearStoredToken(win: PairingWindow): void {
+  try {
+    win.sessionStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // Disabled storage means nothing was persisted anyway.
+  }
 }
 
 function storedToken(win: PairingWindow): string {

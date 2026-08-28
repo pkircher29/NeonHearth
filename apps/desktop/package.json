@@ -26,9 +26,9 @@
     "vitest": "^4.1.11"
   },
   "dependencies": {
-    "@fontsource/fraunces": "^5.2.5",
     "@fontsource/ibm-plex-mono": "^5.2.5",
     "@fontsource/ibm-plex-sans": "^5.2.5",
+    "@fontsource/space-grotesk": "^5.2.5",
     "hls.js": "^1.7.1",
     "three": "^0.185.1"
   }

@@ -15,7 +15,7 @@
 
 <style>
   .floor-bar{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 12px}
-  .floor-tab{display:grid;gap:2px;min-height:44px;padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);text-align:left;cursor:pointer}
+  .floor-tab{display:grid;gap:2px;min-height:44px;padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);text-align:left;cursor:pointer}
   .floor-tab.active{border-color:var(--ember);color:var(--ink)}
   .floor-tab strong{font:600 13px var(--font-body)}
   .floor-tab small{color:var(--ink-mute);font:400 10px var(--font-mono);text-transform:uppercase;letter-spacing:.06em}
