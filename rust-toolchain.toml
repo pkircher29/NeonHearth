@@ -1,4 +1,7 @@
 [toolchain]
-channel = "stable"
+# Pinned to an exact release (audit LOW): the previous `stable` pin resolved to
+# a different compiler every six weeks and cost a clippy-drift fix (bf568b1).
+# Bump deliberately; CI names the same version in .github/workflows/ci.yml.
+channel = "1.96.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

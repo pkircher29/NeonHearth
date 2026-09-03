@@ -26,6 +26,20 @@ vendor: NeonHearth Project
 homepage: https://github.com/pkircher29/NeonHearth
 license: AGPL-3.0-or-later
 
+# ffmpeg is required by the camera media pipeline (crates/lattice-camera
+# media.rs spawns it; audit M-18: it was neither packaged nor declared, so
+# camera media failed on every clean install). Debian/Ubuntu ship the `ffmpeg`
+# package in main. Fedora ships `ffmpeg-free` in the base repos and the full
+# `ffmpeg` via RPM Fusion; both provide /usr/bin/ffmpeg, so the rpm depends
+# on the file rather than either package name.
+overrides:
+  deb:
+    depends:
+      - ffmpeg
+  rpm:
+    depends:
+      - /usr/bin/ffmpeg
+
 contents:
   # Service binary (built by packaging/stage.sh).
   - src: ../dist/linux/bin/lattice-service
