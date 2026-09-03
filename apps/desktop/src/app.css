@@ -1,7 +1,125 @@
-/* Offline-first typography: use bundled/system fallbacks, never a font network request. */
+/* NeonHearth design tokens.
+ *
+ * Offline-first: both typefaces are bundled from node_modules by Vite, never
+ * fetched at runtime. Instrument Sans (variable) carries UI text and display;
+ * IBM Plex Mono carries readings, labels and anything that lines up in columns.
+ */
+@import '@fontsource-variable/instrument-sans/index.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
 @import './ui.css';
-:root { font-family: 'Space Grotesk', Arial, sans-serif; color: #d9f4f5; background: #061018; font-synthesis: none; text-rendering: optimizeLegibility; } * { box-sizing: border-box; } body { margin: 0; min-width: 320px; min-height: 100svh; overflow-x: hidden; background: #061018; } body::before { content: ''; position: fixed; inset: 0; pointer-events: none; opacity: .25; background-image: linear-gradient(rgba(103,237,241,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(103,237,241,.07) 1px,transparent 1px); background-size: 40px 40px; mask-image: linear-gradient(to bottom,black,transparent 78%); } body::after { content: ''; position: fixed; inset: 0; pointer-events: none; opacity: .1; background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
-main { width: min(1120px,100%); min-height: 100svh; margin: auto; padding: clamp(1.25rem,3vw,3rem); display: grid; grid-template-rows: auto 1fr auto auto; position: relative; overflow: hidden; border-inline: 1px solid rgba(105,235,239,.22); isolation: isolate; } .masthead,footer { font: 500 .68rem/1.2 'DM Mono',monospace; letter-spacing: .14em; color: #82aeb5; text-transform: uppercase; display: flex; justify-content: space-between; gap: 1rem; } .eyebrow { margin: 0; color: #85f7fa; } .coordinate { text-align: right; } .hero { align-self: center; position: relative; z-index: 1; padding-block: clamp(4rem,15vh,10rem) clamp(3rem,10vh,7rem); } .thesis-mark { color: #ff856f; font: 500 clamp(4rem,9vw,9rem)/.3 'Syne',sans-serif; margin: 0 0 2rem -.15em; transform: rotate(-14deg); } h1 { max-width: 800px; margin: 0; color: #e5fbfb; font: 700 clamp(3.15rem,9vw,8.5rem)/.83 'Syne',sans-serif; letter-spacing: -.075em; } .lede { max-width: 31rem; margin: 2rem 0 0; color: #9bbfc3; font-size: clamp(1rem,1.8vw,1.3rem); line-height: 1.45; }
-.instrument { position: absolute; inset: 10% -14% auto auto; width: min(60vw,670px); aspect-ratio: 1; opacity: .9; pointer-events: none; } .orbit { position: absolute; inset: 9%; border: 1px solid rgba(105,235,239,.28); border-radius: 48% 52% 56% 44%; animation: orbit 18s linear infinite; } .orbit-two { inset: 22%; border-color: rgba(255,133,111,.45); animation-direction: reverse; animation-duration: 12s; } .trace { position: absolute; inset: 0; display: grid; place-items: center; transform: rotate(-15deg); } .trace::before { content: ''; width: 118%; height: 1px; background: #78f1f2; box-shadow: 0 0 18px #45d5d9; } .trace i { position: absolute; width: .65rem; aspect-ratio: 1; border-radius: 50%; background: #f7ffff; box-shadow: 0 0 0 .22rem #2fd3d5,0 0 1.6rem .4rem rgba(47,211,213,.35); animation: pulse 3s ease-in-out infinite; } .trace i:nth-child(1) { translate: -48% -50%; }.trace i:nth-child(2) { translate: -14% 30%; animation-delay: .4s; }.trace i:nth-child(3) { translate: 20% -20%; animation-delay: .8s; }.trace i:nth-child(4) { translate: 49% 32%; animation-delay: 1.2s; }.trace i:nth-child(5) { translate: 70% -8%; animation-delay: 1.6s; }
-.collector-status { position: relative; z-index: 2; display: grid; grid-template-columns: auto 1fr; gap: 1rem; width: min(600px,100%); padding: 1.1rem 0; border-top: 1px solid rgba(123,238,241,.68); border-bottom: 1px solid rgba(123,238,241,.22); } .signal { display: flex; gap: 3px; align-items: center; height: 2.6rem; padding-inline: .25rem; }.signal span { width: 3px; height: .5rem; background: #ff856f; animation: shimmer 1.4s ease-in-out infinite; }.signal span:nth-child(2) { height: 1.7rem; animation-delay: .15s; }.signal span:nth-child(3) { height: .9rem; animation-delay: .3s; }.ready .signal span { background: #7bf4f5; }.offline .signal span { background: #ff856f; animation-play-state: paused; } .status-copy p { margin: 0; }.status-label { color: #dffeff; font-weight: 600; }.status-detail { margin-top: .25rem !important; color: #8eafb4; font-size: .9rem; line-height: 1.4; } footer { align-items: end; padding-top: 2rem; }.footer-rule { flex: 1; height: 1px; margin-bottom: .35rem; background: rgba(123,238,241,.3); }
-@keyframes orbit { to { transform: rotate(1turn); } } @keyframes pulse { 50% { transform: scale(1.65); opacity: .45; } } @keyframes shimmer { 50% { transform: scaleY(.35); opacity: .45; } } @media (max-width: 600px) { main { padding: 1.25rem; }.coordinate { display: none; }.hero { padding-block: 6rem 4rem; }.instrument { width: 95vw; right: -38vw; top: 14%; }.lede { max-width: 23rem; } footer { flex-wrap: wrap; font-size: .58rem; }.footer-rule { display: none; } } @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; } }
+
+:root {
+  /* Ground and surfaces: a deep blue-black with a cyan bias, three steps. */
+  --bg: #061019;
+  --surface: #0b1c26;
+  --surface-raised: #102a35;
+  --line: #17323d;
+  --line-mid: #20424b;
+  --line-strong: #28505a;
+
+  /* Text. */
+  --ink: #e9fbfc;
+  --muted-strong: #9bb7bb;
+  --muted: #77959d;
+  --faint: #64838b;
+
+  /* Brand accent and the four bandwidth tiers (shared with twin/heat.ts). */
+  --accent: #63f3f0;
+  --accent-ink: #063a3c;
+  --blue: #548cff;
+  --tier-blue: var(--blue);
+  --tier-cyan: var(--accent);
+  --gold: #ffcd66;
+  --tier-gold: var(--gold);
+  --pink: #ff5c9b;
+  --tier-pink: var(--pink);
+
+  /* Semantic status, separate from the tier ramp. */
+  --ok: var(--accent);
+  --watch: var(--gold);
+  --risk: var(--pink);
+  --info: var(--blue);
+
+  /* Type. */
+  --font-body: 'Instrument Sans Variable', 'Instrument Sans', 'Segoe UI', Helvetica, Arial, sans-serif;
+  --font-display: var(--font-body);
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+
+  /* Shape and rhythm. */
+  --radius-sm: 5px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --focus: 3px solid var(--gold);
+
+  font-family: var(--font-body);
+  color: var(--ink);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100svh;
+  overflow-x: hidden;
+  background: var(--bg);
+}
+
+/* Faint drafting grid fading downward, then a whisper of grain: the "neon" is
+ * in the accents, the ground stays matte. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: .25;
+  background-image:
+    linear-gradient(rgba(103, 237, 241, .07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(103, 237, 241, .07) 1px, transparent 1px);
+  background-size: 40px 40px;
+  mask-image: linear-gradient(to bottom, black, transparent 78%);
+}
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: .1;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+button, input, select, textarea { font-family: inherit; }
+:focus-visible { outline: var(--focus); outline-offset: 3px; }
+
+/* Collector status block (CollectorStatus.svelte). */
+.collector-status {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1rem;
+  width: min(600px, 100%);
+  padding: 1.1rem 0;
+  border-top: 1px solid rgba(123, 238, 241, .68);
+  border-bottom: 1px solid rgba(123, 238, 241, .22);
+}
+.signal { display: flex; gap: 3px; align-items: center; height: 2.6rem; padding-inline: .25rem; }
+.signal span { width: 3px; height: .5rem; background: var(--gold); animation: shimmer 1.4s ease-in-out infinite; }
+.signal span:nth-child(2) { height: 1.7rem; animation-delay: .15s; }
+.signal span:nth-child(3) { height: .9rem; animation-delay: .3s; }
+.ready .signal span { background: var(--accent); }
+.offline .signal span { background: var(--pink); animation-play-state: paused; }
+.status-copy p { margin: 0; }
+.status-label { color: var(--ink); font-weight: 600; }
+.status-detail { margin-top: .25rem !important; color: var(--muted); font-size: .9rem; line-height: 1.4; }
+
+@keyframes shimmer { 50% { transform: scaleY(.35); opacity: .45; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+}

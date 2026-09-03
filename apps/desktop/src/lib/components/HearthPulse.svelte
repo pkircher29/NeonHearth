@@ -33,7 +33,7 @@
   let drawnSparks: Spark[] = [];
 
   const GAUGE_TICKS = [125_000, 1_250_000, 12_500_000] as const; // 1, 10, 100 Mbps in bytes/s
-  const TICK_LABELS = ['1', '10', '100'];
+  const TICK_LABELS = ['1', '10', '100 Mbps'];
 
   function withAlpha(hex: string, alpha: number): string {
     const value = parseInt(hex.slice(1), 16);
@@ -50,7 +50,7 @@
     ctx.stroke();
   }
 
-  function draw(ctx: CanvasRenderingContext2D, now: number, live: { devices: readonly DeviceSnapshot[]; upload: number | null; download: number | null; connected: boolean; tier: keyof typeof TIER_COLOR; energy: number; moving: boolean }) {
+  function draw(ctx: CanvasRenderingContext2D, now: number, live: { devices: readonly DeviceSnapshot[]; upload: number | null; download: number | null; connected: boolean; tier: keyof typeof TIER_COLOR; energy: number; moving: boolean; scale: number }) {
     const t = now / 1000;
     const drift = live.moving ? t * 0.02 : 0;
     const wobble = live.moving ? (t / 6) % 1 : 0;
@@ -74,9 +74,11 @@
     ctx.beginPath();
     ctx.arc(HEARTH_CENTER.x, HEARTH_CENTER.y, GAUGE_RADII.upload, GAUGE_START, GAUGE_START + GAUGE_SWEEP); ctx.stroke();
 
-    // Scale ticks at 1 / 10 / 100 Mbps on the outer track.
+    // Scale ticks at 1 / 10 / 100 Mbps on the outer track. Labels are skipped
+    // when the canvas is scaled small enough that 9px type would be illegible.
     ctx.font = '500 9px "IBM Plex Mono", ui-monospace, monospace';
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const showTickLabels = live.scale >= 0.7;
     GAUGE_TICKS.forEach((bytesPerSecond, index) => {
       const angle = GAUGE_START + GAUGE_SWEEP * gaugeFraction(bytesPerSecond);
       const inner = GAUGE_RADII.upload + 6, outer = GAUGE_RADII.upload + 11, label = GAUGE_RADII.upload + 20;
@@ -84,7 +86,9 @@
       ctx.moveTo(HEARTH_CENTER.x + Math.cos(angle) * inner, HEARTH_CENTER.y + Math.sin(angle) * inner);
       ctx.lineTo(HEARTH_CENTER.x + Math.cos(angle) * outer, HEARTH_CENTER.y + Math.sin(angle) * outer);
       ctx.stroke();
-      ctx.fillStyle = 'rgba(233,251,252,0.45)';
+      if (!showTickLabels) return;
+      ctx.fillStyle = 'rgba(233,251,252,0.5)';
+      ctx.textAlign = Math.cos(angle) > 0.3 ? 'left' : Math.cos(angle) < -0.3 ? 'right' : 'center';
       ctx.fillText(TICK_LABELS[index]!, HEARTH_CENTER.x + Math.cos(angle) * label, HEARTH_CENTER.y + Math.sin(angle) * label);
     });
 
@@ -167,7 +171,7 @@
   $effect(() => {
     const element = canvas;
     if (!element) return;
-    const live = { devices, upload, download, connected, tier, energy, moving: animate };
+    const live = { devices, upload, download, connected, tier, energy, moving: animate, scale: cssScale };
     // Hover is read so the highlight ring redraws when not animating.
     void hovered;
     const ctx = element.getContext('2d');
