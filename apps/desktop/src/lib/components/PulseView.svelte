@@ -1,15 +1,15 @@
 <script lang="ts">
   import type { ServerMessage } from '../api/types';
-  import { bandwidthTier, topDevices, type LiveState } from '../stores/live';
-  import NetworkLung, { type ThroughputTier } from './NetworkLung.svelte';
+  import { topDevices, type LiveState } from '../stores/live';
+  import HearthPulse from './HearthPulse.svelte';
   import { formatThroughput } from './networkFormat';
 
-  interface Props { state?: LiveState | null; }
-  let { state: liveState = null }: Props = $props();
+  interface Props { state?: LiveState | null; onselectdevice?: (deviceId: string) => void; }
+  let { state: liveState = null, onselectdevice }: Props = $props();
   let animationPaused = $state(false);
   const hasThroughput = $derived(Boolean(liveState?.connected && liveState.throughput.length));
   const currentBps = $derived(hasThroughput && liveState ? liveState.aggregate.upload + liveState.aggregate.download : null);
-  const tier = $derived<ThroughputTier>(currentBps === null ? 'unavailable' : bandwidthTier(currentBps));
+  const allDevices = $derived(liveState ? liveState.deviceOrder.map((id) => liveState.devices[id]).filter((device): device is NonNullable<typeof device> => Boolean(device)) : []);
   const devices = $derived(liveState ? topDevices(liveState, 4) : []);
   const recentEvents = $derived(liveState?.timeline.slice(-8).reverse() ?? []);
   const curvePath = $derived(pathFor(liveState ? liveState.throughput : []));
@@ -38,7 +38,7 @@
 
 <section class="pulse-view" aria-labelledby="pulse-heading">
   <div class="view-heading"><div><p class="kicker">PULSE / NOW</p><h1 id="pulse-heading">Your network, breathing.</h1><p class="muted">A calm read of what is happening at home.</p></div><button class="pause-button" type="button" aria-pressed={animationPaused} aria-label={animationPaused ? 'Resume decorative animation; data continues' : 'Pause decorative animation; data continues'} onclick={() => animationPaused = !animationPaused}>{animationPaused ? 'Resume motion' : 'Pause motion'}</button></div>
-  <div class="lung-panel"><NetworkLung throughput={currentBps} tier={tier} paused={animationPaused}/><div class="lung-caption"><span class="status-cue watch">△</span><strong>{liveState?.connected ? 'Live readings connected' : 'Protected pairing is waiting'}</strong><span class="muted">{liveState?.connected ? 'Data updates continue when motion is paused.' : 'Live readings appear after setup.'}</span></div></div>
+  <div class="hearth-panel"><HearthPulse devices={allDevices} upload={hasThroughput && liveState ? liveState.aggregate.upload : null} download={hasThroughput && liveState ? liveState.aggregate.download : null} connected={Boolean(liveState?.connected)} paused={animationPaused} onselect={onselectdevice}/><div class="hearth-caption"><span class="status-cue watch">△</span><strong>{liveState?.connected ? 'Live readings connected' : 'Protected pairing is waiting'}</strong><span class="muted">{liveState?.connected ? 'Data updates continue when motion is paused.' : 'Live readings appear after setup.'}</span></div></div>
   <div class="metrics"><article><span class="metric-label">THROUGHPUT</span><strong>{formatThroughput(currentBps)}</strong><span class="metric-note">{hasThroughput ? 'Upload + download now' : 'Unavailable until paired'}</span></article><article><span class="metric-label">PROTOCOL MIX</span>{#if liveState?.protocolMix}<strong>{Object.keys(liveState.protocolMix).length} <small>observed</small></strong><span class="metric-note">Traffic categories from collector</span>{:else}<strong>Unavailable</strong><span class="metric-note">No protocol data received</span>{/if}</article><article><span class="metric-label">COVERAGE</span><strong class="coverage-badge {liveState?.coverage ?? 'unavailable'}"><span aria-hidden="true">{liveState?.coverage === 'complete' ? '✓' : liveState?.coverage === 'mixed' ? '△' : '○'}</span> {liveState?.coverage ?? 'UNAVAILABLE'}</strong><span class="metric-note">Evidence quality, not a heat score</span></article></div>
   <div class="pulse-lower"><div><div class="section-title"><h2>Throughput curve</h2><span class="muted">{hasThroughput ? 'last 60 readings' : 'waiting for readings'}</span></div><div class="curve-panel">{#if hasThroughput}<svg viewBox="0 0 600 130" role="img" aria-label="Bounded throughput curve"><path class="curve-grid" d="M0 20h600M0 69h600M0 118h600"/><path class="curve-path" d={curvePath}/></svg>{:else}<p class="unavailable-copy">Throughput stays quiet here until the collector has a protected connection.</p>{/if}</div></div><div><div class="section-title"><h2>Protocol availability</h2></div>{#if liveState?.protocolMix}<div class="protocol-bars">{#each Object.entries(liveState.protocolMix) as pair}<div><span>{pair[0]}</span><progress max="100" value={protocolShare(pair[1])}></progress><b>{Math.round(protocolShare(pair[1]))}%</b></div>{/each}</div>{:else}<p class="unavailable-copy">Unavailable — no protocol mix has arrived.</p>{/if}</div></div>
   <div class="section-title"><h2>Devices using the most</h2><span class="muted">{devices.length ? `${devices.length} observed` : 'no usage data'}</span></div>{#if devices.length}<div class="top-devices">{#each devices as device}<div class="top-device"><span class="device-symbol">◌</span><span class="device-label"><strong>{device.owner_name ?? `Device ${device.device_id.slice(0, 6)}`}</strong><small>{device.presence.state}</small></span><span class="device-bar"><i style={'width: ' + widthFor(device) + '%'}></i></span><b>{formatThroughput((device.bandwidth.upload ?? 0) + (device.bandwidth.download ?? 0))}</b></div>{/each}</div>{:else}<div class="empty-state"><span class="empty-icon">⌁</span><div><strong>No usage data yet</strong><p class="muted">Usage bars appear only after the collector reports available bandwidth.</p></div></div>{/if}
