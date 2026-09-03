@@ -84,7 +84,7 @@ impl AuditActor {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "owner" => Some(Self::Owner),
             "service" => Some(Self::Service),
@@ -115,7 +115,7 @@ impl AuditCategory {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "approval" => Some(Self::Approval),
             "scan" => Some(Self::Scan),
@@ -362,31 +362,46 @@ impl AuditLog {
             "SELECT id, occurred_at, actor, category, action, subject, detail, prev_hash, entry_hash \
              FROM audit_log WHERE 1=1",
         );
-        if let Some(actor) = filter.actor {
-            query.push(" AND actor = ").push_bind(actor.as_str());
-        }
-        if let Some(category) = filter.category {
-            query.push(" AND category = ").push_bind(category.as_str());
-        }
-        if let Some(subject) = &filter.subject {
-            query.push(" AND subject = ").push_bind(subject.clone());
-        }
-        if let Some(since) = filter.since {
-            let since = encode_time(since)
-                .ok_or_else(|| AuditLogError::Invalid("since is out of range".into()))?;
-            query.push(" AND occurred_at >= ").push_bind(since);
-        }
-        if let Some(until) = filter.until {
-            let until = encode_time(until)
-                .ok_or_else(|| AuditLogError::Invalid("until is out of range".into()))?;
-            query.push(" AND occurred_at < ").push_bind(until);
-        }
+        push_filter(&mut query, filter)?;
         if let Some(after_id) = page.after_id {
             query.push(" AND id > ").push_bind(after_id);
         }
         query
             .push(" ORDER BY id ASC LIMIT ")
             .push_bind(i64::from(page.limit));
+        let rows: Vec<StoredEntryRow> = query
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        rows.into_iter().map(decode_entry).collect()
+    }
+
+    /// Newest-first page for history views: entries with `id < before_id`
+    /// (or the newest entries when `before_id` is `None`), ordered by id
+    /// descending. Same filter semantics and page cap as [`Self::list`].
+    pub async fn list_newest(
+        &self,
+        filter: &AuditFilter,
+        before_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<AppendedEntry>, AuditLogError> {
+        if limit == 0 || limit > MAX_LIST_PAGE {
+            return Err(AuditLogError::Invalid(format!(
+                "page limit must be 1..={MAX_LIST_PAGE}"
+            )));
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id, occurred_at, actor, category, action, subject, detail, prev_hash, entry_hash \
+             FROM audit_log WHERE 1=1",
+        );
+        push_filter(&mut query, filter)?;
+        if let Some(before_id) = before_id {
+            query.push(" AND id < ").push_bind(before_id);
+        }
+        query
+            .push(" ORDER BY id DESC LIMIT ")
+            .push_bind(i64::from(limit));
         let rows: Vec<StoredEntryRow> = query
             .build_query_as()
             .fetch_all(&self.pool)
@@ -839,6 +854,33 @@ async fn prune_locked(
         pruned_through_hash: Some(anchor_hash),
         kept_out_of_order_rows: u64::try_from(kept_out_of_order).unwrap_or(0),
     })
+}
+
+/// Appends the shared `WHERE` clauses of [`AuditFilter`] to a list query.
+fn push_filter(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    filter: &AuditFilter,
+) -> Result<(), AuditLogError> {
+    if let Some(actor) = filter.actor {
+        query.push(" AND actor = ").push_bind(actor.as_str());
+    }
+    if let Some(category) = filter.category {
+        query.push(" AND category = ").push_bind(category.as_str());
+    }
+    if let Some(subject) = &filter.subject {
+        query.push(" AND subject = ").push_bind(subject.clone());
+    }
+    if let Some(since) = filter.since {
+        let since = encode_time(since)
+            .ok_or_else(|| AuditLogError::Invalid("since is out of range".into()))?;
+        query.push(" AND occurred_at >= ").push_bind(since);
+    }
+    if let Some(until) = filter.until {
+        let until = encode_time(until)
+            .ok_or_else(|| AuditLogError::Invalid("until is out of range".into()))?;
+        query.push(" AND occurred_at < ").push_bind(until);
+    }
+    Ok(())
 }
 
 fn decode_entry(row: StoredEntryRow) -> Result<AppendedEntry, AuditLogError> {

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod audit_api;
 mod auth;
 pub mod cameras;
 pub mod discovery;
@@ -58,6 +59,7 @@ pub fn app_with_parts(
     doctor: doctor::DoctorState,
     remote: tailscale::RemoteAccessState,
 ) -> Router {
+    let audit = audit_api::AuditApiState::for_service(&state);
     Router::new()
         .route("/api/v1/health", get(api::health))
         .route("/api/v1/state", get(api::state))
@@ -143,6 +145,7 @@ pub fn app_with_parts(
             get(integrations::events_route),
         )
         .merge(doctor::routes(doctor))
+        .merge(audit_api::routes(audit))
         .layer(axum::Extension(remote.clone()))
         .layer(axum::middleware::from_fn_with_state(
             remote,
