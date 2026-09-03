@@ -42,9 +42,10 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -66,6 +67,15 @@ const DEFAULT_LOOPBACK_PORT: u16 = 58120;
 const SERVE_HTTPS_PORT: u16 = 443;
 /// Marks a replayed command response so clients can tell it was not re-run.
 const REPLAYED_HEADER: &str = "x-command-replayed";
+/// Command ids travel in this header on mutating phone requests.
+const COMMAND_ID_HEADER: &str = "x-command-id";
+/// How often a phone session's sliding expiry is written back. Every
+/// authenticated request used to issue an UPDATE, which turned read polling
+/// into write traffic on SQLite; one touch a minute keeps the 30-day window
+/// sliding with no observable difference.
+const SESSION_TOUCH_INTERVAL_SECS: i64 = 60;
+/// Concurrent integration long-polls one token may hold open.
+const MAX_LONG_POLLS_PER_TOKEN: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Tailscale control seam (T1/T2). There is deliberately NO Funnel operation
@@ -328,7 +338,44 @@ struct RemoteShared {
     clock: Arc<dyn Clock>,
     loopback_port: u16,
     pool: SqlitePool,
-    dedup: tokio::sync::Mutex<HashMap<Uuid, SessionDedup>>,
+    /// Per-session replay windows. A `std` mutex: every critical section is
+    /// short and never spans an `.await`, which also lets the in-flight guard
+    /// release a command from `Drop` when a handler future is cancelled.
+    dedup: Mutex<HashMap<Uuid, SessionDedup>>,
+    /// Per-integration-token long-poll admission.
+    long_polls: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
+}
+
+impl RemoteShared {
+    fn lock_dedup(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, SessionDedup>> {
+        // A poisoned window only means a panicking handler; the map itself
+        // is always left consistent by the short critical sections.
+        self.dedup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Drops a session's replay window (revocation, expiry).
+    fn forget_session(&self, session_id: Uuid) {
+        self.lock_dedup().remove(&session_id);
+    }
+
+    /// Completes an in-flight command: stores the settled response (or, when
+    /// `cached` is `None`, releases the id so a waiting duplicate executes)
+    /// and wakes every duplicate parked on it.
+    fn finish_command(&self, session_id: Uuid, command_id: Uuid, cached: Option<CachedCommand>) {
+        let mut dedup = self.lock_dedup();
+        let Some(window) = dedup.get_mut(&session_id) else {
+            return;
+        };
+        let notify = match cached {
+            Some(cached) => window.settle(command_id, cached),
+            None => window.release(command_id),
+        };
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
 }
 
 /// Cloneable handle to the remote-access state (tailscale control, clock,
@@ -363,9 +410,30 @@ impl RemoteAccessState {
                 clock,
                 loopback_port,
                 pool: state.state_repository().pool().clone(),
-                dedup: tokio::sync::Mutex::new(HashMap::new()),
+                dedup: Mutex::new(HashMap::new()),
+                long_polls: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Admits one more concurrent long-poll for `token_id`, or `None` when
+    /// the token already holds [`MAX_LONG_POLLS_PER_TOKEN`] open. The permit
+    /// releases itself when the poll's future completes or is dropped.
+    pub(crate) fn long_poll_permit(&self, token_id: Uuid) -> Option<OwnedSemaphorePermit> {
+        let mut polls = self
+            .shared
+            .long_polls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Idle tokens hold no permits; drop their entries so the map is
+        // bounded by the tokens that are actually polling.
+        polls.retain(|id, semaphore| {
+            *id == token_id || semaphore.available_permits() < MAX_LONG_POLLS_PER_TOKEN
+        });
+        let semaphore = polls
+            .entry(token_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(MAX_LONG_POLLS_PER_TOKEN)));
+        Arc::clone(semaphore).try_acquire_owned().ok()
     }
 
     fn repository(&self) -> RemoteAccessRepository {
@@ -529,21 +597,92 @@ struct CachedCommand {
     body: Bytes,
 }
 
+/// One command id's place in a session's replay window.
+enum CommandSlot {
+    /// A request with this id is executing; duplicates wait on the notify.
+    Pending(Arc<Notify>),
+    /// The settled response, replayed verbatim to duplicates.
+    Done(CachedCommand),
+}
+
 #[derive(Default)]
 struct SessionDedup {
+    /// Settled ids, oldest first, for bounded eviction.
     order: VecDeque<Uuid>,
-    responses: HashMap<Uuid, CachedCommand>,
+    slots: HashMap<Uuid, CommandSlot>,
 }
 
 impl SessionDedup {
-    fn insert(&mut self, command_id: Uuid, response: CachedCommand) {
-        if self.responses.insert(command_id, response).is_none() {
+    /// Claims `command_id` for the calling request. The in-flight marker
+    /// closes the check-then-execute window: a duplicate that arrives while
+    /// the first request is still running parks on the returned notify
+    /// instead of executing a second time.
+    fn begin(&mut self, command_id: Uuid) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        self.slots
+            .insert(command_id, CommandSlot::Pending(Arc::clone(&notify)));
+        notify
+    }
+
+    /// Stores the settled response for `command_id`, evicting the oldest
+    /// settled entries beyond the window.
+    fn settle(&mut self, command_id: Uuid, response: CachedCommand) -> Option<Arc<Notify>> {
+        let previous = self.slots.insert(command_id, CommandSlot::Done(response));
+        if !matches!(previous, Some(CommandSlot::Done(_))) {
             self.order.push_back(command_id);
         }
         while self.order.len() > COMMAND_DEDUP_WINDOW {
             if let Some(evicted) = self.order.pop_front() {
-                self.responses.remove(&evicted);
+                self.slots.remove(&evicted);
             }
+        }
+        match previous {
+            Some(CommandSlot::Pending(notify)) => Some(notify),
+            _ => None,
+        }
+    }
+
+    /// Forgets an in-flight `command_id` whose request produced nothing worth
+    /// replaying (a 5xx, an oversized body, or a cancelled handler).
+    fn release(&mut self, command_id: Uuid) -> Option<Arc<Notify>> {
+        match self.slots.get(&command_id) {
+            Some(CommandSlot::Pending(_)) => match self.slots.remove(&command_id) {
+                Some(CommandSlot::Pending(notify)) => Some(notify),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn settled(&self, command_id: &Uuid) -> bool {
+        matches!(self.slots.get(command_id), Some(CommandSlot::Done(_)))
+    }
+}
+
+/// Releases a claimed command id if the executing request never settles it
+/// (a client disconnect drops the handler future mid-flight). Without this a
+/// parked duplicate would wait forever.
+struct InFlightCommand<'a> {
+    shared: &'a RemoteShared,
+    session_id: Uuid,
+    command_id: Uuid,
+    settled: bool,
+}
+
+impl InFlightCommand<'_> {
+    fn settle(mut self, cached: Option<CachedCommand>) {
+        self.settled = true;
+        self.shared
+            .finish_command(self.session_id, self.command_id, cached);
+    }
+}
+
+impl Drop for InFlightCommand<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.shared
+                .finish_command(self.session_id, self.command_id, None);
         }
     }
 }
@@ -591,35 +730,44 @@ pub(crate) async fn remote_access_layer(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let now = remote.now();
-    if session.revoked
-        || now >= session.expires_at
-        || !hashes_match(&sha256_hex(&secret), &session.secret_hash)
-    {
+    if session.revoked || now >= session.expires_at {
+        // A dead session's replay window can never be consulted again.
+        remote.shared.forget_session(session_id);
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    // Sliding expiry: every successful authentication moves it forward.
-    if repository
-        .touch_phone_session(
-            session_id,
-            now,
-            now + Duration::days(PHONE_SESSION_TTL_DAYS),
-        )
-        .await
-        .is_err()
+    if !hashes_match(&sha256_hex(&secret), &session.secret_hash) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    // Classify before touching storage: a request this principal may never
+    // make should not cost a write.
+    let access = classify_phone_access(request.method(), request.uri().path());
+    if access == PhoneAccess::Denied {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    // Sliding expiry: successful authentication moves it forward, written
+    // back at most once per SESSION_TOUCH_INTERVAL_SECS.
+    let touch_due = session.last_used_at.is_none_or(|last_used_at| {
+        now - last_used_at >= Duration::seconds(SESSION_TOUCH_INTERVAL_SECS)
+    });
+    if touch_due
+        && repository
+            .touch_phone_session(
+                session_id,
+                now,
+                now + Duration::days(PHONE_SESSION_TTL_DAYS),
+            )
+            .await
+            .is_err()
     {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    match classify_phone_access(request.method(), request.uri().path()) {
-        PhoneAccess::Denied => return StatusCode::FORBIDDEN.into_response(),
-        PhoneAccess::HighImpact => {
-            let live = session
-                .stepup_expires_at
-                .is_some_and(|expires_at| now < expires_at);
-            if !live {
-                return StatusCode::FORBIDDEN.into_response();
-            }
+    if access == PhoneAccess::HighImpact {
+        let live = session
+            .stepup_expires_at
+            .is_some_and(|expires_at| now < expires_at);
+        if !live {
+            return StatusCode::FORBIDDEN.into_response();
         }
-        PhoneAccess::Read => {}
     }
     request
         .extensions_mut()
@@ -629,7 +777,7 @@ pub(crate) async fn remote_access_layer(
     let mutating = !matches!(*request.method(), Method::GET | Method::HEAD);
     let command_id = request
         .headers()
-        .get("x-command-id")
+        .get(COMMAND_ID_HEADER)
         .map(|value| {
             value
                 .to_str()
@@ -638,36 +786,64 @@ pub(crate) async fn remote_access_layer(
         })
         .filter(|_| mutating);
     let command_id = match command_id {
+        // A high-impact command without a replay id cannot be made
+        // idempotent; refuse it rather than silently running it unprotected.
+        None if mutating && access == PhoneAccess::HighImpact => {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
         None => return next.run(request).await,
         Some(None) => return StatusCode::BAD_REQUEST.into_response(),
         Some(Some(command_id)) => command_id,
     };
-    {
-        let dedup = remote.shared.dedup.lock().await;
-        if let Some(cached) = dedup
-            .get(&session_id)
-            .and_then(|window| window.responses.get(&command_id))
-        {
-            return replayed_response(cached);
-        }
+    // Claim the id, or replay / wait on whoever holds it. The claim and the
+    // lookup happen under one lock so two concurrent duplicates can never
+    // both miss.
+    loop {
+        let notify: Arc<Notify>;
+        let notified = {
+            let mut dedup = remote.shared.lock_dedup();
+            let window = dedup.entry(session_id).or_default();
+            match window.slots.get(&command_id) {
+                Some(CommandSlot::Done(cached)) => return replayed_response(cached),
+                Some(CommandSlot::Pending(pending)) => {
+                    notify = Arc::clone(pending);
+                    // Register interest before the lock is released so a
+                    // settle that lands in between still wakes this waiter.
+                    // Boxed so the guard stays confined to this block and is
+                    // never held across the await below.
+                    let mut notified = Box::pin(notify.notified());
+                    notified.as_mut().enable();
+                    notified
+                }
+                None => {
+                    window.begin(command_id);
+                    break;
+                }
+            }
+        };
+        notified.await;
     }
+    let in_flight = InFlightCommand {
+        shared: &remote.shared,
+        session_id,
+        command_id,
+        settled: false,
+    };
     let response = next.run(request).await;
     let (parts, body) = response.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, MAX_CACHED_COMMAND_BODY).await else {
+        in_flight.settle(None);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let cached = CachedCommand {
+    // A 5xx is a transient failure, not a settled outcome: caching it would
+    // pin the client's retry to the failure. Release the id instead so the
+    // retry executes for real.
+    let cached = (!parts.status.is_server_error()).then(|| CachedCommand {
         status: parts.status,
         content_type: parts.headers.get(header::CONTENT_TYPE).cloned(),
         body: bytes.clone(),
-    };
-    {
-        let mut dedup = remote.shared.dedup.lock().await;
-        dedup
-            .entry(session_id)
-            .or_default()
-            .insert(command_id, cached);
-    }
+    });
+    in_flight.settle(cached);
     Response::from_parts(parts, Body::from(bytes))
 }
 
@@ -1060,6 +1236,7 @@ pub(crate) async fn revoke_session_route(
     };
     match remote.repository().revoke_phone_session(id).await {
         Ok(true) => {
+            remote.shared.forget_session(id);
             // Revocation only removes privileges, so it stands even when the
             // audit append fails; the failure is surfaced as 503 instead of
             // silently succeeding.
@@ -1098,48 +1275,44 @@ pub struct StepupResponse {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Charges one failed PIN attempt. The window/count/lock accounting is a
+/// single atomic store update, so N concurrent wrong guesses are charged as
+/// N failures — a stolen session cannot widen its guess budget by racing.
 async fn handle_pin_failure(
     remote: &RemoteAccessState,
     session: &PhoneSessionRow,
     now: DateTime<Utc>,
 ) -> Response {
-    let window_live = session
-        .pin_window_started_at
-        .is_some_and(|started_at| now - started_at < Duration::minutes(PIN_WINDOW_MINUTES));
-    let (count, window_started_at) = if window_live {
-        (
-            session.pin_failed_count.saturating_add(1),
-            session.pin_window_started_at.unwrap_or(now),
-        )
-    } else {
-        (1, now)
-    };
-    let locked_until =
-        (count >= PIN_MAX_FAILURES).then(|| now + Duration::minutes(PIN_WINDOW_MINUTES));
-    if remote
+    let outcome = match remote
         .repository()
-        .record_pin_failure(session.id, count, window_started_at, locked_until)
+        .record_pin_failure(
+            session.id,
+            now,
+            Duration::minutes(PIN_WINDOW_MINUTES),
+            PIN_MAX_FAILURES,
+        )
         .await
-        .is_err()
     {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let audited = append_audit(
         remote.pool(),
         now,
         "stepup_failed",
         session.id.to_string(),
         serde_json::json!({
-            "failures_in_window": count,
-            "locked": locked_until.is_some(),
-            "locked_until": locked_until,
+            "failures_in_window": outcome.failed_count,
+            "locked": outcome.locked_until.is_some(),
+            "locked_until": outcome.locked_until,
         }),
     )
     .await;
     if audited.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    if locked_until.is_some() {
+    if outcome.locked_until.is_some() {
         StatusCode::TOO_MANY_REQUESTS.into_response()
     } else {
         StatusCode::FORBIDDEN.into_response()
@@ -1349,11 +1522,45 @@ mod tests {
             body: Bytes::new(),
         };
         let first = Uuid::new_v4();
-        window.insert(first, cached.clone());
+        window.begin(first);
+        window.settle(first, cached.clone());
         for _ in 0..COMMAND_DEDUP_WINDOW {
-            window.insert(Uuid::new_v4(), cached.clone());
+            let id = Uuid::new_v4();
+            window.begin(id);
+            window.settle(id, cached.clone());
         }
-        assert_eq!(window.responses.len(), COMMAND_DEDUP_WINDOW);
-        assert!(!window.responses.contains_key(&first));
+        assert_eq!(window.slots.len(), COMMAND_DEDUP_WINDOW);
+        assert!(!window.settled(&first));
+    }
+
+    #[test]
+    fn in_flight_commands_are_released_not_settled_and_survive_eviction() {
+        let mut window = SessionDedup::default();
+        let cached = CachedCommand {
+            status: StatusCode::OK,
+            content_type: None,
+            body: Bytes::new(),
+        };
+        let pending = Uuid::new_v4();
+        let notify = window.begin(pending);
+        // Settled entries evict around a pending one: it is not in `order`.
+        for _ in 0..(COMMAND_DEDUP_WINDOW + 8) {
+            let id = Uuid::new_v4();
+            window.begin(id);
+            window.settle(id, cached.clone());
+        }
+        assert!(matches!(
+            window.slots.get(&pending),
+            Some(CommandSlot::Pending(_))
+        ));
+        // Releasing hands back the same notify so waiters can be woken, and
+        // releasing an already-settled or unknown id is a no-op.
+        let released = window.release(pending).expect("pending id releases");
+        assert!(Arc::ptr_eq(&released, &notify));
+        assert!(window.release(pending).is_none());
+        assert!(!window.slots.contains_key(&pending));
+        let done = *window.order.back().unwrap();
+        assert!(window.release(done).is_none());
+        assert!(window.settled(&done));
     }
 }

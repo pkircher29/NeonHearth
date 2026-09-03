@@ -747,7 +747,11 @@ async fn event_ticket_limit_is_rate_limited() {
 
 #[tokio::test]
 async fn openapi_describes_public_and_protected_routes() {
-    let response = app(test_state().await)
+    let app = app(test_state().await);
+    // The document itself is owner information once Serve exposes the
+    // listener to the tailnet: anonymous requests get nothing.
+    let response = app
+        .clone()
         .oneshot(
             Request::get("/api/v1/openapi.json")
                 .body(Body::empty())
@@ -755,6 +759,12 @@ async fn openapi_describes_public_and_protected_routes() {
         )
         .await
         .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = app
+        .oneshot(authorized_state("/api/v1/openapi.json"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     let doc = body(response).await;
     assert!(doc["paths"]["/api/v1/health"].is_object());
     assert!(doc["paths"]["/api/v1/state"].is_object());
@@ -876,4 +886,40 @@ async fn no_eligible_startup_is_degraded_once_and_replays_before_state_snapshot(
     assert_eq!(snapshot["sequence"], 1);
     assert_eq!(snapshot["service_status"], "degraded");
     assert!(!snapshot.to_string().contains("adapter-"));
+}
+
+/// M-3: an action on a device the policy has never enrolled is a 404 with a
+/// reason, distinct from a malformed body (400) or a storage fault (503).
+#[tokio::test]
+async fn policy_action_on_an_unenrolled_device_is_404_with_a_reason() {
+    let app = app(test_state().await);
+    for action in [
+        serde_json::json!("approve"),
+        serde_json::json!("reject"),
+        serde_json::json!("quarantine"),
+        serde_json::json!({ "extend_once": { "until": "2026-09-01T00:00:00Z" } }),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/policy/action")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "device_id": "018f0000-0000-7000-8000-00000000abcd",
+                            "action": action
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{action}");
+        assert_eq!(
+            body(response).await,
+            serde_json::json!({ "error": "device is not enrolled in policy" })
+        );
+    }
 }
