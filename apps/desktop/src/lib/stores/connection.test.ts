@@ -140,4 +140,44 @@ describe('createLiveConnection', () => {
     expect(client.openEvents).toHaveBeenCalledTimes(2);
     connection.stop();
   });
+
+  it('backs off repeated pre-open failures and resets only after a socket opens', async () => {
+    const socketStates: Array<(state: 'open' | 'closed' | 'error') => void> = [];
+    const retryCallbacks: Array<() => void> = [];
+    const delays: number[] = [];
+    const timers = {
+      setTimeout: vi.fn((callback: () => void, delay: number) => {
+        retryCallbacks.push(callback);
+        delays.push(delay);
+        return retryCallbacks.length;
+      }),
+      clearTimeout: vi.fn()
+    };
+    const client = clientStub({
+      openEvents: vi.fn(async (_sequence, _onMessage, onState) => {
+        socketStates.push(onState);
+        return { close: vi.fn() } as unknown as WebSocket;
+      })
+    });
+    const connection = createLiveConnection({ client, timers });
+
+    await connection.start();
+    socketStates[0]?.('closed');
+    expect(delays).toEqual([250]);
+
+    retryCallbacks[0]?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    socketStates[1]?.('error');
+    expect(delays).toEqual([250, 500]);
+
+    retryCallbacks[1]?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    socketStates[2]?.('open');
+    socketStates[2]?.('closed');
+    expect(delays).toEqual([250, 500, 250]);
+
+    connection.stop();
+  });
 });
