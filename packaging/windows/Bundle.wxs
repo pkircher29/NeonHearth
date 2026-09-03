@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NeonHearth Windows setup bundle (WiX Burn, .exe bootstrapper).
+
+  Chains the validated NeonHearth MSI (NeonHearth.wxs) into a single
+  NeonHearth-Setup-<version>-x64.exe with the standard WiX bootstrapper UI.
+  This is a wrapper only: all install logic (service registration, token
+  generation, Npcap limited mode) lives in the MSI and its custom action;
+  the bundle adds no behavior of its own. Npcap detection is deliberately
+  NOT duplicated here - configure-service.ps1 in the MSI is authoritative.
+
+  Build (after the MSI exists; requires WiX v5, pinned 5.0.2 in CI):
+
+    wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
+    wix build packaging\windows\Bundle.wxs ^
+        -ext WixToolset.BootstrapperApplications.wixext ^
+        -bindpath msi=%CD% ^
+        -arch x64 ^
+        -d MsiVersion=0.1.0 -d FullVersion=0.1.0 ^
+        -wx ^
+        -o NeonHearth-Setup-0.1.0-x64.exe
+
+  The msi bindpath must be an ABSOLUTE directory containing
+  NeonHearth-$(var.FullVersion)-x64.msi (same relative-bindpath hazard as
+  the <Files> harvest in NeonHearth.wxs).
+
+  Versioning: MsiVersion is the numeric x.y.z; FullVersion is the complete
+  tag version (may carry a -prerelease suffix) and selects the MSI filename
+  AND is the Bundle/@Version. Unlike MSI ProductVersion, Burn understands
+  semantic versions, so 0.1.0-alpha.5 correctly upgrades a registered
+  0.1.0-alpha.4 bundle (with the plain numeric version both alphas would
+  compare equal and the old bundle's ARP entry would linger).
+
+  Validation without installing:
+    wix burn extract NeonHearth-Setup-...-x64.exe -o <dir> -intermediateFolder <tmp>
+  unpacks the attached container; the extracted payload must be
+  byte-identical to the input MSI. (Running the exe with /layout is NOT a
+  useful check for this bundle: with Compressed="yes" everything is embedded
+  and layout just copies the exe. Note: wix burn extract silently no-ops
+  with warning WIX8503 if -o / -intermediateFolder do not already exist -
+  create both first.) The release workflow does this extract + SHA-256
+  comparison against the MSI it just built.
+
+  STATUS: built with wix 5.0.2 on the build machine and in CI; extraction
+  validated the embedded MSI byte-for-byte. No real install of the bundle
+  has been performed on any machine.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+
+  <?ifndef MsiVersion ?>
+    <?define MsiVersion = "0.1.0" ?>
+  <?endif ?>
+  <?ifndef FullVersion ?>
+    <?define FullVersion = "$(var.MsiVersion)" ?>
+  <?endif ?>
+
+  <Bundle Name="NeonHearth"
+          Manufacturer="NeonHearth Project"
+          Version="$(var.FullVersion)"
+          UpgradeCode="8c2a41d7-6b0e-4f5c-9d21-b4a7c3e9f102"
+          Compressed="yes">
+
+    <!-- Standard bootstrapper UI; empty LicenseUrl on the hyperlink theme
+         shows no license step (nothing to agree to beyond the MSI). -->
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
+                                              LicenseUrl="" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <MsiPackage Id="NeonHearthMsi"
+                  SourceFile="!(bindpath.msi)\NeonHearth-$(var.FullVersion)-x64.msi"
+                  Compressed="yes"
+                  Vital="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

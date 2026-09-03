@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { createApiClient } from './lib/api/client';
   import { createAuthSession, type AuthState } from './lib/auth/session';
+  import { bootstrapServiceToken } from './lib/pairing';
   import { initialLiveState, type LiveState } from './lib/stores/live';
   import { createLiveConnection, type LiveConnection } from './lib/stores/connection';
   import { createHomeApi, type HomeApi } from './lib/stores/home';
@@ -50,6 +51,11 @@
     let storage: Storage | null = null;
     try { storage = window.sessionStorage; } catch { storage = null; }
     const auth = createAuthSession(storage); session = auth;
+    // Local pairing: the installed service serves this page and the Start-menu
+    // launcher passes the owner token in the URL fragment (never sent over the
+    // network). It becomes a remembered owner sign-in for this tab.
+    const launcherToken = bootstrapServiceToken(window);
+    if (launcherToken) auth.signInOwner(launcherToken, true);
     const unsubscribe = auth.subscribe((next) => { if (active) authState = next; });
     const client = createApiClient({ baseUrl: window.location.origin, auth }); cameraClient = client;
     homeApi = createHomeApi({ baseUrl: window.location.origin, auth });

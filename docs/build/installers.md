@@ -1,27 +1,30 @@
 # Installer and packaging scaffolding (Stage 7: RLS4 / RLS5)
 
-Status date: 2026-08-24. This document separates, per the project honesty
-rule, what was **verified on the build machine** (Windows 11 Pro, the machine
-that produced this scaffolding) from what is **authored but unverified**.
-RLS4 and RLS5 remain UNCHECKED: nothing here is a substitute for building the
-actual installer artifacts and clean-machine acceptance.
+Status date: 2026-08-25. This document separates, per the project honesty
+rule, what is **verified** (and where: build machine vs CI) from what is
+**authored but unverified**. RLS4 and RLS5 remain UNCHECKED: installer
+artifacts now build and are payload-validated in CI, but no real
+install/uninstall has happened on any machine, clean or otherwise.
 
 ## What exists
 
 ```
 packaging/
   stage.ps1                       Windows staging: release service build + UI build -> dist/windows/
-  stage.sh                        Linux staging (same layout) -> dist/linux/   [authored, not executed]
+  stage.sh                        Linux staging (same layout) -> dist/linux/
   windows/
-    NeonHearth.wxs                WiX v4 installer definition (MSI, x64, perMachine)
+    NeonHearth.wxs                WiX installer definition (MSI, x64, perMachine) - requires WiX v5
+    Bundle.wxs                    Burn bundle: NeonHearth-Setup-<ver>-x64.exe chaining the MSI
     scripts/configure-service.ps1 Post-install: token, ACL, Npcap detect/limited mode, recovery
   linux/
     neonhearth.service            Hardened systemd unit
     neonhearth.sysusers.conf      sysusers.d fragment (dedicated `neonhearth` user)
     full-capture.conf.example     Drop-in raising AmbientCapabilities for future capture mode
-    nfpm.yaml                     nfpm config producing .deb and .rpm
+    nfpm.yaml                     nfpm config producing .deb and .rpm (version from NEONHEARTH_VERSION)
     scripts/{postinstall,preremove,postremove}.sh
   dist/                           Staging output (generated; not committed)
+.github/workflows/release.yml     Tagged-release pipeline (v* tags) building MSI + exe + deb + rpm
+                                  and publishing a GitHub pre-release with SHA256SUMS
 ```
 
 ## Ground truth the packaging is built on (verified by reading source and by running the binary)
@@ -35,14 +38,28 @@ packaging/
   would be dishonest surface. If a LAN/Tailscale listener is ever added,
   firewall authoring must be revisited then.
 - The service has **no built-in service-install mechanism**; MSI
-  `ServiceInstall` / systemd own registration.
-- The service serves the **loopback API only** — it does not serve the UI
-  bundle over HTTP in this build (no static file routes exist in
-  `lattice-service`). The Vite bundle from `apps/desktop` is installed as
-  data (`ui\` / `/usr/share/neonhearth/ui`) so the future desktop shell has
-  its assets; opening `ui/index.html` directly does not constitute a working
-  app because API calls need the bearer token (dev uses the Vite proxy in
-  `apps/desktop/vite.proxy-auth.ts`).
+  `ServiceInstall` / systemd own registration. It DOES have a built-in SCM
+  entry point: `lattice-service.exe --service` connects the Windows service
+  dispatcher (`win_service.rs`); without the flag it is a plain console app.
+  `ServiceInstall` passes `Arguments="--service"` accordingly.
+- Since v0.1.0-alpha.5 the service **serves the installed UI bundle at
+  `http://127.0.0.1:58120/`** when its `LATTICE_UI_DIR` environment variable
+  points at the staged Vite bundle (`with_ui_assets` in
+  `crates/lattice-service/src/lib.rs`): `index.html` fallback for client
+  routes, correct MIME types, no directory listing, no traversal out of the
+  ui dir (integration-tested in `crates/lattice-service/tests/ui_assets.rs`).
+  Static assets need **no bearer** (they are public build output on a
+  loopback-only listener); every `/api/*` and `/ws` route keeps its existing
+  auth. Without `LATTICE_UI_DIR` the service is API-only exactly as before,
+  so the dev flow (Vite proxy in `apps/desktop/vite.proxy-auth.ts`) is
+  unchanged. `configure-service.ps1` writes
+  `LATTICE_UI_DIR=<INSTALLFOLDER>\ui` (derived from `$PSScriptRoot`) into
+  the service Environment registry value; the systemd unit sets
+  `Environment=LATTICE_UI_DIR=/usr/share/neonhearth/ui`.
+- The listener address is configurable via `LATTICE_BIND`
+  (default `127.0.0.1:58120`) so test instances can run beside an installed
+  service; **non-loopback IPs are refused at startup** (`parse_bind` in
+  `main.rs`), keeping the privilege boundary intact.
 - **Npcap on Windows is a load-time dependency, not a graceful runtime one.**
   Verified empirically: `objdump -p` on the built `lattice-service.exe`
   lists `packet.dll` in the import table (via `pnet_datalink`). Without
@@ -84,46 +101,194 @@ packaging/
    - `stage.sh`: `bash -n` clean; the three Linux package scripts: `sh -n` clean.
    - `stage.ps1`, `configure-service.ps1`: PowerShell language parser reports zero errors.
 
-## Authored but NOT verified on this machine
+## Verified on this machine (2026-08-25): real service start under the SCM
 
-- **`wix build` was not run.** No WiX/Inno/NSIS toolchain exists here
-  (`where wix|iscc|makensis` all empty), and the fallback failed:
-  `dotnet.exe` exists but has **no .NET SDK**, so
-  `dotnet tool install --global wix` fails with "No .NET SDKs were found".
-  Consequences: the `.wxs` is validated as XML only — WiX v4 schema
-  correctness, the `Files Include` wildcard harvesting, the
-  `util:ServiceConfig` recovery element, the `NT SERVICE\NeonHearth`
-  virtual-account `ServiceInstall`, and the deferred
-  `WixQuietExec64` custom action are all unproven until `wix build`
-  and a real install run.
-- **No MSI has been installed/uninstalled anywhere**, so service
-  registration, recovery settings, limited mode, and clean uninstall
-  (service removed, files removed, `%ProgramData%\NeonHearth` left with
-  `README-UNINSTALL.txt`) are design intent, not evidence.
-- **nfpm was not run** (no `nfpm` binary here; downloading one was out of
-  scope), so no `.deb`/`.rpm` exists and the contents mapping is untested.
-- **`stage.sh` has not been executed** (authored on Windows; syntax-checked only).
+The first real MSI installs on this (non-clean) machine surfaced two start
+blockers, both now fixed and re-verified against a live service:
+
+1. **The binary never spoke the SCM protocol.** `Start-Service NeonHearth`
+   timed out with System events 7009 ("timeout waiting for the service to
+   connect") + 7000: the exe was a plain console app with no
+   `StartServiceCtrlDispatcher`. Fix: `--service` flag →
+   `win_service.rs` dispatcher (StartPending → Running-after-bind →
+   StopPending → Stopped, Stop/Shutdown accepted, startup errors reported
+   as Stopped/1066 instead of hanging), and
+   `ServiceInstall Arguments="--service"` in `NeonHearth.wxs`.
+2. **The generated token used the wrong alphabet.** `configure-service.ps1`
+   wrote standard base64 (`+`, `/`), but `AppState::new` (state.rs) only
+   accepts `[A-Za-z0-9._-]` tokens ≥ 32 chars, so the service rejected its
+   own installer-generated token ("invalid service token configuration",
+   observed in `service.log`). Fix: URL-safe alphabet (`+`→`-`, `/`→`_`).
+
+Proof (throwaway `NeonHearthTest` service registered with `sc.exe create
+... binPath= '"<release exe>" --service' obj= LocalSystem`, token +
+`LATTICE_STATE_BASE` in the service-private `Environment` registry value,
+fully deleted afterwards): start reached RUNNING in **0.28 s**,
+`GET /api/v1/health` → 200, `sc.exe stop` showed STOP_PENDING and reached
+STOPPED with exit code 0 in **0.02 s**, `sc.exe delete` clean. Service-mode
+tracing goes to `<state dir>\service.log` (the SCM gives the process no
+console); the console dev flow is unchanged and was re-smoked (health 200,
+state dir layout intact). A clean-machine MSI acceptance run (RLS4) is
+still outstanding.
+
+## Verified in CI (2026-08-25, tagged-release pipeline)
+
+The `v0.1.0-alpha.1` tag ran `.github/workflows/release.yml` to green
+(after one iteration; see the WIX8601 note below) and published a
+pre-release at https://github.com/pkircher29/NeonHearth/releases/tag/v0.1.0-alpha.1
+with `NeonHearth-0.1.0-alpha.1-x64.msi`, `neonhearth_0.1.0~alpha.1_amd64.deb`,
+`neonhearth-0.1.0~alpha.1-1.x86_64.rpm`, and `SHA256SUMS`.
+
+1. **`wix build` (WiX 5.0.2) builds the MSI**, locally and on
+   windows-latest. Two findings from actually running it:
+   - The `<Files>` wildcard-harvesting element **does not exist in WiX
+     4.x** (4.0.6 fails with WIX0005); WiX v5 is required and the pipeline
+     pins 5.0.2.
+   - The `-bindpath` **must be absolute**: `<Files>` resolves a relative
+     bindpath against the `.wxs` file's own directory and a miss is only a
+     warning (WIX8601), which shipped an MSI with an empty `ui\` tree on
+     the first tag run. The workflow now passes an absolute bindpath and
+     `-wx` (warnings-as-errors), and validates the payload by
+     `msiexec /a` administrative extract (exe, configure script, UI
+     bundle asserted present).
+2. **The Burn bundle (`Bundle.wxs`) builds** with
+   `WixToolset.BootstrapperApplications.wixext/5.0.2`, producing
+   `NeonHearth-Setup-<ver>-x64.exe` (WixStdBA hyperlinkLicense theme, no
+   license step). Validated without installing via `wix burn extract`: the
+   embedded payload is byte-identical (SHA-256) to the input MSI. Note
+   `/layout` is not a meaningful check for this bundle (compressed bundle
+   layout just copies the exe), and `wix burn extract` silently no-ops
+   with WIX8503 unless its output/intermediate folders already exist.
+3. **`stage.sh` executed end-to-end on ubuntu-latest** (its first real
+   execution) with no fixes needed beyond marking it executable in the git
+   index (it was committed 100644).
+4. **nfpm 2.47.0 produced the .deb and .rpm**, first exercised locally
+   (Windows nfpm binary against a dummy staged tree) and then in CI
+   against the real one. Payload paths verified by `dpkg-deb --contents`
+   and `rpm2cpio | cpio -t` (binary, unit, sysusers fragment, UI tree).
+   `version: ${NEONHEARTH_VERSION}` env expansion works; nfpm's semver
+   schema turns `0.1.0-alpha.1` into deb `0.1.0~alpha.1` and rpm
+   `0.1.0~alpha.1-1` as expected. Build inputs (Npcap SDK 1.13 zip, nfpm
+   deb) are downloaded pinned with SHA-256 verification.
+5. On hosted Windows runners (no Npcap installed) the workspace links
+   against the **Npcap SDK 1.13 import libraries** (`RUSTFLAGS=-L
+   <sdk>\Lib\x64`); `stage.ps1` now respects a caller-supplied
+   `RUSTFLAGS` and only prepends the dev machine's msys64 path when it
+   exists. Only `Packet.lib` (SDK) and `iphlpapi` (Windows SDK) are
+   needed (`pnet_datalink` link attributes).
+
+## Verified on this machine (2026-08-25): UI serving, pairing, launcher (v0.1.0-alpha.5)
+
+The "installed but nothing to click" gap is closed by three pieces, all
+verified locally against a throwaway release-exe instance on
+`127.0.0.1:58121` (temp `LATTICE_STATE_BASE`, throwaway token — the live
+installed service on 58120 was never touched):
+
+1. **The service serves the dashboard.** With `LATTICE_UI_DIR` pointing at
+   the staged `ui\` bundle: `GET /` → 200 `text/html` (the app shell),
+   `GET /devices` → identical index (SPA fallback), the hashed
+   `assets/index-*.js` → 200 `text/javascript`, `GET /api/v1/state` without
+   a token → 401 + `WWW-Authenticate: Bearer`, with the token → 200, and a
+   `..%2f` traversal attempt returned the SPA index, not the sibling file.
+2. **The browser UI pairs locally via a URL fragment.** `App.svelte`
+   bootstraps its bearer token from `#token=<value>`
+   (`apps/desktop/src/lib/pairing.ts`): charset-validated
+   (`[A-Za-z0-9._-]`, the same alphabet the service enforces), persisted to
+   sessionStorage for reloads, and immediately stripped from the address
+   bar with `history.replaceState`. Fragments are never sent over the
+   network, and the listener is loopback-only regardless. With no fragment
+   and no stored token the client still sends `''` — the dev-proxy flow is
+   untouched. Vitest-covered (`pairing.test.ts`).
+3. **Start-menu "NeonHearth" shortcut.** The MSI authors a non-advertised
+   all-users shortcut to `powershell.exe -WindowStyle Hidden ... -File
+   open-neonhearth.ps1`, which reads the token (and optional
+   `LATTICE_BIND` port) from the service Environment registry value —
+   self-elevating with one UAC prompt when the read is denied — and opens
+   `http://127.0.0.1:58120/#token=<token>` through the non-elevated shell
+   (`explorer.exe`) so the browser does not inherit elevation.
+   `configure-service.ps1` also prints the pre-paired URL to the console at
+   install/configure time (console only, deliberately not into
+   `install-configure.log` — see the security notes below). The MSI build
+   with the new authoring (shortcut + `AllowSameVersionUpgrades`) was
+   verified locally with WiX 5.0.2 (`-wx` clean; Shortcut table and payload
+   confirmed via `msiexec /a` extract and `wix msi decompile`).
+
+**Upgrade authoring:** `MajorUpgrade` now sets
+`AllowSameVersionUpgrades="yes"`. This is required while releases are
+alpha-tagged: MSI `ProductVersion` carries only the numeric `0.1.0` for
+both `v0.1.0-alpha.4` and `v0.1.0-alpha.5`, and without the flag a
+same-version MSI is neither an upgrade nor a downgrade — Windows would
+install a second copy side by side. With it, running the alpha.5 installer
+over an alpha.4 install replaces it in place (service re-registered, token
+preserved because `configure-service.ps1` keeps an existing
+`LATTICE_SERVICE_TOKEN`).
+
+### Security notes (single-owner alpha posture)
+
+- **The pairing token lives in the service's `Environment` registry value**
+  (`HKLM\SYSTEM\CurrentControlSet\Services\NeonHearth`), readable by local
+  administrators. For the single-owner alpha this is accepted: anyone who
+  is an administrator on the box already owns the box. Future fix
+  direction: move the secret to DPAPI-protected storage or the OS
+  credential vault (the service already ships a `KeyringVault`
+  abstraction) and keep only a reference in the registry.
+- **The fragment-token handoff (`#token=...`) never crosses the network**:
+  URL fragments are not sent in HTTP requests, the listener is
+  loopback-only, and the UI strips the fragment from the address bar on
+  load (so it does not persist in browser history) and keeps the token in
+  sessionStorage (per-tab, cleared on browser exit). Residual exposure:
+  the token is briefly visible in the address bar and lands in the shell's
+  process-argument list while the launcher runs — both local-only, same
+  admin-owns-the-box argument as above.
+- `configure-service.ps1` prints the pre-paired URL **to the console only**;
+  it is deliberately kept out of `install-configure.log` because that log
+  lives under `%ProgramData%\NeonHearth`, which non-admin local users can
+  read.
+
+## Authored but NOT verified anywhere
+
+- **No MSI, setup exe, deb, or rpm has been installed/uninstalled on any
+  machine**, so service registration, recovery settings, limited mode,
+  token generation, and clean uninstall (service removed, files removed,
+  `%ProgramData%\NeonHearth` left with `README-UNINSTALL.txt`) are still
+  design intent, not evidence. The `util:ServiceConfig` element, the
+  `NT SERVICE\NeonHearth` virtual-account `ServiceInstall`, and the
+  deferred `WixQuietExec64` custom action compile, but only a real install
+  exercises them.
 - **The systemd unit has never started the service.** The hardening set
   (`ProtectSystem=strict`, `MemoryDenyWriteExecute`, `SystemCallFilter`,
   `RestrictAddressFamilies` etc.) is reasoned from source, not proven under
   systemd; keyring/secret-service interaction on Linux is a known
-  possible friction point to test.
-- MSI `UpgradeCode`/component GUIDs are freshly generated and become
-  contractual only once a first real release ships.
+  possible friction point to test. CI packages the unit but never runs it.
+- **Nothing is signed** (RLS7): SmartScreen will flag the exe/MSI and the
+  deb/rpm carry no repository signatures; releases are therefore marked
+  pre-release with that warning in the notes.
+- MSI `UpgradeCode`/component GUIDs and the bundle `UpgradeCode` are now
+  published in a (pre-)release and must be treated as contractual.
 
 ## Build commands (per platform)
 
-Windows (this repo, elevated not required for staging):
+The release workflow (`.github/workflows/release.yml`, on `v*` tags) runs
+all of the below; tag base version must equal the Cargo workspace version.
+
+Windows (this repo, elevated not required for staging; WiX v5 CLI via
+`dotnet tool install --global wix --version 5.0.2`):
 
 ```powershell
 pwsh -File packaging\stage.ps1              # build + stage into packaging\dist\windows
-# Requires WiX v4 CLI (needs a .NET SDK: dotnet tool install --global wix):
-wix extension add -g WixToolset.Util.wixext
+wix extension add -g WixToolset.Util.wixext/5.0.2
+wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
+# bindpaths MUST be absolute (see WIX8601 note above); -wx enforces it
 wix build packaging\windows\NeonHearth.wxs `
     -ext WixToolset.Util.wixext `
-    -bindpath dist=packaging\dist\windows `
-    -arch x64 `
-    -o packaging\dist\NeonHearth-0.1.0-x64.msi
+    -bindpath dist=$PWD\packaging\dist\windows `
+    -arch x64 -d MsiVersion=0.1.0 -wx `
+    -o NeonHearth-0.1.0-x64.msi
+wix build packaging\windows\Bundle.wxs `
+    -ext WixToolset.BootstrapperApplications.wixext `
+    -bindpath msi=$PWD `
+    -arch x64 -d MsiVersion=0.1.0 -d FullVersion=0.1.0 -wx `
+    -o NeonHearth-Setup-0.1.0-x64.exe
 ```
 
 Linux (from a systemd distro or WSL2 with the pinned toolchain):
@@ -131,6 +296,7 @@ Linux (from a systemd distro or WSL2 with the pinned toolchain):
 ```bash
 packaging/stage.sh                          # build + stage into packaging/dist/linux
 cd packaging/linux
+export NEONHEARTH_VERSION=0.1.0             # tag version without the leading v
 nfpm package --config nfpm.yaml --packager deb --target ../dist/
 nfpm package --config nfpm.yaml --packager rpm --target ../dist/
 ```
@@ -204,23 +370,23 @@ parser was available on the Linux session that authored them).
 
 ## What remains before RLS4 / RLS5 can be checked
 
-1. Run `wix build` on a machine with a .NET SDK; fix schema errors; produce the MSI.
-2. Install/upgrade/uninstall the MSI on a **clean Windows 11 x64 machine**,
-   both with and without Npcap, and record: service running under
-   `NT SERVICE\NeonHearth`, recovery settings present, loopback-only bind,
-   limited-mode notice without Npcap, state dir surviving uninstall.
-3. Run `stage.sh` + `nfpm` on Linux; install the `.deb` and `.rpm` on clean
-   machines; verify unit hardening doesn't break the service
-   (`systemd-analyze security neonhearth`), token generation, and
-   state survival on package removal.
-4. Signing (RLS7) and SBOM/provenance (RLS6) are separate items and untouched here.
+1. Install/upgrade/uninstall the MSI (and the setup exe wrapping it) on a
+   **clean Windows 11 x64 machine**, both with and without Npcap, and
+   record: service running under `NT SERVICE\NeonHearth`, recovery settings
+   present, loopback-only bind, limited-mode notice without Npcap, state
+   dir surviving uninstall.
+2. Install the `.deb` and `.rpm` on clean machines; verify unit hardening
+   doesn't break the service (`systemd-analyze security neonhearth`),
+   token generation, and state survival on package removal.
+3. Signing (RLS7) and SBOM/provenance (RLS6) are separate items and untouched here.
 
 Honest status lines for the evidence ledger:
 
-- RLS4: **not complete** — Windows installer definition + staged inputs exist
-  and the staged binary was smoke-verified locally; no MSI has been built
-  (no WiX toolchain/.NET SDK on the build machine) and no clean-machine
-  install has occurred.
-- RLS5: **not complete** — systemd unit, sysusers fragment, scripts, and
-  nfpm config authored with capabilities matched to actual code behavior;
-  nothing has been packaged or installed on any Linux machine.
+- RLS4: **not complete** — the MSI and setup-exe bundle now build and are
+  payload-validated in CI on every `v*` tag (administrative extract /
+  burn extract; published as pre-release assets with SHA-256s), but they
+  are unsigned and no install of either has occurred on any machine.
+- RLS5: **not complete** — deb and rpm now build in CI from the first real
+  `stage.sh` + nfpm execution with payload listings verified, but neither
+  package has been installed on any Linux machine and the systemd unit has
+  never run the service.
