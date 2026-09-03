@@ -576,7 +576,7 @@ async fn drafts_emit_no_events_and_no_event_ever_embeds_the_draft_blob() {
 #[tokio::test]
 async fn openapi_documents_all_home_routes_and_schemas() {
     let (router, _, _) = fixture().await;
-    let response = send_raw(&router, "GET", "/api/v1/openapi.json", None, false).await;
+    let response = send_raw(&router, "GET", "/api/v1/openapi.json", None, true).await;
     assert_eq!(response.status(), StatusCode::OK);
     let doc = json_body(response).await;
     for (path, methods) in [
