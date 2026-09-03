@@ -8,6 +8,9 @@ const clientStub = (overrides: Partial<ApiClient> = {}) => ({
   ...overrides
 }) as unknown as ApiClient;
 
+// Retry-focused tests count timer calls; the liveness watchdogs are covered separately.
+const noWatchdogs = { openTimeoutMs: 0, staleAfterMs: 0, random: () => 0.5 };
+
 describe('createLiveConnection', () => {
   it('hydrates before opening events and stops without reconnecting', async () => {
     const client = clientStub();
@@ -50,7 +53,7 @@ describe('createLiveConnection', () => {
     let receive: ((message: { type: 'resync_required' }) => void) | undefined;
     const client = clientStub({ openEvents: vi.fn(async (_sequence, onMessage) => { receive = onMessage as typeof receive; return { close: vi.fn() } as unknown as WebSocket; }) });
     const timers = { setTimeout: vi.fn(() => 1), clearTimeout: vi.fn() };
-    const connection = createLiveConnection({ client, timers });
+    const connection = createLiveConnection({ client, timers, ...noWatchdogs });
     await connection.start();
     receive?.({ type: 'resync_required' });
     await Promise.resolve();
@@ -71,7 +74,7 @@ describe('createLiveConnection', () => {
         return { close } as unknown as WebSocket;
       })
     });
-    const connection = createLiveConnection({ client, timers });
+    const connection = createLiveConnection({ client, timers, ...noWatchdogs });
 
     await connection.start();
     receive?.({ type: 'resync_required' });
@@ -100,7 +103,7 @@ describe('createLiveConnection', () => {
         return { close } as unknown as WebSocket;
       })
     });
-    const connection = createLiveConnection({ client, timers });
+    const connection = createLiveConnection({ client, timers, ...noWatchdogs });
 
     await connection.start();
     close?.();
@@ -128,7 +131,7 @@ describe('createLiveConnection', () => {
         return { close: firstClose } as unknown as WebSocket;
       })
     });
-    const connection = createLiveConnection({ client, timers });
+    const connection = createLiveConnection({ client, timers, ...noWatchdogs });
 
     await connection.start();
     fail?.();
@@ -139,5 +142,117 @@ describe('createLiveConnection', () => {
     expect(firstClose).toHaveBeenCalledTimes(1);
     expect(client.openEvents).toHaveBeenCalledTimes(2);
     connection.stop();
+  });
+
+  it('backs off repeated pre-open failures and resets only after a socket opens (H-4)', async () => {
+    const socketStates: Array<(state: 'open' | 'closed' | 'error') => void> = [];
+    const retryCallbacks: Array<() => void> = [];
+    const delays: number[] = [];
+    const timers = {
+      setTimeout: vi.fn((callback: () => void, delay: number) => {
+        retryCallbacks.push(callback);
+        delays.push(delay);
+        return retryCallbacks.length;
+      }),
+      clearTimeout: vi.fn()
+    };
+    const client = clientStub({
+      openEvents: vi.fn(async (_sequence, _onMessage, onState) => {
+        socketStates.push(onState);
+        return { close: vi.fn() } as unknown as WebSocket;
+      })
+    });
+    const connection = createLiveConnection({ client, timers, ...noWatchdogs });
+
+    await connection.start();
+    socketStates[0]?.('closed');
+    expect(delays).toEqual([250]);
+
+    retryCallbacks[0]?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    socketStates[1]?.('error');
+    expect(delays).toEqual([250, 500]);
+
+    retryCallbacks[1]?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    socketStates[2]?.('open');
+    socketStates[2]?.('closed');
+    expect(delays).toEqual([250, 500, 250]);
+
+    connection.stop();
+  });
+
+  it('jitters each retry delay from the injected random source', async () => {
+    const delays: number[] = [];
+    const timers = { setTimeout: vi.fn((_callback: () => void, delay: number) => { delays.push(delay); return delays.length; }), clearTimeout: vi.fn() };
+    const random = vi.fn().mockReturnValueOnce(0).mockReturnValueOnce(0.999);
+    const client = clientStub({ openEvents: vi.fn(async () => { throw new Error('ticket rejected'); }) });
+    const connection = createLiveConnection({ client, timers, random, openTimeoutMs: 0, staleAfterMs: 0 });
+
+    await connection.start();
+    expect(delays).toEqual([125]); // 250 * (0.5 + 0)
+    // Cap applies to the base before jitter: 30 s * 1.499 would exceed the cap only through jitter.
+    const capped = createLiveConnection({ client, timers: { setTimeout: vi.fn((_c: () => void, delay: number) => { delays.push(delay); return 1; }), clearTimeout: vi.fn() }, random: () => 0.5, maxReconnectDelayMs: 100, openTimeoutMs: 0, staleAfterMs: 0 });
+    await capped.start();
+    expect(delays[1]).toBe(100);
+    connection.stop();
+    capped.stop();
+  });
+
+  it('treats a socket that never opens as failed after the open timeout (H-6)', async () => {
+    const scheduled: Array<{ callback: () => void; delay: number }> = [];
+    const timers = { setTimeout: vi.fn((callback: () => void, delay: number) => { scheduled.push({ callback, delay }); return scheduled.length; }), clearTimeout: vi.fn() };
+    const close = vi.fn();
+    const client = clientStub({ openEvents: vi.fn(async () => ({ close } as unknown as WebSocket)) });
+    const connection = createLiveConnection({ client, timers, random: () => 0.5, openTimeoutMs: 10_000, staleAfterMs: 0 });
+
+    await connection.start();
+    expect(scheduled.map((entry) => entry.delay)).toEqual([10_000]);
+    scheduled[0]!.callback(); // no `open` arrived in time
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(connection.getState().connected).toBe(false);
+    expect(scheduled.map((entry) => entry.delay)).toEqual([10_000, 250]); // a retry is now pending
+    connection.stop();
+  });
+
+  it('resyncs a silent open socket after the staleness window (H-6)', async () => {
+    const scheduled: Array<{ callback: () => void; delay: number }> = [];
+    const timers = { setTimeout: vi.fn((callback: () => void, delay: number) => { scheduled.push({ callback, delay }); return scheduled.length; }), clearTimeout: vi.fn() };
+    let onState: ((state: 'open' | 'closed' | 'error') => void) | undefined;
+    const client = clientStub({ openEvents: vi.fn(async (_sequence, _onMessage, callback) => { onState = callback; return { close: vi.fn() } as unknown as WebSocket; }) });
+    const connection = createLiveConnection({ client, timers, random: () => 0.5, openTimeoutMs: 0, staleAfterMs: 20_000 });
+
+    await connection.start();
+    onState?.('open');
+    expect(connection.getState().connected).toBe(true);
+    expect(scheduled.map((entry) => entry.delay)).toEqual([20_000]);
+    scheduled[0]!.callback(); // silence past the window: a full resync, not a plain retry
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(client.snapshotAll).toHaveBeenCalledTimes(2);
+    expect(client.openEvents).toHaveBeenCalledTimes(2);
+    connection.stop();
+  });
+
+  it('aborts an in-flight hydration on stop so a stalled snapshot cannot wedge the next start', async () => {
+    let seenSignal: AbortSignal | undefined;
+    const client = clientStub({
+      snapshotAll: vi.fn((options?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+        seenSignal = options?.signal;
+        options?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      })) as unknown as ApiClient['snapshotAll']
+    });
+    const timers = { setTimeout: vi.fn(() => 1), clearTimeout: vi.fn() };
+    const connection = createLiveConnection({ client, timers, ...noWatchdogs });
+    const starting = connection.start();
+    await Promise.resolve();
+    expect(seenSignal?.aborted).toBe(false);
+    connection.stop();
+    expect(seenSignal?.aborted).toBe(true);
+    await starting;
+    // An aborted hydration is not a failure worth retrying.
+    expect(timers.setTimeout).not.toHaveBeenCalled();
   });
 });
