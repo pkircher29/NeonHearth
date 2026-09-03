@@ -18,7 +18,8 @@ pub mod live;
 pub mod neighbor;
 pub mod passive;
 pub use passive::{
-    OfflinePassiveAdapter, PassiveAdapter, PassiveObservation, PassiveOptions, PassiveParseError,
+    MAX_SKIPPED_FRAMES, OfflinePassiveAdapter, PassiveAdapter, PassiveObservation, PassiveOptions,
+    PassiveParseError, PcapIngest,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
