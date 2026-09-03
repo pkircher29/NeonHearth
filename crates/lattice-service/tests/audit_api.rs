@@ -8,7 +8,9 @@ use axum::{
 use chrono::{TimeZone, Utc};
 use http_body_util::BodyExt;
 use lattice_service::AppState;
-use lattice_store::{AuditActor, AuditCategory, AuditLog, M2StateRepository, NewAuditEntry, connect_memory};
+use lattice_store::{
+    AuditActor, AuditCategory, AuditLog, M2StateRepository, NewAuditEntry, connect_memory,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
