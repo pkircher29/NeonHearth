@@ -7,7 +7,7 @@ use lattice_sensor::{InterfaceClass, SystemInterfaceManager};
 use lattice_service::cameras::SystemAuthorizedRtspConnector;
 use lattice_service::cameras::{
     ApprovedRtspTarget, AuthorizedRtspConnector, FakeAuthorizedRtspConnector, LoopbackRtspProxy,
-    RtspConnection, RtspProxyError, RtspProxyLimits,
+    ProxyConsumer, RtspConnection, RtspProxyError, RtspProxyLimits,
 };
 use md5_digest::{Digest, Md5};
 use secrecy::SecretString;
@@ -114,6 +114,7 @@ fn limits() -> RtspProxyLimits {
         max_body_bytes: 8192,
         max_interleaved_frame_bytes: 4096,
         io_timeout: Duration::from_secs(2),
+        stream_stall_timeout: Duration::from_secs(4),
         lease_ttl: Duration::from_secs(30),
     }
 }
@@ -170,6 +171,7 @@ async fn proxy_rejects_target_mismatch_before_any_connection_and_redacts_failure
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap_err();
@@ -186,6 +188,7 @@ async fn proxy_rejects_target_mismatch_before_any_connection_and_redacts_failure
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap_err();
@@ -204,6 +207,7 @@ async fn proxy_compares_ipv6_vault_target_to_authorized_binding_numerically() {
         approved_ipv6("2001:db8::5"),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap_err();
@@ -219,6 +223,7 @@ async fn proxy_compares_ipv6_vault_target_to_authorized_binding_numerically() {
         approved_ipv6("2001:db8::5"),
         connector,
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -239,6 +244,7 @@ async fn proxy_accepts_only_exact_token_path_and_methods_on_loopback() {
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -355,6 +361,7 @@ async fn proxy_shutdown_is_bounded_when_a_connection_task_will_not_yield() {
             stop: stop.clone(),
         }),
         bounded,
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -386,6 +393,7 @@ async fn delayed_interleaved_frames_flow_without_another_client_request() {
         approved([192, 168, 4, 22]),
         Arc::new(DelayedFrameConnector),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -414,7 +422,8 @@ async fn basic_auth_is_injected_and_sdp_and_location_are_rewritten_to_the_lease(
         "RTSP/1.0 200 OK\r\nCSeq: 7\r\nContent-Base: rtsp://192.168.4.22:8554/live/\r\nLocation: rtsp://192.168.4.22:8554/live\r\nRTP-Info: url=rtsp://192.168.4.22:8554/live/trackID=1;seq=7\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1;source=192.168.4.22\r\nX-Upstream-Debug: rtsp://192.168.4.22/private\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n",
         sdp.len()
     ).into_bytes().into_iter().chain(sdp.iter().copied()).collect();
-    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![response]));
+    let challenge = b"RTSP/1.0 401 Unauthorized\r\nCSeq: 7\r\nWWW-Authenticate: Basic realm=\"camera\"\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![challenge, response]));
     let token = LoopbackSourceToken::new();
     let proxy = LoopbackRtspProxy::start(
         HlsSessionId::new(),
@@ -423,6 +432,7 @@ async fn basic_auth_is_injected_and_sdp_and_location_are_rewritten_to_the_lease(
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -439,11 +449,110 @@ async fn basic_auth_is_injected_and_sdp_and_location_are_rewritten_to_the_lease(
     assert!(text.contains(&format!("RTP-Info: url={uri}/trackID=1;seq=7")));
     assert!(!text.contains("X-Upstream-Debug"));
     assert!(!text.contains("192.168.4.22"));
+    assert!(!text.contains("WWW-Authenticate"));
     assert!(!text.contains(PASSWORD));
-    let upstream = String::from_utf8(connector.requests().await.concat()).unwrap();
-    assert!(upstream.contains("Authorization: Basic "));
-    assert!(upstream.starts_with("DESCRIBE rtsp://192.168.4.22:8554/live RTSP/1.0"));
-    assert!(!upstream.contains(&token.to_string()));
+    let requests = connector.requests().await;
+    assert_eq!(requests.len(), 2);
+    let bare = String::from_utf8(requests[0].clone()).unwrap();
+    let answered = String::from_utf8(requests[1].clone()).unwrap();
+    // Credentials are never volunteered: the first request carries none.
+    assert!(!bare.contains("Authorization"));
+    assert!(answered.contains("Authorization: Basic "));
+    assert!(bare.starts_with("DESCRIBE rtsp://192.168.4.22:8554/live RTSP/1.0"));
+    assert!(!bare.contains(&token.to_string()));
+    assert!(!answered.contains(&token.to_string()));
+}
+
+#[tokio::test]
+async fn basic_scheme_is_cached_per_connection_after_the_first_challenge() {
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
+        b"RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: Basic realm=\"camera\"\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: 0\r\n\r\n".to_vec(),
+    ]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+        ProxyConsumer::Process(std::process::id()),
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    for cseq in [1, 2] {
+        client
+            .write_all(
+                format!(
+                    "OPTIONS {} RTSP/1.0\r\nCSeq: {cseq}\r\n\r\n",
+                    proxy.endpoint()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_rtsp_head(&mut client)
+                .await
+                .starts_with(b"RTSP/1.0 200")
+        );
+    }
+    let requests = connector.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert!(!String::from_utf8_lossy(&requests[0]).contains("Authorization"));
+    assert!(String::from_utf8_lossy(&requests[1]).contains("Authorization: Basic "));
+    // Second request on the same connection: one round trip, Basic pre-sent.
+    assert!(String::from_utf8_lossy(&requests[2]).contains("Authorization: Basic "));
+}
+
+#[tokio::test]
+async fn digest_capable_camera_never_receives_basic_credentials() {
+    // A camera offering both schemes must only ever see Digest.
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
+        b"RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: Basic realm=\"camera\"\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"abc123\", algorithm=MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: 0\r\n\r\n".to_vec(),
+    ]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+        ProxyConsumer::Process(std::process::id()),
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    for cseq in [1, 2] {
+        client
+            .write_all(
+                format!(
+                    "OPTIONS {} RTSP/1.0\r\nCSeq: {cseq}\r\n\r\n",
+                    proxy.endpoint()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_rtsp_head(&mut client)
+                .await
+                .starts_with(b"RTSP/1.0 200")
+        );
+    }
+    let requests = connector.requests().await;
+    assert_eq!(requests.len(), 3);
+    let all = String::from_utf8(requests.concat()).unwrap();
+    assert!(!all.contains("Basic "));
+    assert!(!all.contains(PASSWORD));
+    assert!(!String::from_utf8_lossy(&requests[0]).contains("Authorization"));
+    assert!(authorization(&requests[1]).starts_with("Digest "));
+    // Cached Digest is replayed pre-emptively with an incremented nonce count.
+    assert!(authorization(&requests[2]).contains("nc=00000002"));
 }
 
 #[tokio::test]
@@ -465,6 +574,7 @@ async fn parameterized_mixed_case_sdp_media_type_is_rewritten() {
         approved([192, 168, 4, 22]),
         connector,
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -488,6 +598,7 @@ async fn setup_transport_is_single_copy_stripped_and_tcp_only() {
         approved([192, 168, 4, 22]),
         Arc::new(FakeAuthorizedRtspConnector::new(vec![response])),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -525,6 +636,7 @@ async fn setup_transport_is_single_copy_stripped_and_tcp_only() {
             approved([192, 168, 4, 22]),
             Arc::new(FakeAuthorizedRtspConnector::new(vec![response])),
             limits(),
+            ProxyConsumer::Process(std::process::id()),
         )
         .await
         .unwrap();
@@ -553,6 +665,7 @@ async fn setup_forwards_one_canonical_ffmpeg_tcp_transport() {
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -605,6 +718,7 @@ async fn unsafe_or_misplaced_client_transport_is_rejected_before_connect() {
             approved([192, 168, 4, 22]),
             connector.clone(),
             limits(),
+            ProxyConsumer::Process(std::process::id()),
         )
         .await
         .unwrap();
@@ -633,6 +747,7 @@ async fn unsafe_or_misplaced_client_transport_is_rejected_before_connect() {
             approved([192, 168, 4, 22]),
             connector.clone(),
             limits(),
+            ProxyConsumer::Process(std::process::id()),
         )
         .await
         .unwrap();
@@ -667,6 +782,7 @@ async fn duplicate_or_invalid_forwarded_control_headers_are_rejected_before_conn
             approved([192, 168, 4, 22]),
             connector.clone(),
             limits(),
+            ProxyConsumer::Process(std::process::id()),
         )
         .await
         .unwrap();
@@ -690,6 +806,7 @@ async fn rtp_info_rejects_a_residual_external_rtsp_url_after_expected_rewrite() 
         approved([192, 168, 4, 22]),
         Arc::new(FakeAuthorizedRtspConnector::new(vec![response])),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -718,6 +835,7 @@ async fn digest_challenge_is_answered_internally_and_never_forwarded() {
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -755,6 +873,7 @@ async fn digest_opaque_is_bounded_echoed_exactly_and_authenticates() {
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -805,6 +924,7 @@ async fn digest_rejects_invalid_opaque_without_retrying_or_leaking() {
             approved([192, 168, 4, 22]),
             connector.clone(),
             limits(),
+            ProxyConsumer::Process(std::process::id()),
         )
         .await
         .unwrap();
@@ -824,7 +944,6 @@ async fn repeated_digest_nonce_increments_nc_and_changes_authorization() {
     let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
         b"RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"same-nonce\", algorithm=MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n".to_vec(),
         b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n".to_vec(),
-        b"RTSP/1.0 401 Unauthorized\r\nCSeq: 2\r\nWWW-Authenticate: Digest realm=\"camera\", nonce=\"same-nonce\", algorithm=MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n".to_vec(),
         b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: 0\r\n\r\n".to_vec(),
     ]));
     let proxy = LoopbackRtspProxy::start(
@@ -834,6 +953,7 @@ async fn repeated_digest_nonce_increments_nc_and_changes_authorization() {
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -856,9 +976,9 @@ async fn repeated_digest_nonce_increments_nc_and_changes_authorization() {
         );
     }
     let requests = connector.requests().await;
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 3);
     let first = authorization(&requests[1]);
-    let second = authorization(&requests[3]);
+    let second = authorization(&requests[2]);
     assert!(first.contains("nc=00000001"));
     assert!(second.contains("nc=00000002"));
     assert_ne!(first, second);
@@ -896,6 +1016,7 @@ async fn digest_new_and_stale_nonces_reset_count_and_rotate_cnonce() {
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -941,6 +1062,7 @@ async fn digest_rejects_unsupported_qop_without_forwarding_credentials() {
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -968,6 +1090,7 @@ async fn lease_enforces_owner_expiry_and_interleaved_frame_bound() {
         approved([192, 168, 4, 22]),
         connector,
         short,
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -1002,6 +1125,7 @@ async fn lease_enforces_owner_expiry_and_interleaved_frame_bound() {
         approved([192, 168, 4, 22]),
         connector,
         capped,
+        ProxyConsumer::Process(std::process::id()),
     )
     .await
     .unwrap();
@@ -1012,4 +1136,264 @@ async fn lease_enforces_owner_expiry_and_interleaved_frame_bound() {
     .await;
     assert!(response.is_empty());
     proxy.shutdown(&owner).await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn proxy_rejects_a_loopback_peer_owned_by_another_process() {
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
+        b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n".to_vec(),
+    ]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+        // No such process can own our socket.
+        ProxyConsumer::Process(u32::MAX - 1),
+    )
+    .await
+    .unwrap();
+    let response = request(
+        proxy.local_addr().port(),
+        format!("OPTIONS {} RTSP/1.0\r\nCSeq: 1\r\n\r\n", proxy.endpoint()).as_bytes(),
+    )
+    .await;
+    // Knowing the token is not enough: the peer is rejected before any upstream
+    // connection and before the request is even parsed.
+    assert!(response.starts_with(b"RTSP/1.0 403 Forbidden"));
+    assert_eq!(connector.connection_count().await, 0);
+    assert!(connector.requests().await.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pending_consumer_holds_connections_until_authorized_then_verifies_them() {
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
+        b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n".to_vec(),
+    ]));
+    let owner = HlsSessionId::new();
+    let proxy = LoopbackRtspProxy::start(
+        owner.clone(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+        ProxyConsumer::Pending,
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    client
+        .write_all(format!("OPTIONS {} RTSP/1.0\r\nCSeq: 1\r\n\r\n", proxy.endpoint()).as_bytes())
+        .await
+        .unwrap();
+    // Nothing is served while the consumer is unknown.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(connector.connection_count().await, 0);
+    // Only the owner may name the consumer, and it cannot be changed afterwards.
+    assert_eq!(
+        proxy.authorize_consumer(&HlsSessionId::new(), std::process::id()),
+        Err(RtspProxyError::WrongOwner)
+    );
+    proxy
+        .authorize_consumer(&owner, std::process::id())
+        .unwrap();
+    proxy
+        .authorize_consumer(&owner, std::process::id())
+        .unwrap();
+    assert_eq!(
+        proxy.authorize_consumer(&owner, std::process::id() + 1),
+        Err(RtspProxyError::Consumer)
+    );
+    assert!(
+        read_rtsp_head(&mut client)
+            .await
+            .starts_with(b"RTSP/1.0 200")
+    );
+    assert_eq!(connector.connection_count().await, 1);
+}
+
+#[tokio::test]
+async fn pending_consumer_that_never_arrives_is_rejected_within_io_timeout() {
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(Vec::new()));
+    let mut short = limits();
+    short.io_timeout = Duration::from_millis(100);
+    short.stream_stall_timeout = Duration::from_millis(200);
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        short,
+        ProxyConsumer::Pending,
+    )
+    .await
+    .unwrap();
+    let started = Instant::now();
+    let response = request(
+        proxy.local_addr().port(),
+        format!("OPTIONS {} RTSP/1.0\r\nCSeq: 1\r\n\r\n", proxy.endpoint()).as_bytes(),
+    )
+    .await;
+    assert!(response.starts_with(b"RTSP/1.0 403 Forbidden"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(connector.connection_count().await, 0);
+}
+
+#[tokio::test]
+async fn stream_stall_timeout_governs_idle_after_upstream_connect_not_io_timeout() {
+    let ok = |cseq: u8| {
+        format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n").into_bytes()
+    };
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![ok(1), ok(2), ok(3)]));
+    let mut bounded = limits();
+    bounded.io_timeout = Duration::from_millis(100);
+    bounded.stream_stall_timeout = Duration::from_millis(600);
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        bounded,
+        ProxyConsumer::Process(std::process::id()),
+    )
+    .await
+    .unwrap();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    let options = |cseq: u8| {
+        format!(
+            "OPTIONS {} RTSP/1.0\r\nCSeq: {cseq}\r\n\r\n",
+            proxy.endpoint()
+        )
+        .into_bytes()
+    };
+    client.write_all(&options(1)).await.unwrap();
+    assert!(
+        read_rtsp_head(&mut client)
+            .await
+            .starts_with(b"RTSP/1.0 200")
+    );
+    // Silence longer than io_timeout but shorter than the stall bound is fine.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client.write_all(&options(2)).await.unwrap();
+    assert!(
+        read_rtsp_head(&mut client)
+            .await
+            .starts_with(b"RTSP/1.0 200")
+    );
+    // Silence beyond the stall bound tears the connection down.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let _ = client.write_all(&options(3)).await;
+    let mut rest = Vec::new();
+    let _ = client.read_to_end(&mut rest).await;
+    assert!(rest.is_empty());
+    assert_eq!(connector.requests().await.len(), 2);
+}
+
+#[tokio::test]
+async fn stall_timeout_below_io_timeout_is_an_invalid_limit() {
+    let mut bad = limits();
+    bad.stream_stall_timeout = Duration::from_millis(10);
+    let result = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        Arc::new(FakeAuthorizedRtspConnector::new(Vec::new())),
+        bad,
+        ProxyConsumer::Process(std::process::id()),
+    )
+    .await;
+    assert!(matches!(result, Err(RtspProxyError::InvalidLimits)));
+}
+
+#[tokio::test]
+async fn sdp_host_rewrite_is_delimited_and_same_host_control_paths_round_trip() {
+    // Camera at .22; a longer address containing it and a control URL outside
+    // the base path (`/live`) are both common in the wild.
+    let sdp = b"v=0\r\no=- 1 1 IN IP4 192.168.4.22\r\nc=IN IP4 192.168.4.22\r\ni=peer 192.168.4.220 and 10.192.168.4.22\r\na=control:rtsp://192.168.4.22:8554/stream1/trackID=1\r\n";
+    let describe = format!(
+        "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n",
+        sdp.len()
+    )
+    .into_bytes()
+    .into_iter()
+    .chain(sdp.iter().copied())
+    .collect();
+    let setup = b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: 42\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let play = b"RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: 42\r\nRTP-Info: url=rtsp://192.168.4.22:8554/stream1/trackID=1;seq=9\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
+        describe, setup, play,
+    ]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+        ProxyConsumer::Process(std::process::id()),
+    )
+    .await
+    .unwrap();
+    let uri = proxy.endpoint();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    client
+        .write_all(
+            format!("DESCRIBE {uri} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let head = read_rtsp_head(&mut client).await;
+    let head = String::from_utf8(head).unwrap();
+    let length: usize = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut body = vec![0_u8; length];
+    client.read_exact(&mut body).await.unwrap();
+    let body = String::from_utf8(body).unwrap();
+    // Delimited: the exact host is rewritten, longer addresses are untouched.
+    assert!(body.contains("c=IN IP4 127.0.0.1"));
+    assert!(body.contains("o=- 1 1 IN IP4 127.0.0.1"));
+    assert!(body.contains("i=peer 192.168.4.220 and 10.192.168.4.22"));
+    assert!(!body.contains("127.0.0.10"));
+    // The full same-host path is kept, not just its last segment.
+    assert!(body.contains(&format!("a=control:{uri}/stream1/trackID=1")));
+    // SETUP on that control URL reaches the camera's real path, not base+segment.
+    client
+        .write_all(
+            format!(
+                "SETUP {uri}/stream1/trackID=1 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        read_rtsp_head(&mut client)
+            .await
+            .starts_with(b"RTSP/1.0 200")
+    );
+    client
+        .write_all(format!("PLAY {uri} RTSP/1.0\r\nCSeq: 3\r\nSession: 42\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let play_head = String::from_utf8(read_rtsp_head(&mut client).await).unwrap();
+    assert!(play_head.contains(&format!("RTP-Info: url={uri}/stream1/trackID=1;seq=9")));
+    assert!(!play_head.contains("192.168.4.22"));
+    let requests = connector.requests().await;
+    assert!(
+        String::from_utf8_lossy(&requests[1])
+            .starts_with("SETUP rtsp://192.168.4.22:8554/stream1/trackID=1 RTSP/1.0")
+    );
 }
