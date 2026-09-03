@@ -52,6 +52,7 @@ ignore = [
     { id = "RUSTSEC-2026-0095", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
     { id = "RUSTSEC-2026-0096", reason = "aarch64 Cranelift only (not a release target); fixed by same wasmtime upgrade" },
     { id = "RUSTSEC-2026-0222", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
+    { id = "RUSTSEC-2026-0269", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
 ]
 
 [licenses]
