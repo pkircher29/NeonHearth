@@ -20,7 +20,7 @@ pub use checkpoint::*;
 pub use flow::{CompactionPolicy, FlowIngestor, FlowRepository, FlowStoreError};
 use fs2::FileExt;
 pub use home::*;
-pub use install::{InstallRepository, InstallState};
+pub use install::{InstallRepository, InstallState, latest_migration_version};
 pub use maintenance_db::*;
 pub use policy::{ActuationAttempt, ActuationReservation, PendingDecision, PolicyRepository};
 pub use remote_access::*;

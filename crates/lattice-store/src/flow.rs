@@ -59,11 +59,14 @@ impl FlowIngestor {
         Ok(self.live.flush_payload(tick_ms, now)?)
     }
 }
+/// Upper bound on parent buckets inspected per compaction batch.
+const MAX_COMPACTION_GROUPS: i64 = 4_096;
 #[derive(Clone, Debug)]
 pub struct CompactionPolicy {
     pub seconds: Duration,
     pub minutes: Duration,
     pub hours: Option<Duration>,
+    /// Compaction batch size in child rows; see [`FlowRepository::compact`].
     pub max_rows: usize,
 }
 impl Default for CompactionPolicy {
@@ -142,6 +145,16 @@ impl FlowRepository {
         let rows=sqlx::query("SELECT bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain,upload,download,coverage FROM flow_rollups WHERE resolution=? AND bucket>=? AND bucket<=? ORDER BY bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain LIMIT ?").bind(res_s(res)).bind(ts(start)).bind(ts(end)).bind(i64::try_from(limit).map_err(|_|FlowStoreError::Overflow)?).fetch_all(&self.pool).await?;
         rows.into_iter().map(|r| decode(res, &r)).collect()
     }
+    /// Compacts expired second rows into minutes and expired minute rows into
+    /// hours, oldest parent buckets first, in bounded batches.
+    ///
+    /// `p.max_rows` is a batch size, not a refusal threshold: each batch takes
+    /// the oldest parent buckets whose child rows add up to at most
+    /// `max_rows` (always at least one parent bucket, so progress is
+    /// guaranteed), aggregates and deletes them in one transaction, commits,
+    /// and repeats until nothing eligible remains. A backlog larger than
+    /// `max_rows` therefore converges over several transactions instead of
+    /// failing forever. Returns the total number of child rows removed.
     pub async fn compact(
         &self,
         now: DateTime<Utc>,
@@ -154,17 +167,76 @@ impl FlowRepository {
         let min = now
             .checked_sub_signed(p.minutes)
             .ok_or(FlowStoreError::Overflow)?;
-        let mut tx = self.pool.begin().await?;
-        let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM flow_rollups WHERE (resolution='second' AND unixepoch(bucket)-((unixepoch(bucket)%60+60)%60)+60<=unixepoch(?)) OR (resolution='minute' AND unixepoch(bucket)-((unixepoch(bucket)%3600+3600)%3600)+3600<=unixepoch(?))").bind(sec.to_rfc3339()).bind(min.to_rfc3339()).fetch_one(&mut *tx).await?;
-        if usize::try_from(count).map_err(|_| FlowStoreError::Overflow)? > p.max_rows {
-            return Err(FlowStoreError::Capacity);
+        let batch = i64::try_from(p.max_rows).map_err(|_| FlowStoreError::Overflow)?;
+        let mut removed = self.compact_level(true, sec, now, batch).await?;
+        removed = removed
+            .checked_add(self.compact_level(false, min, now, batch).await?)
+            .ok_or(FlowStoreError::Overflow)?;
+        Ok(removed)
+    }
+    async fn compact_level(
+        &self,
+        seconds_to_minutes: bool,
+        cut: DateTime<Utc>,
+        now: DateTime<Utc>,
+        batch: i64,
+    ) -> Result<u64, FlowStoreError> {
+        let (child, width) = if seconds_to_minutes {
+            ("second", 60)
+        } else {
+            ("minute", 3600)
         };
-        aggregate(&mut tx, true, &sec, now).await?;
-        aggregate(&mut tx, false, &min, now).await?;
-        let a=sqlx::query("DELETE FROM flow_rollups WHERE resolution='second' AND unixepoch(bucket)-((unixepoch(bucket)%60+60)%60)+60<=unixepoch(?)").bind(sec.to_rfc3339()).execute(&mut *tx).await?.rows_affected();
-        let b=sqlx::query("DELETE FROM flow_rollups WHERE resolution='minute' AND unixepoch(bucket)-((unixepoch(bucket)%3600+3600)%3600)+3600<=unixepoch(?)").bind(min.to_rfc3339()).execute(&mut *tx).await?.rows_affected();
-        tx.commit().await?;
-        Ok(a + b)
+        let groups_sql = format!(
+            "SELECT unixepoch(bucket)-((unixepoch(bucket)%{width}+{width})%{width}) AS parent, COUNT(*) FROM flow_rollups WHERE resolution='{child}' AND unixepoch(bucket)-((unixepoch(bucket)%{width}+{width})%{width})+{width}<=unixepoch(?) GROUP BY parent ORDER BY parent LIMIT ?"
+        );
+        let delete_sql = format!(
+            "DELETE FROM flow_rollups WHERE resolution='{child}' AND unixepoch(bucket)-((unixepoch(bucket)%{width}+{width})%{width})+{width}<=unixepoch(?)"
+        );
+        let mut removed: u64 = 0;
+        loop {
+            let mut tx = self.pool.begin().await?;
+            let groups: Vec<(i64, i64)> = sqlx::query_as(&groups_sql)
+                .bind(cut.to_rfc3339())
+                .bind(MAX_COMPACTION_GROUPS)
+                .fetch_all(&mut *tx)
+                .await?;
+            let Some((first_parent, first_count)) = groups.first().copied() else {
+                tx.rollback().await?;
+                break;
+            };
+            // Always take the oldest parent bucket whole, then extend the batch
+            // while the next whole bucket still fits.
+            let mut batch_end = first_parent
+                .checked_add(width)
+                .ok_or(FlowStoreError::Overflow)?;
+            let mut rows = first_count;
+            for (parent, count) in groups.iter().skip(1) {
+                let next = rows.checked_add(*count).ok_or(FlowStoreError::Overflow)?;
+                if next > batch {
+                    break;
+                }
+                rows = next;
+                batch_end = parent.checked_add(width).ok_or(FlowStoreError::Overflow)?;
+            }
+            let batch_cut =
+                DateTime::from_timestamp(batch_end, 0).ok_or(FlowStoreError::Overflow)?;
+            aggregate(&mut tx, seconds_to_minutes, &batch_cut, now).await?;
+            let deleted = sqlx::query(&delete_sql)
+                .bind(batch_cut.to_rfc3339())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            tx.commit().await?;
+            removed = removed
+                .checked_add(deleted)
+                .ok_or(FlowStoreError::Overflow)?;
+            if deleted == 0 {
+                // Defensive: the group query said rows exist; if the delete
+                // removed none, stop rather than spin.
+                break;
+            }
+        }
+        Ok(removed)
     }
 }
 async fn upsert(
