@@ -145,7 +145,7 @@ fn tx16(probe: &UdpProbe, bytes: &[u8]) -> Result<(), ActiveError> {
 fn dns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError> {
     tx16(probe, b)?;
     if b.len() < 12 || b[2] & 0x80 == 0 {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     let q = usize::from(u16::from_be_bytes([b[4], b[5]]));
     let a = usize::from(u16::from_be_bytes([b[6], b[7]]));
@@ -158,19 +158,19 @@ fn dns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError>
         p = p
             .checked_add(4)
             .filter(|p| *p <= b.len())
-            .ok_or(ActiveError::Network)?;
+            .ok_or(ActiveError::Protocol)?;
     }
     let mut out = vec![];
     for _ in 0..a {
         p = skip_name(b, p)?;
         if p + 10 > b.len() {
-            return Err(ActiveError::Network);
+            return Err(ActiveError::Protocol);
         }
         let kind = u16::from_be_bytes([b[p], b[p + 1]]);
         let len = usize::from(u16::from_be_bytes([b[p + 8], b[p + 9]]));
         p += 10;
         if p + len > b.len() {
-            return Err(ActiveError::Network);
+            return Err(ActiveError::Protocol);
         }
         let value = if kind == 1 && len == 4 {
             Ipv4Addr::new(b[p], b[p + 1], b[p + 2], b[p + 3]).to_string()
@@ -196,7 +196,7 @@ fn mdns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
     let question_end = skip_name(b, 12)?
         .checked_add(4)
         .filter(|end| *end <= b.len())
-        .ok_or(ActiveError::Network)?;
+        .ok_or(ActiveError::Protocol)?;
     if &b[12..question_end] != expected.as_slice() {
         return Err(ActiveError::Correlation);
     }
@@ -210,7 +210,7 @@ fn mdns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
         let name_start = p;
         p = skip_name(b, p)?;
         if p + 10 > b.len() {
-            return Err(ActiveError::Network);
+            return Err(ActiveError::Protocol);
         }
         let kind = u16::from_be_bytes([b[p], b[p + 1]]);
         let len = usize::from(u16::from_be_bytes([b[p + 8], b[p + 9]]));
@@ -219,7 +219,7 @@ fn mdns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
         }
         p += 10;
         if p + len > b.len() {
-            return Err(ActiveError::Network);
+            return Err(ActiveError::Protocol);
         }
         facts.push(("answer".into(), format!("ptr_bytes:{len}")));
         p += len
@@ -228,7 +228,7 @@ fn mdns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
 }
 fn skip_name(b: &[u8], mut p: usize) -> Result<usize, ActiveError> {
     for _ in 0..128 {
-        let n = *b.get(p).ok_or(ActiveError::Network)?;
+        let n = *b.get(p).ok_or(ActiveError::Protocol)?;
         if n == 0 {
             return Ok(p + 1);
         }
@@ -236,16 +236,16 @@ fn skip_name(b: &[u8], mut p: usize) -> Result<usize, ActiveError> {
             return if p + 2 <= b.len() {
                 Ok(p + 2)
             } else {
-                Err(ActiveError::Network)
+                Err(ActiveError::Protocol)
             };
         }
         if n > 63 {
-            return Err(ActiveError::Network);
+            return Err(ActiveError::Protocol);
         }
         p = p
             .checked_add(1 + usize::from(n))
             .filter(|p| *p <= b.len())
-            .ok_or(ActiveError::Network)?;
+            .ok_or(ActiveError::Protocol)?;
     }
     Err(ActiveError::ResponseLimit)
 }
@@ -263,7 +263,7 @@ fn dhcp(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
     let mut p = 240;
     let mut out = vec![];
     for _ in 0..64 {
-        let code = *b.get(p).ok_or(ActiveError::Network)?;
+        let code = *b.get(p).ok_or(ActiveError::Protocol)?;
         p += 1;
         if code == 255 {
             break;
@@ -271,10 +271,10 @@ fn dhcp(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
         if code == 0 {
             continue;
         }
-        let len = usize::from(*b.get(p).ok_or(ActiveError::Network)?);
+        let len = usize::from(*b.get(p).ok_or(ActiveError::Protocol)?);
         p += 1;
         if p + len > b.len() {
-            return Err(ActiveError::Network);
+            return Err(ActiveError::Protocol);
         };
         let v = &b[p..p + len];
         match (code, len) {
@@ -311,7 +311,7 @@ fn headers(
     let Correlation::Session(correlations) = &probe.correlation else {
         return Err(ActiveError::Correlation);
     };
-    let text = std::str::from_utf8(b).map_err(|_| ActiveError::Network)?;
+    let text = std::str::from_utf8(b).map_err(|_| ActiveError::Protocol)?;
     if !correlations.is_empty() || !text.lines().next().is_some_and(|line| line.contains("200")) {
         return Err(ActiveError::Correlation);
     }
@@ -339,8 +339,8 @@ fn session_headers(
     if correlations.is_empty() || b.len() > MAX_RESPONSE_BYTES {
         return Err(ActiveError::Correlation);
     }
-    let text = std::str::from_utf8(b).map_err(|_| ActiveError::Network)?;
-    let (head, _body) = text.split_once("\r\n\r\n").ok_or(ActiveError::Network)?;
+    let text = std::str::from_utf8(b).map_err(|_| ActiveError::Protocol)?;
+    let (head, _body) = text.split_once("\r\n\r\n").ok_or(ActiveError::Protocol)?;
     if head
         .as_bytes()
         .windows(2)
@@ -352,10 +352,10 @@ fn session_headers(
             .filter(|pair| pair[0] == b'\r')
             .any(|pair| pair[1] != b'\n')
     {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     let mut lines = head.split("\r\n");
-    let status = lines.next().ok_or(ActiveError::Network)?;
+    let status = lines.next().ok_or(ActiveError::Protocol)?;
     let mut parts = status.split_ascii_whitespace();
     if parts.next() != Some(protocol)
         || parts
@@ -367,15 +367,15 @@ fn session_headers(
     let (mut found, mut out) = (vec![None::<String>; correlations.len()], vec![]);
     for line in lines.take(64) {
         if line.is_empty() || line.starts_with([' ', '\t']) {
-            return Err(ActiveError::Network);
+            return Err(ActiveError::Protocol);
         }
-        let (name, value) = line.split_once(':').ok_or(ActiveError::Network)?;
+        let (name, value) = line.split_once(':').ok_or(ActiveError::Protocol)?;
         if name.is_empty()
             || !name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         {
-            return Err(ActiveError::Network);
+            return Err(ActiveError::Protocol);
         }
         let value = value.trim();
         for (index, (correlation_name, _)) in correlations.iter().enumerate() {
@@ -403,19 +403,19 @@ fn session_headers(
 fn nbns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError> {
     tx16(probe, b)?;
     if b.len() < 12 || b[2] & 0x80 == 0 {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     let mut p = 12;
     p = skip_name(b, p)?;
     p += 4;
     p = skip_name(b, p)?;
     if p + 10 > b.len() {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     let len = usize::from(u16::from_be_bytes([b[p + 8], b[p + 9]]));
     p += 10;
     if p + len > b.len() || len < 1 {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     let count = usize::from(b[p]);
     if count > 16 || 1 + count * 18 > len {
@@ -459,11 +459,11 @@ fn soap(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
         }
         let (resolved, event) = reader
             .read_resolved_event_into(&mut buffer)
-            .map_err(|_| ActiveError::Network)?;
+            .map_err(|_| ActiveError::Protocol)?;
         match event {
             Event::Start(element) => {
                 if current.is_some() {
-                    return Err(ActiveError::Network);
+                    return Err(ActiveError::Protocol);
                 }
                 depth += 1;
                 if depth > 32 {
@@ -508,18 +508,18 @@ fn soap(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
                     b"XAddrs" if probe_depth == Some(depth - 1) && is_wsd => {
                         current = Some(("xaddrs", depth, false))
                     }
-                    _ if depth == 1 => return Err(ActiveError::Network),
+                    _ if depth == 1 => return Err(ActiveError::Protocol),
                     _ => {}
                 }
             }
             Event::Text(text) => {
                 if let Some((key, at, consumed)) = current {
                     if at != depth || consumed {
-                        return Err(ActiveError::Network);
+                        return Err(ActiveError::Protocol);
                     }
                     let value = text
                         .decode()
-                        .map_err(|_| ActiveError::Network)?
+                        .map_err(|_| ActiveError::Protocol)?
                         .into_owned();
                     if value.len() > MAX_FACT_VALUE_BYTES {
                         return Err(ActiveError::ResponseLimit);
@@ -540,9 +540,9 @@ fn soap(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
                     ResolveResult::Bound(Namespace(uri)) => Some(*uri),
                     _ => None,
                 };
-                let (name, start_ns) = stack.pop().ok_or(ActiveError::Network)?;
+                let (name, start_ns) = stack.pop().ok_or(ActiveError::Protocol)?;
                 if name.as_slice() != element.name().as_ref() || start_ns.as_deref() != ns {
-                    return Err(ActiveError::Network);
+                    return Err(ActiveError::Protocol);
                 }
                 if current.is_some_and(|(_, at, _)| at == depth) {
                     current = None
@@ -562,13 +562,13 @@ fn soap(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
                 if envelope == Some(depth) {
                     envelope = None
                 }
-                depth = depth.checked_sub(1).ok_or(ActiveError::Network)?
+                depth = depth.checked_sub(1).ok_or(ActiveError::Protocol)?
             }
             Event::DocType(_)
             | Event::Decl(_)
             | Event::PI(_)
             | Event::GeneralRef(_)
-            | Event::CData(_) => return Err(ActiveError::Network),
+            | Event::CData(_) => return Err(ActiveError::Protocol),
             Event::Eof => break,
             Event::Empty(_) | Event::Comment(_) => {}
         }
