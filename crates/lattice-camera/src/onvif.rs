@@ -589,7 +589,13 @@ impl Default for InventoryLimits {
             max_field_bytes: MAX_PUBLIC_TEXT_BYTES,
             max_token_bytes: MAX_PUBLIC_TEXT_BYTES,
             max_uri_bytes: 2_048,
-            timeout: Duration::from_secs(5),
+            // One total budget for the whole inventory pass. A full pass is
+            // GetDeviceInformation + GetCapabilities + GetProfiles +
+            // GetSystemDateAndTime + one GetStreamUri per profile, so with the
+            // default `max_profiles` of 16 that is up to 20 sequential
+            // exchanges; 10 s leaves ~500 ms per exchange on a busy Wi-Fi
+            // camera instead of the 250 ms a 5 s budget allowed.
+            timeout: Duration::from_secs(10),
         }
     }
 }
