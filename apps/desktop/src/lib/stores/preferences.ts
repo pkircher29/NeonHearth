@@ -19,6 +19,7 @@ export function readMotion(store: StorageLike | null = storage()): MotionPrefere
 export function applyMotion(preference: MotionPreference, store: StorageLike | null = storage(), root: HTMLElement | null = typeof document !== 'undefined' ? document.documentElement : null): void {
   try { if (preference === 'reduced') store?.setItem(MOTION_KEY, 'reduced'); else store?.removeItem(MOTION_KEY); } catch { /* storage unavailable: apply for this session only */ }
   if (root) { if (preference === 'reduced') root.dataset.motion = 'reduced'; else delete root.dataset.motion; }
+  try { if (typeof window !== 'undefined') window.dispatchEvent(new Event('neonhearth:motion')); } catch { /* no window */ }
 }
 
 /** True when either the OS or this app's own setting asks for less motion. */

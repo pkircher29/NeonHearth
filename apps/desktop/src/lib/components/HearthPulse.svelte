@@ -5,6 +5,7 @@
   import { EMBER_RADIUS, GAUGE_RADII, GAUGE_START, GAUGE_SWEEP, HEARTH_CENTER, HEARTH_HEIGHT, HEARTH_WIDTH, TIER_COLOR, describeHearth, emberEnergy, gaugeFraction, layoutSparks, sparkAt, type Spark } from './hearth';
   import { formatThroughput } from './networkFormat';
   import Icon from './Icon.svelte';
+  import { MOTION_KEY, motionReduced } from '../stores/preferences';
 
   interface Props {
     devices?: readonly DeviceSnapshot[];
@@ -156,9 +157,14 @@
 
   onMount(() => {
     const media = typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
-    prefersReduced = media?.matches ?? false;
-    const onMedia = (event: MediaQueryListEvent) => { prefersReduced = event.matches; };
+    prefersReduced = motionReduced();
+    const onMedia = () => { prefersReduced = motionReduced(); };
     media?.addEventListener?.('change', onMedia);
+    // The in-app switch writes localStorage and stamps the root; the same
+    // tab is told through this event, other tabs through `storage`.
+    const onStorage = (event: StorageEvent) => { if (event.key === null || event.key === MOTION_KEY) prefersReduced = motionReduced(); };
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('neonhearth:motion', onMedia);
     const onVisibility = () => { pageHidden = document.hidden; };
     document.addEventListener('visibilitychange', onVisibility);
     let observer: ResizeObserver | null = null;
@@ -166,7 +172,7 @@
       observer = new ResizeObserver((entries) => { const width = entries[0]?.contentRect.width; if (width) cssScale = width / HEARTH_WIDTH; });
       observer.observe(canvas);
     }
-    return () => { media?.removeEventListener?.('change', onMedia); document.removeEventListener('visibilitychange', onVisibility); observer?.disconnect(); };
+    return () => { media?.removeEventListener?.('change', onMedia); window.removeEventListener('storage', onStorage); window.removeEventListener('neonhearth:motion', onMedia); document.removeEventListener('visibilitychange', onVisibility); observer?.disconnect(); };
   });
 
   $effect(() => {

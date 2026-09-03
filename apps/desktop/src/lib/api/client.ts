@@ -184,6 +184,12 @@ export const INTEGRATION_SCOPES: readonly IntegrationScope[] = ['devices:read', 
 export interface IntegrationToken { id: string; name: string; scopes: string[]; created_at: string; revoked: boolean }
 export interface MintedIntegrationToken extends Omit<IntegrationToken, 'revoked'> { token: string }
 
+/** Network Doctor probe targets (GET/PUT /doctor/settings). */
+export interface DoctorSettings { interface: string; gateway: string | null; gateway_source: string; configured_resolvers: string[]; independent_resolver: string; internet_probe_address: string; internet_probe_port: number; dns_probe_name: string; external_probes_confirmed: boolean }
+export type DoctorSettingsUpdate = Partial<Omit<DoctorSettings, 'gateway_source'>>;
+/** A 400 from PUT /doctor/settings carries the reason; surfaced as a typed outcome. */
+export type DoctorSettingsOutcome = { status: 'saved'; settings: DoctorSettings } | { status: 'rejected'; error: string };
+
 const AUDIT_ACTORS: readonly string[] = ['owner', 'service', 'module'];
 const AUDIT_CATEGORIES: readonly string[] = ['approval', 'scan', 'enforcement', 'doctor_action', 'audit_module'];
 const CHAIN_BREAKS: readonly string[] = ['id_gap', 'prev_hash_mismatch', 'entry_hash_mismatch', 'invalid_row', 'head_mismatch'];
@@ -235,6 +241,13 @@ function isIntegrationToken(value: unknown): value is IntegrationToken {
 function isMintedIntegrationToken(value: unknown): value is MintedIntegrationToken {
   return isRecord(value) && exact(value, ['id', 'name', 'scopes', 'token', 'created_at']) && typeof value.id === 'string' && UUID.test(value.id) && typeof value.name === 'string' && Array.isArray(value.scopes) && value.scopes.every((scope) => typeof scope === 'string') && typeof value.token === 'string' && HEX64.test(value.token) && isDate(value.created_at);
 }
+function isDoctorSettings(value: unknown): value is DoctorSettings {
+  if (!isRecord(value) || !exact(value, ['interface', 'gateway', 'gateway_source', 'configured_resolvers', 'independent_resolver', 'internet_probe_address', 'internet_probe_port', 'dns_probe_name', 'external_probes_confirmed'])) return false;
+  return typeof value.interface === 'string' && (value.gateway === null || typeof value.gateway === 'string') && typeof value.gateway_source === 'string'
+    && Array.isArray(value.configured_resolvers) && value.configured_resolvers.length <= 8 && value.configured_resolvers.every((item) => typeof item === 'string')
+    && typeof value.independent_resolver === 'string' && typeof value.internet_probe_address === 'string' && typeof value.internet_probe_port === 'number'
+    && typeof value.dns_probe_name === 'string' && typeof value.external_probes_confirmed === 'boolean';
+}
 function isItemList<T>(value: unknown, isItem: (item: unknown) => item is T): value is { items: T[] } {
   return isRecord(value) && exact(value, ['items']) && Array.isArray(value.items) && value.items.length <= 1024 && value.items.every(isItem);
 }
@@ -250,6 +263,8 @@ export interface ApiClient {
   auditPage(options?: { before?: number; limit?: number; category?: AuditCategory; actor?: AuditActor; signal?: AbortSignal }): Promise<AuditPage>;
   /** History: recompute hashes over the newest `tail` entries (or the whole chain). */
   auditVerify(tail?: number): Promise<AuditVerify>;
+  doctorSettings(): Promise<DoctorSettings>;
+  updateDoctorSettings(update: DoctorSettingsUpdate): Promise<DoctorSettingsOutcome>;
   remoteStatus(): Promise<RemoteStatus>;
   /** Owner-only: configure private Tailscale Serve for the phone surface. */
   remoteServe(): Promise<RemoteServe>;
@@ -860,6 +875,22 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl = fetch
     if (!isAuditVerify(value)) throw new Error('Invalid audit verify response');
     return value;
   }
+  async function doctorSettings(): Promise<DoctorSettings> {
+    const value = await request('/api/v1/doctor/settings', authorized('GET'));
+    if (!isDoctorSettings(value)) throw new Error('Invalid doctor settings response');
+    return value;
+  }
+  async function updateDoctorSettings(update: DoctorSettingsUpdate): Promise<DoctorSettingsOutcome> {
+    const response = await send('/api/v1/doctor/settings', authorized('PUT', update));
+    if (response.status === 400) {
+      const body: unknown = await response.json().catch(() => null);
+      return { status: 'rejected', error: isRecord(body) && typeof body.error === 'string' ? body.error : 'The collector rejected these settings.' };
+    }
+    if (!response.ok) throw new ApiError(response.status);
+    const value: unknown = await response.json();
+    if (!isDoctorSettings(value)) throw new Error('Invalid doctor settings response');
+    return { status: 'saved', settings: value };
+  }
   async function remoteStatus(): Promise<RemoteStatus> {
     const value = await request('/api/v1/remote/status', authorized('GET'));
     if (!isRemoteStatus(value)) throw new Error('Invalid remote status response');
@@ -909,5 +940,5 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl = fetch
     return { expires_at: value.expires_at };
   }
 
-  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, doctorRun, doctorReport, doctorApprove, doctorRepair, auditPage, auditVerify, remoteStatus, remoteServe, remoteSessions, revokePhoneSession, integrationTokens, mintIntegrationToken, revokeIntegrationToken, pairPhone, stepUp };
+  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, doctorRun, doctorReport, doctorApprove, doctorRepair, auditPage, auditVerify, doctorSettings, updateDoctorSettings, remoteStatus, remoteServe, remoteSessions, revokePhoneSession, integrationTokens, mintIntegrationToken, revokeIntegrationToken, pairPhone, stepUp };
 }
