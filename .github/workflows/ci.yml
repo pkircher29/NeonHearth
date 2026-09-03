@@ -75,6 +75,11 @@ jobs:
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
     runs-on: ubuntu-latest
+    env:
+      # The action runs in its own container with its own rustup; the repo's
+      # rust-toolchain.toml pin (1.96.0) is not installed there. cargo-deny
+      # only reads Cargo.lock, so any toolchain will do.
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
