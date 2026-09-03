@@ -91,8 +91,8 @@ defects, not permanent acceptances:
 | Crate (pinned) | Advisories | Fix |
 |---|---|---|
 | `wasmtime = "27"` (only `lattice-audit-wasm`) | RUSTSEC-2025-0046, -2025-0118, -2026-0020/0021/0085–0089/0091–0096/0222 (16 total; includes sandbox-escape classes, several specific to Winch/aarch64/pooling-allocator/component-model configurations we do not use) | Upgrade to a maintained line (>=43.0.1, ideally >=47.0.3), then delete the wasmtime ignore block |
-| `hickory-proto = "0.25"` (DNS parsing, `lattice-sensor`) | RUSTSEC-2026-0118 (DNSSEC NSEC3 unbounded loop — no fixed release published; we do not enable `DnssecDnsHandle`), RUSTSEC-2026-0119 (encoder CPU amplification — fixed in 0.26.1) | Bump to 0.26.x; re-check -0118 for a fixed release |
-| `quick-xml = "0.38"` (SSDP/device XML) | RUSTSEC-2026-0194, -2026-0195 (quadratic/unbounded parsing DoS — fixed in 0.41.0) | Bump to 0.41.x |
+| `hickory-proto = "0.26"` (DNS parsing, `lattice-sensor`) | RUSTSEC-2026-0118 and -2026-0119 were resolved by the bump to 0.26.1 (the advisories list `>=0.26.0-beta.1` / `>=0.26.1` as unaffected); no ignore remains | None; keep on the 0.26.x line |
+| `quick-xml = "0.41"` (SSDP/device XML) | RUSTSEC-2026-0194 and -2026-0195 were resolved by the bump to 0.41.0; no ignore remains | None; keep on the 0.41.x line |
 
 New advisories against any other crate still fail CI immediately.
 
