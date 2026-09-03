@@ -451,7 +451,8 @@ impl IdentityEngine {
         self.prepare(&mut incoming)?;
         if let Some(alias) = id {
             let root = self.resolve(alias)?;
-            self.preadd(alias, incoming.len())?;
+            self.prune_expired(alias, now)?;
+            self.preadd(alias, incoming.len(), now)?;
             self.facts
                 .get_mut(&alias)
                 .ok_or(IdentityError::DeviceNotFound)?
@@ -486,7 +487,8 @@ impl IdentityEngine {
         matches.sort_by_key(|x| x.0.to_string());
         if matches.len() == 1 && matches[0].1.auto {
             let root = matches[0].0;
-            self.preadd(root, incoming.len())?;
+            self.prune_expired(root, now)?;
+            self.preadd(root, incoming.len(), now)?;
             self.facts
                 .get_mut(&root)
                 .ok_or(IdentityError::DeviceNotFound)?
@@ -534,26 +536,98 @@ impl IdentityEngine {
         }
         Ok(())
     }
-    fn preadd(&self, id: DeviceId, n: usize) -> Result<(), IdentityError> {
+    /// Checks the per-device fact budget against the facts that are still live at
+    /// `now`; expired evidence never counts against the budget.
+    fn preadd(&self, id: DeviceId, n: usize, now: DateTime<Utc>) -> Result<(), IdentityError> {
         let c = self.component(id)?;
-        let count: usize = c.iter().map(|d| self.facts[d].len()).sum();
+        let count: usize = c
+            .iter()
+            .map(|d| self.facts[d].iter().filter(|f| live(f, now)).count())
+            .sum();
         if count + n > self.cfg.max_facts_per_device {
             return Err(IdentityError::Capacity("facts"));
         }
         Ok(())
     }
-    pub fn add_facts(
+    /// Drops every fact whose expiry has passed for each member of `id`'s merge
+    /// component, so expired evidence stops occupying the fact budget.
+    fn prune_expired(&mut self, id: DeviceId, now: DateTime<Utc>) -> Result<(), IdentityError> {
+        for d in self.component(id)? {
+            if let Some(fs) = self.facts.get_mut(&d) {
+                fs.retain(|f| live(f, now));
+            }
+        }
+        Ok(())
+    }
+    pub fn add_facts(&mut self, id: DeviceId, fs: Vec<EvidenceFact>) -> Result<(), IdentityError> {
+        self.add_facts_at(id, fs, Utc::now())
+    }
+    pub fn add_facts_at(
         &mut self,
         id: DeviceId,
         mut fs: Vec<EvidenceFact>,
+        now: DateTime<Utc>,
     ) -> Result<(), IdentityError> {
         self.prepare(&mut fs)?;
-        self.preadd(id, fs.len())?;
+        self.prune_expired(id, now)?;
+        self.preadd(id, fs.len(), now)?;
         self.facts
             .get_mut(&id)
             .ok_or(IdentityError::DeviceNotFound)?
             .extend(fs);
         Ok(())
+    }
+    /// Evicts every merge component that has no live evidence at `now` and whose
+    /// newest observation is older than `retention`. Components the owner has
+    /// annotated, or that still carry a pending merge proposal, are kept so they
+    /// remain visible for owner attention. Returns the evicted device ids so the
+    /// caller can surface them; evicted ids are never handed out again.
+    pub fn evict_stale(
+        &mut self,
+        retention: chrono::Duration,
+    ) -> Result<Vec<DeviceId>, IdentityError> {
+        self.evict_stale_at(Utc::now(), retention)
+    }
+    pub fn evict_stale_at(
+        &mut self,
+        now: DateTime<Utc>,
+        retention: chrono::Duration,
+    ) -> Result<Vec<DeviceId>, IdentityError> {
+        let cutoff = now
+            .checked_sub_signed(retention)
+            .ok_or(IdentityError::InvalidInput("retention"))?;
+        let mut evicted = vec![];
+        for c in self.components()? {
+            let stale = c.iter().all(|d| {
+                self.facts[d]
+                    .iter()
+                    .all(|f| !live(f, now) && f.observed_at < cutoff)
+            });
+            let annotated = self.owners.iter().any(|o| c.contains(&o.device_id));
+            let pending = self.proposals.iter().any(|p| {
+                p.status == ProposalStatus::Pending && (c.contains(&p.left) || c.contains(&p.right))
+            });
+            if stale && !annotated && !pending {
+                evicted.extend(c);
+            }
+        }
+        if evicted.is_empty() {
+            return Ok(evicted);
+        }
+        let gone: HashSet<DeviceId> = evicted.iter().copied().collect();
+        self.facts.retain(|d, _| !gone.contains(d));
+        self.edges
+            .retain(|_, e| !gone.contains(&e.a) && !gone.contains(&e.b));
+        let dropped: HashSet<ProposalId> = self
+            .proposals
+            .iter()
+            .filter(|p| gone.contains(&p.left) || gone.contains(&p.right))
+            .map(|p| p.id)
+            .collect();
+        self.proposals.retain(|p| !dropped.contains(&p.id));
+        self.audit.retain(|a| !dropped.contains(&a.proposal_id));
+        evicted.sort_by_key(ToString::to_string);
+        Ok(evicted)
     }
     pub fn resolve(&self, id: DeviceId) -> Result<DeviceId, IdentityError> {
         Ok(canon(&self.component(id)?))
@@ -976,6 +1050,10 @@ fn mac(v: &str) -> Result<String, IdentityError> {
 }
 fn local_mac(v: &str) -> bool {
     u8::from_str_radix(v.get(..2).unwrap_or(""), 16).is_ok_and(|x| x & 2 != 0)
+}
+/// A fact is live until its expiry passes; facts without an expiry never expire.
+fn live(f: &EvidenceFact, now: DateTime<Utc>) -> bool {
+    f.expires_at.is_none_or(|x| x > now)
 }
 fn allowed(k: &str, f: EvidenceFamily) -> bool {
     if f == EvidenceFamily::RouterHint {
