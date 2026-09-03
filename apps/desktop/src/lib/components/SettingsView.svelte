@@ -67,18 +67,18 @@
 </section>
 
 <style>
-  .settings-card { margin-top: 26px; padding: 20px; border: 1px solid #20424b; border-radius: 12px; background: #0b1c26; display: grid; gap: 12px; }
-  .settings-card h2 { margin: 0; font: 600 17px Arial; }
+  .settings-card { margin-top: 26px; padding: 20px; border: 1px solid var(--line-mid); border-radius: 12px; background: var(--surface); display: grid; gap: 12px; }
+  .settings-card h2 { margin: 0; font: 600 17px var(--font-display); }
   .settings-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 0; }
-  .settings-facts div { padding-top: 10px; border-top: 1px solid #20424b; }
-  .settings-facts dt { color: #77959d; font: 10px monospace; text-transform: uppercase; }
-  .settings-facts dd { margin: 5px 0 0; color: #cce4e7; font-size: 12px; }
+  .settings-facts div { padding-top: 10px; border-top: 1px solid var(--line-mid); }
+  .settings-facts dt { color: var(--muted); font: 10px var(--font-mono); text-transform: uppercase; }
+  .settings-facts dd { margin: 5px 0 0; color: var(--ink); font-size: 12px; }
   .pair-form { display: grid; gap: 10px; }
   .pair-form .search { margin: 0; }
-  .pair-error { margin: 0; padding: 9px; border: 1px solid #ff5c9b; border-radius: 5px; color: #ff5c9b; font: 11px monospace; }
-  .confirm, .quiet { min-height: 44px; padding: 10px 14px; border: 1px solid #63f3f0; border-radius: 5px; background: #63f3f0; color: #031418; font: 700 12px Arial; cursor: pointer; justify-self: start; }
-  .quiet { color: #cce4e7; border-color: #28505a; background: transparent; }
+  .pair-error { margin: 0; padding: 9px; border: 1px solid var(--pink); border-radius: 5px; color: var(--pink); font: 11px var(--font-mono); }
+  .confirm, .quiet { min-height: 44px; padding: 10px 14px; border: 1px solid var(--accent); border-radius: 5px; background: var(--accent); color: var(--accent-ink); font: 700 12px var(--font-display); cursor: pointer; justify-self: start; }
+  .quiet { color: var(--ink); border-color: var(--line-strong); background: transparent; }
   .confirm:disabled { opacity: .5; cursor: not-allowed; }
-  .pairing-code { padding: 14px; border: 1px dashed #ffcd66; border-radius: 8px; display: grid; gap: 8px; }
-  .pairing-code code { display: block; padding: 10px; border-radius: 5px; background: #061019; color: #ffcd66; font: 13px monospace; overflow-wrap: anywhere; user-select: all; }
+  .pairing-code { padding: 14px; border: 1px dashed var(--gold); border-radius: 8px; display: grid; gap: 8px; }
+  .pairing-code code { display: block; padding: 10px; border-radius: 5px; background: var(--bg); color: var(--gold); font: 13px var(--font-mono); overflow-wrap: anywhere; user-select: all; }
 </style>

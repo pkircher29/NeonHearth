@@ -73,9 +73,9 @@ describe('HearthPulse', () => {
   });
 
   it('falls back to an unavailable description before pairing', () => {
-    const { getByRole, getByText } = render(HearthPulse, { devices: [], connected: false });
+    const { getByRole, getAllByText } = render(HearthPulse, { devices: [], connected: false });
     expect(getByRole('img').getAttribute('aria-label')).toMatch(/unavailable until the collector is paired/);
-    expect(getByText('unavailable')).toBeTruthy();
+    expect(getAllByText('unavailable').length).toBeGreaterThanOrEqual(1);
   });
 
   it('offers a keyboard path to every device when selection is wired', async () => {

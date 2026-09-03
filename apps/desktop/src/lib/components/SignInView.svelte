@@ -57,11 +57,11 @@
 
 <style>
   .sign-in { max-width: 530px; margin: 10vh auto; }
-  .sign-in h1 { margin: 9px 0 8px; font: 700 clamp(2rem, 4vw, 3.4rem)/.95 Arial; letter-spacing: -.05em; }
+  .sign-in h1 { margin: 9px 0 8px; font: 700 clamp(2rem, 4vw, 3.4rem)/.95 var(--font-display); letter-spacing: -.05em; }
   .sign-in-form { display: grid; gap: 14px; margin-top: 8px; }
   .small { font-size: 12px; margin: -6px 0 0; }
-  .remember { display: flex; gap: 9px; align-items: center; color: #9bb7bb; font-size: 12px; }
-  .remember input { width: 16px; height: 16px; accent-color: #63f3f0; }
-  .sign-in-error { margin: 0; padding: 9px; border: 1px solid #ff5c9b; border-radius: 5px; color: #ff5c9b; font: 11px monospace; }
-  .sign-in-submit { min-height: 44px; padding: 10px 16px; border: 1px solid #63f3f0; border-radius: 5px; background: #63f3f0; color: #031418; font: 700 13px Arial; cursor: pointer; justify-self: start; }
+  .remember { display: flex; gap: 9px; align-items: center; color: var(--muted-strong); font-size: 12px; }
+  .remember input { width: 16px; height: 16px; accent-color: var(--accent); }
+  .sign-in-error { margin: 0; padding: 9px; border: 1px solid var(--pink); border-radius: 5px; color: var(--pink); font: 11px var(--font-mono); }
+  .sign-in-submit { min-height: 44px; padding: 10px 16px; border: 1px solid var(--accent); border-radius: 5px; background: var(--accent); color: var(--accent-ink); font: 700 13px var(--font-display); cursor: pointer; justify-self: start; }
 </style>

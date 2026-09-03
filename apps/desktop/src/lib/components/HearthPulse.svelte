@@ -4,6 +4,7 @@
   import { heatTier } from '../twin/heat';
   import { EMBER_RADIUS, GAUGE_RADII, GAUGE_START, GAUGE_SWEEP, HEARTH_CENTER, HEARTH_HEIGHT, HEARTH_WIDTH, TIER_COLOR, describeHearth, emberEnergy, gaugeFraction, layoutSparks, sparkAt, type Spark } from './hearth';
   import { formatThroughput } from './networkFormat';
+  import Icon from './Icon.svelte';
 
   interface Props {
     devices?: readonly DeviceSnapshot[];
@@ -198,7 +199,7 @@
     ></canvas>
     <div class="readout">
       <span class="total">{formatThroughput(total)}</span>
-      <span class="split"><b class="down">↓ {formatThroughput(connected ? download : null)}</b><b class="up">↑ {formatThroughput(connected ? upload : null)}</b></span>
+      <span class="split"><b class="down"><Icon name="down" size={11} strokeWidth={2.4} /> {formatThroughput(connected ? download : null)}</b><b class="up"><Icon name="up" size={11} strokeWidth={2.4} /> {formatThroughput(connected ? upload : null)}</b></span>
     </div>
   </div>
 
@@ -226,6 +227,7 @@
   .readout { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); text-align: center; display: grid; gap: 2px; pointer-events: none; padding-top: 2px; }
   .readout .total { font: 700 clamp(18px, 3.6cqw, 26px) / 1 var(--font-display, Arial, sans-serif); letter-spacing: -0.02em; color: var(--ink, #e9fbfc); text-shadow: 0 1px 12px rgba(6, 16, 24, 0.7); }
   .readout .split { display: flex; gap: 12px; justify-content: center; margin-top: 84px; font: 500 11px var(--font-mono, monospace); letter-spacing: 0.04em; }
+  .readout .split b { display: inline-flex; align-items: center; gap: 3px; }
   .readout .down { color: var(--tier-cyan, #63f3f0); }
   .readout .up { color: var(--tier-gold, #ffcd66); }
   .hearth.unavailable .readout .total { color: var(--muted, #77959d); }
