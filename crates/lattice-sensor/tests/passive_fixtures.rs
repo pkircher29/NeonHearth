@@ -1065,9 +1065,136 @@ fn invalid_utf8_oversized_text_and_xml_entities_are_rejected_without_observation
     let mut bytes = fs::read(fixtures().join("ws-discovery.pcap")).unwrap();
     let at = 24 + 16 + 14 + 20 + 8;
     bytes[at..at + 9].copy_from_slice(b"<!DOCTYPE");
+    // The frame itself is rejected...
+    let frame = PcapReader::new(Cursor::new(bytes.as_slice()))
+        .unwrap()
+        .next_packet()
+        .unwrap()
+        .unwrap()
+        .data
+        .into_owned();
     assert!(
+        lattice_sensor::PassiveAdapter::normalize(
+            &OfflinePassiveAdapter,
+            "x",
+            chrono::Utc::now(),
+            &frame,
+            &PassiveOptions::default()
+        )
+        .is_err()
+    );
+    // ...and an offline ingest counts it as skipped without producing an observation.
+    let report = OfflinePassiveAdapter
+        .ingest_pcap_report("x", &bytes, &PassiveOptions::default())
+        .unwrap();
+    assert!(report.observations.is_empty());
+    assert_eq!(report.skipped_frames, 1);
+}
+
+fn pcap_from_frames(frames: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(0xa1b2_c3d4u32.to_le_bytes());
+    out.extend(2u16.to_le_bytes());
+    out.extend(4u16.to_le_bytes());
+    out.extend(0u32.to_le_bytes());
+    out.extend(0u32.to_le_bytes());
+    out.extend(65535u32.to_le_bytes());
+    out.extend(1u32.to_le_bytes());
+    for (n, frame) in frames.iter().enumerate() {
+        out.extend((1_704_067_200u32 + n as u32).to_le_bytes());
+        out.extend(0u32.to_le_bytes());
+        out.extend((frame.len() as u32).to_le_bytes());
+        out.extend((frame.len() as u32).to_le_bytes());
+        out.extend(*frame);
+    }
+    out
+}
+
+/// An mDNS response carrying `count` A records for `a.local`.
+fn mdns_response_with_a_records(count: u16) -> Vec<u8> {
+    let mut payload = vec![0, 0, 0x84, 0];
+    payload.extend(0u16.to_be_bytes());
+    payload.extend(count.to_be_bytes());
+    payload.extend([0, 0, 0, 0]);
+    for n in 0..count {
+        payload.extend([1, b'a', 5, b'l', b'o', b'c', b'a', b'l', 0]);
+        payload.extend(1u16.to_be_bytes());
+        payload.extend(1u16.to_be_bytes());
+        payload.extend(60u32.to_be_bytes());
+        payload.extend(4u16.to_be_bytes());
+        payload.extend([192, 0, 2, (n % 200) as u8 + 1]);
+    }
+    payload
+}
+
+#[test]
+fn offline_ingest_skips_malformed_frames_and_reports_the_count() {
+    let arp = fs::read(fixtures().join("arp.pcap")).unwrap();
+    let mut reader = PcapReader::new(Cursor::new(arp.as_slice())).unwrap();
+    let good = reader.next_packet().unwrap().unwrap().data.into_owned();
+    let looped_dns = udp_frame(
+        53000,
+        53,
+        &[0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 0x0c, 0, 1, 0, 1],
+    );
+    let odd_nbns = udp_frame(137, 137, &[1, 2, 3]);
+    let capture = pcap_from_frames(&[&good, &looped_dns, &good, &odd_nbns]);
+    let report = OfflinePassiveAdapter
+        .ingest_pcap_report("x", &capture, &PassiveOptions::default())
+        .unwrap();
+    assert_eq!(report.skipped_frames, 2);
+    assert_eq!(report.observations.len(), 2);
+    assert!(
+        report
+            .observations
+            .iter()
+            .all(|observation| observation.protocol == "arp")
+    );
+    // The plain entry point keeps its shape and the same tolerance.
+    assert_eq!(
         OfflinePassiveAdapter
-            .ingest_pcap("x", &bytes, &PassiveOptions::default())
-            .is_err()
+            .ingest_pcap("x", &capture, &PassiveOptions::default())
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn offline_ingest_still_rejects_a_capture_that_is_mostly_garbage() {
+    let odd_nbns = udp_frame(137, 137, &[1, 2, 3]);
+    let frames: Vec<&[u8]> = (0..=lattice_sensor::MAX_SKIPPED_FRAMES)
+        .map(|_| odd_nbns.as_slice())
+        .collect();
+    assert!(matches!(
+        OfflinePassiveAdapter.ingest_pcap_report(
+            "x",
+            &pcap_from_frames(&frames),
+            &PassiveOptions::default()
+        ),
+        Err(lattice_sensor::PassiveParseError::Metadata)
+    ));
+}
+
+#[test]
+fn oversized_mdns_responses_keep_their_leading_records_instead_of_failing() {
+    let frame = udp_frame(5353, 5353, &mdns_response_with_a_records(40));
+    let observations = lattice_sensor::PassiveAdapter::normalize(
+        &OfflinePassiveAdapter,
+        "x",
+        chrono::Utc::now(),
+        &frame,
+        &PassiveOptions::default(),
+    )
+    .unwrap();
+    let addresses = observations
+        .iter()
+        .flat_map(|observation| observation.facts.iter())
+        .filter(|fact| fact.key == "host_address")
+        .count();
+    assert!(addresses > 0 && addresses < 40, "kept {addresses} of 40");
+    assert_eq!(
+        addresses,
+        lattice_sensor::passive::MAX_FACTS_PER_OBSERVATION - 1
     );
 }

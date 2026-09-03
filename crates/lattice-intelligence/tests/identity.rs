@@ -357,9 +357,11 @@ fn expiry_validation_capacity_and_ordering_are_bounded() {
         )
         .unwrap();
     assert_ne!(a, b);
+    // `b` holds one live fact, so two more overflow a budget of two. (`a`'s only
+    // fact is already expired and no longer counts; see the eviction tests.)
     assert!(matches!(
         e.add_facts(
-            a,
+            b,
             vec![
                 fact(EvidenceFamily::Naming, "hostname", "one", 0.5),
                 fact(EvidenceFamily::Service, "uuid", "two", 0.5)
@@ -417,4 +419,143 @@ fn public_identification_shape_is_stable() {
         confidence: 0.85,
         families: vec![],
     };
+}
+
+#[test]
+fn expired_facts_are_pruned_on_ingest_and_free_the_fact_budget() {
+    let mut e = IdentityEngine::new(
+        IdentityConfig {
+            max_facts_per_device: 3,
+            ..Default::default()
+        },
+        vec![id(1), id(2)].into_iter(),
+    )
+    .unwrap();
+    let t0 = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+    let short_lived = |value: &str, at: chrono::DateTime<Utc>| {
+        let mut f = fact(EvidenceFamily::Naming, "hostname", value, 0.6);
+        f.observed_at = at;
+        f.expires_at = Some(at + Duration::seconds(30));
+        f
+    };
+    let d = e
+        .observe_at(
+            None,
+            vec![fact(
+                EvidenceFamily::LinkLayer,
+                "mac",
+                "aa:bb:cc:dd:ee:01",
+                0.9,
+            )],
+            t0,
+        )
+        .unwrap();
+    e.observe_at(Some(d), vec![short_lived("h0", t0)], t0)
+        .unwrap();
+    e.observe_at(Some(d), vec![short_lived("h1", t0)], t0)
+        .unwrap();
+    // The budget is full while every hostname fact is live...
+    assert!(matches!(
+        e.observe_at(
+            Some(d),
+            vec![short_lived("h2", t0)],
+            t0 + Duration::seconds(1)
+        ),
+        Err(IdentityError::Capacity(_))
+    ));
+    // ...and frees once they expire, at which point the expired facts are gone.
+    let later = t0 + Duration::minutes(1);
+    e.observe_at(Some(d), vec![short_lived("h2", later)], later)
+        .unwrap();
+    let values: Vec<String> = e.facts(d).unwrap().into_iter().map(|f| f.value).collect();
+    assert!(values.contains(&"aa:bb:cc:dd:ee:01".to_owned()));
+    assert!(values.contains(&"h2".to_owned()));
+    assert!(!values.contains(&"h0".to_owned()) && !values.contains(&"h1".to_owned()));
+    assert_eq!(e.snapshot().facts, 2);
+    // `add_facts_at` applies the same pruning.
+    e.add_facts_at(
+        d,
+        vec![short_lived("h3", later)],
+        later + Duration::minutes(1),
+    )
+    .unwrap();
+    assert_eq!(e.snapshot().facts, 2);
+}
+
+#[test]
+fn stale_components_are_evicted_but_annotated_or_pending_ones_are_kept() {
+    let mut e = IdentityEngine::new(
+        IdentityConfig::default(),
+        vec![id(1), id(2), id(3), id(4), id(5)].into_iter(),
+    )
+    .unwrap();
+    let t0 = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+    let expiring = |mac: &str| {
+        let mut f = fact(EvidenceFamily::LinkLayer, "mac", mac, 0.9);
+        f.observed_at = t0;
+        f.expires_at = Some(t0 + Duration::hours(1));
+        f
+    };
+    let a = e
+        .observe_at(None, vec![expiring("aa:bb:cc:dd:ee:01")], t0)
+        .unwrap();
+    let b = e
+        .observe_at(None, vec![expiring("aa:bb:cc:dd:ee:02")], t0)
+        .unwrap();
+    let c = e
+        .observe_at(None, vec![expiring("aa:bb:cc:dd:ee:03")], t0)
+        .unwrap();
+    let d = e
+        .observe_at(None, vec![expiring("aa:bb:cc:dd:ee:04")], t0)
+        .unwrap();
+    e.set_owner_fact(b, "name", "Printer", t0).unwrap();
+    e.propose_merge(
+        c,
+        d,
+        0.9,
+        vec![EvidenceFamily::Naming],
+        vec!["same host".into()],
+    )
+    .unwrap();
+
+    // Expired but younger than the retention window: nothing goes.
+    assert!(
+        e.evict_stale_at(t0 + Duration::hours(2), Duration::days(1))
+            .unwrap()
+            .is_empty()
+    );
+    // Past retention: only the unannotated component with no pending proposal.
+    let evicted = e
+        .evict_stale_at(t0 + Duration::days(2), Duration::days(1))
+        .unwrap();
+    assert_eq!(evicted, vec![a]);
+    assert_eq!(e.resolve(a), Err(IdentityError::DeviceNotFound));
+    assert!(e.resolve(b).is_ok() && e.resolve(c).is_ok() && e.resolve(d).is_ok());
+    assert_eq!(e.snapshot().devices, 3);
+
+    // Deciding the proposal releases c and d; the accepted merge edge goes with them.
+    let proposal = e.proposals()[0].id;
+    e.decide(proposal, Decision::Accept).unwrap();
+    let evicted = e
+        .evict_stale_at(t0 + Duration::days(2), Duration::days(1))
+        .unwrap();
+    assert_eq!(evicted.len(), 2);
+    assert!(evicted.contains(&c) && evicted.contains(&d));
+    assert_eq!(e.snapshot().devices, 1);
+    assert_eq!(e.snapshot().edges, 0);
+    assert!(e.proposals().is_empty() && e.audit().is_empty());
+    // Owner history for the kept device survives and the checkpoint stays valid.
+    assert_eq!(e.owner_audit().len(), 1);
+    let restored =
+        IdentityEngine::from_checkpoint(IdentityConfig::default(), e.checkpoint()).unwrap();
+    assert_eq!(restored.snapshot(), e.snapshot());
+    // An evicted id is never reissued.
+    let fresh = e
+        .observe_at(
+            None,
+            vec![expiring("aa:bb:cc:dd:ee:05")],
+            t0 + Duration::days(2),
+        )
+        .unwrap();
+    assert_eq!(fresh, id(5));
 }
