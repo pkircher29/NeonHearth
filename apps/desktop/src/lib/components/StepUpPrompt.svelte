@@ -42,13 +42,13 @@
 </div>
 
 <style>
-  .stepup-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: #06101999; backdrop-filter: blur(3px); }
-  .stepup { width: min(420px, 92vw); padding: 22px; border: 1px solid #28505a; border-radius: 12px; background: #0b1c26; display: grid; gap: 10px; }
-  .stepup h2 { margin: 0; font: 700 22px Arial; }
+  .stepup-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: var(--bg)99; backdrop-filter: blur(3px); }
+  .stepup { width: min(420px, 92vw); padding: 22px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); display: grid; gap: 10px; }
+  .stepup h2 { margin: 0; font: 700 22px var(--font-display); }
   .stepup .search { margin: 8px 0 0; }
-  .stepup-error { margin: 0; padding: 9px; border: 1px solid #ff5c9b; border-radius: 5px; color: #ff5c9b; font: 11px monospace; }
+  .stepup-error { margin: 0; padding: 9px; border: 1px solid var(--pink); border-radius: 5px; color: var(--pink); font: 11px var(--font-mono); }
   .stepup-actions { display: flex; gap: 9px; }
-  .stepup-actions button { min-height: 44px; padding: 10px 14px; border: 1px solid #63f3f0; border-radius: 5px; background: #63f3f0; color: #031418; font: 700 12px Arial; cursor: pointer; }
-  .stepup-actions .quiet { color: #cce4e7; border-color: #28505a; background: transparent; }
+  .stepup-actions button { min-height: 44px; padding: 10px 14px; border: 1px solid var(--accent); border-radius: 5px; background: var(--accent); color: var(--accent-ink); font: 700 12px var(--font-display); cursor: pointer; }
+  .stepup-actions .quiet { color: var(--ink); border-color: var(--line-strong); background: transparent; }
   .stepup-actions button:disabled { opacity: .5; cursor: not-allowed; }
 </style>

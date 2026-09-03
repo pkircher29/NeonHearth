@@ -1,4 +1,5 @@
 import type { Coverage, DeviceSnapshot, EnforcementStatus, PolicyEvaluation, RequestedAction, ServerMessage, Snapshot } from '../api/types';
+import { heatTier } from '../twin/heat';
 
 export interface ThroughputPoint { at: string; upload: number; download: number }
 export type CoverageSummary = Coverage | 'unavailable' | 'mixed';
@@ -125,5 +126,6 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
   return summarize(next);
 }
 
-export function bandwidthTier(totalBps: number): 'blue' | 'cyan' | 'gold' | 'pink' { const megabits = totalBps / 1_000_000; return megabits < 1 ? 'blue' : megabits <= 10 ? 'cyan' : megabits <= 30 ? 'gold' : 'pink'; }
+/** Tier for a rate in BYTES per second; shares the documented thresholds with the twin's heat ramp. */
+export function bandwidthTier(totalBytesPerSecond: number): 'blue' | 'cyan' | 'gold' | 'pink' { const tier = heatTier(totalBytesPerSecond); return tier === 'unavailable' ? 'blue' : tier; }
 export function topDevices(state: LiveState, limit = 5): DeviceSnapshot[] { return state.deviceOrder.map((id) => state.devices[id]).filter((device): device is DeviceSnapshot => Boolean(device) && device.bandwidth.available).sort((a, b) => (b.bandwidth.upload ?? 0) + (b.bandwidth.download ?? 0) - (a.bandwidth.upload ?? 0) - (a.bandwidth.download ?? 0)).slice(0, limit); }

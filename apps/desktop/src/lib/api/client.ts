@@ -165,6 +165,93 @@ export interface DoctorRun { run_id: string; started_at: string; report: Diagnos
 export type DoctorRunOutcome = { status: 'completed'; run: DoctorRun } | { status: 'already_running' };
 export interface DoctorApproval { approval_id: string; expires_at: string }
 
+/** History: one hash-chained audit entry as GET /audit returns it. */
+export type AuditActor = 'owner' | 'service' | 'module';
+export type AuditCategory = 'approval' | 'scan' | 'enforcement' | 'doctor_action' | 'audit_module';
+export interface AuditEntry { id: number; occurred_at: string; actor: AuditActor; category: AuditCategory; action: string; subject: string | null; detail: unknown; prev_hash: string; entry_hash: string }
+export interface ChainHead { id: number; entry_hash: string }
+export interface AuditPage { entries: AuditEntry[]; head: ChainHead | null; next_before: number | null }
+export type ChainBreakKind = 'id_gap' | 'prev_hash_mismatch' | 'entry_hash_mismatch' | 'invalid_row' | 'head_mismatch';
+export interface ChainReport { checked: number; start_id: number | null; end_id: number | null; anchored: boolean; first_break: { id: number; kind: ChainBreakKind } | null }
+export interface AuditVerify { report: ChainReport; head: ChainHead | null; valid: boolean }
+
+/** Remote access (Settings). */
+export interface RemoteStatus { daemon: { running: boolean; backend_state: string; dns_name: string | null } | null; daemon_error: string | null; serve_configured: boolean; funnel_conflict: boolean; loopback_port: number }
+export interface RemoteServe { configured: boolean; changed: boolean; https_port: number; target: string; dns_name: string | null }
+export interface PhoneSession { session_id: string; device_label: string; created_at: string; expires_at: string; last_used_at: string | null; revoked: boolean }
+export type IntegrationScope = 'devices:read' | 'presence:read' | 'bandwidth:read' | 'policy:read';
+export const INTEGRATION_SCOPES: readonly IntegrationScope[] = ['devices:read', 'presence:read', 'bandwidth:read', 'policy:read'];
+export interface IntegrationToken { id: string; name: string; scopes: string[]; created_at: string; revoked: boolean }
+export interface MintedIntegrationToken extends Omit<IntegrationToken, 'revoked'> { token: string }
+
+/** Network Doctor probe targets (GET/PUT /doctor/settings). */
+export interface DoctorSettings { interface: string; gateway: string | null; gateway_source: string; configured_resolvers: string[]; independent_resolver: string; internet_probe_address: string; internet_probe_port: number; dns_probe_name: string; external_probes_confirmed: boolean }
+export type DoctorSettingsUpdate = Partial<Omit<DoctorSettings, 'gateway_source'>>;
+/** A 400 from PUT /doctor/settings carries the reason; surfaced as a typed outcome. */
+export type DoctorSettingsOutcome = { status: 'saved'; settings: DoctorSettings } | { status: 'rejected'; error: string };
+
+const AUDIT_ACTORS: readonly string[] = ['owner', 'service', 'module'];
+const AUDIT_CATEGORIES: readonly string[] = ['approval', 'scan', 'enforcement', 'doctor_action', 'audit_module'];
+const CHAIN_BREAKS: readonly string[] = ['id_gap', 'prev_hash_mismatch', 'entry_hash_mismatch', 'invalid_row', 'head_mismatch'];
+const HEX64 = /^[0-9a-f]{64}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+function isId(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value > 0; }
+function isChainHead(value: unknown): value is ChainHead {
+  return isRecord(value) && exact(value, ['id', 'entry_hash']) && isId(value.id) && typeof value.entry_hash === 'string' && HEX64.test(value.entry_hash);
+}
+function isAuditEntry(value: unknown): value is AuditEntry {
+  if (!isRecord(value) || !exact(value, ['id', 'occurred_at', 'actor', 'category', 'action', 'subject', 'detail', 'prev_hash', 'entry_hash'])) return false;
+  return isId(value.id) && isDate(value.occurred_at) && typeof value.actor === 'string' && AUDIT_ACTORS.includes(value.actor)
+    && typeof value.category === 'string' && AUDIT_CATEGORIES.includes(value.category)
+    && typeof value.action === 'string' && value.action.length > 0 && value.action.length <= 128
+    && (value.subject === null || (typeof value.subject === 'string' && value.subject.length <= 256))
+    && 'detail' in value && typeof value.prev_hash === 'string' && HEX64.test(value.prev_hash) && typeof value.entry_hash === 'string' && HEX64.test(value.entry_hash);
+}
+function isAuditPage(value: unknown): value is AuditPage {
+  if (!isRecord(value) || !exact(value, ['entries', 'head', 'next_before'])) return false;
+  if (!Array.isArray(value.entries) || value.entries.length > 512 || !value.entries.every(isAuditEntry)) return false;
+  if (value.head !== null && !isChainHead(value.head)) return false;
+  return value.next_before === null || isId(value.next_before);
+}
+function isChainReport(value: unknown): value is ChainReport {
+  if (!isRecord(value) || !exact(value, ['checked', 'start_id', 'end_id', 'anchored', 'first_break'])) return false;
+  if (typeof value.checked !== 'number' || !Number.isSafeInteger(value.checked) || value.checked < 0 || typeof value.anchored !== 'boolean') return false;
+  if (value.start_id !== null && !isId(value.start_id)) return false;
+  if (value.end_id !== null && !isId(value.end_id)) return false;
+  if (value.first_break === null) return true;
+  return isRecord(value.first_break) && exact(value.first_break, ['id', 'kind']) && isId(value.first_break.id) && typeof value.first_break.kind === 'string' && CHAIN_BREAKS.includes(value.first_break.kind);
+}
+function isAuditVerify(value: unknown): value is AuditVerify {
+  return isRecord(value) && exact(value, ['report', 'head', 'valid']) && isChainReport(value.report) && (value.head === null || isChainHead(value.head)) && typeof value.valid === 'boolean';
+}
+function isRemoteStatus(value: unknown): value is RemoteStatus {
+  if (!isRecord(value) || !exact(value, ['daemon', 'daemon_error', 'serve_configured', 'funnel_conflict', 'loopback_port'])) return false;
+  if (value.daemon !== null && !(isRecord(value.daemon) && exact(value.daemon, ['running', 'backend_state', 'dns_name']) && typeof value.daemon.running === 'boolean' && typeof value.daemon.backend_state === 'string' && (value.daemon.dns_name === null || typeof value.daemon.dns_name === 'string'))) return false;
+  return (value.daemon_error === null || typeof value.daemon_error === 'string') && typeof value.serve_configured === 'boolean' && typeof value.funnel_conflict === 'boolean' && typeof value.loopback_port === 'number';
+}
+function isRemoteServe(value: unknown): value is RemoteServe {
+  return isRecord(value) && exact(value, ['configured', 'changed', 'https_port', 'target', 'dns_name']) && typeof value.configured === 'boolean' && typeof value.changed === 'boolean' && typeof value.https_port === 'number' && typeof value.target === 'string' && (value.dns_name === null || typeof value.dns_name === 'string');
+}
+function isPhoneSession(value: unknown): value is PhoneSession {
+  return isRecord(value) && exact(value, ['session_id', 'device_label', 'created_at', 'expires_at', 'last_used_at', 'revoked']) && typeof value.session_id === 'string' && UUID.test(value.session_id) && typeof value.device_label === 'string' && isDate(value.created_at) && isDate(value.expires_at) && (value.last_used_at === null || isDate(value.last_used_at)) && typeof value.revoked === 'boolean';
+}
+function isIntegrationToken(value: unknown): value is IntegrationToken {
+  return isRecord(value) && exact(value, ['id', 'name', 'scopes', 'created_at', 'revoked']) && typeof value.id === 'string' && UUID.test(value.id) && typeof value.name === 'string' && Array.isArray(value.scopes) && value.scopes.every((scope) => typeof scope === 'string') && isDate(value.created_at) && typeof value.revoked === 'boolean';
+}
+function isMintedIntegrationToken(value: unknown): value is MintedIntegrationToken {
+  return isRecord(value) && exact(value, ['id', 'name', 'scopes', 'token', 'created_at']) && typeof value.id === 'string' && UUID.test(value.id) && typeof value.name === 'string' && Array.isArray(value.scopes) && value.scopes.every((scope) => typeof scope === 'string') && typeof value.token === 'string' && HEX64.test(value.token) && isDate(value.created_at);
+}
+function isDoctorSettings(value: unknown): value is DoctorSettings {
+  if (!isRecord(value) || !exact(value, ['interface', 'gateway', 'gateway_source', 'configured_resolvers', 'independent_resolver', 'internet_probe_address', 'internet_probe_port', 'dns_probe_name', 'external_probes_confirmed'])) return false;
+  return typeof value.interface === 'string' && (value.gateway === null || typeof value.gateway === 'string') && typeof value.gateway_source === 'string'
+    && Array.isArray(value.configured_resolvers) && value.configured_resolvers.length <= 8 && value.configured_resolvers.every((item) => typeof item === 'string')
+    && typeof value.independent_resolver === 'string' && typeof value.internet_probe_address === 'string' && typeof value.internet_probe_port === 'number'
+    && typeof value.dns_probe_name === 'string' && typeof value.external_probes_confirmed === 'boolean';
+}
+function isItemList<T>(value: unknown, isItem: (item: unknown) => item is T): value is { items: T[] } {
+  return isRecord(value) && exact(value, ['items']) && Array.isArray(value.items) && value.items.length <= 1024 && value.items.every(isItem);
+}
+
 export interface ApiClient {
   health(): Promise<Health>;
   snapshot(options?: SnapshotPageOptions): Promise<Snapshot>;
@@ -172,6 +259,20 @@ export interface ApiClient {
   issueEventTicket(): Promise<EventTicket>;
   /** Owner-only: mints a phone session and returns its one-time pairing secret. */
   pairPhone(deviceLabel: string, pin: string): Promise<PairPhoneResponse>;
+  /** History: newest-first page of the audit chain. */
+  auditPage(options?: { before?: number; limit?: number; category?: AuditCategory; actor?: AuditActor; signal?: AbortSignal }): Promise<AuditPage>;
+  /** History: recompute hashes over the newest `tail` entries (or the whole chain). */
+  auditVerify(tail?: number): Promise<AuditVerify>;
+  doctorSettings(): Promise<DoctorSettings>;
+  updateDoctorSettings(update: DoctorSettingsUpdate): Promise<DoctorSettingsOutcome>;
+  remoteStatus(): Promise<RemoteStatus>;
+  /** Owner-only: configure private Tailscale Serve for the phone surface. */
+  remoteServe(): Promise<RemoteServe>;
+  remoteSessions(): Promise<PhoneSession[]>;
+  revokePhoneSession(sessionId: string): Promise<void>;
+  integrationTokens(): Promise<IntegrationToken[]>;
+  mintIntegrationToken(name: string, scopes: IntegrationScope[]): Promise<MintedIntegrationToken>;
+  revokeIntegrationToken(id: string): Promise<void>;
   /** Phone-only: unlocks high-impact routes for the grace window. */
   stepUp(pin: string): Promise<StepupResult>;
   openEvents(
@@ -757,6 +858,75 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl = fetch
   const isPairPhoneResponse = (value: unknown): value is PairPhoneResponse => isRecord(value) && exact(value, ['session_id', 'secret', 'expires_at'])
     && typeof value.session_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.session_id)
     && typeof value.secret === 'string' && /^[0-9a-f]{64}$/.test(value.secret) && isDate(value.expires_at);
+  async function auditPage(options: { before?: number; limit?: number; category?: AuditCategory; actor?: AuditActor; signal?: AbortSignal } = {}): Promise<AuditPage> {
+    const params = new URLSearchParams();
+    if (options.before !== undefined) { if (!isId(options.before)) throw new Error('Invalid audit cursor'); params.set('before', String(options.before)); }
+    if (options.limit !== undefined) { if (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 512) throw new Error('Invalid audit page'); params.set('limit', String(options.limit)); }
+    if (options.category !== undefined) params.set('category', options.category);
+    if (options.actor !== undefined) params.set('actor', options.actor);
+    const query = params.toString();
+    const value = await request(`/api/v1/audit${query ? `?${query}` : ''}`, authorized('GET'), options.signal);
+    if (!isAuditPage(value)) throw new Error('Invalid audit page response');
+    return value;
+  }
+  async function auditVerify(tail?: number): Promise<AuditVerify> {
+    if (tail !== undefined && (!Number.isSafeInteger(tail) || tail < 1 || tail > 10_000)) throw new Error('Invalid verify window');
+    const value = await request(`/api/v1/audit/verify${tail === undefined ? '' : `?tail=${tail}`}`, authorized('GET'));
+    if (!isAuditVerify(value)) throw new Error('Invalid audit verify response');
+    return value;
+  }
+  async function doctorSettings(): Promise<DoctorSettings> {
+    const value = await request('/api/v1/doctor/settings', authorized('GET'));
+    if (!isDoctorSettings(value)) throw new Error('Invalid doctor settings response');
+    return value;
+  }
+  async function updateDoctorSettings(update: DoctorSettingsUpdate): Promise<DoctorSettingsOutcome> {
+    const response = await send('/api/v1/doctor/settings', authorized('PUT', update));
+    if (response.status === 400) {
+      const body: unknown = await response.json().catch(() => null);
+      return { status: 'rejected', error: isRecord(body) && typeof body.error === 'string' ? body.error : 'The collector rejected these settings.' };
+    }
+    if (!response.ok) throw new ApiError(response.status);
+    const value: unknown = await response.json();
+    if (!isDoctorSettings(value)) throw new Error('Invalid doctor settings response');
+    return { status: 'saved', settings: value };
+  }
+  async function remoteStatus(): Promise<RemoteStatus> {
+    const value = await request('/api/v1/remote/status', authorized('GET'));
+    if (!isRemoteStatus(value)) throw new Error('Invalid remote status response');
+    return value;
+  }
+  async function remoteServe(): Promise<RemoteServe> {
+    const value = await request('/api/v1/remote/serve', authorized('POST'));
+    if (!isRemoteServe(value)) throw new Error('Invalid remote serve response');
+    return value;
+  }
+  async function remoteSessions(): Promise<PhoneSession[]> {
+    const value = await request('/api/v1/remote/sessions', authorized('GET'));
+    if (!isItemList(value, isPhoneSession)) throw new Error('Invalid sessions response');
+    return value.items;
+  }
+  async function revokePhoneSession(sessionId: string): Promise<void> {
+    if (!UUID.test(sessionId)) throw new Error('Invalid session id');
+    const response = await send(`/api/v1/remote/sessions/${sessionId}`, authorized('DELETE'));
+    if (!response.ok) throw new ApiError(response.status);
+  }
+  async function integrationTokens(): Promise<IntegrationToken[]> {
+    const value = await request('/api/v1/integrations/tokens', authorized('GET'));
+    if (!isItemList(value, isIntegrationToken)) throw new Error('Invalid tokens response');
+    return value.items;
+  }
+  async function mintIntegrationToken(name: string, scopes: IntegrationScope[]): Promise<MintedIntegrationToken> {
+    if (name.length === 0 || new TextEncoder().encode(name).length > 128 || scopes.length === 0 || scopes.length > 4 || !scopes.every((scope) => INTEGRATION_SCOPES.includes(scope))) throw new Error('Invalid token request');
+    const value = await request('/api/v1/integrations/tokens', authorized('POST', { name, scopes }));
+    if (!isMintedIntegrationToken(value)) throw new Error('Invalid token response');
+    return value;
+  }
+  async function revokeIntegrationToken(id: string): Promise<void> {
+    if (!UUID.test(id)) throw new Error('Invalid token id');
+    const response = await send(`/api/v1/integrations/tokens/${id}`, authorized('DELETE'));
+    if (!response.ok) throw new ApiError(response.status);
+  }
   async function pairPhone(deviceLabel: string, pin: string): Promise<PairPhoneResponse> {
     if (deviceLabel.length === 0 || new TextEncoder().encode(deviceLabel).length > 128 || !/^[0-9]{6}$/.test(pin)) throw new Error('Invalid pairing request');
     const value = await request('/api/v1/remote/pair', authorized('POST', { device_label: deviceLabel, pin }));
@@ -770,5 +940,5 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl = fetch
     return { expires_at: value.expires_at };
   }
 
-  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, doctorRun, doctorReport, doctorApprove, doctorRepair, pairPhone, stepUp };
+  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, doctorRun, doctorReport, doctorApprove, doctorRepair, auditPage, auditVerify, doctorSettings, updateDoctorSettings, remoteStatus, remoteServe, remoteSessions, revokePhoneSession, integrationTokens, mintIntegrationToken, revokeIntegrationToken, pairPhone, stepUp };
 }
