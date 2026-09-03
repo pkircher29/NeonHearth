@@ -1,6 +1,8 @@
 // Home Twin 2D plan editor store (M5 · H2, H3, H4, H11).
 // Types mirror docs/architecture/m5-home-twin-contracts.md exactly (snake_case wire shape).
 
+import type { AuthSource } from '../api/client';
+
 // ---- Contract types ----
 export interface PlanPoint { x: number; y: number }
 export type OpeningKind = 'door' | 'window' | 'stair';
@@ -312,20 +314,31 @@ export interface HomeApi {
   deletePlacement(deviceId: string): Promise<void>;
 }
 
-export interface HomeApiOptions { baseUrl: string; serviceToken: string; fetchImpl?: typeof fetch }
+export interface HomeApiOptions { baseUrl: string; serviceToken?: string; auth?: AuthSource; fetchImpl?: typeof fetch; requestTimeoutMs?: number }
 
-export function createHomeApi({ baseUrl, serviceToken, fetchImpl = fetch }: HomeApiOptions): HomeApi {
+export function createHomeApi({ baseUrl, serviceToken, auth, fetchImpl = fetch, requestTimeoutMs = 15_000 }: HomeApiOptions): HomeApi {
   const apiUrl = (path: string) => new URL(path, baseUrl).toString();
-  const authorized = (method: string, body?: unknown): RequestInit => ({
-    method,
-    headers: body === undefined
-      ? { Authorization: `Bearer ${serviceToken}` }
-      : { Authorization: `Bearer ${serviceToken}`, 'content-type': 'application/json' },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) })
-  });
+  const credential = (): string | null => auth ? auth.header() : (serviceToken ? `Bearer ${serviceToken}` : null);
+  const authorized = (method: string, body?: unknown): RequestInit => {
+    const header = credential();
+    const headers: Record<string, string> = header === null ? {} : { Authorization: header };
+    if (body !== undefined) headers['content-type'] = 'application/json';
+    return { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) };
+  };
+  // Same discipline as the API client: bounded fetches, auth refusals reported.
+  async function send(path: string, init: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const timer = requestTimeoutMs > 0 ? setTimeout(() => controller.abort(new Error('Request timed out')), requestTimeoutMs) : undefined;
+    try {
+      const response = await fetchImpl(apiUrl(path), { ...init, signal: controller.signal });
+      if (response.status === 401) auth?.unauthorized?.();
+      else if (response.status === 403 && credential()?.startsWith('PhoneSession ')) auth?.stepupRequired?.();
+      return response;
+    } finally { if (timer !== undefined) clearTimeout(timer); }
+  }
 
   async function fetchHome(): Promise<HomeSnapshot> {
-    const response = await fetchImpl(apiUrl('/api/v1/home'), authorized('GET'));
+    const response = await send('/api/v1/home', authorized('GET'));
     if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
     const value: unknown = await response.json();
     if (!isHomeSnapshot(value)) throw new Error('Invalid home response');
@@ -334,7 +347,7 @@ export function createHomeApi({ baseUrl, serviceToken, fetchImpl = fetch }: Home
 
   async function savePlan(plan: HomePlan, expectedVersion: number): Promise<SavePlanResult> {
     if (!isHomePlan(plan) || !Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new Error('Invalid plan save');
-    const response = await fetchImpl(apiUrl('/api/v1/home/plan'), authorized('PUT', { expected_version: expectedVersion, plan }));
+    const response = await send('/api/v1/home/plan', authorized('PUT', { expected_version: expectedVersion, plan }));
     if (response.status === 409) return { status: 'conflict' };
     if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
     let version = expectedVersion + 1;
@@ -349,17 +362,17 @@ export function createHomeApi({ baseUrl, serviceToken, fetchImpl = fetch }: Home
   async function saveDraft(draft: HomeDraft): Promise<void> {
     const body = JSON.stringify(draft);
     if (new TextEncoder().encode(body).length > DRAFT_MAX_BYTES) throw new Error('Draft exceeds safety bound');
-    const response = await fetchImpl(apiUrl('/api/v1/home/draft'), { method: 'PUT', headers: { Authorization: `Bearer ${serviceToken}`, 'content-type': 'application/json' }, body });
+    const response = await send('/api/v1/home/draft', { ...authorized('PUT', {}), body });
     if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
   }
 
   async function deleteDraft(): Promise<void> {
-    const response = await fetchImpl(apiUrl('/api/v1/home/draft'), authorized('DELETE'));
+    const response = await send('/api/v1/home/draft', authorized('DELETE'));
     if (!response.ok && response.status !== 404) throw new Error(`Request failed with status ${response.status}`);
   }
 
   async function loadDraft(): Promise<DraftResult> {
-    const response = await fetchImpl(apiUrl('/api/v1/home/draft'), authorized('GET'));
+    const response = await send('/api/v1/home/draft', authorized('GET'));
     if (response.status === 404) return { status: 'none' };
     if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
     const text = await response.text();
@@ -375,13 +388,13 @@ export function createHomeApi({ baseUrl, serviceToken, fetchImpl = fetch }: Home
 
   async function putPlacement(placement: Placement): Promise<void> {
     if (!isPlacement(placement)) throw new Error('Invalid placement');
-    const response = await fetchImpl(apiUrl(`/api/v1/home/placements/${placement.device_id}`), authorized('PUT', placement));
+    const response = await send(`/api/v1/home/placements/${placement.device_id}`, authorized('PUT', placement));
     if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
   }
 
   async function deletePlacement(deviceId: string): Promise<void> {
     if (!isOpaqueId(deviceId)) throw new Error('Invalid placement');
-    const response = await fetchImpl(apiUrl(`/api/v1/home/placements/${deviceId}`), authorized('DELETE'));
+    const response = await send(`/api/v1/home/placements/${deviceId}`, authorized('DELETE'));
     if (!response.ok && response.status !== 404) throw new Error(`Request failed with status ${response.status}`);
   }
 

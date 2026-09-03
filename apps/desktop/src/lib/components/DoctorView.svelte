@@ -9,17 +9,34 @@
   let run = $state<DoctorRun | null>(null);
   let running = $state(false);
   let runError = $state<string | null>(null);
-  // Per-finding UI state, keyed by finding index within the current run.
+  // A failed report load is its own state with a reload path; it must never
+  // read as "no diagnostic has run yet" (audit M-30).
+  let loadError = $state<string | null>(null);
+  // Per-finding UI state keyed by run id + finding index, so a repair that
+  // resolves after a newer run cannot attach to the wrong finding.
   let approvals = $state<Record<string, DoctorApproval | null>>({});
   let busy = $state<Record<string, boolean>>({});
   let errors = $state<Record<string, string | null>>({});
   let repairs = $state<Record<string, RepairReport | null>>({});
+  const repairing = $derived(Object.values(busy).some(Boolean));
+  let active = true;
+
+  async function loadReport(): Promise<void> {
+    loading = true;
+    loadError = null;
+    try {
+      const latest = await client.doctorReport();
+      if (active) run = latest;
+    } catch (cause) {
+      if (active) loadError = `Could not load the latest diagnostic: ${message(cause)}`;
+    } finally {
+      if (active) loading = false;
+    }
+  }
 
   onMount(() => {
-    let active = true;
-    void client.doctorReport()
-      .then((latest) => { if (active) { run = latest; loading = false; } })
-      .catch((cause) => { if (active) { runError = `Could not load the latest diagnostic: ${message(cause)}`; loading = false; } });
+    active = true;
+    void loadReport();
     return () => { active = false; };
   });
 
@@ -36,6 +53,7 @@
         runError = 'A diagnostic is already running. Only one diagnostic runs at a time — try again in a moment.';
       } else {
         run = outcome.run;
+        loadError = null;
         approvals = {}; busy = {}; errors = {}; repairs = {};
       }
     } catch (cause) {
@@ -167,7 +185,7 @@
       <h1 id="doctor-heading">Find it, prove it, fix it.</h1>
       <p class="muted">Every check carries its evidence, and no repair is called done without a before-and-after measurement.</p>
     </div>
-    <button type="button" class="run-action" aria-label="Run diagnostic" disabled={running || loading} onclick={() => void runDiagnostic()}>{running ? 'Running diagnostic…' : 'Run diagnostic'}</button>
+    <button type="button" class="run-action" aria-label="Run diagnostic" disabled={running || loading || repairing} onclick={() => void runDiagnostic()}>{running ? 'Running diagnostic…' : 'Run diagnostic'}</button>
   </div>
 
   {#if runError}<p class="doctor-error" role="alert">{runError}</p>{/if}
@@ -175,6 +193,11 @@
 
   {#if loading}
     <p class="doctor-loading" role="status">Loading the latest diagnostic…</p>
+  {:else if loadError}
+    <div class="doctor-load-error" role="alert">
+      <p>{loadError}</p>
+      <button type="button" class="act" onclick={() => void loadReport()}>Reload</button>
+    </div>
   {:else if !run}
     <div class="empty-state doctor-empty">
       <span class="empty-icon" aria-hidden="true">✚</span>
@@ -207,8 +230,8 @@
         <p class="muted no-findings">No faults were found. Every completed check passed.</p>
       {:else}
         <ul class="finding-list">
-          {#each run.findings as finding, index (index)}
-            {@const key = String(index)}
+          {#each run.findings as finding, index (`${run.run_id}:${index}`)}
+            {@const key = `${run.run_id}:${index}`}
             {@const plan = finding.plan}
             {@const name = title(finding.diagnosis.kind)}
             {@const inFlight = Boolean(busy[key])}
@@ -287,6 +310,8 @@
   .doctor-loading{margin-top:24px;color:#9bb7bb}
   .doctor-empty{margin-top:28px}
   .doctor-error{margin:14px 0 0;padding:9px;border:1px solid #ff5c9b;border-radius:5px;color:#ff5c9b;font:11px monospace}
+  .doctor-load-error{margin-top:24px;padding:14px;border:1px dashed #ff5c9b;border-radius:7px;display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+  .doctor-load-error p{margin:0;color:#ffb4cc;font-size:12px}
   .doctor-checks h2,.doctor-findings h2{margin:30px 0 6px;font:600 17px Arial}
   .run-facts{font-size:12px}
   .budget-warning{margin:12px 0 0;padding:9px;border:1px dashed #ffcd66;color:#ffcd66;font:11px monospace}

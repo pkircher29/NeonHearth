@@ -2,16 +2,47 @@ import type { Bandwidth, BandwidthFrame, CameraDetail, CameraHealth, CameraInven
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
+/**
+ * Where the client gets its credential. `header()` returns the full
+ * Authorization value or null when the caller has no credential (the dev
+ * proxy injects one upstream; production shows the sign-in screen after the
+ * first 401). The client NEVER sends an empty bearer.
+ */
+export interface AuthSource {
+  header(): string | null;
+  /** A request was refused with 401: the credential (if any) is invalid. */
+  unauthorized?(): void;
+  /** A phone-session request was refused with 403: PIN step-up is needed. */
+  stepupRequired?(): void;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super(`Request failed with status ${status}`);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 export interface ApiClientOptions {
   baseUrl: string;
-  serviceToken: string;
+  /** Fixed owner bearer; superseded by `auth` when both are given. */
+  serviceToken?: string;
+  auth?: AuthSource;
   fetchImpl?: typeof fetch;
   WebSocketImpl?: typeof WebSocket;
+  /** Every fetch is abandoned after this long (0 disables). Default 15 s. */
+  requestTimeoutMs?: number;
 }
+
+export interface PairPhoneResponse { session_id: string; secret: string; expires_at: string }
+export interface StepupResult { expires_at: string }
 
 export interface SnapshotPageOptions {
   limit?: number;
   after?: string;
+  signal?: AbortSignal;
 }
 
 /**
@@ -137,8 +168,12 @@ export interface DoctorApproval { approval_id: string; expires_at: string }
 export interface ApiClient {
   health(): Promise<Health>;
   snapshot(options?: SnapshotPageOptions): Promise<Snapshot>;
-  snapshotAll(options?: { limit?: number; maxPages?: number; maxRecords?: number }): Promise<Snapshot>;
+  snapshotAll(options?: { limit?: number; maxPages?: number; maxRecords?: number; signal?: AbortSignal }): Promise<Snapshot>;
   issueEventTicket(): Promise<EventTicket>;
+  /** Owner-only: mints a phone session and returns its one-time pairing secret. */
+  pairPhone(deviceLabel: string, pin: string): Promise<PairPhoneResponse>;
+  /** Phone-only: unlocks high-impact routes for the grace window. */
+  stepUp(pin: string): Promise<StepupResult>;
   openEvents(
     afterSequence: number,
     onMessage: (message: ServerMessage) => void,
@@ -540,17 +575,46 @@ function isDoctorApproval(value: unknown): value is DoctorApproval {
     && isApprovalIdToken(value.approval_id) && isDate(value.expires_at);
 }
 
-export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebSocketImpl = WebSocket }: ApiClientOptions): ApiClient {
+export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl = fetch, WebSocketImpl = WebSocket, requestTimeoutMs = 15_000 }: ApiClientOptions): ApiClient {
   const apiUrl = (path: string) => new URL(path, baseUrl).toString();
+  const credential = (): string | null => auth ? auth.header() : (serviceToken ? `Bearer ${serviceToken}` : null);
 
-  async function request(path: string, init?: RequestInit): Promise<unknown> {
-    const response = await fetchImpl(apiUrl(path), init);
-    if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+  /**
+   * One fetch path: applies the request timeout (combined with any caller
+   * signal) and reports auth refusals to the credential source so the app can
+   * show sign-in (401) or the PIN prompt (403 on a phone session).
+   */
+  async function send(path: string, init: RequestInit = {}, signal?: AbortSignal): Promise<Response> {
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal?.reason ?? new Error('Request aborted'));
+    if (signal?.aborted) abort();
+    else signal?.addEventListener('abort', abort, { once: true });
+    const timer = requestTimeoutMs > 0 ? setTimeout(() => controller.abort(new Error('Request timed out')), requestTimeoutMs) : undefined;
+    try {
+      const response = await fetchImpl(apiUrl(path), { ...init, signal: controller.signal });
+      if (response.status === 401) auth?.unauthorized?.();
+      else if (response.status === 403 && credential()?.startsWith('PhoneSession ')) auth?.stepupRequired?.();
+      return response;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+    }
+  }
+
+  async function request(path: string, init?: RequestInit, signal?: AbortSignal): Promise<unknown> {
+    const response = await send(path, init, signal);
+    if (!response.ok) throw new ApiError(response.status);
     return response.json() as Promise<unknown>;
   }
 
-  function authorized(method: 'GET' | 'POST') {
-    return { method, headers: { Authorization: `Bearer ${serviceToken}` } };
+  function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    const header = credential();
+    return header === null ? extra : { Authorization: header, ...extra };
+  }
+  function authorized(method: 'GET' | 'POST' | 'PUT' | 'DELETE', body?: unknown): RequestInit {
+    return body === undefined
+      ? { method, headers: authHeaders() }
+      : { method, headers: authHeaders({ 'content-type': 'application/json' }), body: JSON.stringify(body) };
   }
 
   async function health(): Promise<Health> {
@@ -570,34 +634,45 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
     if (options?.limit !== undefined) params.set('limit', String(options.limit));
     if (options?.after !== undefined) params.set('after', options.after);
     const query = params.toString();
-    const value = await request(query ? `/api/v1/state?${query}` : '/api/v1/state', authorized('GET'));
+    const value = await request(query ? `/api/v1/state?${query}` : '/api/v1/state', authorized('GET'), options?.signal);
     if (!isSnapshot(value)) throw new Error('Invalid snapshot response');
     return value;
   }
 
-  async function snapshotAll(options: { limit?: number; maxPages?: number; maxRecords?: number } = {}): Promise<Snapshot> {
+  async function snapshotAll(options: { limit?: number; maxPages?: number; maxRecords?: number; signal?: AbortSignal } = {}): Promise<Snapshot> {
     const limit = options.limit ?? 256;
     const maxPages = options.maxPages ?? 256;
     const maxRecords = options.maxRecords ?? 65536;
     if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 256 || !Number.isSafeInteger(maxRecords) || maxRecords < 1 || maxRecords > 65536) throw new Error('Invalid snapshot bounds');
-    const devices: DeviceSnapshot[] = [];
-    let after: string | undefined;
-    let sequence: number | undefined;
-    let serviceStatus = 'unknown';
-    const cursors = new Set<string>();
-    for (let page = 0; page < maxPages; page += 1) {
-      const current = await snapshot({ limit, ...(after ? { after } : {}) });
-      if (sequence === undefined) sequence = current.sequence;
-      if (current.sequence !== sequence) throw new Error('Snapshot sequence changed');
-      serviceStatus = current.service_status;
-      devices.push(...current.devices);
-      if (devices.length > maxRecords) throw new Error('Snapshot exceeds safety bound');
-      if (current.next_after === null) return { sequence, devices, next_after: null, service_status: serviceStatus };
-      if (cursors.has(current.next_after)) throw new Error('Snapshot cursor cycle');
-      cursors.add(current.next_after);
-      after = current.next_after;
+    // Under a live event stream the sequence can advance between pages. A
+    // moved watermark restarts the walk at the new sequence (bounded), so a
+    // busy home still hydrates instead of failing every attempt.
+    const maxRestarts = 3;
+    for (let restart = 0; ; restart += 1) {
+      const devices: DeviceSnapshot[] = [];
+      let after: string | undefined;
+      let sequence: number | undefined;
+      let serviceStatus = 'unknown';
+      let moved = false;
+      const cursors = new Set<string>();
+      for (let page = 0; page < maxPages; page += 1) {
+        const current = await snapshot({ limit, ...(after ? { after } : {}), ...(options.signal ? { signal: options.signal } : {}) });
+        if (sequence === undefined) sequence = current.sequence;
+        if (current.sequence !== sequence) {
+          if (current.sequence < sequence || restart >= maxRestarts) throw new Error('Snapshot sequence changed');
+          moved = true;
+          break;
+        }
+        serviceStatus = current.service_status;
+        devices.push(...current.devices);
+        if (devices.length > maxRecords) throw new Error('Snapshot exceeds safety bound');
+        if (current.next_after === null) return { sequence, devices, next_after: null, service_status: serviceStatus };
+        if (cursors.has(current.next_after)) throw new Error('Snapshot cursor cycle');
+        cursors.add(current.next_after);
+        after = current.next_after;
+      }
+      if (!moved) throw new Error('Snapshot page bound exceeded');
     }
-    throw new Error('Snapshot page bound exceeded');
   }
 
   async function issueEventTicket(): Promise<EventTicket> {
@@ -632,44 +707,36 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
   async function camera(id: string): Promise<CameraDetail> { if(!isOpaqueId(id))throw new Error('Invalid camera id'); const v=await request(`/api/v1/cameras/${id}`,authorized('GET')); if(!isCameraDetail(v))throw new Error('Invalid camera response'); return v; }
   async function cameraHealth(id: string): Promise<CameraHealth> { if(!isOpaqueId(id)) throw new Error('Invalid camera id'); const v=await request(`/api/v1/cameras/${id}/health`, authorized('GET')); if (!isCameraHealth(v)) throw new Error('Invalid camera health'); return v; }
   async function cameraInventory(id: string): Promise<CameraInventoryProjection|null> { if(!isOpaqueId(id))throw new Error('Invalid camera id'); const v=await request(`/api/v1/cameras/${id}/inventory`,authorized('GET')); if(v!==null&&!isInventory(v))throw new Error('Invalid camera inventory'); return v as CameraInventoryProjection|null; }
-  async function cameraSnapshot(id: string, streamId?: string): Promise<Blob> { if(!isOpaqueId(id)||(streamId!==undefined&&!isOpaqueId(streamId)))throw new Error('Invalid camera id'); const response=await fetchImpl(apiUrl(`/api/v1/cameras/${id}/snapshot${streamId?`?stream_id=${encodeURIComponent(streamId)}`:''}`),authorized('GET')); if(!response.ok)throw new Error(`Request failed with status ${response.status}`); if(response.headers.get('content-type')?.split(';')[0] !== 'image/jpeg') throw new Error('Invalid camera snapshot media type'); const blob=await response.blob(); if(blob.size > 8*1024*1024) throw new Error('Camera snapshot exceeds safety bound'); return blob; }
-  async function startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse> { if(!isOpaqueId(id)||!isOpaqueId(streamId))throw new Error('Invalid camera session id'); const v=await request(`/api/v1/cameras/${id}/sessions`,{...authorized('POST'),headers:{Authorization:`Bearer ${serviceToken}`,'content-type':'application/json'},body:JSON.stringify({stream_id:streamId})}); if(!isSession(v))throw new Error('Invalid camera session'); return v; }
-  async function closeCameraSession(sessionId: string): Promise<void> { if(!isSessionId(sessionId))throw new Error('Invalid camera session id'); const response=await fetchImpl(apiUrl(`/api/v1/camera-sessions/${sessionId}`),{method:'DELETE',headers:{Authorization:`Bearer ${serviceToken}`}}); if(!response.ok)throw new Error(`Request failed with status ${response.status}`); }
+  async function cameraSnapshot(id: string, streamId?: string): Promise<Blob> { if(!isOpaqueId(id)||(streamId!==undefined&&!isOpaqueId(streamId)))throw new Error('Invalid camera id'); const response=await send(`/api/v1/cameras/${id}/snapshot${streamId?`?stream_id=${encodeURIComponent(streamId)}`:''}`,authorized('GET')); if(!response.ok)throw new ApiError(response.status); if(response.headers.get('content-type')?.split(';')[0] !== 'image/jpeg') throw new Error('Invalid camera snapshot media type'); const blob=await response.blob(); if(blob.size > 8*1024*1024) throw new Error('Camera snapshot exceeds safety bound'); return blob; }
+  async function startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse> { if(!isOpaqueId(id)||!isOpaqueId(streamId))throw new Error('Invalid camera session id'); const v=await request(`/api/v1/cameras/${id}/sessions`,authorized('POST',{stream_id:streamId})); if(!isSession(v))throw new Error('Invalid camera session'); return v; }
+  async function closeCameraSession(sessionId: string): Promise<void> { if(!isSessionId(sessionId))throw new Error('Invalid camera session id'); const response=await send(`/api/v1/camera-sessions/${sessionId}`,authorized('DELETE')); if(!response.ok)throw new ApiError(response.status); }
   async function policyAction(deviceId: string, action: OwnerActionInput): Promise<PolicyActionResult> {
     if (!isDeviceId(deviceId) || !isOwnerActionInput(action)) throw new Error('Invalid policy action');
-    const value = await request('/api/v1/policy/action', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${serviceToken}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ device_id: deviceId, action })
-    });
+    const value = await request('/api/v1/policy/action', authorized('POST', { device_id: deviceId, action }));
     if (!isPolicyActionResult(value)) throw new Error('Invalid policy action response');
     return value;
   }
   async function doctorRun(): Promise<DoctorRunOutcome> {
-    const response = await fetchImpl(apiUrl('/api/v1/doctor/run'), authorized('POST'));
+    const response = await send('/api/v1/doctor/run', authorized('POST'));
     // One diagnostic at a time: a concurrent run is a typed outcome, not an error.
     if (response.status === 409) return { status: 'already_running' };
-    if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+    if (!response.ok) throw new ApiError(response.status);
     const value: unknown = await response.json();
     if (!isDoctorRun(value)) throw new Error('Invalid doctor run response');
     return { status: 'completed', run: value };
   }
   async function doctorReport(): Promise<DoctorRun | null> {
-    const response = await fetchImpl(apiUrl('/api/v1/doctor/report'), authorized('GET'));
+    const response = await send('/api/v1/doctor/report', authorized('GET'));
     // 204: no diagnostic has completed yet.
     if (response.status === 204) return null;
-    if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+    if (!response.ok) throw new ApiError(response.status);
     const value: unknown = await response.json();
     if (!isDoctorRun(value)) throw new Error('Invalid doctor report response');
     return value;
   }
   async function doctorApprove(diagnosisKind: DiagnosisKind): Promise<DoctorApproval> {
     if (!isDiagnosisKind(diagnosisKind)) throw new Error('Invalid doctor approval request');
-    const value = await request('/api/v1/doctor/approvals', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${serviceToken}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ diagnosis_kind: diagnosisKind })
-    });
+    const value = await request('/api/v1/doctor/approvals', authorized('POST', { diagnosis_kind: diagnosisKind }));
     if (!isDoctorApproval(value)) throw new Error('Invalid doctor approval response');
     return value;
   }
@@ -677,19 +744,31 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
     if (!isDiagnosisKind(diagnosisKind) || (approvalId !== undefined && !isApprovalIdToken(approvalId))) {
       throw new Error('Invalid doctor repair request');
     }
-    const value = await request('/api/v1/doctor/repair', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${serviceToken}`, 'content-type': 'application/json' },
-      body: JSON.stringify(approvalId === undefined ? { diagnosis_kind: diagnosisKind } : { diagnosis_kind: diagnosisKind, approval_id: approvalId })
-    });
+    const value = await request('/api/v1/doctor/repair', authorized('POST', approvalId === undefined ? { diagnosis_kind: diagnosisKind } : { diagnosis_kind: diagnosisKind, approval_id: approvalId }));
     if (!isRecord(value) || !exact(value, ['repair']) || !isRepairReport(value.repair)) throw new Error('Invalid doctor repair response');
     return value.repair;
   }
   function authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): void {
     const target = new URL(url, baseUrl); const origin = new URL(baseUrl).origin;
     if (target.origin !== origin || target.username || target.password || target.search || target.hash || target.pathname.includes('%') || !/^\/api\/v1\/camera-sessions\/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/(?:playlist\.m3u8|segments\/[A-Za-z0-9_.-]{1,255})$/.test(target.pathname)) throw new Error('Camera media request rejected');
-    xhr.setRequestHeader('Authorization', `Bearer ${serviceToken}`);
+    const header = credential();
+    if (header !== null) xhr.setRequestHeader('Authorization', header);
+  }
+  const isPairPhoneResponse = (value: unknown): value is PairPhoneResponse => isRecord(value) && exact(value, ['session_id', 'secret', 'expires_at'])
+    && typeof value.session_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.session_id)
+    && typeof value.secret === 'string' && /^[0-9a-f]{64}$/.test(value.secret) && isDate(value.expires_at);
+  async function pairPhone(deviceLabel: string, pin: string): Promise<PairPhoneResponse> {
+    if (deviceLabel.length === 0 || new TextEncoder().encode(deviceLabel).length > 128 || !/^[0-9]{6}$/.test(pin)) throw new Error('Invalid pairing request');
+    const value = await request('/api/v1/remote/pair', authorized('POST', { device_label: deviceLabel, pin }));
+    if (!isPairPhoneResponse(value)) throw new Error('Invalid pairing response');
+    return value;
+  }
+  async function stepUp(pin: string): Promise<StepupResult> {
+    if (!/^[0-9]{6}$/.test(pin)) throw new Error('Invalid PIN');
+    const value = await request('/api/v1/remote/stepup', authorized('POST', { pin }));
+    if (!isRecord(value) || !exact(value, ['expires_at']) || !isDate(value.expires_at)) throw new Error('Invalid step-up response');
+    return { expires_at: value.expires_at };
   }
 
-  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, doctorRun, doctorReport, doctorApprove, doctorRepair };
+  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, doctorRun, doctorReport, doctorApprove, doctorRepair, pairPhone, stepUp };
 }

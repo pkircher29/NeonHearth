@@ -21,6 +21,8 @@
     presence?: Record<string, PresenceState>;
     bandwidth?: Record<string, number>;
     reducedMotion?: boolean;
+    /** False while the hosting panel is hidden: the render loop stops (audit M-26). */
+    visible?: boolean;
     onselect?: (device_id: string) => void;
     onfallback?: () => void;
     fallback?: Snippet;
@@ -32,6 +34,7 @@
     presence = {},
     bandwidth = {},
     reducedMotion = false,
+    visible = true,
     onselect,
     onfallback,
     fallback
@@ -43,6 +46,11 @@
   let isolatedFloorId = $state<string | null>(null);
   let prefersReduced = $state(false);
   const reduced = $derived(reducedMotion || prefersReduced);
+  // Test-observable counters: the scene rebuilds when geometry changes; the
+  // camera resets only when the PLAN changes (audit H-5).
+  let rebuildCount = $state(0);
+  let resetCount = $state(0);
+  let loopRunning = $state(false);
 
   const sceneDesc = $derived<SceneDescription>(
     plan ? buildSceneDescription(plan, placements, devices) : { floors: [], bounds: null }
@@ -70,6 +78,9 @@
   let focusTo: THREE.Vector3 | null = null;
   let focusStart = 0;
   let rafHandle = 0;
+  let dirty = true;
+  let lastPlan: HomePlan | null | undefined;
+  let resizeObserver: ResizeObserver | null = null;
   let dragging: 'orbit' | 'pan' | null = null;
   let dragMoved = 0;
   let lastPointer = { x: 0, y: 0 };
@@ -89,27 +100,37 @@
   }
 
   function requestRender() {
-    // In reduced motion there is no loop; changes render exactly once.
-    if (reduced || mode !== '3d') {
+    // Without a loop (reduced motion, hidden panel) changes render exactly
+    // once; with a loop they mark the next frame dirty.
+    dirty = true;
+    if (!rafHandle && mode === '3d') {
       applyCamera();
       renderFrame();
+      dirty = false;
     }
   }
 
   function stopLoop() {
     if (rafHandle) cancelAnimationFrame(rafHandle);
     rafHandle = 0;
+    loopRunning = false;
   }
 
   function startLoop() {
     stopLoop();
     const tick = (now: number) => {
-      stepAnimations(now);
-      applyCamera();
-      renderFrame();
+      const animating = pulses.size > 0 || (focusFrom !== null && focusTo !== null);
+      if (animating) stepAnimations(now);
+      // Render only when something changed: an idle scene costs no GPU time.
+      if (dirty || animating) {
+        applyCamera();
+        renderFrame();
+        dirty = false;
+      }
       rafHandle = requestAnimationFrame(tick);
     };
     rafHandle = requestAnimationFrame(tick);
+    loopRunning = true;
   }
 
   function stepAnimations(now: number) {
@@ -143,11 +164,15 @@
     focusTo = null;
     theta = -Math.PI / 4;
     phi = 1.05;
+    resetCount += 1;
     if (bounds) {
-      const mid = sceneDesc.floors.length
-        ? (Math.min(...sceneDesc.floors.map((f) => f.elevation_m))
-            + Math.max(...sceneDesc.floors.map((f) => f.elevation_m + f.ceiling_m))) / 2
-        : 1;
+      let lowest = Infinity;
+      let highest = -Infinity;
+      for (const floor of sceneDesc.floors) {
+        if (floor.elevation_m < lowest) lowest = floor.elevation_m;
+        if (floor.elevation_m + floor.ceiling_m > highest) highest = floor.elevation_m + floor.ceiling_m;
+      }
+      const mid = sceneDesc.floors.length ? (lowest + highest) / 2 : 1;
       target.set(bounds.center.x, mid, bounds.center.y);
       radius = bounds.radius_m * 2.4;
     } else {
@@ -173,6 +198,7 @@
       focusTo = destination;
       focusStart = performance.now();
       radius = Math.min(radius, 6);
+      dirty = true;
     }
   }
 
@@ -345,6 +371,7 @@
     }
     scene.add(staticRoot);
     applyVisibility();
+    rebuildCount += 1;
   }
 
   function applyVisibility() {
@@ -359,7 +386,7 @@
       const node = pinNodes.get(pin.device_id);
       const state = presence[pin.device_id] ?? 'unknown';
       const previous = prevPresence.get(pin.device_id);
-      if (previous !== undefined && previous !== state && !reduced) pulses.set(pin.device_id, now);
+      if (previous !== undefined && previous !== state && !reduced) { pulses.set(pin.device_id, now); dirty = true; }
       prevPresence.set(pin.device_id, state);
       if (!node) continue;
       const material = node.pin.material as THREE.MeshBasicMaterial;
@@ -408,13 +435,21 @@
     camera = new THREE.PerspectiveCamera(50, 4 / 3, 0.1, 500);
     mode = '3d';
     window.addEventListener('resize', resize);
+    // The stage can change size while its panel is hidden (a window resize
+    // fires, but the hidden stage measures 0); observe the element itself.
+    if (typeof ResizeObserver === 'function' && stage) {
+      resizeObserver = new ResizeObserver(() => resize());
+      resizeObserver.observe(stage);
+    }
     resize();
-    resetView();
     return () => {
       stopLoop();
       window.removeEventListener('resize', resize);
+      resizeObserver?.disconnect();
+      resizeObserver = null;
       if (staticRoot) disposeObject(staticRoot);
       renderer?.dispose();
+      renderer?.forceContextLoss?.();
       renderer = null;
       scene = null;
       camera = null;
@@ -424,10 +459,18 @@
   $effect(() => {
     if (mode !== '3d') return;
     const desc = sceneDesc; // tracked read; the work below must not track more
+    const currentPlan = plan;
     untrack(() => {
       rebuildStatic(desc);
-      prevPresence.clear();
-      resetView();
+      if (currentPlan !== lastPlan) {
+        // A new plan is a new home: start the camera from its bounds.
+        lastPlan = currentPlan;
+        prevPresence.clear();
+        resetView();
+      }
+      // Fresh pin meshes need their live colors before the next frame.
+      updatePins(typeof performance !== 'undefined' ? performance.now() : 0);
+      requestRender();
     });
   });
 
@@ -450,11 +493,12 @@
 
   $effect(() => {
     if (mode !== '3d') return;
-    if (reduced) {
+    if (reduced || !visible) {
       stopLoop();
-      requestRender();
+      if (visible) requestRender();
     } else {
       startLoop();
+      requestRender();
     }
     return () => stopLoop();
   });
@@ -467,6 +511,9 @@
   data-floor-count={sceneDesc.floors.length}
   data-pin-count={allPins.length}
   data-selected={selected ?? ''}
+  data-rebuild-count={rebuildCount}
+  data-reset-count={resetCount}
+  data-loop={loopRunning ? 'running' : 'stopped'}
   aria-label="3D home twin"
 >
   {#if mode === '3d'}

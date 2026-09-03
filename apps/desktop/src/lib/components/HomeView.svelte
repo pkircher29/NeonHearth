@@ -3,26 +3,36 @@
   import { onMount } from 'svelte';
   import { createHomeApi, type HomeApi, type HomeSnapshot } from '../stores/home';
   import type { LiveState } from '../stores/live';
+  import type { TwinDevice } from '../twin/geometry';
   import HomeEditorView from './HomeEditorView.svelte';
   import HomeTwin3D from './HomeTwin3D.svelte';
-  import { toBandwidthMap, toHomeDeviceRefs, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
+  import { sameTwinDevices, toBandwidthMap, toHomeDeviceRefs, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
 
-  // `api` is a test seam: when absent, the view builds the real loopback client on mount
-  // exactly the way App builds the camera client.
+  // `api` is a test seam and the App's injection point: when absent, the view
+  // builds the real loopback client on mount.
   let { liveState, api = null }: { liveState: LiveState; api?: HomeApi | null } = $props();
 
   type HomeTab = 'editor' | 'twin';
   let tab = $state<HomeTab>('editor');
   let twinVisited = $state(false); // the twin mounts on first visit, then stays alive so selection survives tab switches
   let homeApi = $state<HomeApi | null>(null);
+  // One snapshot, loaded once here, shared by the editor and the twin (audit M-27).
   let snapshot = $state<HomeSnapshot | null>(null);
+  let loading = $state(true);
   let snapshotError = $state(false);
   let fallbackNotice = $state(false);
   let selectedDeviceId = $state<string | null>(null);
   let reducedMotion = $state(false);
 
   const deviceRefs = $derived(toHomeDeviceRefs(liveState.devices));
-  const twinDevices = $derived(toTwinDevices(liveState.devices));
+  // Memoized by content (audit H-5): a fresh array per bandwidth frame would
+  // make the twin rebuild its scene and reset the camera several times a second.
+  let twinCache: TwinDevice[] = [];
+  const twinDevices = $derived.by(() => {
+    const next = toTwinDevices(liveState.devices);
+    if (!sameTwinDevices(twinCache, next)) twinCache = next;
+    return twinCache;
+  });
   const presence = $derived(toPresenceMap(liveState.devices));
   const bandwidth = $derived(toBandwidthMap(liveState.devices));
   const selectedName = $derived(
@@ -42,16 +52,22 @@
     fallbackNotice = true;
     tab = 'editor';
   }
+  function onSnapshot(next: HomeSnapshot) {
+    snapshot = next;
+  }
 
   async function loadSnapshot() {
     const current = homeApi;
     if (!current) return;
     snapshotError = false;
+    loading = true;
     try {
       snapshot = await current.fetchHome(); // a 404 already degraded to an empty plan in the wrapper
     } catch {
       snapshot = null;
       snapshotError = true;
+    } finally {
+      loading = false;
     }
   }
 
@@ -59,7 +75,7 @@
     if (typeof window.matchMedia === 'function') {
       reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     }
-    homeApi = withEmptyPlanOn404(api ?? createHomeApi({ baseUrl: window.location.origin, serviceToken: '' }));
+    homeApi = withEmptyPlanOn404(api ?? createHomeApi({ baseUrl: window.location.origin }));
     void loadSnapshot();
   });
 </script>
@@ -82,35 +98,34 @@
     </div>
   {/if}
 
-  {#if homeApi}
+  {#if !homeApi}
+    <p class="home-connecting muted">Connecting to the local collector…</p>
+  {:else if loading}
+    <div class="editor-state" role="status">Reading home plan…</div>
+  {:else if snapshotError || !snapshot}
+    <div class="editor-state error" role="alert">The home plan is unavailable right now. Try again shortly. <button type="button" onclick={() => void loadSnapshot()}>Retry</button></div>
+  {:else}
     <div id="home-panel-editor" role="tabpanel" aria-labelledby="home-tab-editor" hidden={tab !== 'editor'}>
-      <HomeEditorView api={homeApi} devices={deviceRefs} />
+      <HomeEditorView api={homeApi} devices={deviceRefs} {snapshot} onsnapshot={onSnapshot} />
     </div>
     {#if twinVisited}
       <div id="home-panel-twin" role="tabpanel" aria-labelledby="home-tab-twin" hidden={tab !== 'twin'}>
         <div class="view-heading">
           <p class="kicker">HOME / 3D VIEW</p>
         </div>
-        {#if snapshotError}
-          <div class="home-banner error" role="alert">
-            The home plan could not be loaded for the 3D view.
-            <button type="button" onclick={() => void loadSnapshot()}>Retry</button>
-          </div>
-        {/if}
         <HomeTwin3D
-          plan={snapshot?.plan ?? null}
-          placements={snapshot?.placements ?? []}
+          plan={snapshot.plan}
+          placements={snapshot.placements}
           devices={twinDevices}
           {presence}
           {bandwidth}
           {reducedMotion}
+          visible={tab === 'twin'}
           onselect={onTwinSelect}
           onfallback={onTwinFallback}
         />
       </div>
     {/if}
-  {:else}
-    <p class="home-connecting muted">Connecting to the local collector…</p>
   {/if}
 </section>
 
@@ -123,9 +138,10 @@
   .home-selection { margin: 0; color: #9bb7bb; font: 11px monospace; }
   .home-selection strong { color: #63f3f0; font-weight: 700; }
   .home-banner { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px 14px; border: 1px solid #ffcd66; border-radius: 8px; background: #0b1c26; color: #cce4e7; font-size: 12px; }
-  .home-banner.error { border-color: #ff5c9b; color: #ffb4cc; }
   .home-banner button { min-height: 38px; padding: 7px 12px; border: 1px solid #63f3f0; border-radius: 5px; background: transparent; color: #63f3f0; font: 600 12px Arial; cursor: pointer; }
-  .home-banner.error button { border-color: #ff5c9b; color: #ff5c9b; }
+  .editor-state { margin-top: 14px; padding: 18px; border: 1px dashed #28505a; color: #9bb7bb; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .editor-state.error { border-color: #ff5c9b; color: #ffb4cc; }
+  .editor-state button { min-height: 40px; padding: 8px 14px; border: 1px solid #63f3f0; border-radius: 5px; background: transparent; color: #63f3f0; font: 600 12px Arial; cursor: pointer; }
   .home-connecting { margin: 18px 0 0; }
   [role='tabpanel'][hidden] { display: none; }
 </style>
