@@ -2,13 +2,17 @@
   import { onMount } from 'svelte';
   import {
     createEditorState, emptyHomePlan, reduceEditor, selectUncertain, selectUnplaced, snap, snapPoint, wallLength,
-    type EditorAction, type EditorState, type Estimate, type HomeApi, type HomeDeviceRef, type HomeDraft, type OpeningKind, type Placement, type PlanPoint, type Room, type Wall
+    type EditorAction, type EditorState, type Estimate, type HomeApi, type HomeDeviceRef, type HomeDraft, type HomeSnapshot, type OpeningKind, type Placement, type PlanPoint, type Room, type Wall
   } from '../stores/home';
   import HomeEditorFloorBar from './HomeEditorFloorBar.svelte';
   import HomeEditorInspector, { type InspectorTarget } from './HomeEditorInspector.svelte';
   import HomeEditorTray, { type EstimatedRow } from './HomeEditorTray.svelte';
 
-  let { api, devices = [] }: { api: HomeApi; devices?: HomeDeviceRef[] } = $props();
+  // `snapshot` is the already-loaded home when a parent owns it (HomeView
+  // shares one fetch with the 3D twin, audit M-27); without it the editor
+  // fetches on mount. `onsnapshot` reports every server-acknowledged change
+  // (committed plan, placements, reloads) so the parent's twin stays current.
+  let { api, devices = [], snapshot = undefined, onsnapshot }: { api: HomeApi; devices?: HomeDeviceRef[]; snapshot?: HomeSnapshot | null; onsnapshot?: (snapshot: HomeSnapshot) => void } = $props();
 
   const SCALE = 40; // pixels per meter
   const CANVAS_W_M = 18;
@@ -107,6 +111,51 @@
     autosaveTimer = setTimeout(() => { void persistDraft(); }, AUTOSAVE_DELAY_MS);
   }
 
+  // ---- Placement persistence (audit M-29) ----
+  // One in-flight write per device with a latest-value slot: a burst of
+  // nudges (key repeat, undo/redo) collapses to at most one queued write, and
+  // the server always ends on the newest position. A failed write rolls the
+  // device back to its last server-acknowledged placement.
+  type PlacementWrite = { kind: 'put'; placement: Placement } | { kind: 'delete' };
+  const confirmedPlacements = new Map<string, Placement>();
+  const inFlight = new Map<string, Promise<void>>();
+  const queued = new Map<string, PlacementWrite>();
+  function rememberConfirmed(placements: Placement[]) {
+    confirmedPlacements.clear();
+    for (const placement of placements) confirmedPlacements.set(placement.device_id, placement);
+  }
+  function emitSnapshot() {
+    onsnapshot?.({ plan: $state.snapshot(editor).doc.plan, placements: $state.snapshot(editor).doc.placements.map((placement) => ({ ...placement })), estimates: $state.snapshot(estimates) });
+  }
+  function rollbackPlacement(deviceId: string) {
+    const confirmed = confirmedPlacements.get(deviceId);
+    const placements = confirmed
+      ? (editor.doc.placements.some((candidate) => candidate.device_id === deviceId)
+        ? editor.doc.placements.map((candidate) => (candidate.device_id === deviceId ? { ...confirmed } : candidate))
+        : [...editor.doc.placements, { ...confirmed }])
+      : editor.doc.placements.filter((candidate) => candidate.device_id !== deviceId);
+    editor = { ...editor, doc: { ...editor.doc, placements } };
+    emitSnapshot();
+  }
+  function queuePlacementWrite(deviceId: string, write: PlacementWrite) {
+    if (inFlight.has(deviceId)) { queued.set(deviceId, write); return; }
+    const run = (async () => {
+      try {
+        if (write.kind === 'put') { await api.putPlacement({ ...write.placement }); confirmedPlacements.set(deviceId, write.placement); }
+        else { await api.deletePlacement(deviceId); confirmedPlacements.delete(deviceId); }
+      } catch {
+        queued.delete(deviceId);
+        notice = write.kind === 'put' ? 'The placement could not be saved to the service. It was put back where the service last saw it.' : 'The placement could not be removed from the service. It was restored.';
+        rollbackPlacement(deviceId);
+      } finally {
+        inFlight.delete(deviceId);
+        const next = queued.get(deviceId);
+        if (next) { queued.delete(deviceId); queuePlacementWrite(deviceId, next); }
+      }
+    })();
+    inFlight.set(deviceId, run);
+  }
+
   function dispatch(action: EditorAction): boolean {
     const previous = editor;
     const next = reduceEditor(previous, action);
@@ -119,13 +168,12 @@
     if (nextPlacements !== previousPlacements) {
       for (const placement of nextPlacements) {
         const before = previousPlacements.find((candidate) => candidate.device_id === placement.device_id);
-        if (before !== placement) void api.putPlacement({ ...placement }).catch(() => { notice = 'The placement could not be saved to the service.'; });
+        if (before !== placement) queuePlacementWrite(placement.device_id, { kind: 'put', placement: { ...placement } });
       }
       for (const before of previousPlacements) {
-        if (!nextPlacements.some((candidate) => candidate.device_id === before.device_id)) {
-          void api.deletePlacement(before.device_id).catch(() => { notice = 'The placement could not be removed from the service.'; });
-        }
+        if (!nextPlacements.some((candidate) => candidate.device_id === before.device_id)) queuePlacementWrite(before.device_id, { kind: 'delete' });
       }
+      emitSnapshot();
     }
     return true;
   }
@@ -153,6 +201,7 @@
       editor = { ...editor, doc: { ...editor.doc, plan: { ...editor.doc.plan, version: result.version } } };
       autosaveState = 'idle';
       notice = `Plan saved as version ${result.version}.`;
+      emitSnapshot();
       void api.deleteDraft().catch(() => { /* A stale draft is harmless; the committed plan wins. */ });
     } catch { notice = 'The plan could not be saved. Try again shortly.'; }
     finally { committing = false; }
@@ -162,16 +211,21 @@
     loading = true;
     await loadHome();
   }
+  function adopt(loaded: HomeSnapshot) {
+    editor = createEditorState(loaded.plan, loaded.placements);
+    estimates = loaded.estimates;
+    version = loaded.plan.version;
+    activeFloorId = loaded.plan.floors[0]?.floor_id ?? null;
+    selection = null;
+    autosaveState = 'idle';
+    rememberConfirmed(loaded.placements);
+  }
   async function loadHome() {
     loadError = null;
     try {
-      const snapshot = await api.fetchHome();
-      editor = createEditorState(snapshot.plan, snapshot.placements);
-      estimates = snapshot.estimates;
-      version = snapshot.plan.version;
-      activeFloorId = snapshot.plan.floors[0]?.floor_id ?? null;
-      selection = null;
-      autosaveState = 'idle';
+      const loaded = await api.fetchHome();
+      adopt(loaded);
+      onsnapshot?.(loaded);
     } catch { loadError = 'The home plan is unavailable right now. Try again shortly.'; }
     finally { loading = false; }
   }
@@ -189,7 +243,8 @@
 
   onMount(() => {
     void (async () => {
-      await loadHome();
+      if (snapshot) { adopt(snapshot); loading = false; }
+      else await loadHome();
       if (loadError) return;
       try {
         const draft = await api.loadDraft();

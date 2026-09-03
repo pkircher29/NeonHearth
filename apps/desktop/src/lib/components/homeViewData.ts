@@ -23,6 +23,21 @@ export function toTwinDevices(devices: Record<string, DeviceSnapshot>): TwinDevi
   }));
 }
 
+/**
+ * Content equality for twin refs. Live state is replaced on every bandwidth
+ * frame; the 3D scene must only rebuild when the device SET or its labels
+ * change, so the caller keeps the previous array whenever this holds.
+ */
+export function sameTwinDevices(previous: TwinDevice[], next: TwinDevice[]): boolean {
+  if (previous.length !== next.length) return false;
+  for (let index = 0; index < previous.length; index += 1) {
+    const a = previous[index]!;
+    const b = next[index]!;
+    if (a.device_id !== b.device_id || a.label !== b.label || Boolean(a.is_camera) !== Boolean(b.is_camera)) return false;
+  }
+  return true;
+}
+
 export function toPresenceMap(devices: Record<string, DeviceSnapshot>): Record<string, PresenceState> {
   const map: Record<string, PresenceState> = {};
   for (const device of Object.values(devices)) map[device.device_id] = device.presence.state;

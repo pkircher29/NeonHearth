@@ -189,6 +189,39 @@ describe('HomeTwin3D 3D path (stub renderer)', () => {
     expect(view.container.querySelector('.twin')?.getAttribute('data-mode')).toBe('3d');
   });
 
+  it('rebuilds the scene for new placements but resets the camera only for a new plan (H-5)', async () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    const root = view.container.querySelector('.twin')!;
+    expect(root.getAttribute('data-rebuild-count')).toBe('1');
+    expect(root.getAttribute('data-reset-count')).toBe('1');
+
+    // Same plan and placements, a fresh-but-equal devices array: nothing rebuilds.
+    await view.rerender({ devices: devices.map((device) => ({ ...device })), presence: { 'device-1': 'online' } });
+    expect(root.getAttribute('data-rebuild-count')).toBe('2'); // a new array IS a change at this level; HomeView memoizes it
+    expect(root.getAttribute('data-reset-count')).toBe('1');
+
+    // A moved placement rebuilds the geometry without touching the camera.
+    await view.rerender({ placements: [{ ...placements[0]!, x: 2.5 }, placements[1]!] });
+    expect(root.getAttribute('data-rebuild-count')).toBe('3');
+    expect(root.getAttribute('data-reset-count')).toBe('1');
+
+    // A different plan object is a new home: the camera reframes it.
+    await view.rerender({ plan: { ...plan, version: 2 } });
+    expect(root.getAttribute('data-rebuild-count')).toBe('4');
+    expect(root.getAttribute('data-reset-count')).toBe('2');
+  });
+
+  it('stops the render loop while hidden and resumes when visible again (M-26)', async () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, visible: false });
+    const root = view.container.querySelector('.twin')!;
+    expect(root.getAttribute('data-reduced-motion')).toBe('false');
+    expect(root.getAttribute('data-loop')).toBe('stopped');
+    await view.rerender({ visible: true });
+    expect(root.getAttribute('data-loop')).toBe('running');
+    await view.rerender({ visible: false });
+    expect(root.getAttribute('data-loop')).toBe('stopped');
+  });
+
   it('falls back gracefully when the renderer cannot be created', async () => {
     mocks.createTwinRenderer.mockReturnValueOnce(null as never);
     const onfallback = vi.fn();

@@ -6,7 +6,7 @@ import type { DeviceSnapshot } from '../api/types';
 import type { HomeApi, HomeSnapshot } from '../stores/home';
 import { initialLiveState, type LiveState } from '../stores/live';
 import HomeView from './HomeView.svelte';
-import { isNotFound, toBandwidthMap, toHomeDeviceRefs, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
+import { isNotFound, sameTwinDevices, toBandwidthMap, toHomeDeviceRefs, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
 
 // The twin's WebGL seam is the documented mock point (src/lib/twin/webgl.ts):
 // enabled=true keeps the 3D mode alive in jsdom, enabled=false exercises the fallback.
@@ -131,7 +131,6 @@ describe('HomeView', () => {
   it('offers a retry when the home fetch fails, then recovers', async () => {
     const fetchHome = vi.fn<() => Promise<HomeSnapshot>>()
       .mockRejectedValueOnce(new Error('Request failed with status 500'))
-      .mockRejectedValueOnce(new Error('Request failed with status 500'))
       .mockResolvedValue(snapshotFixture());
     render(HomeView, { liveState: liveFixture(), api: apiStub({ fetchHome }) });
 
@@ -139,6 +138,52 @@ describe('HomeView', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     expect(await screen.findByLabelText(/Floor plan for Ground/)).toBeTruthy();
     expect(screen.queryByText(/The home plan is unavailable right now/)).toBeNull();
+    // One fetch feeds both the editor and the twin (M-27): the retry is the second call.
+    expect(fetchHome).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the twin scene stable across live frames with the same device set (H-5)', async () => {
+    webgl.enabled = true;
+    const view = render(HomeView, { liveState: liveFixture(), api: apiStub() });
+    await screen.findByRole('heading', { name: 'Draw the home you protect.' });
+    await fireEvent.click(screen.getByRole('tab', { name: '3D view' }));
+    const twin = await screen.findByLabelText('3D home twin');
+    const rebuilds = Number(twin.getAttribute('data-rebuild-count'));
+    const resets = Number(twin.getAttribute('data-reset-count'));
+
+    // A bandwidth frame replaces every device object but not the device set.
+    const next = liveFixture();
+    next.devices[cameraId] = { ...next.devices[cameraId]!, bandwidth: { ...next.devices[cameraId]!.bandwidth, upload: 9000 } };
+    await view.rerender({ liveState: { ...next, sequence: 9 } });
+    expect(Number(twin.getAttribute('data-rebuild-count'))).toBe(rebuilds);
+    expect(Number(twin.getAttribute('data-reset-count'))).toBe(resets);
+
+    // A renamed device changes the set: one rebuild, still no camera reset.
+    const renamed = liveFixture();
+    renamed.devices[laptopId] = { ...renamed.devices[laptopId]!, owner_name: 'Study laptop' };
+    await view.rerender({ liveState: renamed });
+    expect(Number(twin.getAttribute('data-rebuild-count'))).toBe(rebuilds + 1);
+    expect(Number(twin.getAttribute('data-reset-count'))).toBe(resets);
+  });
+
+  it('loads the home once and refreshes the twin after an editor placement (M-27)', async () => {
+    webgl.enabled = true;
+    const api = apiStub();
+    const view = render(HomeView, { liveState: liveFixture(), api });
+    await screen.findByRole('heading', { name: 'Draw the home you protect.' });
+    await fireEvent.click(screen.getByRole('tab', { name: '3D view' }));
+    const twin = await screen.findByLabelText('3D home twin');
+    expect(twin.getAttribute('data-pin-count')).toBe('1');
+    await fireEvent.click(screen.getByRole('tab', { name: 'Plan editor' }));
+
+    const canvas = view.container.querySelector('.plan-canvas')!;
+    const drop = new MouseEvent('drop', { bubbles: true, clientX: 61, clientY: 84 });
+    Object.defineProperty(drop, 'dataTransfer', { value: { getData: (format: string) => (format === 'text/plain' ? laptopId : '') } });
+    await fireEvent(canvas, drop);
+
+    expect(api.putPlacement).toHaveBeenCalledTimes(1);
+    expect(twin.getAttribute('data-pin-count')).toBe('2');
+    expect(api.fetchHome).toHaveBeenCalledTimes(1);
   });
 
   it('switches to the plan editor with a notice when the twin falls back', async () => {
@@ -153,6 +198,14 @@ describe('HomeView', () => {
 });
 
 describe('homeViewData', () => {
+  it('compares twin devices by content', () => {
+    const a = toTwinDevices(liveFixture().devices);
+    expect(sameTwinDevices(a, toTwinDevices(liveFixture().devices))).toBe(true);
+    expect(sameTwinDevices(a, [])).toBe(false);
+    expect(sameTwinDevices(a, [{ ...a[0]!, label: 'Other' }, a[1]!])).toBe(false);
+    expect(sameTwinDevices(a, [{ ...a[0]!, is_camera: false }, a[1]!])).toBe(false);
+  });
+
   it('derives device refs, twin devices, presence and bandwidth maps from live devices', () => {
     const devices = liveFixture().devices;
 
