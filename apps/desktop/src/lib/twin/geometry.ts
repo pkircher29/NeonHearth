@@ -342,11 +342,18 @@ function floorPoints(floor: PlanFloor): Vec2[] {
 export function floorExtent(floor: PlanFloor): { min: Vec2; max: Vec2 } | null {
   const points = floorPoints(floor);
   if (points.length === 0) return null;
-  const xs = points.map((point) => point.x);
-  const ys = points.map((point) => point.y);
+  // Loops, not spread: `Math.min(...xs)` throws a RangeError past the engine's
+  // argument limit (~65k on JavaScriptCore), which a large plan can reach.
+  let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
+  for (const point of points) {
+    if (point.x < minX) minX = point.x;
+    if (point.x > maxX) maxX = point.x;
+    if (point.y < minY) minY = point.y;
+    if (point.y > maxY) maxY = point.y;
+  }
   return {
-    min: { x: Math.min(...xs) - EXTENT_PADDING_M, y: Math.min(...ys) - EXTENT_PADDING_M },
-    max: { x: Math.max(...xs) + EXTENT_PADDING_M, y: Math.max(...ys) + EXTENT_PADDING_M }
+    min: { x: minX - EXTENT_PADDING_M, y: minY - EXTENT_PADDING_M },
+    max: { x: maxX + EXTENT_PADDING_M, y: maxY + EXTENT_PADDING_M }
   };
 }
 
@@ -492,28 +499,30 @@ export function buildSceneDescription(
   });
 
   let bounds: SceneBounds | null = null;
-  const xs: number[] = [];
-  const ys: number[] = [];
-  const heights: number[] = [];
+  // Running extremes instead of collected arrays + spread (see floorExtent).
+  let count = 0;
+  let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
+  let minH = Infinity; let maxH = -Infinity;
+  const include = (x: number, y: number, h: number) => {
+    count += 1;
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    if (h < minH) minH = h; if (h > maxH) maxH = h;
+  };
   for (const group of floors) {
     const floor = sortedFloors.find((candidate) => candidate.floor_id === group.floor_id)!;
     const extent = floorExtent(floor);
     if (extent) {
-      xs.push(extent.min.x, extent.max.x);
-      ys.push(extent.min.y, extent.max.y);
-      heights.push(group.elevation_m, group.elevation_m + group.ceiling_m);
+      include(extent.min.x, extent.min.y, group.elevation_m);
+      include(extent.max.x, extent.max.y, group.elevation_m + group.ceiling_m);
     }
-    for (const pin of group.pins) {
-      xs.push(pin.position.x);
-      ys.push(pin.position.y);
-      heights.push(group.elevation_m + pin.height_m);
-    }
+    for (const pin of group.pins) include(pin.position.x, pin.position.y, group.elevation_m + pin.height_m);
   }
-  if (xs.length > 0) {
-    const min = { x: Math.min(...xs), y: Math.min(...ys) };
-    const max = { x: Math.max(...xs), y: Math.max(...ys) };
+  if (count > 0) {
+    const min = { x: minX, y: minY };
+    const max = { x: maxX, y: maxY };
     const horizontal = Math.hypot(max.x - min.x, max.y - min.y) / 2;
-    const vertical = heights.length > 0 ? Math.max(...heights) - Math.min(...heights) : 0;
+    const vertical = maxH - minH;
     bounds = {
       min,
       max,

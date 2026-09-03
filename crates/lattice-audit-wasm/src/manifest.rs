@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -586,7 +586,9 @@ pub fn verify_manifest(
         return Err(AuditError::UnsafeSideEffects(manifest.side_effects.clone()));
     }
     let sig = Signature::from_bytes(&manifest.signature);
-    key.verify(&manifest.canonical_unsigned(), &sig)
+    // Strict verification rejects non-canonical S values and small-order
+    // components, matching the advisory crate's vendor-key check.
+    key.verify_strict(&manifest.canonical_unsigned(), &sig)
         .map_err(|_| AuditError::InvalidSignature)?;
     Ok(VerifiedManifest {
         inner: manifest.clone(),

@@ -287,16 +287,81 @@ pub enum MediaError {
     ProcessFailed,
 }
 
+/// Environment variable that pins the ffmpeg executable (absolute path only).
+pub const FFMPEG_ENV: &str = "NEONHEARTH_FFMPEG";
+
+/// The ffmpeg executable this process will spawn, resolved once per process.
+///
+/// Resolution order (see [`resolve_ffmpeg_executable`]): the absolute path in
+/// `NEONHEARTH_FFMPEG`, then the platform install location if it exists, then
+/// the first `ffmpeg` found on `PATH`, then the platform install location
+/// regardless (so a missing binary fails at spawn with a typed error).
 #[must_use]
 pub fn ffmpeg_executable() -> &'static Path {
+    static RESOLVED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        resolve_ffmpeg_executable(
+            std::env::var_os(FFMPEG_ENV).as_deref(),
+            std::env::var_os("PATH").as_deref(),
+            &|candidate| candidate.is_file(),
+        )
+    })
+}
+
+/// Platform install location for ffmpeg. On Windows this is the flat MSI
+/// install directory (the installer places every binary directly in
+/// `INSTALLFOLDER`; there is no `bin\` subdirectory).
+#[must_use]
+pub fn platform_default_ffmpeg() -> &'static Path {
     #[cfg(target_os = "windows")]
     {
-        Path::new(r"C:\Program Files\NeonHearth\bin\ffmpeg.exe")
+        Path::new(r"C:\Program Files\NeonHearth\ffmpeg.exe")
     }
     #[cfg(not(target_os = "windows"))]
     {
         Path::new("/usr/bin/ffmpeg")
     }
+}
+
+const FFMPEG_FILE_NAME: &str = if cfg!(target_os = "windows") {
+    "ffmpeg.exe"
+} else {
+    "ffmpeg"
+};
+
+/// Pure resolver behind [`ffmpeg_executable`]; `exists` abstracts the
+/// filesystem so the order is testable without touching the host.
+///
+/// A relative or traversing override is ignored rather than honoured: the
+/// media contract only ever spawns an absolute, non-traversing path.
+#[must_use]
+pub fn resolve_ffmpeg_executable(
+    override_path: Option<&OsStr>,
+    path_var: Option<&OsStr>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(value) = override_path {
+        let candidate = PathBuf::from(value);
+        if !value.is_empty() && validate_output_dir(&candidate).is_ok() {
+            return candidate;
+        }
+    }
+    let default = platform_default_ffmpeg();
+    if exists(default) {
+        return default.to_path_buf();
+    }
+    if let Some(path_var) = path_var {
+        for directory in std::env::split_paths(path_var) {
+            if !directory.is_absolute() {
+                continue;
+            }
+            let candidate = directory.join(FFMPEG_FILE_NAME);
+            if validate_output_dir(&candidate).is_ok() && exists(&candidate) {
+                return candidate;
+            }
+        }
+    }
+    default.to_path_buf()
 }
 
 pub fn hls_args(
@@ -402,6 +467,12 @@ pub trait MediaProcess: Send {
     async fn kill(&mut self) -> Result<(), MediaError>;
     async fn wait(&mut self) -> Result<MediaProcessExit, MediaError>;
     fn try_wait(&mut self) -> Result<Option<MediaProcessExit>, MediaError>;
+    /// OS process id of the running consumer, when the implementation has one.
+    /// The loopback proxy uses it to verify that the peer connecting to the
+    /// media source is this process and nothing else on the host.
+    fn pid(&self) -> Option<u32> {
+        None
+    }
 
     async fn close(&mut self) -> Result<(), MediaError> {
         match tokio::time::timeout(MEDIA_PROCESS_CLOSE_TIMEOUT, async {
@@ -533,6 +604,10 @@ impl MediaProcess for ProductionMediaProcess {
         Ok(MediaProcessExit {
             success: status.success(),
         })
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.child.id()
     }
 
     fn try_wait(&mut self) -> Result<Option<MediaProcessExit>, MediaError> {

@@ -57,12 +57,13 @@ describe('reduceLiveMessage', () => {
     expect(initialLiveState.devices).toEqual({});
     expect(initialLiveState.coverage).toBe('unavailable');
     expect(initialLiveState.protocolMix).toBeNull();
-    expect(bandwidthTier(999_999)).toBe('blue');
-    expect(bandwidthTier(1_000_000)).toBe('cyan');
-    expect(bandwidthTier(10_000_000)).toBe('cyan');
-    expect(bandwidthTier(10_000_001)).toBe('gold');
-    expect(bandwidthTier(30_000_000)).toBe('gold');
-    expect(bandwidthTier(30_000_001)).toBe('pink');
+    // Bytes per second in; thresholds are 1 / 10 / 30 megabits per second.
+    expect(bandwidthTier(124_999)).toBe('blue');
+    expect(bandwidthTier(125_000)).toBe('cyan');
+    expect(bandwidthTier(1_249_999)).toBe('cyan');
+    expect(bandwidthTier(1_250_000)).toBe('gold');
+    expect(bandwidthTier(3_749_999)).toBe('gold');
+    expect(bandwidthTier(3_750_000)).toBe('pink');
   });
   it('returns the identical state for duplicate or out-of-order events', () => {
     const current = { ...initialLiveState, sequence: 4, connected: true, serviceStatus: 'ready' };

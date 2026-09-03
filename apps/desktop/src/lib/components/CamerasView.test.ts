@@ -27,6 +27,26 @@ describe('CamerasView', () => {
     expect(await screen.findByText(message)).toBeTruthy();
   });
 
+  it('offers a retry on failure that reloads the list (M-28)', async () => {
+    const cameras = vi.fn().mockRejectedValueOnce(new Error('Request failed with status 503')).mockResolvedValue({ items: [detail], next_after: null });
+    render(CamerasView, { client: clientStub({ cameras }) });
+    expect(await screen.findByText(/Collector is unavailable/i)).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findAllByText('Luma Porch')).toHaveLength(2);
+    expect(cameras).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows the readable cameras with a count of the unreadable ones', async () => {
+    const other = '018f47a0-9b5c-7a22-8a33-112233445588';
+    const client = clientStub({
+      cameras: vi.fn(async () => ({ items: [detail, { ...detail, camera_id: other }], next_after: null })),
+      camera: vi.fn(async (cameraId: string) => { if (cameraId === other) throw new Error('Request failed with status 404'); return detail; })
+    });
+    render(CamerasView, { client });
+    expect(await screen.findByText(/1 camera could not be read this time/)).toBeTruthy();
+    expect(screen.getAllByText('Luma Porch')).toHaveLength(2);
+  });
+
   it('uses an honest live fallback and a mobile-safe grid', async () => {
     const view = render(CamerasView, { client: clientStub() });
     expect(await screen.findByText(/Live view needs a stream selected/i)).toBeTruthy();

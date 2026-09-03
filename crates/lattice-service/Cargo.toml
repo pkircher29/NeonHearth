@@ -29,6 +29,8 @@ serde_json.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "process"] }
+tower-http = { workspace = true, features = ["timeout"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
 tracing-subscriber.workspace = true
 tracing.workspace = true
 utoipa.workspace = true
@@ -47,7 +49,12 @@ keyring.workspace = true
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 async-trait.workspace = true

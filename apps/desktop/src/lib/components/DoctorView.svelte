@@ -9,17 +9,34 @@
   let run = $state<DoctorRun | null>(null);
   let running = $state(false);
   let runError = $state<string | null>(null);
-  // Per-finding UI state, keyed by finding index within the current run.
+  // A failed report load is its own state with a reload path; it must never
+  // read as "no diagnostic has run yet" (audit M-30).
+  let loadError = $state<string | null>(null);
+  // Per-finding UI state keyed by run id + finding index, so a repair that
+  // resolves after a newer run cannot attach to the wrong finding.
   let approvals = $state<Record<string, DoctorApproval | null>>({});
   let busy = $state<Record<string, boolean>>({});
   let errors = $state<Record<string, string | null>>({});
   let repairs = $state<Record<string, RepairReport | null>>({});
+  const repairing = $derived(Object.values(busy).some(Boolean));
+  let active = true;
+
+  async function loadReport(): Promise<void> {
+    loading = true;
+    loadError = null;
+    try {
+      const latest = await client.doctorReport();
+      if (active) run = latest;
+    } catch (cause) {
+      if (active) loadError = `Could not load the latest diagnostic: ${message(cause)}`;
+    } finally {
+      if (active) loading = false;
+    }
+  }
 
   onMount(() => {
-    let active = true;
-    void client.doctorReport()
-      .then((latest) => { if (active) { run = latest; loading = false; } })
-      .catch((cause) => { if (active) { runError = `Could not load the latest diagnostic: ${message(cause)}`; loading = false; } });
+    active = true;
+    void loadReport();
     return () => { active = false; };
   });
 
@@ -36,6 +53,7 @@
         runError = 'A diagnostic is already running. Only one diagnostic runs at a time — try again in a moment.';
       } else {
         run = outcome.run;
+        loadError = null;
         approvals = {}; busy = {}; errors = {}; repairs = {};
       }
     } catch (cause) {
@@ -167,7 +185,7 @@
       <h1 id="doctor-heading">Find it, prove it, fix it.</h1>
       <p class="muted">Every check carries its evidence, and no repair is called done without a before-and-after measurement.</p>
     </div>
-    <button type="button" class="run-action" aria-label="Run diagnostic" disabled={running || loading} onclick={() => void runDiagnostic()}>{running ? 'Running diagnostic…' : 'Run diagnostic'}</button>
+    <button type="button" class="run-action" aria-label="Run diagnostic" disabled={running || loading || repairing} onclick={() => void runDiagnostic()}>{running ? 'Running diagnostic…' : 'Run diagnostic'}</button>
   </div>
 
   {#if runError}<p class="doctor-error" role="alert">{runError}</p>{/if}
@@ -175,6 +193,11 @@
 
   {#if loading}
     <p class="doctor-loading" role="status">Loading the latest diagnostic…</p>
+  {:else if loadError}
+    <div class="doctor-load-error" role="alert">
+      <p>{loadError}</p>
+      <button type="button" class="act" onclick={() => void loadReport()}>Reload</button>
+    </div>
   {:else if !run}
     <div class="empty-state doctor-empty">
       <span class="empty-icon" aria-hidden="true">✚</span>
@@ -207,8 +230,8 @@
         <p class="muted no-findings">No faults were found. Every completed check passed.</p>
       {:else}
         <ul class="finding-list">
-          {#each run.findings as finding, index (index)}
-            {@const key = String(index)}
+          {#each run.findings as finding, index (`${run.run_id}:${index}`)}
+            {@const key = `${run.run_id}:${index}`}
             {@const plan = finding.plan}
             {@const name = title(finding.diagnosis.kind)}
             {@const inFlight = Boolean(busy[key])}
@@ -280,66 +303,68 @@
 
 <style>
   .doctor-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:18px}
-  .run-action{min-height:44px;padding:10px 16px;border:1px solid #63f3f0;border-radius:5px;background:#63f3f0;color:#031418;font:700 13px Arial;cursor:pointer}
+  .run-action{min-height:44px;padding:10px 16px;border:1px solid var(--accent);border-radius:5px;background:var(--accent);color:var(--accent-ink);font:700 13px var(--font-display);cursor:pointer}
   .run-action:disabled{opacity:.5;cursor:not-allowed}
-  .run-progress{margin:16px 0 0;padding:10px;border:1px dashed #548cff;color:#9cc0ff;font:11px monospace}
-  .run-progress span{color:#63f3f0}
-  .doctor-loading{margin-top:24px;color:#9bb7bb}
+  .run-progress{margin:16px 0 0;padding:10px;border:1px dashed var(--blue);color:#9cc0ff;font:11px var(--font-mono)}
+  .run-progress span{color:var(--accent)}
+  .doctor-loading{margin-top:24px;color:var(--muted-strong)}
   .doctor-empty{margin-top:28px}
-  .doctor-error{margin:14px 0 0;padding:9px;border:1px solid #ff5c9b;border-radius:5px;color:#ff5c9b;font:11px monospace}
-  .doctor-checks h2,.doctor-findings h2{margin:30px 0 6px;font:600 17px Arial}
+  .doctor-error{margin:14px 0 0;padding:9px;border:1px solid var(--pink);border-radius:5px;color:var(--pink);font:11px var(--font-mono)}
+  .doctor-load-error{margin-top:24px;padding:14px;border:1px dashed var(--pink);border-radius:7px;display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+  .doctor-load-error p{margin:0;color:#ffb4cc;font-size:12px}
+  .doctor-checks h2,.doctor-findings h2{margin:30px 0 6px;font:600 17px var(--font-display)}
   .run-facts{font-size:12px}
-  .budget-warning{margin:12px 0 0;padding:9px;border:1px dashed #ffcd66;color:#ffcd66;font:11px monospace}
+  .budget-warning{margin:12px 0 0;padding:9px;border:1px dashed var(--gold);color:var(--gold);font:11px var(--font-mono)}
   .check-list{margin:14px 0 0;padding:0;list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
-  .check-row{padding:13px;border:1px solid #20424b;border-left:4px solid #63f3f0;border-radius:7px;background:#0b1c26}
-  .check-row.state-failed{border-left-color:#ff5c9b}
-  .check-row.state-skipped{border-left-color:#77959d;border-style:dashed}
-  .check-row h3{margin:0;font:600 13px Arial;text-transform:capitalize}
-  .check-status{margin:7px 0 0;color:#cce4e7;font-size:12px}
-  .status-mark{display:inline-grid;place-items:center;width:17px;height:17px;border:1px solid #28505a;border-radius:4px;font:10px monospace}
-  .state-passed .status-mark{color:#63f3f0;border-color:#63f3f0}
-  .state-failed .status-mark{color:#ff5c9b;border-color:#ff5c9b}
-  .state-skipped .status-mark{color:#77959d}
-  .check-confidence,.finding-confidence{margin:6px 0 0;color:#77959d;font:10px monospace;text-transform:uppercase;letter-spacing:.08em}
+  .check-row{padding:13px;border:1px solid var(--line-mid);border-left:4px solid var(--accent);border-radius:7px;background:var(--surface)}
+  .check-row.state-failed{border-left-color:var(--pink)}
+  .check-row.state-skipped{border-left-color:var(--muted);border-style:dashed}
+  .check-row h3{margin:0;font:600 13px var(--font-display);text-transform:capitalize}
+  .check-status{margin:7px 0 0;color:var(--ink);font-size:12px}
+  .status-mark{display:inline-grid;place-items:center;width:17px;height:17px;border:1px solid var(--line-strong);border-radius:4px;font:10px var(--font-mono)}
+  .state-passed .status-mark{color:var(--accent);border-color:var(--accent)}
+  .state-failed .status-mark{color:var(--pink);border-color:var(--pink)}
+  .state-skipped .status-mark{color:var(--muted)}
+  .check-confidence,.finding-confidence{margin:6px 0 0;color:var(--muted);font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.08em}
   .measurements{margin:9px 0 0;padding:0;list-style:none;display:grid;gap:4px}
-  .measurements li{color:#9bb7bb;font:11px monospace}
-  .measurements li::before{content:'· ';color:#548cff}
+  .measurements li{color:var(--muted-strong);font:11px var(--font-mono)}
+  .measurements li::before{content:'· ';color:var(--blue)}
   .finding-list{margin:14px 0 0;padding:0;list-style:none;display:grid;gap:13px}
-  .finding-card{padding:18px;border:1px solid #20424b;border-left:4px solid #ffcd66;border-radius:8px;background:#0b1c26}
-  .finding-card.class-safe_automatic{border-left-color:#63f3f0}
-  .finding-card.class-observation_only{border-left-color:#77959d}
-  .finding-card h3{margin:0;font:600 17px Arial}
-  .impact{margin:8px 0 0;color:#cce4e7;font-size:13px}
-  .plan-class{margin:14px 0 0;color:#63f3f0;font:10px monospace;text-transform:uppercase;letter-spacing:.08em}
-  .class-approval_required_reversible .plan-class{color:#ffcd66}
-  .class-guided_physical .plan-class,.class-observation_only .plan-class{color:#9bb7bb}
-  .rationale{margin:5px 0 0;color:#9bb7bb;font-size:12px}
-  .repair-actions{margin-top:14px;padding-top:12px;border-top:1px solid #17323d;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-  .act{min-height:34px;padding:7px 14px;border:1px solid #28505a;border-radius:5px;background:#102a35;color:#cce4e7;font:600 12px Arial;cursor:pointer}
-  .act:hover:not(:disabled){border-color:#63f3f0}
+  .finding-card{padding:18px;border:1px solid var(--line-mid);border-left:4px solid var(--gold);border-radius:8px;background:var(--surface)}
+  .finding-card.class-safe_automatic{border-left-color:var(--accent)}
+  .finding-card.class-observation_only{border-left-color:var(--muted)}
+  .finding-card h3{margin:0;font:600 17px var(--font-display)}
+  .impact{margin:8px 0 0;color:var(--ink);font-size:13px}
+  .plan-class{margin:14px 0 0;color:var(--accent);font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.08em}
+  .class-approval_required_reversible .plan-class{color:var(--gold)}
+  .class-guided_physical .plan-class,.class-observation_only .plan-class{color:var(--muted-strong)}
+  .rationale{margin:5px 0 0;color:var(--muted-strong);font-size:12px}
+  .repair-actions{margin-top:14px;padding-top:12px;border-top:1px solid var(--line);display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .act{min-height:34px;padding:7px 14px;border:1px solid var(--line-strong);border-radius:5px;background:var(--surface-raised);color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
+  .act:hover:not(:disabled){border-color:var(--accent)}
   .act:disabled{opacity:.45;cursor:not-allowed}
   .act.danger{border-color:#8a6a3e;color:#ffe0a3}
-  .act.danger:hover:not(:disabled){border-color:#ffcd66}
-  .confirm-step{display:inline-flex;flex-wrap:wrap;gap:8px;align-items:center;padding:4px 8px;border:1px dashed #ffcd66;border-radius:5px}
-  .confirm-question{color:#ffe0a3;font:11px monospace;text-transform:uppercase}
-  .guided-steps{margin:14px 0 0;padding-left:22px;display:grid;gap:6px;color:#cce4e7;font-size:12px}
-  .guided-steps li::marker{color:#63f3f0;font-weight:700}
-  .observation-note{margin:14px 0 0;padding:9px;border:1px dashed #77959d;color:#9bb7bb;font:11px monospace}
-  .repair-report{margin-top:14px;padding:12px;border:1px solid #28505a;border-radius:7px;background:#081720}
-  .repair-report.tone-success{border-color:#63f3f0}
-  .repair-report.tone-regressed{border-color:#ff5c9b}
-  .repair-report.tone-unverified{border-color:#ffcd66;border-style:dashed}
-  .repair-headline{margin:0;font:600 13px Arial;color:#cce4e7}
-  .tone-success .repair-headline{color:#63f3f0}
-  .tone-regressed .repair-headline{color:#ff5c9b}
-  .tone-unverified .repair-headline{color:#ffcd66}
-  .rollback-banner{margin:10px 0 0;padding:9px;border:1px solid #ffcd66;border-radius:5px;color:#ffcd66;font:11px monospace}
-  .rollback-banner.failed{border-color:#ff5c9b;color:#ff5c9b}
+  .act.danger:hover:not(:disabled){border-color:var(--gold)}
+  .confirm-step{display:inline-flex;flex-wrap:wrap;gap:8px;align-items:center;padding:4px 8px;border:1px dashed var(--gold);border-radius:5px}
+  .confirm-question{color:#ffe0a3;font:11px var(--font-mono);text-transform:uppercase}
+  .guided-steps{margin:14px 0 0;padding-left:22px;display:grid;gap:6px;color:var(--ink);font-size:12px}
+  .guided-steps li::marker{color:var(--accent);font-weight:700}
+  .observation-note{margin:14px 0 0;padding:9px;border:1px dashed var(--muted);color:var(--muted-strong);font:11px var(--font-mono)}
+  .repair-report{margin-top:14px;padding:12px;border:1px solid var(--line-strong);border-radius:7px;background:#081720}
+  .repair-report.tone-success{border-color:var(--accent)}
+  .repair-report.tone-regressed{border-color:var(--pink)}
+  .repair-report.tone-unverified{border-color:var(--gold);border-style:dashed}
+  .repair-headline{margin:0;font:600 13px var(--font-display);color:var(--ink)}
+  .tone-success .repair-headline{color:var(--accent)}
+  .tone-regressed .repair-headline{color:var(--pink)}
+  .tone-unverified .repair-headline{color:var(--gold)}
+  .rollback-banner{margin:10px 0 0;padding:9px;border:1px solid var(--gold);border-radius:5px;color:var(--gold);font:11px var(--font-mono)}
+  .rollback-banner.failed{border-color:var(--pink);color:var(--pink)}
   .verify-grid{margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px}
-  .verify-grid div{padding:9px;border:1px solid #17323d;border-radius:5px}
-  .verify-grid h4{margin:0;color:#77959d;font:10px monospace;text-transform:uppercase;letter-spacing:.08em}
-  .verify-grid p{margin:6px 0 0;color:#cce4e7;font:12px monospace}
-  .unverified-note{margin:10px 0 0;color:#ffcd66;font:11px monospace}
+  .verify-grid div{padding:9px;border:1px solid var(--line);border-radius:5px}
+  .verify-grid h4{margin:0;color:var(--muted);font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.08em}
+  .verify-grid p{margin:6px 0 0;color:var(--ink);font:12px var(--font-mono)}
+  .unverified-note{margin:10px 0 0;color:var(--gold);font:11px var(--font-mono)}
   .no-findings{margin-top:12px}
   @media(max-width:850px){.doctor-heading{display:block}.run-action{margin-top:14px;width:100%}.verify-grid{grid-template-columns:1fr}.check-list{grid-template-columns:1fr}}
 </style>

@@ -35,6 +35,13 @@
     there explaining that.
   - UI assets (apps/desktop Vite bundle) are installed under ui\ for the
     desktop shell. The service does not serve them over HTTP in this build.
+  - 2026-09-03 audit remediation (authored, not yet built): MajorUpgrade is
+    scheduled afterInstallExecute so the pairing token survives upgrades
+    (M-4); an opt-in BundledFfmpeg component group installs ffmpeg.exe flat
+    in the install folder (M-18); configure-service.ps1 now sets explicit
+    non-inherited ACLs on the state directory and the service registry key
+    (H-1, H-2). Confirm at first `wix build` that the <?ifdef?> blocks and
+    the MajorUpgrade/@Schedule value are accepted by the WiX v4 schema.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
@@ -46,7 +53,20 @@
            Scope="perMachine"
            Compressed="yes">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of NeonHearth is already installed." />
+    <!-- Schedule="afterInstallExecute" (audit M-4): with the WiX default
+         (afterInstallValidate) RemoveExistingProducts uninstalls the OLD
+         product first, whose ServiceControl Remove="uninstall" deletes the
+         service key, including the Environment value that holds the pairing
+         token. The configure action then runs under NOT Installed, finds no
+         token, and generates a new one: every major upgrade broke pairing.
+         With afterInstallExecute the new product's InstallServices updates
+         the existing registration and configure-service.ps1 sees and
+         preserves the token; only then is the old product removed, and its
+         shared components (same GUIDs, refcount > 0) are left in place so
+         DeleteServices does not act. Reasoned from the Windows Installer
+         sequencing rules; not yet proven by an actual upgrade run. -->
+    <MajorUpgrade Schedule="afterInstallExecute"
+                  DowngradeErrorMessage="A newer version of NeonHearth is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- Npcap presence: WinPcap-compatible Packet.dll in System32. The
@@ -107,6 +127,21 @@
       <Files Include="!(bindpath.dist)\ui\**" />
     </ComponentGroup>
 
+    <!-- Optional bundled ffmpeg (audit M-18). The camera media pipeline
+         needs an ffmpeg binary; nothing installed it before. Build with
+         `-d BundleFfmpeg=1` after placing ffmpeg.exe (and its licence text)
+         in packaging\dist\windows\bin to install it FLAT in the install
+         folder, which is where configure-service.ps1 looks before setting
+         NEONHEARTH_FFMPEG for the service. Opt-in so a build without the
+         binary staged does not fail wildcard harvesting. ffmpeg's own
+         licence (LGPL/GPL depending on build) must be shipped alongside. -->
+    <?ifdef BundleFfmpeg?>
+    <ComponentGroup Id="BundledFfmpeg" Directory="INSTALLFOLDER">
+      <Files Include="!(bindpath.dist)\bin\ffmpeg*.exe" />
+      <Files Include="!(bindpath.dist)\bin\ffmpeg-LICENSE*.txt" />
+    </ComponentGroup>
+    <?endif?>
+
     <ComponentGroup Id="InstallScripts" Directory="SCRIPTSFOLDER">
       <Component Id="ConfigureScript" Guid="b3f57a24-9c1e-4dd2-8a0b-77d0f2f4c9a2" Bitness="always64">
         <File Id="ConfigureServicePs1" Source="!(bindpath.dist)\scripts\configure-service.ps1" KeyPath="yes" />
@@ -138,6 +173,9 @@
       <ComponentGroupRef Id="ServiceComponents" />
       <ComponentGroupRef Id="UiAssets" />
       <ComponentGroupRef Id="InstallScripts" />
+      <?ifdef BundleFfmpeg?>
+      <ComponentGroupRef Id="BundledFfmpeg" />
+      <?endif?>
     </Feature>
   </Package>
 </Wix>

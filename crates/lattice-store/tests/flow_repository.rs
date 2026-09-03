@@ -239,33 +239,62 @@ async fn compaction_cutoff_is_full_parent_inclusive_and_hours_live_forever() {
         1
     );
 }
+/// M-12: `max_rows` is a batch size, not a refusal threshold. A backlog many
+/// times larger than the batch converges over several committed batches, and
+/// bytes are conserved through both levels (seconds -> minutes -> hours).
 #[tokio::test]
-async fn compaction_capacity_failure_is_atomic() {
+async fn compaction_backlog_larger_than_the_batch_converges() {
     let pool = connect_memory().await.unwrap();
     let repo = FlowRepository::new(pool, 100).unwrap();
-    repo.apply(
-        &[
-            RollupChange::Upsert(roll(Resolution::Second, 0, 2, Coverage::Complete)),
-            RollupChange::Upsert(roll(Resolution::Second, 1, 3, Coverage::Complete)),
-        ],
-        t(2),
-    )
-    .await
-    .unwrap();
+    // Ten second rows across five different minutes, all inside hour 0.
+    let mut changes = Vec::new();
+    let mut expected_upload = 0u64;
+    for minute in 0..5i64 {
+        for offset in 0..2i64 {
+            let upload = u64::try_from(minute * 10 + offset + 1).unwrap();
+            expected_upload += upload;
+            changes.push(RollupChange::Upsert(roll(
+                Resolution::Second,
+                minute * 60 + offset,
+                upload,
+                Coverage::Complete,
+            )));
+        }
+    }
+    repo.apply(&changes, t(300)).await.unwrap();
     let p = CompactionPolicy {
         seconds: Duration::seconds(60),
         minutes: Duration::seconds(120),
         hours: None,
-        max_rows: 1,
+        max_rows: 3,
     };
-    assert!(repo.compact(t(4000), &p).await.is_err());
-    assert_eq!(
-        repo.range(Resolution::Second, t(-1), t(10), 100)
+    // Ten second rows are removed (in batches of at most one or two
+    // minutes each), then the five minute rows they produced are folded into
+    // the hour in a second level of batches.
+    assert_eq!(repo.compact(t(4000), &p).await.unwrap(), 15);
+    assert!(
+        repo.range(Resolution::Second, t(-1), t(400), 100)
             .await
             .unwrap()
-            .len(),
-        2
+            .is_empty()
     );
+    assert!(
+        repo.range(Resolution::Minute, t(-1), t(400), 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let hours = repo.range(Resolution::Hour, t(0), t(0), 100).await.unwrap();
+    assert_eq!(hours.len(), 1);
+    assert_eq!(
+        hours[0].bytes,
+        ByteCount {
+            upload: expected_upload,
+            download: expected_upload
+        }
+    );
+    // Nothing left to do: a second run is a no-op, not an error.
+    assert_eq!(repo.compact(t(4000), &p).await.unwrap(), 0);
 }
 
 #[tokio::test]

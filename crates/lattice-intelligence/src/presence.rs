@@ -905,6 +905,14 @@ fn semantically_retained(e: &PresenceEvidence, arrival: DateTime<Utc>, c: &Prese
         PresenceEvidenceKind::ConfirmationFailure => {
             arrival.signed_duration_since(e.observed_at) <= c.confirmation_window
         }
+        // Traffic only supports presence through its online window and can only
+        // be corrected within the correction window, so keeping it for the full
+        // retention period would let a chatty device fill its evidence cap and
+        // then reject every later lease or neighbour observation.
+        PresenceEvidenceKind::Traffic => {
+            arrival.signed_duration_since(e.observed_at)
+                <= std::cmp::max(c.online_window, c.correction_window)
+        }
         _ => arrival.signed_duration_since(e.observed_at) <= c.retention,
     }
 }

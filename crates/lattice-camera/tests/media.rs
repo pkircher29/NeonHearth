@@ -4,9 +4,14 @@ use lattice_camera::{
     CameraId, FakeMediaProcessFactory, HlsSession, HlsSessionId, LoopbackSourceToken, MediaError,
     MediaJob, MediaProcess, MediaProcessExit, MediaProcessFactory, MediaProcessSpec,
     ProductionMediaProcessFactory, SnapshotRequest, StreamId, ffmpeg_executable, hls_args,
-    snapshot_args,
+    platform_default_ffmpeg, resolve_ffmpeg_executable, snapshot_args,
 };
-use std::{ffi::OsString, future::pending, path::Path, time::Duration};
+use std::{
+    ffi::{OsStr, OsString},
+    future::pending,
+    path::Path,
+    time::Duration,
+};
 use uuid::Uuid;
 
 const CAMERA: &str = "192.168.4.22";
@@ -213,11 +218,62 @@ fn argument_builders_reject_non_absolute_or_traversing_output_and_invalid_port()
 }
 
 #[test]
-fn production_executable_is_platform_fixed() {
+fn platform_default_matches_the_installer_layout() {
     #[cfg(target_os = "linux")]
-    assert_eq!(ffmpeg_executable(), Path::new("/usr/bin/ffmpeg"));
+    assert_eq!(platform_default_ffmpeg(), Path::new("/usr/bin/ffmpeg"));
     #[cfg(target_os = "windows")]
-    assert!(ffmpeg_executable().ends_with("NeonHearth\\bin\\ffmpeg.exe"));
+    {
+        // The MSI installs every binary flat in INSTALLFOLDER; there is no bin\.
+        assert_eq!(
+            platform_default_ffmpeg(),
+            Path::new(r"C:\Program Files\NeonHearth\ffmpeg.exe")
+        );
+    }
+    // The resolved executable is always absolute and never traverses.
+    assert!(ffmpeg_executable().is_absolute());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ffmpeg_resolution_prefers_override_then_default_then_path() {
+    let default = platform_default_ffmpeg();
+    let override_path = Path::new("/opt/custom/ffmpeg");
+    let on_path = Path::new("/opt/tools/ffmpeg");
+    let path_var = OsString::from("relative/bin:/nowhere:/opt/tools");
+
+    // 1. An absolute override wins even when nothing exists on disk.
+    let never = |_: &Path| false;
+    assert_eq!(
+        resolve_ffmpeg_executable(Some(override_path.as_os_str()), Some(&path_var), &never),
+        override_path
+    );
+    // 2. A relative, empty, or traversing override is ignored.
+    for bad in ["ffmpeg", "", "/opt/../usr/bin/ffmpeg", "./ffmpeg"] {
+        let only_path = |candidate: &Path| candidate == on_path;
+        assert_eq!(
+            resolve_ffmpeg_executable(Some(OsStr::new(bad)), Some(&path_var), &only_path),
+            on_path,
+            "override {bad:?} must be ignored"
+        );
+    }
+    // 3. The platform default is preferred over PATH when it exists.
+    let both = |candidate: &Path| candidate == default || candidate == on_path;
+    assert_eq!(
+        resolve_ffmpeg_executable(None, Some(&path_var), &both),
+        default
+    );
+    // 4. PATH is searched in order, skipping relative entries.
+    let only_path = |candidate: &Path| candidate == on_path;
+    assert_eq!(
+        resolve_ffmpeg_executable(None, Some(&path_var), &only_path),
+        on_path
+    );
+    // 5. Nothing found: fall back to the platform default so spawn fails typed.
+    assert_eq!(
+        resolve_ffmpeg_executable(None, Some(&path_var), &never),
+        default
+    );
+    assert_eq!(resolve_ffmpeg_executable(None, None, &never), default);
 }
 
 #[tokio::test]

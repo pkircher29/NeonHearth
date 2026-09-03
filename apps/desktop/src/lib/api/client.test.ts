@@ -1,6 +1,95 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createApiClient, isSequence } from './client';
+import { createApiClient, isSequence, type AuthSource } from './client';
+
+describe('createApiClient credentials (M-25)', () => {
+  it('omits the Authorization header entirely when no credential is held, never sending an empty bearer', async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ sequence: 1, devices: [], next_after: null, service_status: 'ready' }), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', fetchImpl });
+    await client.snapshot();
+    const init = fetchImpl.mock.calls[0]![1] as RequestInit;
+    expect(init.headers).toEqual({});
+    expect(JSON.stringify(init)).not.toContain('Bearer');
+  });
+
+  it('takes the header from the auth source, phone sessions included, and prefers it over a fixed token', async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ sequence: 1, devices: [], next_after: null, service_status: 'ready' }), { status: 200 }));
+    let header: string | null = 'PhoneSession 018f47a0-9b5c-7a22-8a33-112233445599:' + 'a'.repeat(64);
+    const auth: AuthSource = { header: () => header };
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'ignored', auth, fetchImpl });
+    await client.snapshot();
+    expect((fetchImpl.mock.calls[0]![1] as RequestInit).headers).toEqual({ Authorization: header });
+    header = null;
+    await client.snapshot();
+    expect((fetchImpl.mock.calls[1]![1] as RequestInit).headers).toEqual({});
+  });
+
+  it('reports 401 to the auth source and 403 only for phone sessions', async () => {
+    const unauthorized = vi.fn();
+    const stepupRequired = vi.fn();
+    let header: string | null = 'Bearer ' + 'x'.repeat(40);
+    const auth: AuthSource = { header: () => header, unauthorized, stepupRequired };
+    const fetchImpl = vi.fn().mockResolvedValueOnce(new Response(null, { status: 401 })).mockResolvedValueOnce(new Response(null, { status: 403 })).mockResolvedValueOnce(new Response(null, { status: 403 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', auth, fetchImpl });
+    await expect(client.snapshot()).rejects.toThrow('status 401');
+    expect(unauthorized).toHaveBeenCalledTimes(1);
+    await expect(client.doctorRun()).rejects.toThrow('status 403');
+    expect(stepupRequired).not.toHaveBeenCalled(); // an owner bearer has no PIN step-up
+    header = 'PhoneSession 018f47a0-9b5c-7a22-8a33-112233445599:' + 'a'.repeat(64);
+    await expect(client.doctorRun()).rejects.toThrow('status 403');
+    expect(stepupRequired).toHaveBeenCalledTimes(1);
+  });
+
+  it('abandons a stalled request after the timeout (H-6)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason ?? new Error('aborted')));
+      }));
+      const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl, requestTimeoutMs: 1_000 });
+      const pending = client.health();
+      const outcome = expect(pending).rejects.toThrow('Request timed out');
+      await vi.advanceTimersByTimeAsync(1_000);
+      await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('honors a caller abort signal on snapshot walks', async () => {
+    const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('Connection stopped')));
+    }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+    const controller = new AbortController();
+    const pending = client.snapshotAll({ signal: controller.signal });
+    controller.abort(new Error('Connection stopped'));
+    await expect(pending).rejects.toThrow('Connection stopped');
+  });
+
+  it('mints a phone pairing with the exact wire body and validates the one-time secret', async () => {
+    const minted = { session_id: '018f47a0-9b5c-4a22-8a33-112233445599', secret: 'b'.repeat(64), expires_at: '2026-10-03T00:00:00Z' };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(minted), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+    await expect(client.pairPhone("Paul's phone", '123456')).resolves.toEqual(minted);
+    expect(fetchImpl).toHaveBeenCalledExactlyOnceWith('https://collector.example/api/v1/remote/pair', {
+      method: 'POST', headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' }, body: JSON.stringify({ device_label: "Paul's phone", pin: '123456' }), signal: expect.any(AbortSignal)
+    });
+    await expect(client.pairPhone('', '123456')).rejects.toThrow('Invalid pairing request');
+    await expect(client.pairPhone('phone', '12345')).rejects.toThrow('Invalid pairing request');
+    const malformed = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify({ ...minted, secret: 'short' }), { status: 200 })) });
+    await expect(malformed.pairPhone('phone', '123456')).rejects.toThrow('Invalid pairing response');
+  });
+
+  it('steps up a phone session with the PIN and validates the grace window', async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ expires_at: '2026-09-03T10:05:00Z' }), { status: 200 }));
+    const auth: AuthSource = { header: () => 'PhoneSession 018f47a0-9b5c-7a22-8a33-112233445599:' + 'a'.repeat(64) };
+    const client = createApiClient({ baseUrl: 'https://collector.example', auth, fetchImpl });
+    await expect(client.stepUp('654321')).resolves.toEqual({ expires_at: '2026-09-03T10:05:00Z' });
+    expect((fetchImpl.mock.calls[0]![1] as RequestInit).body).toBe(JSON.stringify({ pin: '654321' }));
+    await expect(client.stepUp('abc')).rejects.toThrow('Invalid PIN');
+  });
+});
 
 describe('createApiClient', () => {
   it('authorizes only same-origin canonical playlist or segment media requests', () => {
@@ -38,7 +127,7 @@ describe('createApiClient', () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ health: 'healthy', confidence: 0.9 }), { status: 200 }));
     const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
     await expect(client.cameraHealth(id)).resolves.toEqual({ health: 'healthy', confidence: 0.9 });
-    expect(fetchImpl).toHaveBeenCalledWith(`https://collector.example/api/v1/cameras/${id}/health`, { method: 'GET', headers: { Authorization: 'Bearer secret' } });
+    expect(fetchImpl).toHaveBeenCalledWith(`https://collector.example/api/v1/cameras/${id}/health`, { method: 'GET', headers: { Authorization: 'Bearer secret' }, signal: expect.any(AbortSignal) });
   });
 
   it('uses only bounded opaque camera URLs and exact media/session contracts', async () => {
@@ -217,10 +306,10 @@ describe('createApiClient', () => {
     await client.snapshot({ limit: 2, after: '018f47a0-9b5c-7a22-8a33-112233445599' });
 
     expect(fetchImpl).toHaveBeenNthCalledWith(1, 'https://collector.example/api/v1/state', {
-      method: 'GET', headers: { Authorization: 'Bearer secret' }
+      method: 'GET', headers: { Authorization: 'Bearer secret' }, signal: expect.any(AbortSignal)
     });
     expect(fetchImpl).toHaveBeenNthCalledWith(2, 'https://collector.example/api/v1/state?limit=2&after=018f47a0-9b5c-7a22-8a33-112233445599', {
-      method: 'GET', headers: { Authorization: 'Bearer secret' }
+      method: 'GET', headers: { Authorization: 'Bearer secret' }, signal: expect.any(AbortSignal)
     });
   });
 
@@ -238,11 +327,21 @@ describe('createApiClient', () => {
     await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: cycleFetch }).snapshotAll()).rejects.toThrow('cursor cycle');
   });
 
-  it('rejects a paginated sequence watermark change', async () => {
+  it('restarts a paginated walk when the sequence advances and rejects a backwards or endless move', async () => {
     const id = '018f47a0-9b5c-7a22-8a33-445566778899';
-    const response = (sequence: number) => new Response(JSON.stringify({ sequence, devices: [], next_after: null, service_status: 'ready' }), { status: 200 });
-    const fetchImpl = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ sequence: 1, devices: [], next_after: id, service_status: 'ready' }), { status: 200 })).mockResolvedValueOnce(response(2));
-    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl }).snapshotAll()).rejects.toThrow('sequence changed');
+    const page = (sequence: number, next_after: string | null, devices: unknown[] = []) => new Response(JSON.stringify({ sequence, devices, next_after, service_status: 'ready' }), { status: 200 });
+    // Page 2 arrives at a newer sequence: the walk restarts at 2 and completes there.
+    const forward = vi.fn().mockResolvedValueOnce(page(1, id)).mockResolvedValueOnce(page(2, null)).mockResolvedValueOnce(page(2, id, [validDevice])).mockResolvedValueOnce(page(2, null));
+    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: forward }).snapshotAll()).resolves.toMatchObject({ sequence: 2, devices: [validDevice], next_after: null });
+    expect(forward).toHaveBeenCalledTimes(4);
+    // A sequence that goes backwards is corrupt, not busy.
+    const backwards = vi.fn().mockResolvedValueOnce(page(3, id)).mockResolvedValueOnce(page(2, null));
+    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: backwards }).snapshotAll()).rejects.toThrow('sequence changed');
+    // The restart budget is bounded: a stream that always moves still fails.
+    let sequence = 0;
+    const endless = vi.fn(async (input: RequestInfo | URL) => page(String(input).includes('after=') ? ++sequence + 100 : ++sequence, id));
+    await expect(createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: endless }).snapshotAll()).rejects.toThrow('sequence changed');
+    expect(endless).toHaveBeenCalledTimes(8);
   });
 
   it('rejects invalid snapshot pages before fetching', async () => {
@@ -287,7 +386,8 @@ describe('createApiClient', () => {
 
     expect(fetchImpl).toHaveBeenCalledWith('https://collector.example/api/v1/events/ticket', {
       method: 'POST',
-      headers: { Authorization: 'Bearer secret-service-token' }
+      headers: { Authorization: 'Bearer secret-service-token' },
+      signal: expect.any(AbortSignal)
     });
     expect(sockets).toEqual(['wss://collector.example/api/v1/events?ticket=single-use+ticket&after_sequence=7']);
     expect(sockets[0]).not.toContain('secret-service-token');
@@ -399,11 +499,13 @@ describe('createApiClient', () => {
     expect(fetchImpl).toHaveBeenNthCalledWith(1, 'https://collector.example/api/v1/policy/action', {
       method: 'POST',
       headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      signal: expect.any(AbortSignal),
       body: JSON.stringify({ device_id: id, action: 'approve' })
     });
     expect(fetchImpl).toHaveBeenNthCalledWith(4, 'https://collector.example/api/v1/policy/action', {
       method: 'POST',
       headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      signal: expect.any(AbortSignal),
       body: JSON.stringify({ device_id: id, action: { extend_once: { until: '2026-08-26T00:00:00Z' } } })
     });
   });
@@ -491,7 +593,7 @@ describe('createApiClient', () => {
 
     await expect(client.doctorRun()).resolves.toEqual({ status: 'completed', run: runEnvelope });
     expect(fetchImpl).toHaveBeenCalledExactlyOnceWith('https://collector.example/api/v1/doctor/run', {
-      method: 'POST', headers: { Authorization: 'Bearer secret' }
+      method: 'POST', headers: { Authorization: 'Bearer secret' }, signal: expect.any(AbortSignal)
     });
   });
 
@@ -528,7 +630,7 @@ describe('createApiClient', () => {
     const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
     await expect(client.doctorReport()).resolves.toEqual(runEnvelope);
     expect(fetchImpl).toHaveBeenCalledExactlyOnceWith('https://collector.example/api/v1/doctor/report', {
-      method: 'GET', headers: { Authorization: 'Bearer secret' }
+      method: 'GET', headers: { Authorization: 'Bearer secret' }, signal: expect.any(AbortSignal)
     });
 
     const malformed = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify({ ...runEnvelope, findings: 'none' }), { status: 200 })) });
@@ -544,6 +646,7 @@ describe('createApiClient', () => {
     expect(fetchImpl).toHaveBeenCalledExactlyOnceWith('https://collector.example/api/v1/doctor/approvals', {
       method: 'POST',
       headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      signal: expect.any(AbortSignal),
       body: JSON.stringify({ diagnosis_kind: gatewayKind })
     });
 
@@ -577,11 +680,13 @@ describe('createApiClient', () => {
     expect(fetchImpl).toHaveBeenNthCalledWith(1, 'https://collector.example/api/v1/doctor/repair', {
       method: 'POST',
       headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      signal: expect.any(AbortSignal),
       body: JSON.stringify({ diagnosis_kind: safeKind })
     });
     expect(fetchImpl).toHaveBeenNthCalledWith(2, 'https://collector.example/api/v1/doctor/repair', {
       method: 'POST',
       headers: { Authorization: 'Bearer secret', 'content-type': 'application/json' },
+      signal: expect.any(AbortSignal),
       body: JSON.stringify({ diagnosis_kind: gatewayKind, approval_id: 'appr-0001' })
     });
 

@@ -47,13 +47,39 @@ impl std::fmt::Debug for Sandbox {
     }
 }
 
-pub struct Sandbox {
+/// A compiled module and the engine it was compiled for. Compilation is the
+/// expensive part of admission, so a broker keeps one of these per verified
+/// module digest and builds a [`Sandbox`] around it per request.
+pub(crate) struct CompiledModule {
     engine: Engine,
     module: Module,
-    limits: Limits,
     /// A module runs in a fresh store, but an engine epoch is global. Serialize
     /// admissions so one invocation's deadline cannot interrupt another one.
+    /// The mutex lives with the engine so sharing the compiled module keeps
+    /// that guarantee.
     execution: tokio::sync::Mutex<()>,
+}
+
+impl CompiledModule {
+    fn compile(wasm: &[u8]) -> Result<Self, AuditError> {
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        config.async_support(true);
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).map_err(|_| AuditError::InvalidModule)?;
+        let module = Module::new(&engine, wasm).map_err(|_| AuditError::InvalidModule)?;
+        validate_abi(&module)?;
+        Ok(Self {
+            engine,
+            module,
+            execution: tokio::sync::Mutex::new(()),
+        })
+    }
+}
+
+pub struct Sandbox {
+    compiled: Arc<CompiledModule>,
+    limits: Limits,
 }
 
 #[derive(Clone, Copy)]
@@ -169,6 +195,15 @@ impl Sandbox {
         verified: VerifiedManifest,
         limits: &Limits,
     ) -> Result<Self, AuditError> {
+        Self::check_limits(&verified, limits)?;
+        let compiled = Self::compile(&verified).await?;
+        Self::with_compiled(&verified, compiled, limits)
+    }
+    /// Rejects effective limits that are invalid or exceed the signed ones.
+    pub(crate) fn check_limits(
+        verified: &VerifiedManifest,
+        limits: &Limits,
+    ) -> Result<(), AuditError> {
         let signed = verified.limits();
         if !valid_limits(limits)
             || limits.max_bytes > signed.max_bytes
@@ -181,20 +216,32 @@ impl Sandbox {
                 "invalid effective limits".into(),
             ));
         }
-        let mut config = Config::new();
-        config.consume_fuel(true);
-        config.async_support(true);
-        config.epoch_interruption(true);
+        Ok(())
+    }
+    /// Compiles a verified module off the async executor. Cranelift compilation
+    /// of a module up to the signed size cap can take hundreds of milliseconds,
+    /// which must not stall other tasks on the runtime.
+    pub(crate) async fn compile(
+        verified: &VerifiedManifest,
+    ) -> Result<Arc<CompiledModule>, AuditError> {
+        let wasm = verified.wasm().to_vec();
+        let compiled = tokio::task::spawn_blocking(move || CompiledModule::compile(&wasm))
+            .await
+            .map_err(|_| AuditError::InvalidModule)??;
+        Ok(Arc::new(compiled))
+    }
+    /// Builds a sandbox around an already compiled module, re-checking the
+    /// per-request limits against the module's static shape.
+    pub(crate) fn with_compiled(
+        verified: &VerifiedManifest,
+        compiled: Arc<CompiledModule>,
+        limits: &Limits,
+    ) -> Result<Self, AuditError> {
+        Self::check_limits(verified, limits)?;
         validate_static_limits(verified.wasm(), limits)?;
-        let engine = Engine::new(&config).map_err(|_| AuditError::InvalidModule)?;
-        let module =
-            Module::new(&engine, verified.wasm()).map_err(|_| AuditError::InvalidModule)?;
-        validate_abi(&module)?;
         Ok(Self {
-            engine,
-            module,
+            compiled,
             limits: limits.clone(),
-            execution: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -208,8 +255,8 @@ impl Sandbox {
         }
         // Tokio's mutex is not poisonable. The guard covers the epoch ticker's
         // entire lifetime, and max_time begins only after this admission.
-        let _execution = self.execution.lock().await;
-        let ticker = EpochTicker::start(self.engine.clone(), self.limits.max_time);
+        let _execution = self.compiled.execution.lock().await;
+        let ticker = EpochTicker::start(self.compiled.engine.clone(), self.limits.max_time);
         let result =
             tokio::time::timeout(self.limits.max_time, self.execute_inner(input, host)).await;
         drop(ticker);
@@ -226,7 +273,7 @@ impl Sandbox {
     ) -> Result<AuditResult, AuditError> {
         let max_memory = page_bytes(self.limits.max_memory_pages)?;
         let mut store = Store::new(
-            &self.engine,
+            &self.compiled.engine,
             StoreState {
                 host,
                 limiter: LimitsState {
@@ -248,7 +295,7 @@ impl Sandbox {
             .fuel_async_yield_interval(Some(1_000))
             .map_err(|_| AuditError::FuelExhausted)?;
         store.set_epoch_deadline(1);
-        let mut linker = Linker::new(&self.engine);
+        let mut linker = Linker::new(&self.compiled.engine);
         linker
             .func_wrap_async(
                 "audit",
@@ -348,7 +395,7 @@ impl Sandbox {
             .map_err(|_| AuditError::InvalidAbi)?;
 
         let instance = linker
-            .instantiate_async(&mut store, &self.module)
+            .instantiate_async(&mut store, &self.compiled.module)
             .await
             .map_err(|error| map_error(&store, &error))?;
         let memory = instance

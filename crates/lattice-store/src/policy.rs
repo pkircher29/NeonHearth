@@ -7,6 +7,18 @@ use lattice_domain::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::SqlitePool;
+use std::collections::HashMap;
+
+/// Largest `IN (...)` list one batched query binds; well under SQLite's
+/// default 32766 variable limit and keeps statements short.
+const SQL_BATCH_SIZE: usize = 256;
+
+#[derive(sqlx::FromRow)]
+struct KeyedPolicyRow {
+    device_id: String,
+    #[sqlx(flatten)]
+    policy: PolicyRow,
+}
 
 #[derive(sqlx::FromRow)]
 struct PolicyRow {
@@ -293,6 +305,125 @@ impl PolicyRepository {
 
     /// Returns the durable policy projection for every enrolled device. Runtime
     /// maintenance uses this rather than waiting for another discovery event.
+    /// Loads the policy rows for many devices in one query, keyed by device.
+    /// Devices without a policy row are simply absent from the map.
+    pub async fn load_many(
+        &self,
+        device_ids: &[DeviceId],
+    ) -> anyhow::Result<HashMap<DeviceId, DevicePolicy>> {
+        let mut policies = HashMap::with_capacity(device_ids.len());
+        for chunk in device_ids.chunks(SQL_BATCH_SIZE) {
+            let mut query = sqlx::QueryBuilder::new(
+                "SELECT p.device_id, d.first_seen_at, p.baseline_exempt, p.identification_json,
+                        p.owner_decision_json, p.risk_json, p.protection_json,
+                        p.extension_until
+                 FROM device_policy p
+                 JOIN devices d ON d.device_id=p.device_id
+                 WHERE p.device_id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for id in chunk {
+                separated.push_bind(id.to_string());
+            }
+            separated.push_unseparated(")");
+            let rows: Vec<KeyedPolicyRow> = query.build_query_as().fetch_all(&self.pool).await?;
+            for keyed in rows {
+                let row = keyed.policy;
+                let device_id = DeviceId::parse(&keyed.device_id)
+                    .context("invalid persisted policy device id")?;
+                policies.insert(
+                    device_id,
+                    DevicePolicy {
+                        device_id,
+                        first_seen_at: parse_time(
+                            &row.first_seen_at,
+                            "device first-seen timestamp",
+                        )?,
+                        baseline_exempt: row.baseline_exempt != 0,
+                        identification: decode(&row.identification_json, "identification")?,
+                        owner_decision: decode(&row.owner_decision_json, "owner decision")?,
+                        risk: decode(&row.risk_json, "risk signal")?,
+                        protection: decode(&row.protection_json, "protection")?,
+                        extension_until: row
+                            .extension_until
+                            .as_deref()
+                            .map(|value| parse_time(value, "extension timestamp"))
+                            .transpose()?,
+                    },
+                );
+            }
+        }
+        Ok(policies)
+    }
+
+    /// Loads the published decisions for many devices in one query. Devices
+    /// with no published decision are absent from the map.
+    pub async fn published_decisions_many(
+        &self,
+        device_ids: &[DeviceId],
+    ) -> anyhow::Result<HashMap<DeviceId, PolicyChanged>> {
+        let mut decisions = HashMap::new();
+        for chunk in device_ids.chunks(SQL_BATCH_SIZE) {
+            let mut query = sqlx::QueryBuilder::new(
+                "SELECT device_id, published_decision_json FROM device_policy WHERE device_id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for id in chunk {
+                separated.push_bind(id.to_string());
+            }
+            separated.push_unseparated(")");
+            let rows: Vec<(String, Option<String>)> =
+                query.build_query_as().fetch_all(&self.pool).await?;
+            for (id, value) in rows {
+                let Some(value) = value else { continue };
+                let device_id =
+                    DeviceId::parse(&id).context("invalid persisted policy device id")?;
+                decisions.insert(device_id, decode(&value, "published policy decision")?);
+            }
+        }
+        Ok(decisions)
+    }
+
+    /// Loads the pending outbox decisions for many devices in one query, with
+    /// the same exact/legacy distinction as [`Self::pending_decision_value`].
+    pub async fn pending_decision_values_many(
+        &self,
+        device_ids: &[DeviceId],
+    ) -> anyhow::Result<HashMap<DeviceId, PendingDecision>> {
+        let mut pending = HashMap::new();
+        for chunk in device_ids.chunks(SQL_BATCH_SIZE) {
+            let mut query = sqlx::QueryBuilder::new(
+                "SELECT device_id, fingerprint, decision_json FROM policy_outbox WHERE device_id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for id in chunk {
+                separated.push_bind(id.to_string());
+            }
+            separated.push_unseparated(")");
+            let rows: Vec<(String, String, Option<String>)> =
+                query.build_query_as().fetch_all(&self.pool).await?;
+            for (id, fingerprint, decision_json) in rows {
+                let device_id =
+                    DeviceId::parse(&id).context("invalid persisted policy device id")?;
+                let Some(decision_json) = decision_json else {
+                    pending.insert(device_id, PendingDecision::Legacy);
+                    continue;
+                };
+                let decision: PolicyChanged = decode(&decision_json, "pending policy decision")?;
+                ensure!(
+                    encode(&decision)? == fingerprint,
+                    "pending policy decision fingerprint does not match exact decision"
+                );
+                ensure!(
+                    decision.device_id == device_id,
+                    "pending policy decision device does not match outbox device"
+                );
+                pending.insert(device_id, PendingDecision::Exact(decision));
+            }
+        }
+        Ok(pending)
+    }
+
     pub async fn list(&self) -> anyhow::Result<Vec<DevicePolicy>> {
         let ids: Vec<String> =
             sqlx::query_scalar("SELECT device_id FROM device_policy ORDER BY device_id")
