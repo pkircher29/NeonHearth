@@ -64,10 +64,16 @@ async fn initialize_preserves_original_first_run_time_and_install_id() -> anyhow
     let repeated = repository.initialize(later).await?;
 
     assert_eq!(initial.first_run_at, first);
-    assert_eq!(initial.schema_version, lattice_store::latest_migration_version());
+    assert_eq!(
+        initial.schema_version,
+        lattice_store::latest_migration_version()
+    );
     assert_eq!(initial.install_id, repeated.install_id);
     assert_eq!(initial.first_run_at, repeated.first_run_at);
-    assert_eq!(repeated.schema_version, lattice_store::latest_migration_version());
+    assert_eq!(
+        repeated.schema_version,
+        lattice_store::latest_migration_version()
+    );
     Ok(())
 }
 
