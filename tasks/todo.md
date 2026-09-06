@@ -33,3 +33,13 @@
 - [x] Show searchable reported titles and product clues without changing confirmed identity.
 - [x] Verify hostile responses, cancellation, persistence, and the running Windows app.
 - GitHub delivery: merge after the required checks pass; the pull request records the final status.
+
+## Device recognition and GlassWire capabilities
+
+- [x] Guard addresses, name confirmation, and isolated device web links.
+- [x] Offline IEEE assignments and reported device recognition with icons.
+- [x] Native host connection and traffic collector with explicit coverage.
+- [x] Persistent traffic history, application/host breakdown, usage, and CSV export.
+- [x] Local connection alerts and application firewall controls (privileged enforcement still requires OS validation).
+- [x] Security regression tests, actual Windows UI verification, and native package activation.
+- GitHub delivery: merge after all pull-request checks pass; the pull request records the final status.

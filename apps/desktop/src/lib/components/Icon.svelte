@@ -1,8 +1,14 @@
 <script lang="ts" module>
   // Stroke icons on a 24-unit grid. Kept local so the app ships no icon font
   // and no runtime asset request; every glyph inherits currentColor.
-  export type IconName = 'pulse' | 'devices' | 'guard' | 'cameras' | 'home' | 'doctor' | 'history' | 'settings' | 'more' | 'hearth' | 'lock' | 'down' | 'up' | 'search' | 'check' | 'alert' | 'dot';
+  export type IconName = 'pulse' | 'devices' | 'guard' | 'cameras' | 'home' | 'doctor' | 'history' | 'settings' | 'more' | 'hearth' | 'lock' | 'down' | 'up' | 'search' | 'check' | 'alert' | 'dot' | 'unknown-device' | 'phone' | 'printer' | 'router' | 'server' | 'smart-device';
   const PATHS: Record<IconName, string> = {
+    'unknown-device': 'M5 5h14v14H5zM9.5 9a2.5 2.5 0 115 0c0 2-2.5 2-2.5 4M12 16h.01',
+    phone: 'M7 3h10v18H7zM11 18h2',
+    printer: 'M7 8V3h10v5M7 17H3V8h18v9h-4M7 14h10v7H7zM17 11h.01',
+    router: 'M3 13h18v7H3zM6 13V5M18 13V5M6 17h.01M10 17h.01M9 7a5 5 0 016 0',
+    server: 'M4 3h16v8H4zM4 13h16v8H4zM7 7h.01M7 17h.01M12 7h5M12 17h5',
+    'smart-device': 'M8 16a6 6 0 118 0M8 16h8v3H8zM10 22h4M12 2V1M2 10H1M23 10h-1',
     pulse: 'M3 12h4l2.5-6 4 12 2.5-6h5',
     devices: 'M4 5.5h16v9H4zM9 18.5h6M12 14.5v4',
     guard: 'M12 3l7 3v5.5c0 4.4-3 7.9-7 9.5-4-1.6-7-5.1-7-9.5V6zM9.5 12l1.8 1.8L15 10',

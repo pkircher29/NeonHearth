@@ -86,6 +86,8 @@ jobs:
         run: cargo test --locked -p lattice-launcher
       - name: Test native inventory and Winsock binding without Npcap
         run: cargo test --locked -p lattice-sensor --lib --test windows_binding
+      - name: Test native host telemetry and authenticated device labels
+        run: cargo test --locked -p lattice-service --lib --test device_names --test host_monitor_api
 
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)

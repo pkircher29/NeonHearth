@@ -2,6 +2,7 @@ export interface NetworkDetails {
   status: string; observed_at: string;
   devices: Array<{ device_id: string; mac_addresses: string[]; ip_addresses: string[];
     home_assistant: {device_id: string; name: string; manufacturer: string | null; model: string | null; area: string | null} | null;
+    mac_assignments?: Array<{mac_address: string; organization: string | null; registry: string | null; status: string}>;
   }>;
 }
 export interface AutomationEntity {
@@ -67,6 +68,7 @@ export function createAutomationApi(serviceToken: string | { header(): string | 
           !value.devices.every(d => record(d) && text(d.device_id) &&
             Array.isArray(d.mac_addresses) && d.mac_addresses.length <= 32 && d.mac_addresses.every(text) &&
             Array.isArray(d.ip_addresses) && d.ip_addresses.length <= 32 && d.ip_addresses.every(text) &&
+            (d.mac_assignments === undefined || (Array.isArray(d.mac_assignments) && d.mac_assignments.length <= 32 && d.mac_assignments.every(a => record(a) && text(a.mac_address) && nullable(a.organization) && nullable(a.registry) && text(a.status)))) &&
             (d.home_assistant === null || (record(d.home_assistant) && text(d.home_assistant.device_id) && text(d.home_assistant.name) &&
               nullable(d.home_assistant.manufacturer) && nullable(d.home_assistant.model) && nullable(d.home_assistant.area))))) {
         throw new Error('Network address details are unavailable.');

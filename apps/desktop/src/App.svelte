@@ -7,6 +7,9 @@
   import { createLiveConnection, type LiveConnection } from './lib/stores/connection';
   import { createHomeApi, type HomeApi } from './lib/stores/home';
   import CollectorStatus, { collectorStateFor } from './lib/components/CollectorStatus.svelte';
+  import TrafficView from './lib/components/TrafficView.svelte';
+  import {createHostApi,type HostApi} from './lib/api/hostMonitor';
+  let hostApi=$state<HostApi|null>(null);
   import PulseView from './lib/components/PulseView.svelte';
   import DevicesView from './lib/components/DevicesView.svelte';
   import GuardView from './lib/components/GuardView.svelte';
@@ -21,6 +24,11 @@
   import Icon, { type IconName } from './lib/components/Icon.svelte';
   import { formatThreadTime, threadEntries } from './lib/components/liveThread';
 
+  import { createDeviceLabelsApi, type DeviceLabelsApi, type DeviceLabel } from './lib/api/deviceLabels';
+  let labelsApi = $state<DeviceLabelsApi | null>(null);
+  let labels = $state<Record<string, DeviceLabel>>({});
+  let guardScan = $state<import('./lib/api/networkScan').ScanStatus | null>(null);
+  function labelSaved(label: DeviceLabel) { labels = {...labels, [label.device_id]:label}; }
   import AutomationView from './lib/components/AutomationView.svelte';
   import { createScanApi, type ScanApi } from './lib/api/networkScan';
   let scanApi = $state<ScanApi | null>(null);
@@ -30,9 +38,10 @@
   let networkDetails = $state<NetworkDetails | null>(null);
   async function refreshAutomation() { if (automationApi) automationSnapshot = await automationApi.snapshot(); }
 
-  type Destination = 'pulse' | 'devices' | 'guard' | 'cameras' | 'home' | 'doctor' | 'history' | 'settings' | 'automation';
-  const nav: Array<[Destination, string, IconName]> = [['pulse', 'Pulse', 'pulse'], ['devices', 'Devices', 'devices'], ['guard', 'Guard', 'guard'], ['cameras', 'Cameras', 'cameras'], ['home', 'Home', 'home'], ['automation', 'Automation', 'home'], ['doctor', 'Doctor', 'doctor'], ['history', 'History', 'history'], ['settings', 'Settings', 'settings']];
+  type Destination = 'traffic' | 'pulse' | 'devices' | 'guard' | 'cameras' | 'home' | 'doctor' | 'history' | 'settings' | 'automation';
+  const nav: Array<[Destination, string, IconName]> = [['pulse', 'Pulse', 'pulse'], ['devices', 'Devices', 'devices'], ['traffic', 'Traffic', 'pulse'], ['guard', 'Guard', 'guard'], ['cameras', 'Cameras', 'cameras'], ['home', 'Home', 'home'], ['automation', 'Automation', 'home'], ['doctor', 'Doctor', 'doctor'], ['history', 'History', 'history'], ['settings', 'Settings', 'settings']];
   let view: Destination = $state('pulse'); let liveState: LiveState = $state(initialLiveState); let moreOpen = $state(false);
+  const namedState = $derived({...liveState, devices: Object.fromEntries(Object.entries(liveState.devices).map(([id, device]) => [id, {...device, ...labels[id]}]))});
   let deviceQuery = $state('');
   const thread = $derived(threadEntries(liveState.timeline, 6));
   function showDevice(deviceId: string) { const device = liveState.devices[deviceId]; deviceQuery = device?.owner_name ?? deviceId.slice(0, 8); view = 'devices'; moreOpen = false; }
@@ -51,7 +60,7 @@
   function restartConnection() { connection?.stop(); void connection?.start(); }
   function signInOwner(token: string, remember: boolean) { if (session?.signInOwner(token, remember)) restartConnection(); }
   function signInPhone(code: string, remember: boolean) { if (session?.signInPhone(code, remember)) restartConnection(); }
-  function signOut() { automationSnapshot = null; networkDetails = null; session?.signOut(); connection?.stop(); liveState = initialLiveState; }
+  function signOut() { labels = {}; guardScan = null; automationSnapshot = null; networkDetails = null; session?.signOut(); connection?.stop(); liveState = initialLiveState; }
   async function stepUp(pin: string) { if (!cameraClient) return; const result = await cameraClient.stepUp(pin); session?.stepupGranted(result.expires_at); }
 
   onMount(() => {
@@ -71,16 +80,20 @@
     connection = createLiveConnection({ client, onState: (state) => { if (active) liveState = state; } });
     automationApi = createAutomationApi(auth);
     scanApi = createScanApi(auth);
+    labelsApi = createDeviceLabelsApi(auth);
+    hostApi = createHostApi(auth);
     let automationTimer: ReturnType<typeof setTimeout>;
     async function pollAutomation() {
       if (!active) return;
-      if (auth.state.credential?.kind === 'owner' && ['automation', 'home', 'devices'].includes(view)) {
-        const result = await Promise.allSettled([automationApi!.snapshot(), automationApi!.network()]);
+      if (auth.state.credential?.kind === 'owner' && ['automation', 'home', 'devices', 'guard'].includes(view)) {
+        const result = await Promise.allSettled([automationApi!.snapshot(), automationApi!.network(), labelsApi!.list(), view === 'guard' ? scanApi!.status() : Promise.resolve(null)]);
         if (active && auth.state.credential?.kind === 'owner') {
           automationSnapshot = result[0].status === 'fulfilled' ? result[0].value : null;
           networkDetails = result[1].status === 'fulfilled' ? result[1].value : null;
+          if (result[2].status === 'fulfilled') labels = Object.fromEntries(result[2].value.map(label => [label.device_id,label]));
+          guardScan = result[3].status === 'fulfilled' ? result[3].value : null;
         }
-      } else if (auth.state.credential?.kind !== 'owner') { automationSnapshot = null; networkDetails = null; }
+      } else if (auth.state.credential?.kind !== 'owner') { automationSnapshot = null; networkDetails = null; labels = {}; guardScan = null; }
       if (active) automationTimer = setTimeout(() => void pollAutomation(), 2000);
     }
     void pollAutomation();
@@ -89,7 +102,7 @@
   });
 </script>
 <svelte:head><title>NeonHearth — {view}</title></svelte:head>
-<div class="app-shell"><aside class="rail"><div class="brand"><span class="brand-mark"><Icon name="hearth" size={22} strokeWidth={1.6} /></span><span>NEON<br/>HEARTH</span></div><nav aria-label="Primary">{#each nav as item}<button class:active={view === item[0]} type="button" aria-current={view === item[0] ? 'page' : undefined} onclick={() => { view = item[0]; moreOpen = false; }}><span class="nav-icon"><Icon name={item[2]} /></span><span>{item[1]}</span></button>{/each}</nav><div class="rail-foot"><span class="secure-icon"><Icon name="lock" size={18} /></span><span>LOCAL<br/>ONLY</span></div></aside><header class="mobile-head"><div class="brand"><span class="brand-mark"><Icon name="hearth" size={20} strokeWidth={1.6} /></span><span>NEONHEARTH</span></div><span class="kicker">{view.toUpperCase()}</span></header><main>{#if signedOut}<SignInView failure={authState?.failure ?? null} onowner={signInOwner} onphone={signInPhone} />{:else if view === 'pulse'}<PulseView state={liveState} onselectdevice={showDevice}/>{:else if view === 'devices'}<DevicesView liveState={liveState} initialQuery={deviceQuery} network={networkDetails} scanApi={authState?.credential?.kind === 'owner' ? scanApi : null}/>{:else if view === 'guard'}<GuardView state={liveState} client={cameraClient} />{:else if view === 'cameras'}{#if cameraClient}<CamerasView client={cameraClient} />{:else}<section class="not-ready"><p class="muted">Connecting to the local collector…</p></section>{/if}{:else if view === 'home'}<HomeView liveState={liveState} api={homeApi} automation={automationSnapshot} network={networkDetails}/>{:else if view === 'automation'}{#if automationApi && authState?.credential?.kind === 'owner'}<AutomationView api={automationApi} snapshot={automationSnapshot} refresh={refreshAutomation} openHome={() => view = 'home'}/>{:else}<p class="muted">Sign in as the owner to configure home automation.</p>{/if}{:else if view === 'doctor'}{#if cameraClient}<DoctorView client={cameraClient} />{:else}<section class="not-ready"><p class="muted">Connecting to the local collector…</p></section>{/if}{:else if view === 'history'}{#if cameraClient}<HistoryView client={cameraClient} />{:else}<section class="not-ready"><p class="muted">Connecting to the local collector…</p></section>{/if}{:else if view === 'settings'}{#if cameraClient && authState}<SettingsView client={cameraClient} auth={authState} onsignout={signOut} />{:else}<section class="not-ready"><p class="muted">Connecting to the local collector…</p></section>{/if}{/if}</main><aside class="events-rail"><div class="section-title"><h2>Live thread</h2><span class="live-pill">● {thread.length ? 'ACTIVE' : 'QUIET'}</span></div>{#if thread.length}<div class="event-list" aria-label="Live events">{#each thread as entry (entry.key)}<div class="event-row"><span class="event-kind {entry.cue}" aria-label={`${entry.cue} status`}><Icon name={entry.cue === 'risk' ? 'alert' : entry.cue === 'secure' ? 'check' : entry.cue === 'watch' ? 'alert' : 'dot'} size={12} strokeWidth={2.2} /></span><span><strong>{entry.title}</strong><small>{entry.detail}</small></span><time>{formatThreadTime(entry.at)}</time></div>{/each}</div>{:else}<div class="event-quiet"><span><Icon name="hearth" size={26} /></span><strong>Nothing needs attention</strong><p class="muted">Presence and Guard changes will appear here as your home changes.</p></div>{/if}<CollectorStatus state={collectorState}/></aside><nav class="mobile-nav" aria-label="Mobile navigation">{#each nav.slice(0, 2) as item}<button class:active={view === item[0]} type="button" aria-current={view === item[0] ? 'page' : undefined} onclick={() => { view = item[0]; moreOpen = false; }}><span><Icon name={item[2]} /></span>{item[1]}</button>{/each}<button class:active={moreOpen} type="button" aria-expanded={moreOpen} aria-controls="mobile-drawer" onclick={() => moreOpen = !moreOpen}><span><Icon name="more" /></span>More</button></nav>{#if moreOpen}<div class="mobile-drawer" id="mobile-drawer" aria-label="More destinations">{#each nav.slice(2) as item}<button class:active={view === item[0]} type="button" onclick={() => { view = item[0]; moreOpen = false; }}><span><Icon name={item[2]} size={18} /></span>{item[1]}</button>{/each}</div>{/if}{#if authState?.stepupRequired}<StepUpPrompt onsubmit={stepUp} oncancel={() => session?.dismissStepup()} />{/if}</div>
+<div class="app-shell"><aside class="rail"><div class="brand"><span class="brand-mark"><Icon name="hearth" size={22} strokeWidth={1.6} /></span><span>NEON<br/>HEARTH</span></div><nav aria-label="Primary">{#each nav as item}<button class:active={view === item[0]} type="button" aria-current={view === item[0] ? 'page' : undefined} onclick={() => { view = item[0]; moreOpen = false; }}><span class="nav-icon"><Icon name={item[2]} /></span><span>{item[1]}</span></button>{/each}</nav><div class="rail-foot"><span class="secure-icon"><Icon name="lock" size={18} /></span><span>LOCAL<br/>ONLY</span></div></aside><header class="mobile-head"><div class="brand"><span class="brand-mark"><Icon name="hearth" size={20} strokeWidth={1.6} /></span><span>NEONHEARTH</span></div><span class="kicker">{view.toUpperCase()}</span></header><main>{#if signedOut}<SignInView failure={authState?.failure ?? null} onowner={signInOwner} onphone={signInPhone} />{:else if view === 'pulse'}<PulseView state={namedState} onselectdevice={showDevice}/>{:else if view === 'traffic'}{#if hostApi && authState?.credential?.kind === 'owner'}<TrafficView api={hostApi}/>{:else}<p class="muted">Sign in as the owner to view this computer's applications and traffic.</p>{/if}{:else if view === 'devices'}<DevicesView liveState={namedState} labelsApi={authState?.credential?.kind === 'owner' ? labelsApi : null} onsaved={labelSaved} initialQuery={deviceQuery} network={networkDetails} scanApi={authState?.credential?.kind === 'owner' ? scanApi : null}/>{:else if view === 'guard'}<GuardView state={namedState} client={cameraClient} network={networkDetails} scan={guardScan} labelsApi={authState?.credential?.kind === 'owner' ? labelsApi : null} onsaved={labelSaved} />{:else if view === 'cameras'}{#if cameraClient}<CamerasView client={cameraClient} />{:else}<section class="not-ready"><p class="muted">Connecting to the local collector…</p></section>{/if}{:else if view === 'home'}<HomeView liveState={namedState} api={homeApi} automation={automationSnapshot} network={networkDetails}/>{:else if view === 'automation'}{#if automationApi && authState?.credential?.kind === 'owner'}<AutomationView api={automationApi} snapshot={automationSnapshot} refresh={refreshAutomation} openHome={() => view = 'home'}/>{:else}<p class="muted">Sign in as the owner to configure home automation.</p>{/if}{:else if view === 'doctor'}{#if cameraClient}<DoctorView client={cameraClient} />{:else}<section class="not-ready"><p class="muted">Connecting to the local collector…</p></section>{/if}{:else if view === 'history'}{#if cameraClient}<HistoryView client={cameraClient} />{:else}<section class="not-ready"><p class="muted">Connecting to the local collector…</p></section>{/if}{:else if view === 'settings'}{#if cameraClient && authState}<SettingsView client={cameraClient} auth={authState} onsignout={signOut} />{:else}<section class="not-ready"><p class="muted">Connecting to the local collector…</p></section>{/if}{/if}</main><aside class="events-rail"><div class="section-title"><h2>Live thread</h2><span class="live-pill">● {thread.length ? 'ACTIVE' : 'QUIET'}</span></div>{#if thread.length}<div class="event-list" aria-label="Live events">{#each thread as entry (entry.key)}<div class="event-row"><span class="event-kind {entry.cue}" aria-label={`${entry.cue} status`}><Icon name={entry.cue === 'risk' ? 'alert' : entry.cue === 'secure' ? 'check' : entry.cue === 'watch' ? 'alert' : 'dot'} size={12} strokeWidth={2.2} /></span><span><strong>{entry.title}</strong><small>{entry.detail}</small></span><time>{formatThreadTime(entry.at)}</time></div>{/each}</div>{:else}<div class="event-quiet"><span><Icon name="hearth" size={26} /></span><strong>Nothing needs attention</strong><p class="muted">Presence and Guard changes will appear here as your home changes.</p></div>{/if}<CollectorStatus state={collectorState}/></aside><nav class="mobile-nav" aria-label="Mobile navigation">{#each nav.slice(0, 2) as item}<button class:active={view === item[0]} type="button" aria-current={view === item[0] ? 'page' : undefined} onclick={() => { view = item[0]; moreOpen = false; }}><span><Icon name={item[2]} /></span>{item[1]}</button>{/each}<button class:active={moreOpen} type="button" aria-expanded={moreOpen} aria-controls="mobile-drawer" onclick={() => moreOpen = !moreOpen}><span><Icon name="more" /></span>More</button></nav>{#if moreOpen}<div class="mobile-drawer" id="mobile-drawer" aria-label="More destinations">{#each nav.slice(2) as item}<button class:active={view === item[0]} type="button" onclick={() => { view = item[0]; moreOpen = false; }}><span><Icon name={item[2]} size={18} /></span>{item[1]}</button>{/each}</div>{/if}{#if authState?.stepupRequired}<StepUpPrompt onsubmit={stepUp} oncancel={() => session?.dismissStepup()} />{/if}</div>
 <style>
   :global(button:focus-visible), :global(input:focus-visible) { outline: 3px solid #ffcd66; outline-offset: 3px; }
   .events-rail .event-list { border-top: 1px solid #17323d; }

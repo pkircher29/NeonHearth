@@ -956,5 +956,7 @@ pub async fn openapi(_: Authorized) -> Json<utoipa::openapi::OpenApi> {
     let mut document = ApiDoc::openapi();
     document.merge(crate::automation::AutomationApiDoc::openapi());
     document.merge(crate::network_scan::ScanApiDoc::openapi());
+    document.merge(crate::device_labels::DeviceLabelsApiDoc::openapi());
+    document.merge(crate::host_monitor::api::HostApiDoc::openapi());
     Json(document)
 }

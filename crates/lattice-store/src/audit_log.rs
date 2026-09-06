@@ -264,6 +264,30 @@ fn storage(error: sqlx::Error) -> AuditLogError {
     AuditLogError::Storage(error.to_string())
 }
 
+/// Used by state mutations that must commit their audit record atomically.
+pub(crate) async fn append_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    entry: &NewAuditEntry,
+) -> Result<AppendedEntry, AuditLogError> {
+    let occurred_at = encode_time(entry.occurred_at)
+        .ok_or_else(|| AuditLogError::Invalid("occurred_at is out of range".into()))?;
+    let detail = serde_json::to_string(&entry.detail)
+        .map_err(|_| AuditLogError::Invalid("detail is not serializable".into()))?;
+    if entry.action.is_empty()
+        || entry.action.len() > MAX_ACTION_BYTES
+        || entry
+            .subject
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.len() > MAX_SUBJECT_BYTES)
+        || detail.len() > MAX_DETAIL_BYTES
+    {
+        return Err(AuditLogError::Invalid(
+            "audit entry exceeds its bounds".into(),
+        ));
+    }
+    append_locked(tx, entry, &occurred_at, &detail).await
+}
+
 #[derive(Clone)]
 pub struct AuditLog {
     pool: SqlitePool,

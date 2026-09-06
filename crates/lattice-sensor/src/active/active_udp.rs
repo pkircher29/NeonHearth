@@ -433,13 +433,42 @@ fn nbns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
     if count > 16 || 1 + count * 18 > len {
         return Err(ActiveError::ResponseLimit);
     }
-    let mut out = vec![];
+    // RFC 1002 section 4.2.18: group names identify a workgroup/domain,
+    // not this device. Prefer a unique workstation name, then a server name.
+    let mut workstation = std::collections::BTreeSet::new();
+    let mut server = std::collections::BTreeSet::new();
     for i in 0..count {
         let start = p + 1 + i * 18;
+        let flags = u16::from_be_bytes([b[start + 16], b[start + 17]]);
+        if flags & 0x8000 != 0 || flags & 0x1800 != 0 || flags & 0x0400 == 0 {
+            continue;
+        }
+        let name = safe(&b[start..start + 15]).trim().to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        match b[start + 15] {
+            0x00 => {
+                workstation.insert(name);
+            }
+            0x20 => {
+                server.insert(name);
+            }
+            _ => {}
+        }
+    }
+    let names = if workstation.is_empty() {
+        server
+    } else {
+        workstation
+    };
+    let mut out = vec![];
+    if names.len() == 1 {
         out.push((
             "node_name".into(),
-            safe(&b[start..start + 15]).trim().to_owned(),
+            names.into_iter().next().unwrap_or_default(),
         ));
+        out.push(("node_name_kind".into(), "unique".into()));
     }
     Ok(out)
 }
