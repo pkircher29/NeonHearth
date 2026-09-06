@@ -400,7 +400,7 @@ export function createHomeApi({ baseUrl, serviceToken, auth, fetchImpl = fetch, 
 
   async function loadDraft(): Promise<DraftResult> {
     const response = await send('/api/v1/home/draft', authorized('GET'));
-    if (response.status === 404) return { status: 'none' };
+    if (response.status === 204 || response.status === 404) return { status: 'none' };
     if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
     const text = await response.text();
     let draft: unknown = null;

@@ -710,6 +710,25 @@ fn capacity_retention_metadata_and_serialization_are_deterministic() {
 }
 
 #[test]
+fn repeated_neighbor_observations_remain_usable_after_hours_of_monitoring() {
+    let mut engine = PresenceEngine::new(PresenceConfig::default()).unwrap();
+    for second in (0..3 * 3600).step_by(5) {
+        engine
+            .ingest(
+                ev(
+                    PresenceEvidenceKind::NeighborCache,
+                    second,
+                    Some(second + 30),
+                ),
+                t(second),
+            )
+            .expect("Expired neighbor samples must not block ongoing monitoring");
+    }
+    assert_eq!(engine.state(id()), Some(PresenceState::Quiet));
+    assert!(engine.snapshot().evidence < 256);
+}
+
+#[test]
 fn chatty_traffic_never_fills_the_evidence_cap_or_blocks_later_leases() {
     // online 10s, correction 30s, cap 16: one traffic sample every 10s for
     // three hours is 1080 samples, far past the cap if traffic were retained

@@ -234,6 +234,9 @@ describe('createHomeApi', () => {
   it('reports a missing draft, a valid draft, and discards a corrupt draft', async () => {
     const none = createHomeApi({ ...options, fetchImpl: vi.fn(async () => new Response(null, { status: 404 })) });
     await expect(none.loadDraft()).resolves.toEqual({ status: 'none' });
+    const emptyFetch = vi.fn(async () => new Response(null, { status: 204 }));
+    await expect(createHomeApi({ ...options, fetchImpl: emptyFetch }).loadDraft()).resolves.toEqual({ status: 'none' });
+    expect(emptyFetch).toHaveBeenCalledTimes(1); // The service's no-draft response must not trigger deletion.
 
     const draft = { plan: fixturePlan(), saved_at: '2026-08-24T00:00:00Z' };
     const valid = createHomeApi({ ...options, fetchImpl: vi.fn(async () => new Response(JSON.stringify(draft), { status: 200 })) });

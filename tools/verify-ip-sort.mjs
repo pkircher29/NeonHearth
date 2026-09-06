@@ -2,7 +2,9 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 const require = createRequire(new URL('../apps/desktop/package.json', import.meta.url));
 const { chromium, expect } = require('@playwright/test');
-const connection = JSON.parse(await readFile(new URL('../.local/runtime/connection.json', import.meta.url), 'utf8'));
+const connection = JSON.parse(process.env.NEONHEARTH_CONNECTION_STDIN === '1'
+  ? require('node:fs').readFileSync(0, 'utf8')
+  : await readFile(process.env.NEONHEARTH_QA_CONNECTION || new URL('../.local/runtime/connection.json', import.meta.url), 'utf8'));
 const browser = await chromium.launch({ executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe' });
 try {
   const page = await browser.newPage({ viewport:{width:1500,height:1000} });

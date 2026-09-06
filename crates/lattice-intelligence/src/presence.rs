@@ -897,11 +897,13 @@ fn semantically_retained(e: &PresenceEvidence, arrival: DateTime<Utc>, c: &Prese
         PresenceEvidenceKind::Lease
         | PresenceEvidenceKind::RouterAssociation
         | PresenceEvidenceKind::NeighborCache
-        | PresenceEvidenceKind::ProbeSuccess
-            if e.valid_until.is_some_and(|until| until >= arrival) =>
-        {
-            true
-        }
+        | PresenceEvidenceKind::ProbeSuccess => e.valid_until.map_or_else(
+            || arrival.signed_duration_since(e.observed_at) <= c.retention,
+            // An expired sample can only support a correction until this window
+            // closes. Retaining every poll for 24 hours fills the bounded cache
+            // and prevents subsequent observations, even after a restart.
+            |until| arrival.signed_duration_since(until) <= c.correction_window,
+        ),
         PresenceEvidenceKind::ConfirmationFailure => {
             arrival.signed_duration_since(e.observed_at) <= c.confirmation_window
         }
