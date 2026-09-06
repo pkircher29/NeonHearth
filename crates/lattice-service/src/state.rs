@@ -46,6 +46,8 @@ impl fmt::Display for InvalidServiceToken {
 impl std::error::Error for InvalidServiceToken {}
 #[derive(Clone)]
 pub struct AppState {
+    scans: crate::network_scan::ScanHub,
+    automation: crate::automation::AutomationHub,
     token: SecretString,
     events: EventBus,
     state_repository: M2StateRepository,
@@ -69,6 +71,8 @@ impl AppState {
             return Err(InvalidServiceToken);
         }
         Ok(Self {
+            scans: crate::network_scan::ScanHub::new(state_repository.pool().clone()),
+            automation: crate::automation::AutomationHub::new(state_repository.pool().clone()),
             token: SecretString::from(token),
             events: EventBus::new(4096, 1024),
             state_repository,
@@ -91,6 +95,12 @@ impl AppState {
     }
     pub fn events(&self) -> &EventBus {
         &self.events
+    }
+    pub fn automation(&self) -> &crate::automation::AutomationHub {
+        &self.automation
+    }
+    pub fn scans(&self) -> &crate::network_scan::ScanHub {
+        &self.scans
     }
     pub async fn service_status(&self) -> String {
         self.service_status.lock().await.as_str().to_owned()

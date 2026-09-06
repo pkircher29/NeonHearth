@@ -14,6 +14,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 use thiserror::Error;
+mod link_discovery;
 pub const MAX_FRAME_BYTES: usize = 65_535;
 pub const MAX_METADATA_BYTES: usize = 2_048;
 pub const MAX_PCAP_BYTES: usize = 4 * 1024 * 1024;
@@ -190,6 +191,10 @@ impl PassiveAdapter for OfflinePassiveAdapter {
         }
         if f.len() < 14 {
             return Err(PassiveParseError::Truncated);
+        }
+        if let Some(observations) = link_discovery::decode(i, t, f, o)? {
+            validate_normalized(&observations, MAX_OBSERVATIONS_PER_FRAME)?;
+            return Ok(observations);
         }
         // Let a maintained wire codec validate the complete Ethernet/IP/transport
         // shape before the bounded protocol-specific extraction below.

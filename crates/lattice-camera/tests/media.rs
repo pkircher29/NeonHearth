@@ -1,17 +1,16 @@
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+#[cfg(target_os = "linux")]
+use lattice_camera::resolve_ffmpeg_executable;
 use lattice_camera::{
     CameraId, FakeMediaProcessFactory, HlsSession, HlsSessionId, LoopbackSourceToken, MediaError,
     MediaJob, MediaProcess, MediaProcessExit, MediaProcessFactory, MediaProcessSpec,
     ProductionMediaProcessFactory, SnapshotRequest, StreamId, ffmpeg_executable, hls_args,
-    platform_default_ffmpeg, resolve_ffmpeg_executable, snapshot_args,
+    platform_default_ffmpeg, snapshot_args,
 };
-use std::{
-    ffi::{OsStr, OsString},
-    future::pending,
-    path::Path,
-    time::Duration,
-};
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
+use std::{ffi::OsString, future::pending, path::Path, time::Duration};
 use uuid::Uuid;
 
 const CAMERA: &str = "192.168.4.22";

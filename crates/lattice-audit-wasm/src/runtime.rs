@@ -92,8 +92,41 @@ enum ExecutionFailure {
     Host(AuditHostError),
 }
 
-struct StoreState<'a, H: AuditHost> {
-    host: &'a H,
+enum HostCall {
+    Deterministic(tokio::sync::oneshot::Sender<u32>),
+    Exchange(
+        Vec<u8>,
+        usize,
+        tokio::sync::oneshot::Sender<Result<Vec<u8>, AuditHostError>>,
+    ),
+}
+
+/// Wasmtime 36 owns 'static store data. Keep the borrowed, authorized host in
+/// the caller's scoped future and exchange bounded requests through a channel.
+/// No host task or borrow can outlive execute(), including on cancellation.
+#[derive(Clone)]
+struct HostProxy(tokio::sync::mpsc::Sender<HostCall>);
+impl HostProxy {
+    async fn deterministic(&self) -> Result<u32, AuditHostError> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.0
+            .send(HostCall::Deterministic(send))
+            .await
+            .map_err(|_| AuditHostError::Cancelled)?;
+        receive.await.map_err(|_| AuditHostError::Cancelled)
+    }
+    async fn exchange(&self, request: Vec<u8>, cap: usize) -> Result<Vec<u8>, AuditHostError> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.0
+            .send(HostCall::Exchange(request, cap, send))
+            .await
+            .map_err(|_| AuditHostError::Cancelled)?;
+        receive.await.map_err(|_| AuditHostError::Cancelled)?
+    }
+}
+
+struct StoreState {
+    host: HostProxy,
     limiter: LimitsState,
     requests: u32,
     max_requests: u32,
@@ -257,8 +290,26 @@ impl Sandbox {
         // entire lifetime, and max_time begins only after this admission.
         let _execution = self.compiled.execution.lock().await;
         let ticker = EpochTicker::start(self.compiled.engine.clone(), self.limits.max_time);
-        let result =
-            tokio::time::timeout(self.limits.max_time, self.execute_inner(input, host)).await;
+        let (send, mut receive) = tokio::sync::mpsc::channel(1);
+        let forward = async {
+            while let Some(call) = receive.recv().await {
+                match call {
+                    HostCall::Deterministic(reply) => {
+                        let _ = reply.send(host.deterministic().await);
+                    }
+                    HostCall::Exchange(request, cap, reply) => {
+                        let _ = reply.send(host.exchange(request, cap).await);
+                    }
+                }
+            }
+        };
+        let execution = async {
+            tokio::select! {
+                result = self.execute_inner(input, HostProxy(send)) => result,
+                _ = forward => Err(AuditError::InvalidAbi),
+            }
+        };
+        let result = tokio::time::timeout(self.limits.max_time, execution).await;
         drop(ticker);
         match result {
             Ok(result) => result,
@@ -266,10 +317,10 @@ impl Sandbox {
         }
     }
 
-    async fn execute_inner<H: AuditHost>(
+    async fn execute_inner(
         &self,
         input: &[u8],
-        host: &H,
+        host: HostProxy,
     ) -> Result<AuditResult, AuditError> {
         let max_memory = page_bytes(self.limits.max_memory_pages)?;
         let mut store = Store::new(
@@ -300,7 +351,7 @@ impl Sandbox {
             .func_wrap_async(
                 "audit",
                 "deterministic",
-                |mut caller: wasmtime::Caller<'_, StoreState<'_, H>>, ()| {
+                |mut caller: wasmtime::Caller<'_, StoreState>, ()| {
                     Box::new(async move {
                         let host = {
                             let data = caller.data_mut();
@@ -312,9 +363,15 @@ impl Sandbox {
                                 .requests
                                 .checked_add(1)
                                 .ok_or_else(|| anyhow::anyhow!("request counter overflow"))?;
-                            data.host
+                            data.host.clone()
                         };
-                        Ok(host.deterministic().await as i32)
+                        match host.deterministic().await {
+                            Ok(value) => Ok(value as i32),
+                            Err(error) => {
+                                caller.data_mut().failure = Some(ExecutionFailure::Host(error));
+                                Err(anyhow::anyhow!("host request cancelled"))
+                            }
+                        }
                     })
                 },
             )
@@ -323,7 +380,7 @@ impl Sandbox {
             .func_wrap_async(
                 "audit",
                 "exchange",
-                |mut caller: wasmtime::Caller<'_, StoreState<'_, H>>,
+                |mut caller: wasmtime::Caller<'_, StoreState>,
                  (req_ptr, req_len, out_ptr, out_cap): (i32, i32, i32, i32)| {
                     Box::new(async move {
                         let (req_ptr, req_len, out_ptr, out_cap) = match (
@@ -370,7 +427,7 @@ impl Sandbox {
                             data.bytes += exchange_bytes.expect("validated exchange byte count");
                         }
                         let request = memory.data(&caller)[req_ptr..req_ptr + req_len].to_vec();
-                        let host = caller.data().host;
+                        let host = caller.data().host.clone();
                         let response = match host.exchange(request, out_cap).await {
                             Ok(response) if response.len() <= out_cap => response,
                             Ok(_) | Err(AuditHostError::ExchangeFailed) => {
@@ -547,7 +604,7 @@ fn validate_abi(module: &Module) -> Result<(), AuditError> {
     Ok(())
 }
 
-fn map_error<H: AuditHost>(store: &Store<StoreState<'_, H>>, error: &anyhow::Error) -> AuditError {
+fn map_error(store: &Store<StoreState>, error: &anyhow::Error) -> AuditError {
     match store.data().failure.or(store.data().limiter.failure) {
         Some(ExecutionFailure::Memory) => AuditError::MemoryLimitExceeded,
         Some(ExecutionFailure::Table) => AuditError::TableLimitExceeded,

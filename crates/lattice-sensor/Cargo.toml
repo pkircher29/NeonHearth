@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 lattice-domain = { path = "../lattice-domain" }
 lattice-camera = { path = "../lattice-camera" }
-pnet_datalink.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 serde.workspace = true
@@ -32,7 +31,10 @@ futures-util.workspace = true
 subtle.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_IO"] }
+
+[target.'cfg(not(windows))'.dependencies]
+pnet_datalink.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = { workspace = true }

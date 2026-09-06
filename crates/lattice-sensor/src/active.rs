@@ -27,7 +27,10 @@ use zeroize::Zeroizing;
 use crate::{AuthorizedBinding, InterfaceId, TargetGuard};
 
 mod active_udp;
+pub mod mdns_discovery;
 mod scheduler_runner;
+#[cfg(windows)]
+mod windows_icmp;
 pub use active_udp::{
     NonceSource, UdpProbe, build_udp_probe, build_udp_probe_with_nonce, parse_udp_reply,
 };
@@ -659,6 +662,7 @@ fn normalize(
 
 /// Bounded numeric-target transport. It never resolves names and never follows redirects.
 pub struct SystemTransport;
+mod smb;
 #[async_trait]
 impl AttemptTransport for SystemTransport {
     async fn attempt(
@@ -866,6 +870,10 @@ async fn icmp_attempt(
     let binding = guard
         .authorized_binding(request.interface, ip)
         .map_err(|_| ActiveError::Unauthorized)?;
+    #[cfg(windows)]
+    if ip.is_ipv4() {
+        return windows_icmp::echo(binding, timeout).await;
+    }
     let config = Config::builder()
         .kind(if ip.is_ipv4() { ICMP::V4 } else { ICMP::V6 })
         .bind(binding.source_socket())
@@ -930,6 +938,21 @@ async fn tcp_attempt(
         }
         Err(_) => return Err(ActiveError::Network),
     };
+    // A completed handshake is sufficient evidence that a TCP port is open.
+    // Quiet services often wait for the client; waiting for a banner here would
+    // incorrectly turn a successful port check into the engine's outer timeout.
+    if d.id.starts_with("full.tcp.") {
+        return Ok(TransportResponse::Success(vec![(
+            "tcp_state".into(),
+            "open".into(),
+        )]));
+    }
+    if d.id == "tcp.smb.445" {
+        guard
+            .authorize(probe_request.interface, ip)
+            .map_err(|_| ActiveError::Unauthorized)?;
+        return smb::negotiate(&mut stream).await;
+    }
     let request = if d.id.contains("http") || d.id.contains("camera") || d.id.contains("web") {
         format!("HEAD / HTTP/1.0\r\nHost: {ip}\r\nConnection: close\r\n\r\n").into_bytes()
     } else {
@@ -950,7 +973,11 @@ async fn tcp_attempt(
             .map_err(|_| ActiveError::Network)?;
     }
     let mut buf = vec![0; d.max_response_bytes.min(MAX_RESPONSE_BYTES)];
-    let n = stream.read(&mut buf).await.unwrap_or(0);
+    let n = tokio::time::timeout(Duration::from_millis(300), stream.read(&mut buf))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(0);
     buf.truncate(n);
     let metadata = if d.id.contains("http") || d.id.contains("camera") || d.id.contains("web") {
         parse_http_metadata(&buf)?
@@ -1158,7 +1185,10 @@ pub fn pin_socket_to_interface<S: std::os::windows::io::AsRawSocket>(
             &mut len,
         )
     };
-    if result == SOCKET_ERROR || len != size_of::<u32>() as i32 || actual != configured {
+    // Winsock accepts IPv4's index in network byte order but returns it in
+    // host byte order. IPv6 uses host order for both operations.
+    if result == SOCKET_ERROR || len != size_of::<u32>() as i32 || actual != binding.interface_index
+    {
         return Err(ActiveError::Unavailable);
     }
     Ok(())

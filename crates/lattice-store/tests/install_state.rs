@@ -29,6 +29,10 @@ async fn concurrent_connects_serialize_first_migration() -> anyhow::Result<()> {
     let (left, right) = tokio::join!(lattice_store::connect(&url), lattice_store::connect(&url));
     let left = left?;
     let right = right?;
+    let expected_count = sqlx::migrate!()
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+        .count() as i64;
     for pool in [&left, &right] {
         let migrations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
             .fetch_one(pool)
@@ -36,7 +40,7 @@ async fn concurrent_connects_serialize_first_migration() -> anyhow::Result<()> {
         let sequences: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_sequence")
             .fetch_one(pool)
             .await?;
-        assert_eq!(migrations.0, 21);
+        assert_eq!(migrations.0, expected_count);
         assert_eq!(sequences.0, 1);
     }
     Ok(())

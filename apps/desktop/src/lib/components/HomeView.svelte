@@ -3,14 +3,15 @@
   import { onMount } from 'svelte';
   import { createHomeApi, type HomeApi, type HomeSnapshot } from '../stores/home';
   import type { LiveState } from '../stores/live';
+  import type { AutomationSnapshot, NetworkDetails } from '../api/automation';
   import type { TwinDevice } from '../twin/geometry';
   import HomeEditorView from './HomeEditorView.svelte';
   import HomeTwin3D from './HomeTwin3D.svelte';
   import { sameTwinDevices, toBandwidthMap, toHomeDeviceRefs, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
 
-  // `api` is a test seam and the App's injection point: when absent, the view
-  // builds the real loopback client on mount.
-  let { liveState, api = null }: { liveState: LiveState; api?: HomeApi | null } = $props();
+  // `api` is a test seam: when absent, the view builds the real loopback client on mount
+  // exactly the way App builds the camera client.
+  let { liveState, api = null, automation = null, network = null }: { liveState: LiveState; api?: HomeApi | null; automation?: AutomationSnapshot | null; network?: NetworkDetails | null } = $props();
 
   type HomeTab = 'editor' | 'twin';
   let tab = $state<HomeTab>('editor');
@@ -24,12 +25,17 @@
   let selectedDeviceId = $state<string | null>(null);
   let reducedMotion = $state(false);
 
-  const deviceRefs = $derived(toHomeDeviceRefs(liveState.devices));
+  const addresses = $derived(new Map(network?.devices.map(device => [device.device_id, device]) ?? []));
+  function knownName(id: string): string | null {
+    const info = addresses.get(id);
+    return liveState.devices[id]?.owner_name ?? info?.home_assistant?.name ?? info?.mac_addresses[0] ?? null;
+  }
+  const deviceRefs = $derived([...toHomeDeviceRefs(liveState.devices).map(d => ({ ...d, name: knownName(d.device_id) ?? d.name })), ...(automation?.devices ?? []).map(d => ({ device_id: d.device_id, name: d.name }))]);
   // Memoized by content (audit H-5): a fresh array per bandwidth frame would
   // make the twin rebuild its scene and reset the camera several times a second.
   let twinCache: TwinDevice[] = [];
   const twinDevices = $derived.by(() => {
-    const next = toTwinDevices(liveState.devices);
+    const next = [...toTwinDevices(liveState.devices).map(d => ({ ...d, label: knownName(d.device_id) ?? d.label })), ...(automation?.devices ?? []).map(d => ({ device_id: d.device_id, label: d.name, is_camera: d.entities.some(e => e.entity_id.startsWith('camera.')) }))];
     if (!sameTwinDevices(twinCache, next)) twinCache = next;
     return twinCache;
   });
@@ -38,7 +44,7 @@
   const selectedName = $derived(
     selectedDeviceId === null
       ? null
-      : liveState.devices[selectedDeviceId]?.owner_name ?? `Device ${selectedDeviceId.slice(0, 8)}`
+      : knownName(selectedDeviceId) ?? automation?.devices.find(d => d.device_id === selectedDeviceId)?.name ?? `Device ${selectedDeviceId.slice(0, 8)}`
   );
 
   function openTab(next: HomeTab) {
@@ -105,6 +111,9 @@
   {:else if snapshotError || !snapshot}
     <div class="editor-state error" role="alert">The home plan is unavailable right now. Try again shortly. <button type="button" onclick={() => void loadSnapshot()}>Retry</button></div>
   {:else}
+    {#if automation?.devices.length}
+      <p class="home-banner">{automation.devices.length} Home Assistant devices are available in the placement tray. Reported rooms: {automation.areas.join(', ') || 'none'}. Draw the rooms to match your home, then place each device. Room names do not establish physical coordinates.</p>
+    {/if}
     <div id="home-panel-editor" role="tabpanel" aria-labelledby="home-tab-editor" hidden={tab !== 'editor'}>
       <HomeEditorView api={homeApi} devices={deviceRefs} {snapshot} onsnapshot={onSnapshot} />
     </div>

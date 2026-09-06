@@ -85,6 +85,9 @@ async fn backup_verify_restore_round_trip_preserves_data() -> anyhow::Result<()>
     let path = directory.path().join("state.db");
     let pool = seeded_db(&path, 10).await?;
     let maintenance = DbMaintenance::new(pool.clone(), &path);
+    let source_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
 
     let backup_path = directory.path().join("backups").join("snapshot.db");
     std::fs::create_dir_all(backup_path.parent().unwrap())?;
@@ -93,7 +96,7 @@ async fn backup_verify_restore_round_trip_preserves_data() -> anyhow::Result<()>
     assert!(!backup_path.with_extension("db.tmp").exists());
 
     let verification = DbMaintenance::verify_backup(&backup_path).await?;
-    assert_eq!(verification.migration_version, 23);
+    assert_eq!(verification.migration_version, source_version);
 
     // Diverge the live database after the snapshot.
     let log = AuditLog::new(pool.clone());
@@ -107,7 +110,7 @@ async fn backup_verify_restore_round_trip_preserves_data() -> anyhow::Result<()>
 
     // Restore consumes the maintenance handle (and with it the open pool).
     let report = maintenance.restore_from(&backup_path).await?;
-    assert_eq!(report.verification.migration_version, 23);
+    assert_eq!(report.verification.migration_version, source_version);
     assert!(report.previous_database.is_some());
 
     let pool = connect_path(&path).await?;

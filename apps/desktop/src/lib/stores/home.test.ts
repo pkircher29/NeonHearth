@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
-  HISTORY_LIMIT, createEditorState, createHomeApi, isHomePlan, reduceEditor, selectUncertain, selectUnplaced, snap, wallLength,
+  HISTORY_LIMIT, copyFloorFootprint, createEditorState, createHomeApi, isHomePlan, reduceEditor, selectUncertain, selectUnplaced, snap, wallLength,
   type EditorState, type Estimate, type HomeDeviceRef, type HomePlan, type Placement
 } from './home';
 
@@ -34,6 +34,33 @@ const fresh = (placements: Placement[] = []): EditorState => createEditorState(f
 const ground = (state: EditorState) => state.doc.plan.floors[0];
 
 describe('editor reducer', () => {
+  it('copies independent geometry to an empty floor and preserves placements through undo/redo', () => {
+    const state = fresh([fixturePlacement()]);
+    let id = 100;
+    const floor = copyFloorFootprint(ground(state), state.doc.plan.floors[1], () => freshId(String(id++).padStart(4, '0')));
+    const copied = reduceEditor(state, { type: 'copy_footprint', floor });
+    expect(copied.doc.plan.floors[1].walls[0].start).toEqual(ground(state).walls[0].start);
+    expect(copied.doc.plan.floors[1].walls[0].start).not.toBe(ground(state).walls[0].start);
+    expect(floor.walls[0].wall_id).not.toBe(wallId);
+    expect(floor.walls[0].openings[0].opening_id).not.toBe(doorId);
+    expect(floor.rooms[0].room_id).not.toBe(roomId);
+    expect(copied.doc.placements).toBe(state.doc.placements);
+    expect(reduceEditor(copied, { type: 'copy_footprint', floor })).toBe(copied);
+    const undone = reduceEditor(copied, { type: 'undo' });
+    expect(undone.doc).toBe(state.doc);
+    expect(reduceEditor(undone, { type: 'redo' }).doc).toBe(copied.doc);
+    const edited = reduceEditor(copied, { type: 'delete_wall', floor_id: upperId, wall_id: floor.walls[0].wall_id });
+    expect(ground(edited).walls).toHaveLength(1);
+    expect(edited.doc.plan.floors[1].walls).toHaveLength(0);
+  });
+
+  it('preserves exact inch geometry instead of rounding it back to the metric grid', () => {
+    const added = reduceEditor(fresh(), { type: 'add_wall', floor_id: groundId, wall_id: freshId('0900'), start: { x: 0, y: 0 }, end: { x: 3.048, y: 0 }, grid_m: 0.0254 });
+    expect(ground(added).walls.at(-1)!.end.x).toBe(3.048);
+    const moved = reduceEditor(added, { type: 'move_wall', floor_id: groundId, wall_id: freshId('0900'), start: { x: 0.0254, y: 0 }, end: { x: 3.0734, y: 0 }, grid_m: 0.0254 });
+    expect(wallLength(ground(moved).walls.at(-1)!)).toBeCloseTo(3.048, 10);
+  });
+
   it('adds walls snapped to the 0.1 m grid and rejects zero-length walls', () => {
     const state = fresh();
     const added = reduceEditor(state, { type: 'add_wall', floor_id: groundId, wall_id: freshId('0100'), start: { x: 1.234, y: 0.96 }, end: { x: 3.049, y: 0.96 } });
@@ -207,6 +234,9 @@ describe('createHomeApi', () => {
   it('reports a missing draft, a valid draft, and discards a corrupt draft', async () => {
     const none = createHomeApi({ ...options, fetchImpl: vi.fn(async () => new Response(null, { status: 404 })) });
     await expect(none.loadDraft()).resolves.toEqual({ status: 'none' });
+    const emptyFetch = vi.fn(async () => new Response(null, { status: 204 }));
+    await expect(createHomeApi({ ...options, fetchImpl: emptyFetch }).loadDraft()).resolves.toEqual({ status: 'none' });
+    expect(emptyFetch).toHaveBeenCalledTimes(1); // The service's no-draft response must not trigger deletion.
 
     const draft = { plan: fixturePlan(), saved_at: '2026-08-24T00:00:00Z' };
     const valid = createHomeApi({ ...options, fetchImpl: vi.fn(async () => new Response(JSON.stringify(draft), { status: 200 })) });

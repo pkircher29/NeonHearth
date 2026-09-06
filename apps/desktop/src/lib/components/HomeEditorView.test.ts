@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { fireEvent, render, screen } from '@testing-library/svelte';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Estimate, HomeApi, HomeDeviceRef, HomePlan, Placement } from '../stores/home';
 import HomeEditorView from './HomeEditorView.svelte';
@@ -44,6 +44,45 @@ function apiStub(overrides: Partial<HomeApi> = {}, options: { placements?: Place
 }
 
 describe('HomeEditorView', () => {
+  beforeEach(() => {
+    const values = new Map<string, string>();
+    vi.stubGlobal('localStorage', { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => values.set(key, value) });
+  });
+  it('switches units without changing geometry and saves an eight-foot ceiling in meters', async () => {
+    const api = apiStub();
+    const view = render(HomeEditorView, { api, devices });
+    await screen.findByRole('button', { name: /Ground/ });
+    const before = view.container.querySelector('.wall')!.outerHTML;
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Measurement units' }), { target: { value: 'imperial' } });
+    expect(screen.getByRole('button', { name: 'Wall, 13.78 ft' })).toBeTruthy();
+    expect(localStorage.getItem('neonhearth.home.units')).toBe('imperial');
+    await fireEvent.click(screen.getByRole('button', { name: /Ground/ }));
+    await fireEvent.change(screen.getByLabelText('Ceiling height (ft)'), { target: { value: '8' } });
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Measurement units' }), { target: { value: 'metric' } });
+    expect((screen.getByLabelText('Ceiling height (m)') as HTMLInputElement).valueAsNumber).toBe(2.4384);
+    expect(view.container.querySelector('.wall')!.outerHTML).toBe(before);
+    await fireEvent.click(screen.getByRole('button', { name: 'Save plan' }));
+    expect(api.savePlan).toHaveBeenCalledWith(expect.objectContaining({ floors: expect.arrayContaining([expect.objectContaining({ ceiling_height_m: 2.4384 })]) }), 3);
+  });
+
+  it('copies to an existing empty floor, undo restores it, and a new-floor copy saves', async () => {
+    const api = apiStub();
+    const view = render(HomeEditorView, { api, devices });
+    await screen.findByRole('button', { name: /Ground/ });
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Footprint destination' }), { target: { value: upperId } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Copy footprint' }));
+    expect(screen.getByRole('application').getAttribute('aria-label')).toContain('Upstairs');
+    expect(view.container.querySelectorAll('.wall')).toHaveLength(1);
+    expect(view.container.querySelector('.wall')!.getAttribute('data-wall-id')).not.toBe(wallId);
+    await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+    expect(view.container.querySelectorAll('.wall')).toHaveLength(0);
+    await fireEvent.click(screen.getByRole('button', { name: /Ground/ }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Copy footprint' }));
+    expect(screen.getByRole('application').getAttribute('aria-label')).toContain('Floor 2');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save plan' }));
+    expect(vi.mocked(api.savePlan).mock.calls[0][0].floors).toHaveLength(3);
+    expect(api.putPlacement).not.toHaveBeenCalled();
+  });
   it('renders floors, walls and rooms from the committed plan', async () => {
     const view = render(HomeEditorView, { api: apiStub(), devices });
     expect(await screen.findByRole('button', { name: /Ground/ })).toBeTruthy();

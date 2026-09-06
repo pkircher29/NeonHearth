@@ -23,37 +23,8 @@ version = 2
 # must be triaged and either replaced or moved to `ignore` with a reason.
 unmaintained = "workspace"
 yanked = "deny"
-# Every entry here MUST carry the reason it is temporarily accepted and what
-# unblocks removal. These are NOT permanent acceptances: all of the entries
-# below require semver-incompatible dependency upgrades (Cargo.toml changes)
-# and are tracked as open defects in docs/build/supply-chain.md ("Action
-# required" section). New advisories still fail the gate.
-ignore = [
-    # -- wasmtime 27.0.0 (used only by lattice-audit-wasm to sandbox audit
-    #    modules). All fixes require upgrading past the pinned major
-    #    (>=36.0.7 / >=43.0.1 / >=47.0.3 depending on advisory); no fix exists
-    #    within the 27.x line. Upgrade wasmtime in Cargo.toml, then delete
-    #    this whole block. Several advisories only apply to configurations we
-    #    do not use (Winch backend, aarch64 Cranelift, pooling allocator,
-    #    component model / WASI-http), but the upgrade is required regardless.
-    { id = "RUSTSEC-2025-0046", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2025-0118", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0020", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0021", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0085", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0086", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0087", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0088", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0089", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0091", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0092", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0093", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0094", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0095", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0096", reason = "aarch64 Cranelift only (not a release target); fixed by same wasmtime upgrade" },
-    { id = "RUSTSEC-2026-0222", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-    { id = "RUSTSEC-2026-0269", reason = "fix is outside pinned wasmtime major; upgrade tracked in supply-chain.md" },
-]
+# No vulnerability exceptions. Fix or remove affected dependencies.
+ignore = []
 
 [licenses]
 version = 2
@@ -89,6 +60,7 @@ exceptions = [
     { name = "lattice-intelligence", allow = ["AGPL-3.0-or-later"] },
     { name = "lattice-policy", allow = ["AGPL-3.0-or-later"] },
     { name = "lattice-service", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-launcher", allow = ["AGPL-3.0-or-later"] },
     { name = "lattice-advisory", allow = ["AGPL-3.0-or-later"] },
     { name = "lattice-audit-wasm", allow = ["AGPL-3.0-or-later"] },
     { name = "lattice-w6", allow = ["AGPL-3.0-or-later"] },

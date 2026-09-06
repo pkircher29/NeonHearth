@@ -711,6 +711,8 @@ fn load_or_create_key(path: &Path) -> Result<Zeroizing<[u8; FILE_VAULT_KEY_BYTES
 }
 
 fn restrict_directory(dir: &Path) -> Result<(), VaultError> {
+    #[cfg(not(unix))]
+    let _ = dir;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

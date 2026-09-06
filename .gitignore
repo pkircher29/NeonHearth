@@ -20,5 +20,9 @@
 !/crates/lattice-sensor/tests/fixtures/pcap/*.pcapng
 /artifacts/
 /dist/
+/.local/
+
+
+__pycache__/
 # Local build/test output (Playwright screenshots etc.); never committed.
 /output/

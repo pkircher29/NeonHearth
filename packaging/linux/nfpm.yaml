@@ -41,9 +41,13 @@ overrides:
   deb:
     depends:
       - ffmpeg
+      - avahi-daemon
+      - avahi-utils
   rpm:
     depends:
       - /usr/bin/ffmpeg
+      - avahi
+      - avahi-tools
 
 contents:
   # Service binary (built by packaging/stage.sh).

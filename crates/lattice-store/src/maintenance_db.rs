@@ -443,7 +443,13 @@ fn create_private_empty(path: &Path) -> Result<(), MaintenanceError> {
 
 /// Flushes `path`'s contents to stable storage and returns its size.
 fn sync_file(path: &Path) -> Result<u64, MaintenanceError> {
-    let file = std::fs::File::open(path).map_err(|error| io_error("open file for fsync", error))?;
+    // FlushFileBuffers requires write access on Windows. Do not truncate or
+    // recreate the verified backup when opening its existing handle for sync.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(cfg!(windows))
+        .open(path)
+        .map_err(|error| io_error("open file for fsync", error))?;
     file.sync_all()
         .map_err(|error| io_error("fsync file", error))?;
     let size = file

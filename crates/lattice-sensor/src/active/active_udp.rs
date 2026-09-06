@@ -402,15 +402,27 @@ fn session_headers(
 }
 fn nbns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError> {
     tx16(probe, b)?;
-    if b.len() < 12 || b[2] & 0x80 == 0 {
+    if b.len() < 12 || b[2] & 0x80 == 0 || b[3] & 0x0f != 0 {
         return Err(ActiveError::Protocol);
     }
     let mut p = 12;
-    p = skip_name(b, p)?;
-    p += 4;
+    // NBSTAT responders commonly omit the question section (QDCOUNT=0).
+    let questions = u16::from_be_bytes([b[4], b[5]]);
+    if questions > 1 || u16::from_be_bytes([b[6], b[7]]) != 1 {
+        return Err(ActiveError::Correlation);
+    }
+    if questions == 1 {
+        p = skip_name(b, p)?
+            .checked_add(4)
+            .filter(|end| *end <= b.len())
+            .ok_or(ActiveError::Network)?;
+    }
     p = skip_name(b, p)?;
     if p + 10 > b.len() {
         return Err(ActiveError::Protocol);
+    }
+    if b[p..p + 4] != [0, 0x21, 0, 1] {
+        return Err(ActiveError::Correlation);
     }
     let len = usize::from(u16::from_be_bytes([b[p + 8], b[p + 9]]));
     p += 10;

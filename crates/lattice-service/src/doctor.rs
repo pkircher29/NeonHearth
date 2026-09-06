@@ -384,6 +384,7 @@ fn platform_resolvers() -> Vec<String> {
 
 /// Parses `/proc/net/route`: picks the lowest-metric row whose destination is
 /// `0.0.0.0` and whose flags carry `RTF_GATEWAY`.
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_net_route(table: &str) -> Option<(String, String)> {
     const RTF_UP: u32 = 0x1;
     const RTF_GATEWAY: u32 = 0x2;
@@ -414,6 +415,7 @@ fn parse_proc_net_route(table: &str) -> Option<(String, String)> {
 }
 
 /// Parses `nameserver` lines from `resolv.conf`, deduplicated and capped.
+#[cfg(any(target_os = "linux", test))]
 fn parse_resolv_conf(text: &str) -> Vec<String> {
     let mut resolvers: Vec<String> = Vec::new();
     for line in text.lines() {

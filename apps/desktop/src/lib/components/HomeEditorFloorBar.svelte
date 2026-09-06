@@ -1,13 +1,14 @@
 <script lang="ts">
   import type { Floor } from '../stores/home';
+  import { formatLength, type HomeUnits } from '../homeUnits';
 
-  let { floors, active, onselect, onadd }: { floors: Floor[]; active: string | null; onselect: (floorId: string) => void; onadd: () => void } = $props();
+  let { floors, active, onselect, onadd, units = 'metric' }: { floors: Floor[]; active: string | null; onselect: (floorId: string) => void; onadd: () => void; units?: HomeUnits } = $props();
 </script>
 
 <nav class="floor-bar" aria-label="Floors">
   {#each floors as floor (floor.floor_id)}
     <button type="button" class="floor-tab" class:active={floor.floor_id === active} aria-pressed={floor.floor_id === active} onclick={() => onselect(floor.floor_id)}>
-      <strong>{floor.name}</strong><small>level {floor.level} · {floor.ceiling_height_m.toFixed(1)} m</small>
+      <strong>{floor.name}</strong><small>level {floor.level} · {formatLength(floor.ceiling_height_m, units)}</small>
     </button>
   {/each}
   <button type="button" class="floor-add" onclick={onadd}>+ Add floor</button>

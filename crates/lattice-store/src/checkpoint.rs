@@ -641,7 +641,10 @@ impl M2StateRepository {
         digest: Vec<u8>,
         flow: Option<(&FlowRepository, &[RollupChange], DateTime<Utc>)>,
     ) -> Result<(), CheckpointError> {
-        let mut tx = self.pool.begin().await?;
+        // Reserve the writer before reading the checkpoint. A deferred transaction
+        // can fail a read-to-write upgrade immediately when another writer is active,
+        // even with busy_timeout configured. IMMEDIATE waits before taking that snapshot.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(discovery) = &input.discovery {
             let old: Option<Vec<u8>> = sqlx::query_scalar(
                 "SELECT commit_digest FROM discovery_commits WHERE input_hash=?",

@@ -115,7 +115,7 @@ impl PolicyRepository {
         decision: Option<&PolicyChanged>,
     ) -> anyhow::Result<ActuationReservation> {
         let encoded = encode(&action)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(existing) = self.actuation_attempt_in(&mut tx, device_id).await? {
             ensure!(
                 existing.policy_version == policy_version && existing.action == action,
@@ -182,7 +182,7 @@ impl PolicyRepository {
         &self,
         now: DateTime<Utc>,
     ) -> anyhow::Result<DateTime<Utc>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let install_exists: Option<i64> =
             sqlx::query_scalar("SELECT singleton FROM install_state WHERE singleton=1")
                 .fetch_optional(&mut *tx)
@@ -222,7 +222,10 @@ impl PolicyRepository {
     /// Enrolls a known device exactly once against the immutable install
     /// timestamp. Repeated calls return the original cohort membership.
     pub async fn enroll(&self, device_id: DeviceId) -> anyhow::Result<DevicePolicy> {
-        let mut tx = self.pool.begin().await?;
+        // These transactions read before writing. Acquire the writer reservation
+        // first so concurrent discovery, home edits, and HA updates can wait
+        // without a deferred read-to-write upgrade failing immediately.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let first_seen: Option<String> =
             sqlx::query_scalar("SELECT first_seen_at FROM devices WHERE device_id=?")
                 .bind(device_id.to_string())
@@ -476,7 +479,7 @@ impl PolicyRepository {
         fingerprint: &str,
         decision_json: Option<String>,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let published: Option<String> =
             sqlx::query_scalar("SELECT decision_fingerprint FROM device_policy WHERE device_id=?")
                 .bind(device_id.to_string())

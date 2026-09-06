@@ -952,9 +952,9 @@ impl Modify for SecurityAddon {
             );
     }
 }
-/// The route map is owner information: once Serve is configured every tailnet
-/// peer can reach this listener, so the document is served only to an
-/// authenticated principal.
 pub async fn openapi(_: Authorized) -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+    let mut document = ApiDoc::openapi();
+    document.merge(crate::automation::AutomationApiDoc::openapi());
+    document.merge(crate::network_scan::ScanApiDoc::openapi());
+    Json(document)
 }

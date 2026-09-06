@@ -1,13 +1,13 @@
 //! Cross-platform interface inventory and the discovery target safety boundary.
 //!
-//! `pnet_datalink` is deliberately the only system-enumeration dependency here:
-//! it uses platform APIs on Windows and Linux and exposes addresses, prefix lengths,
-//! stable operating-system interface indices, and interface flags without invoking a
-//! shell. This crate does not open sockets or send probes.
+//! Interface inventory uses native Windows IP Helper tables and `pnet_datalink`
+//! on other platforms. Reading interfaces needs no packet-capture driver, shell,
+//! privileged service, or active network probe.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
+#[cfg(not(windows))]
 use pnet_datalink::interfaces;
 use thiserror::Error;
 
@@ -17,6 +17,8 @@ pub mod flow;
 pub mod live;
 pub mod neighbor;
 pub mod passive;
+#[cfg(windows)]
+mod windows_interfaces;
 pub use passive::{
     MAX_SKIPPED_FRAMES, OfflinePassiveAdapter, PassiveAdapter, PassiveObservation, PassiveOptions,
     PassiveParseError, PcapIngest,
@@ -204,12 +206,22 @@ pub fn diff_inventory(before: &InterfaceInventory, after: &InterfaceInventory) -
 pub enum InterfaceManagerError {
     #[error("system interface enumeration did not produce a usable interface index")]
     InvalidInterfaceIndex,
+    #[error("system interface inventory is unavailable")]
+    Unavailable,
+    #[error("system interface inventory exceeds its supported bounds")]
+    Capacity,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct SystemInterfaceManager;
 
 impl SystemInterfaceManager {
+    #[cfg(windows)]
+    pub fn snapshot(&self) -> Result<InterfaceInventory, InterfaceManagerError> {
+        windows_interfaces::snapshot()
+    }
+
+    #[cfg(not(windows))]
     pub fn snapshot(&self) -> Result<InterfaceInventory, InterfaceManagerError> {
         let system_interfaces = interfaces();
         if system_interfaces
@@ -225,7 +237,7 @@ impl SystemInterfaceManager {
                     let description = (!interface.description.is_empty())
                         .then_some(interface.description.clone());
                     let loopback = interface.is_loopback();
-                    let up = platform_interface_is_up(interface.index, interface.is_up());
+                    let up = interface.is_up();
                     let addresses = interface
                         .ips
                         .into_iter()
@@ -251,25 +263,6 @@ impl SystemInterfaceManager {
                 .collect(),
         ))
     }
-}
-
-#[cfg(not(windows))]
-fn platform_interface_is_up(_index: u32, reported_up: bool) -> bool {
-    reported_up
-}
-
-#[cfg(windows)]
-fn platform_interface_is_up(index: u32, _reported_up: bool) -> bool {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{GetIfEntry2, MIB_IF_ROW2};
-    use windows_sys::Win32::NetworkManagement::Ndis::NET_IF_OPER_STATUS_UP;
-
-    let mut row = MIB_IF_ROW2 {
-        InterfaceIndex: index,
-        ..Default::default()
-    };
-    // `GetIfEntry2` is the documented Windows interface-status API. It fills the
-    // zero-initialized row selected by InterfaceIndex and opens no network socket.
-    unsafe { GetIfEntry2(&mut row) == 0 && row.OperStatus == NET_IF_OPER_STATUS_UP }
 }
 
 #[derive(Clone, Debug)]
