@@ -143,7 +143,9 @@ async fn regression_rolls_a_reversible_repair_back_automatically() {
     let transport = FakeRepairTransport::new()
         .with_snapshot(snapshot_entries())
         .push_measurements(vec![meas(Metric::LossPercent, 10.0)])
-        .push_measurements(vec![meas(Metric::LossPercent, 30.0)]);
+        .push_measurements(vec![meas(Metric::LossPercent, 30.0)])
+        // Re-measured after the restore: back at baseline.
+        .push_measurements(vec![meas(Metric::LossPercent, 10.0)]);
     let report = executor()
         .execute(&transport, &dns_repair(), &loss_symptom())
         .await;
@@ -165,9 +167,10 @@ async fn regression_rolls_a_reversible_repair_back_automatically() {
             "rolled_back"
         ]
     );
+    // The restore is proven by a re-measurement, not assumed.
     assert_eq!(
-        transport.calls().last().copied(),
-        Some(TransportCall::Restore)
+        &transport.calls()[transport.calls().len() - 2..],
+        &[TransportCall::Restore, TransportCall::Measure]
     );
     let verification = report.verification.as_ref().unwrap();
     assert_eq!(verification.before.value, 10.0);
@@ -207,6 +210,7 @@ async fn mid_apply_failure_triggers_rollback_of_a_reversible_repair() {
     let transport = FakeRepairTransport::new()
         .with_snapshot(snapshot_entries())
         .with_apply_error(RepairTransportError::Apply("router rejected change".into()))
+        .push_measurements(vec![meas(Metric::LossPercent, 10.0)])
         .push_measurements(vec![meas(Metric::LossPercent, 10.0)]);
     let report = executor()
         .execute(&transport, &dns_repair(), &loss_symptom())
@@ -228,6 +232,7 @@ async fn mid_apply_failure_triggers_rollback_of_a_reversible_repair() {
             TransportCall::Measure,
             TransportCall::Apply,
             TransportCall::Restore,
+            TransportCall::Measure,
         ]
     );
 }
@@ -293,7 +298,8 @@ async fn unverifiable_result_rolls_back_and_reports_verification_failure() {
     let transport = FakeRepairTransport::new()
         .with_snapshot(snapshot_entries())
         .push_measurements(vec![meas(Metric::LossPercent, 10.0)])
-        .push_measure_error(RepairTransportError::Measure("probe path down".into()));
+        .push_measure_error(RepairTransportError::Measure("probe path down".into()))
+        .push_measurements(vec![meas(Metric::LossPercent, 10.0)]);
     let report = executor()
         .execute(&transport, &dns_repair(), &loss_symptom())
         .await;
@@ -340,7 +346,9 @@ async fn higher_is_better_metrics_compare_in_the_right_direction() {
 
     let transport = FakeRepairTransport::new()
         .push_measurements(vec![meas(Metric::ReachabilitySuccess, 1.0)])
-        .push_measurements(vec![meas(Metric::ReachabilitySuccess, 0.0)]);
+        .push_measurements(vec![meas(Metric::ReachabilitySuccess, 0.0)])
+        // Re-measured after the restore: reachability is back.
+        .push_measurements(vec![meas(Metric::ReachabilitySuccess, 1.0)]);
     let repair = ExecutableRepair::Safe {
         action: SafeAction::RefreshAppCaches,
     };
@@ -384,4 +392,89 @@ fn symptom_rejects_non_positive_or_non_finite_deltas() {
         )
         .is_err()
     );
+}
+
+/// A NaN re-measurement is unverifiable, not "unchanged": the repair is
+/// rolled back and reported as a verification failure.
+#[tokio::test]
+async fn non_finite_measurement_is_a_verification_failure_not_unchanged() {
+    let transport = FakeRepairTransport::new()
+        .with_snapshot(snapshot_entries())
+        .push_measurements(vec![meas(Metric::LossPercent, 10.0)])
+        .push_measurements(vec![meas(Metric::LossPercent, f64::NAN)])
+        .push_measurements(vec![meas(Metric::LossPercent, 10.0)]);
+    let report = executor()
+        .execute(&transport, &dns_repair(), &loss_symptom())
+        .await;
+
+    assert!(matches!(
+        &report.outcome,
+        RepairOutcome::VerificationFailed { error } if error.contains("non-finite")
+    ));
+    assert_eq!(report.rollback, RollbackOutcome::Succeeded);
+    assert!(report.verification.is_none());
+    assert_eq!(
+        event_names(&report),
+        vec![
+            "started",
+            "snapshotted",
+            "applied",
+            "verification_failed",
+            "rolled_back"
+        ]
+    );
+
+    // A NaN baseline stops before anything is applied.
+    let transport = FakeRepairTransport::new()
+        .with_snapshot(snapshot_entries())
+        .push_measurements(vec![meas(Metric::LossPercent, f64::INFINITY)]);
+    let report = executor()
+        .execute(&transport, &dns_repair(), &loss_symptom())
+        .await;
+    assert!(matches!(
+        &report.outcome,
+        RepairOutcome::BaselineFailed { error } if error.contains("non-finite")
+    ));
+    assert!(!transport.calls().contains(&TransportCall::Apply));
+}
+
+/// A restore that returns `Ok` but leaves the symptom regressed is a failed
+/// rollback: success is proven by re-measuring, never assumed.
+#[tokio::test]
+async fn rollback_that_does_not_restore_the_symptom_is_reported_as_failed() {
+    let transport = FakeRepairTransport::new()
+        .with_snapshot(snapshot_entries())
+        .push_measurements(vec![meas(Metric::LossPercent, 10.0)])
+        .push_measurements(vec![meas(Metric::LossPercent, 30.0)])
+        // Still regressed after the "successful" restore.
+        .push_measurements(vec![meas(Metric::LossPercent, 30.0)]);
+    let report = executor()
+        .execute(&transport, &dns_repair(), &loss_symptom())
+        .await;
+
+    assert_eq!(
+        report.outcome,
+        RepairOutcome::Completed {
+            verdict: Verdict::Regressed
+        }
+    );
+    assert!(matches!(
+        &report.rollback,
+        RollbackOutcome::Failed { error } if error.contains("did not return to baseline")
+    ));
+
+    // A restore whose re-measurement fails is unverified, which is also not
+    // a success.
+    let transport = FakeRepairTransport::new()
+        .with_snapshot(snapshot_entries())
+        .push_measurements(vec![meas(Metric::LossPercent, 10.0)])
+        .push_measurements(vec![meas(Metric::LossPercent, 30.0)])
+        .push_measure_error(RepairTransportError::Measure("probe path down".into()));
+    let report = executor()
+        .execute(&transport, &dns_repair(), &loss_symptom())
+        .await;
+    assert!(matches!(
+        &report.rollback,
+        RollbackOutcome::Failed { error } if error.contains("could not be verified")
+    ));
 }

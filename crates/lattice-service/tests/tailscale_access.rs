@@ -815,12 +815,13 @@ async fn stepup_grants_a_five_minute_grace_for_high_impact_routes() {
     let expires_at: DateTime<Utc> = grant["expires_at"].as_str().unwrap().parse().unwrap();
     assert_eq!(expires_at, fixture.clock.now() + Duration::minutes(5));
 
-    let response = send(
+    let response = send_with_headers(
         &fixture.router,
         "PUT",
         "/api/v1/home/plan",
         Some(empty_plan_save(0)),
         &phone,
+        &[("x-command-id", "018f47a0-9b5c-7a22-8a33-1122334455a0")],
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1111,12 +1112,23 @@ async fn websocket_reconnect_with_resume_redelivers_and_reexecutes_nothing() {
 #[tokio::test]
 async fn openapi_documents_the_remote_routes() {
     let fixture = fixture().await;
+    // The route map is served to principals only: once Serve is on, every
+    // tailnet peer can reach this listener.
     let response = send(
         &fixture.router,
         "GET",
         "/api/v1/openapi.json",
         None,
         &Auth::None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = send(
+        &fixture.router,
+        "GET",
+        "/api/v1/openapi.json",
+        None,
+        &Auth::Owner,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1134,4 +1146,189 @@ async fn openapi_documents_the_remote_routes() {
             "missing {method} {path}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: the PIN budget and the replay window under parallel requests.
+// ---------------------------------------------------------------------------
+
+/// M-1: five wrong guesses in flight at once are five failures. A
+/// read-modify-write counter would charge them as one and leave the
+/// budget almost untouched.
+#[tokio::test]
+async fn concurrent_pin_failures_are_each_charged_against_the_budget() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id, secret);
+
+    let (a, b, c, d, e) = tokio::join!(
+        stepup(&fixture, &phone, "000000"),
+        stepup(&fixture, &phone, "000000"),
+        stepup(&fixture, &phone, "000000"),
+        stepup(&fixture, &phone, "000000"),
+        stepup(&fixture, &phone, "000000"),
+    );
+    let mut statuses: Vec<u16> = [&a, &b, &c, &d, &e]
+        .iter()
+        .map(|response| response.status().as_u16())
+        .collect();
+    statuses.sort_unstable();
+    assert_eq!(statuses, [403, 403, 403, 403, 429]);
+
+    // The session is locked: even the correct PIN is refused.
+    let response = stepup(&fixture, &phone, "123456").await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Every failure was charged with a distinct running count.
+    let rows = approval_audit_rows(&fixture.pool).await;
+    let mut counts: Vec<u64> = rows
+        .iter()
+        .filter(|row| row.action == "stepup_failed")
+        .map(|row| row.detail["failures_in_window"].as_u64().unwrap())
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(counts, [1, 2, 3, 4, 5]);
+}
+
+/// M-2: a duplicate that arrives while the first send is still executing
+/// waits for it and replays the settled result; it never runs twice.
+#[tokio::test]
+async fn a_concurrent_duplicate_command_waits_and_replays_instead_of_executing() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id, secret);
+    assert_eq!(
+        stepup(&fixture, &phone, "123456").await.status(),
+        StatusCode::OK
+    );
+
+    let headers = [("x-command-id", "018f47a0-9b5c-7a22-8a33-1122334455cc")];
+    let save = || {
+        send_with_headers(
+            &fixture.router,
+            "PUT",
+            "/api/v1/home/plan",
+            Some(empty_plan_save(0)),
+            &phone,
+            &headers,
+        )
+    };
+    let (first, second) = tokio::join!(save(), save());
+    // A second execution would 409 (expected_version 0 vs stored 1).
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let replayed = [&first, &second]
+        .iter()
+        .filter(|response| response.headers().get("x-command-replayed").is_some())
+        .count();
+    assert_eq!(replayed, 1, "exactly one of the pair is a replay");
+    assert_eq!(json_body(first).await["version"], 1);
+    assert_eq!(json_body(second).await["version"], 1);
+}
+
+/// T4 hardening: a high-impact phone command without a replay id cannot be
+/// made idempotent, so it is refused instead of silently run unprotected.
+#[tokio::test]
+async fn high_impact_phone_commands_must_carry_a_command_id() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id, secret);
+    assert_eq!(
+        stepup(&fixture, &phone, "123456").await.status(),
+        StatusCode::OK
+    );
+
+    let response = send(
+        &fixture.router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(empty_plan_save(0)),
+        &phone,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Nothing executed: the same save succeeds once it carries an id.
+    let response = send_with_headers(
+        &fixture.router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(empty_plan_save(0)),
+        &phone,
+        &[("x-command-id", "018f47a0-9b5c-7a22-8a33-1122334455dd")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["version"], 1);
+
+    // Reads and step-up itself never need one; the owner bearer never does.
+    let response = send(&fixture.router, "GET", "/api/v1/state", None, &phone).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send(
+        &fixture.router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(empty_plan_save(1)),
+        &Auth::Owner,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// The sliding expiry is written back once a minute, not on every read, so
+/// phone polling does not turn into SQLite write traffic.
+#[tokio::test]
+async fn session_last_use_is_written_once_a_minute_not_per_request() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id, secret);
+    async fn last_used(fixture: &Fixture) -> Option<DateTime<Utc>> {
+        let response = send(
+            &fixture.router,
+            "GET",
+            "/api/v1/remote/sessions",
+            None,
+            &Auth::Owner,
+        )
+        .await;
+        json_body(response).await["items"][0]["last_used_at"]
+            .as_str()
+            .map(|value| value.parse::<DateTime<Utc>>().unwrap())
+    }
+    assert_eq!(last_used(&fixture).await, None);
+
+    let response = send(&fixture.router, "GET", "/api/v1/state", None, &phone).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(last_used(&fixture).await, Some(epoch()));
+
+    // Thirty seconds later a read authenticates without touching the row.
+    fixture.clock.advance(Duration::seconds(30));
+    let response = send(&fixture.router, "GET", "/api/v1/state", None, &phone).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(last_used(&fixture).await, Some(epoch()));
+
+    // Past the minute the next read slides the window again.
+    fixture.clock.advance(Duration::seconds(31));
+    let response = send(&fixture.router, "GET", "/api/v1/state", None, &phone).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        last_used(&fixture).await,
+        Some(epoch() + Duration::seconds(61))
+    );
+
+    // A denied route never costs a write either.
+    fixture.clock.advance(Duration::minutes(5));
+    let response = send(
+        &fixture.router,
+        "GET",
+        "/api/v1/remote/sessions",
+        None,
+        &phone,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        last_used(&fixture).await,
+        Some(epoch() + Duration::seconds(61))
+    );
 }

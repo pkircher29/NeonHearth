@@ -2,16 +2,47 @@ import type { Bandwidth, BandwidthFrame, CameraDetail, CameraHealth, CameraInven
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
+/**
+ * Where the client gets its credential. `header()` returns the full
+ * Authorization value or null when the caller has no credential (the dev
+ * proxy injects one upstream; production shows the sign-in screen after the
+ * first 401). The client NEVER sends an empty bearer.
+ */
+export interface AuthSource {
+  header(): string | null;
+  /** A request was refused with 401: the credential (if any) is invalid. */
+  unauthorized?(): void;
+  /** A phone-session request was refused with 403: PIN step-up is needed. */
+  stepupRequired?(): void;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super(`Request failed with status ${status}`);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 export interface ApiClientOptions {
   baseUrl: string;
-  serviceToken: string;
+  /** Fixed owner bearer; superseded by `auth` when both are given. */
+  serviceToken?: string;
+  auth?: AuthSource;
   fetchImpl?: typeof fetch;
   WebSocketImpl?: typeof WebSocket;
+  /** Every fetch is abandoned after this long (0 disables). Default 15 s. */
+  requestTimeoutMs?: number;
 }
+
+export interface PairPhoneResponse { session_id: string; secret: string; expires_at: string }
+export interface StepupResult { expires_at: string }
 
 export interface SnapshotPageOptions {
   limit?: number;
   after?: string;
+  signal?: AbortSignal;
 }
 
 /**
@@ -134,11 +165,116 @@ export interface DoctorRun { run_id: string; started_at: string; report: Diagnos
 export type DoctorRunOutcome = { status: 'completed'; run: DoctorRun } | { status: 'already_running' };
 export interface DoctorApproval { approval_id: string; expires_at: string }
 
+/** History: one hash-chained audit entry as GET /audit returns it. */
+export type AuditActor = 'owner' | 'service' | 'module';
+export type AuditCategory = 'approval' | 'scan' | 'enforcement' | 'doctor_action' | 'audit_module';
+export interface AuditEntry { id: number; occurred_at: string; actor: AuditActor; category: AuditCategory; action: string; subject: string | null; detail: unknown; prev_hash: string; entry_hash: string }
+export interface ChainHead { id: number; entry_hash: string }
+export interface AuditPage { entries: AuditEntry[]; head: ChainHead | null; next_before: number | null }
+export type ChainBreakKind = 'id_gap' | 'prev_hash_mismatch' | 'entry_hash_mismatch' | 'invalid_row' | 'head_mismatch';
+export interface ChainReport { checked: number; start_id: number | null; end_id: number | null; anchored: boolean; first_break: { id: number; kind: ChainBreakKind } | null }
+export interface AuditVerify { report: ChainReport; head: ChainHead | null; valid: boolean }
+
+/** Remote access (Settings). */
+export interface RemoteStatus { daemon: { running: boolean; backend_state: string; dns_name: string | null } | null; daemon_error: string | null; serve_configured: boolean; funnel_conflict: boolean; loopback_port: number }
+export interface RemoteServe { configured: boolean; changed: boolean; https_port: number; target: string; dns_name: string | null }
+export interface PhoneSession { session_id: string; device_label: string; created_at: string; expires_at: string; last_used_at: string | null; revoked: boolean }
+export type IntegrationScope = 'devices:read' | 'presence:read' | 'bandwidth:read' | 'policy:read';
+export const INTEGRATION_SCOPES: readonly IntegrationScope[] = ['devices:read', 'presence:read', 'bandwidth:read', 'policy:read'];
+export interface IntegrationToken { id: string; name: string; scopes: string[]; created_at: string; revoked: boolean }
+export interface MintedIntegrationToken extends Omit<IntegrationToken, 'revoked'> { token: string }
+
+/** Network Doctor probe targets (GET/PUT /doctor/settings). */
+export interface DoctorSettings { interface: string; gateway: string | null; gateway_source: string; configured_resolvers: string[]; independent_resolver: string; internet_probe_address: string; internet_probe_port: number; dns_probe_name: string; external_probes_confirmed: boolean }
+export type DoctorSettingsUpdate = Partial<Omit<DoctorSettings, 'gateway_source'>>;
+/** A 400 from PUT /doctor/settings carries the reason; surfaced as a typed outcome. */
+export type DoctorSettingsOutcome = { status: 'saved'; settings: DoctorSettings } | { status: 'rejected'; error: string };
+
+const AUDIT_ACTORS: readonly string[] = ['owner', 'service', 'module'];
+const AUDIT_CATEGORIES: readonly string[] = ['approval', 'scan', 'enforcement', 'doctor_action', 'audit_module'];
+const CHAIN_BREAKS: readonly string[] = ['id_gap', 'prev_hash_mismatch', 'entry_hash_mismatch', 'invalid_row', 'head_mismatch'];
+const HEX64 = /^[0-9a-f]{64}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+function isId(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value > 0; }
+function isChainHead(value: unknown): value is ChainHead {
+  return isRecord(value) && exact(value, ['id', 'entry_hash']) && isId(value.id) && typeof value.entry_hash === 'string' && HEX64.test(value.entry_hash);
+}
+function isAuditEntry(value: unknown): value is AuditEntry {
+  if (!isRecord(value) || !exact(value, ['id', 'occurred_at', 'actor', 'category', 'action', 'subject', 'detail', 'prev_hash', 'entry_hash'])) return false;
+  return isId(value.id) && isDate(value.occurred_at) && typeof value.actor === 'string' && AUDIT_ACTORS.includes(value.actor)
+    && typeof value.category === 'string' && AUDIT_CATEGORIES.includes(value.category)
+    && typeof value.action === 'string' && value.action.length > 0 && value.action.length <= 128
+    && (value.subject === null || (typeof value.subject === 'string' && value.subject.length <= 256))
+    && 'detail' in value && typeof value.prev_hash === 'string' && HEX64.test(value.prev_hash) && typeof value.entry_hash === 'string' && HEX64.test(value.entry_hash);
+}
+function isAuditPage(value: unknown): value is AuditPage {
+  if (!isRecord(value) || !exact(value, ['entries', 'head', 'next_before'])) return false;
+  if (!Array.isArray(value.entries) || value.entries.length > 512 || !value.entries.every(isAuditEntry)) return false;
+  if (value.head !== null && !isChainHead(value.head)) return false;
+  return value.next_before === null || isId(value.next_before);
+}
+function isChainReport(value: unknown): value is ChainReport {
+  if (!isRecord(value) || !exact(value, ['checked', 'start_id', 'end_id', 'anchored', 'first_break'])) return false;
+  if (typeof value.checked !== 'number' || !Number.isSafeInteger(value.checked) || value.checked < 0 || typeof value.anchored !== 'boolean') return false;
+  if (value.start_id !== null && !isId(value.start_id)) return false;
+  if (value.end_id !== null && !isId(value.end_id)) return false;
+  if (value.first_break === null) return true;
+  return isRecord(value.first_break) && exact(value.first_break, ['id', 'kind']) && isId(value.first_break.id) && typeof value.first_break.kind === 'string' && CHAIN_BREAKS.includes(value.first_break.kind);
+}
+function isAuditVerify(value: unknown): value is AuditVerify {
+  return isRecord(value) && exact(value, ['report', 'head', 'valid']) && isChainReport(value.report) && (value.head === null || isChainHead(value.head)) && typeof value.valid === 'boolean';
+}
+function isRemoteStatus(value: unknown): value is RemoteStatus {
+  if (!isRecord(value) || !exact(value, ['daemon', 'daemon_error', 'serve_configured', 'funnel_conflict', 'loopback_port'])) return false;
+  if (value.daemon !== null && !(isRecord(value.daemon) && exact(value.daemon, ['running', 'backend_state', 'dns_name']) && typeof value.daemon.running === 'boolean' && typeof value.daemon.backend_state === 'string' && (value.daemon.dns_name === null || typeof value.daemon.dns_name === 'string'))) return false;
+  return (value.daemon_error === null || typeof value.daemon_error === 'string') && typeof value.serve_configured === 'boolean' && typeof value.funnel_conflict === 'boolean' && typeof value.loopback_port === 'number';
+}
+function isRemoteServe(value: unknown): value is RemoteServe {
+  return isRecord(value) && exact(value, ['configured', 'changed', 'https_port', 'target', 'dns_name']) && typeof value.configured === 'boolean' && typeof value.changed === 'boolean' && typeof value.https_port === 'number' && typeof value.target === 'string' && (value.dns_name === null || typeof value.dns_name === 'string');
+}
+function isPhoneSession(value: unknown): value is PhoneSession {
+  return isRecord(value) && exact(value, ['session_id', 'device_label', 'created_at', 'expires_at', 'last_used_at', 'revoked']) && typeof value.session_id === 'string' && UUID.test(value.session_id) && typeof value.device_label === 'string' && isDate(value.created_at) && isDate(value.expires_at) && (value.last_used_at === null || isDate(value.last_used_at)) && typeof value.revoked === 'boolean';
+}
+function isIntegrationToken(value: unknown): value is IntegrationToken {
+  return isRecord(value) && exact(value, ['id', 'name', 'scopes', 'created_at', 'revoked']) && typeof value.id === 'string' && UUID.test(value.id) && typeof value.name === 'string' && Array.isArray(value.scopes) && value.scopes.every((scope) => typeof scope === 'string') && isDate(value.created_at) && typeof value.revoked === 'boolean';
+}
+function isMintedIntegrationToken(value: unknown): value is MintedIntegrationToken {
+  return isRecord(value) && exact(value, ['id', 'name', 'scopes', 'token', 'created_at']) && typeof value.id === 'string' && UUID.test(value.id) && typeof value.name === 'string' && Array.isArray(value.scopes) && value.scopes.every((scope) => typeof scope === 'string') && typeof value.token === 'string' && HEX64.test(value.token) && isDate(value.created_at);
+}
+function isDoctorSettings(value: unknown): value is DoctorSettings {
+  if (!isRecord(value) || !exact(value, ['interface', 'gateway', 'gateway_source', 'configured_resolvers', 'independent_resolver', 'internet_probe_address', 'internet_probe_port', 'dns_probe_name', 'external_probes_confirmed'])) return false;
+  return typeof value.interface === 'string' && (value.gateway === null || typeof value.gateway === 'string') && typeof value.gateway_source === 'string'
+    && Array.isArray(value.configured_resolvers) && value.configured_resolvers.length <= 8 && value.configured_resolvers.every((item) => typeof item === 'string')
+    && typeof value.independent_resolver === 'string' && typeof value.internet_probe_address === 'string' && typeof value.internet_probe_port === 'number'
+    && typeof value.dns_probe_name === 'string' && typeof value.external_probes_confirmed === 'boolean';
+}
+function isItemList<T>(value: unknown, isItem: (item: unknown) => item is T): value is { items: T[] } {
+  return isRecord(value) && exact(value, ['items']) && Array.isArray(value.items) && value.items.length <= 1024 && value.items.every(isItem);
+}
+
 export interface ApiClient {
   health(): Promise<Health>;
   snapshot(options?: SnapshotPageOptions): Promise<Snapshot>;
-  snapshotAll(options?: { limit?: number; maxPages?: number; maxRecords?: number }): Promise<Snapshot>;
+  snapshotAll(options?: { limit?: number; maxPages?: number; maxRecords?: number; signal?: AbortSignal }): Promise<Snapshot>;
   issueEventTicket(): Promise<EventTicket>;
+  /** Owner-only: mints a phone session and returns its one-time pairing secret. */
+  pairPhone(deviceLabel: string, pin: string): Promise<PairPhoneResponse>;
+  /** History: newest-first page of the audit chain. */
+  auditPage(options?: { before?: number; limit?: number; category?: AuditCategory; actor?: AuditActor; signal?: AbortSignal }): Promise<AuditPage>;
+  /** History: recompute hashes over the newest `tail` entries (or the whole chain). */
+  auditVerify(tail?: number): Promise<AuditVerify>;
+  doctorSettings(): Promise<DoctorSettings>;
+  updateDoctorSettings(update: DoctorSettingsUpdate): Promise<DoctorSettingsOutcome>;
+  remoteStatus(): Promise<RemoteStatus>;
+  /** Owner-only: configure private Tailscale Serve for the phone surface. */
+  remoteServe(): Promise<RemoteServe>;
+  remoteSessions(): Promise<PhoneSession[]>;
+  revokePhoneSession(sessionId: string): Promise<void>;
+  integrationTokens(): Promise<IntegrationToken[]>;
+  mintIntegrationToken(name: string, scopes: IntegrationScope[]): Promise<MintedIntegrationToken>;
+  revokeIntegrationToken(id: string): Promise<void>;
+  /** Phone-only: unlocks high-impact routes for the grace window. */
+  stepUp(pin: string): Promise<StepupResult>;
   openEvents(
     afterSequence: number,
     onMessage: (message: ServerMessage) => void,
@@ -540,31 +676,46 @@ function isDoctorApproval(value: unknown): value is DoctorApproval {
     && isApprovalIdToken(value.approval_id) && isDate(value.expires_at);
 }
 
-/**
- * The service rejected the bearer token (HTTP 401). This is the typed signal
- * the connection layer uses to distinguish "this window's pairing expired"
- * (recoverable only by re-pairing) from transient network failures that
- * deserve a retry loop.
- */
-export class UnauthorizedError extends Error {
-  constructor() {
-    super('Pairing rejected with status 401');
-    this.name = 'UnauthorizedError';
-  }
-}
-
-export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebSocketImpl = WebSocket }: ApiClientOptions): ApiClient {
+export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl = fetch, WebSocketImpl = WebSocket, requestTimeoutMs = 15_000 }: ApiClientOptions): ApiClient {
   const apiUrl = (path: string) => new URL(path, baseUrl).toString();
+  const credential = (): string | null => auth ? auth.header() : (serviceToken ? `Bearer ${serviceToken}` : null);
 
-  async function request(path: string, init?: RequestInit): Promise<unknown> {
-    const response = await fetchImpl(apiUrl(path), init);
-    if (response.status === 401) throw new UnauthorizedError();
-    if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+  /**
+   * One fetch path: applies the request timeout (combined with any caller
+   * signal) and reports auth refusals to the credential source so the app can
+   * show sign-in (401) or the PIN prompt (403 on a phone session).
+   */
+  async function send(path: string, init: RequestInit = {}, signal?: AbortSignal): Promise<Response> {
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal?.reason ?? new Error('Request aborted'));
+    if (signal?.aborted) abort();
+    else signal?.addEventListener('abort', abort, { once: true });
+    const timer = requestTimeoutMs > 0 ? setTimeout(() => controller.abort(new Error('Request timed out')), requestTimeoutMs) : undefined;
+    try {
+      const response = await fetchImpl(apiUrl(path), { ...init, signal: controller.signal });
+      if (response.status === 401) auth?.unauthorized?.();
+      else if (response.status === 403 && credential()?.startsWith('PhoneSession ')) auth?.stepupRequired?.();
+      return response;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+    }
+  }
+
+  async function request(path: string, init?: RequestInit, signal?: AbortSignal): Promise<unknown> {
+    const response = await send(path, init, signal);
+    if (!response.ok) throw new ApiError(response.status);
     return response.json() as Promise<unknown>;
   }
 
-  function authorized(method: 'GET' | 'POST') {
-    return { method, headers: { Authorization: `Bearer ${serviceToken}` } };
+  function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    const header = credential();
+    return header === null ? extra : { Authorization: header, ...extra };
+  }
+  function authorized(method: 'GET' | 'POST' | 'PUT' | 'DELETE', body?: unknown): RequestInit {
+    return body === undefined
+      ? { method, headers: authHeaders() }
+      : { method, headers: authHeaders({ 'content-type': 'application/json' }), body: JSON.stringify(body) };
   }
 
   async function health(): Promise<Health> {
@@ -584,34 +735,45 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
     if (options?.limit !== undefined) params.set('limit', String(options.limit));
     if (options?.after !== undefined) params.set('after', options.after);
     const query = params.toString();
-    const value = await request(query ? `/api/v1/state?${query}` : '/api/v1/state', authorized('GET'));
+    const value = await request(query ? `/api/v1/state?${query}` : '/api/v1/state', authorized('GET'), options?.signal);
     if (!isSnapshot(value)) throw new Error('Invalid snapshot response');
     return value;
   }
 
-  async function snapshotAll(options: { limit?: number; maxPages?: number; maxRecords?: number } = {}): Promise<Snapshot> {
+  async function snapshotAll(options: { limit?: number; maxPages?: number; maxRecords?: number; signal?: AbortSignal } = {}): Promise<Snapshot> {
     const limit = options.limit ?? 256;
     const maxPages = options.maxPages ?? 256;
     const maxRecords = options.maxRecords ?? 65536;
     if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 256 || !Number.isSafeInteger(maxRecords) || maxRecords < 1 || maxRecords > 65536) throw new Error('Invalid snapshot bounds');
-    const devices: DeviceSnapshot[] = [];
-    let after: string | undefined;
-    let sequence: number | undefined;
-    let serviceStatus = 'unknown';
-    const cursors = new Set<string>();
-    for (let page = 0; page < maxPages; page += 1) {
-      const current = await snapshot({ limit, ...(after ? { after } : {}) });
-      if (sequence === undefined) sequence = current.sequence;
-      if (current.sequence !== sequence) throw new Error('Snapshot sequence changed');
-      serviceStatus = current.service_status;
-      devices.push(...current.devices);
-      if (devices.length > maxRecords) throw new Error('Snapshot exceeds safety bound');
-      if (current.next_after === null) return { sequence, devices, next_after: null, service_status: serviceStatus };
-      if (cursors.has(current.next_after)) throw new Error('Snapshot cursor cycle');
-      cursors.add(current.next_after);
-      after = current.next_after;
+    // Under a live event stream the sequence can advance between pages. A
+    // moved watermark restarts the walk at the new sequence (bounded), so a
+    // busy home still hydrates instead of failing every attempt.
+    const maxRestarts = 3;
+    for (let restart = 0; ; restart += 1) {
+      const devices: DeviceSnapshot[] = [];
+      let after: string | undefined;
+      let sequence: number | undefined;
+      let serviceStatus = 'unknown';
+      let moved = false;
+      const cursors = new Set<string>();
+      for (let page = 0; page < maxPages; page += 1) {
+        const current = await snapshot({ limit, ...(after ? { after } : {}), ...(options.signal ? { signal: options.signal } : {}) });
+        if (sequence === undefined) sequence = current.sequence;
+        if (current.sequence !== sequence) {
+          if (current.sequence < sequence || restart >= maxRestarts) throw new Error('Snapshot sequence changed');
+          moved = true;
+          break;
+        }
+        serviceStatus = current.service_status;
+        devices.push(...current.devices);
+        if (devices.length > maxRecords) throw new Error('Snapshot exceeds safety bound');
+        if (current.next_after === null) return { sequence, devices, next_after: null, service_status: serviceStatus };
+        if (cursors.has(current.next_after)) throw new Error('Snapshot cursor cycle');
+        cursors.add(current.next_after);
+        after = current.next_after;
+      }
+      if (!moved) throw new Error('Snapshot page bound exceeded');
     }
-    throw new Error('Snapshot page bound exceeded');
   }
 
   async function issueEventTicket(): Promise<EventTicket> {
@@ -646,44 +808,36 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
   async function camera(id: string): Promise<CameraDetail> { if(!isOpaqueId(id))throw new Error('Invalid camera id'); const v=await request(`/api/v1/cameras/${id}`,authorized('GET')); if(!isCameraDetail(v))throw new Error('Invalid camera response'); return v; }
   async function cameraHealth(id: string): Promise<CameraHealth> { if(!isOpaqueId(id)) throw new Error('Invalid camera id'); const v=await request(`/api/v1/cameras/${id}/health`, authorized('GET')); if (!isCameraHealth(v)) throw new Error('Invalid camera health'); return v; }
   async function cameraInventory(id: string): Promise<CameraInventoryProjection|null> { if(!isOpaqueId(id))throw new Error('Invalid camera id'); const v=await request(`/api/v1/cameras/${id}/inventory`,authorized('GET')); if(v!==null&&!isInventory(v))throw new Error('Invalid camera inventory'); return v as CameraInventoryProjection|null; }
-  async function cameraSnapshot(id: string, streamId?: string): Promise<Blob> { if(!isOpaqueId(id)||(streamId!==undefined&&!isOpaqueId(streamId)))throw new Error('Invalid camera id'); const response=await fetchImpl(apiUrl(`/api/v1/cameras/${id}/snapshot${streamId?`?stream_id=${encodeURIComponent(streamId)}`:''}`),authorized('GET')); if(!response.ok)throw new Error(`Request failed with status ${response.status}`); if(response.headers.get('content-type')?.split(';')[0] !== 'image/jpeg') throw new Error('Invalid camera snapshot media type'); const blob=await response.blob(); if(blob.size > 8*1024*1024) throw new Error('Camera snapshot exceeds safety bound'); return blob; }
-  async function startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse> { if(!isOpaqueId(id)||!isOpaqueId(streamId))throw new Error('Invalid camera session id'); const v=await request(`/api/v1/cameras/${id}/sessions`,{...authorized('POST'),headers:{Authorization:`Bearer ${serviceToken}`,'content-type':'application/json'},body:JSON.stringify({stream_id:streamId})}); if(!isSession(v))throw new Error('Invalid camera session'); return v; }
-  async function closeCameraSession(sessionId: string): Promise<void> { if(!isSessionId(sessionId))throw new Error('Invalid camera session id'); const response=await fetchImpl(apiUrl(`/api/v1/camera-sessions/${sessionId}`),{method:'DELETE',headers:{Authorization:`Bearer ${serviceToken}`}}); if(!response.ok)throw new Error(`Request failed with status ${response.status}`); }
+  async function cameraSnapshot(id: string, streamId?: string): Promise<Blob> { if(!isOpaqueId(id)||(streamId!==undefined&&!isOpaqueId(streamId)))throw new Error('Invalid camera id'); const response=await send(`/api/v1/cameras/${id}/snapshot${streamId?`?stream_id=${encodeURIComponent(streamId)}`:''}`,authorized('GET')); if(!response.ok)throw new ApiError(response.status); if(response.headers.get('content-type')?.split(';')[0] !== 'image/jpeg') throw new Error('Invalid camera snapshot media type'); const blob=await response.blob(); if(blob.size > 8*1024*1024) throw new Error('Camera snapshot exceeds safety bound'); return blob; }
+  async function startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse> { if(!isOpaqueId(id)||!isOpaqueId(streamId))throw new Error('Invalid camera session id'); const v=await request(`/api/v1/cameras/${id}/sessions`,authorized('POST',{stream_id:streamId})); if(!isSession(v))throw new Error('Invalid camera session'); return v; }
+  async function closeCameraSession(sessionId: string): Promise<void> { if(!isSessionId(sessionId))throw new Error('Invalid camera session id'); const response=await send(`/api/v1/camera-sessions/${sessionId}`,authorized('DELETE')); if(!response.ok)throw new ApiError(response.status); }
   async function policyAction(deviceId: string, action: OwnerActionInput): Promise<PolicyActionResult> {
     if (!isDeviceId(deviceId) || !isOwnerActionInput(action)) throw new Error('Invalid policy action');
-    const value = await request('/api/v1/policy/action', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${serviceToken}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ device_id: deviceId, action })
-    });
+    const value = await request('/api/v1/policy/action', authorized('POST', { device_id: deviceId, action }));
     if (!isPolicyActionResult(value)) throw new Error('Invalid policy action response');
     return value;
   }
   async function doctorRun(): Promise<DoctorRunOutcome> {
-    const response = await fetchImpl(apiUrl('/api/v1/doctor/run'), authorized('POST'));
+    const response = await send('/api/v1/doctor/run', authorized('POST'));
     // One diagnostic at a time: a concurrent run is a typed outcome, not an error.
     if (response.status === 409) return { status: 'already_running' };
-    if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+    if (!response.ok) throw new ApiError(response.status);
     const value: unknown = await response.json();
     if (!isDoctorRun(value)) throw new Error('Invalid doctor run response');
     return { status: 'completed', run: value };
   }
   async function doctorReport(): Promise<DoctorRun | null> {
-    const response = await fetchImpl(apiUrl('/api/v1/doctor/report'), authorized('GET'));
+    const response = await send('/api/v1/doctor/report', authorized('GET'));
     // 204: no diagnostic has completed yet.
     if (response.status === 204) return null;
-    if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+    if (!response.ok) throw new ApiError(response.status);
     const value: unknown = await response.json();
     if (!isDoctorRun(value)) throw new Error('Invalid doctor report response');
     return value;
   }
   async function doctorApprove(diagnosisKind: DiagnosisKind): Promise<DoctorApproval> {
     if (!isDiagnosisKind(diagnosisKind)) throw new Error('Invalid doctor approval request');
-    const value = await request('/api/v1/doctor/approvals', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${serviceToken}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ diagnosis_kind: diagnosisKind })
-    });
+    const value = await request('/api/v1/doctor/approvals', authorized('POST', { diagnosis_kind: diagnosisKind }));
     if (!isDoctorApproval(value)) throw new Error('Invalid doctor approval response');
     return value;
   }
@@ -691,19 +845,100 @@ export function createApiClient({ baseUrl, serviceToken, fetchImpl = fetch, WebS
     if (!isDiagnosisKind(diagnosisKind) || (approvalId !== undefined && !isApprovalIdToken(approvalId))) {
       throw new Error('Invalid doctor repair request');
     }
-    const value = await request('/api/v1/doctor/repair', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${serviceToken}`, 'content-type': 'application/json' },
-      body: JSON.stringify(approvalId === undefined ? { diagnosis_kind: diagnosisKind } : { diagnosis_kind: diagnosisKind, approval_id: approvalId })
-    });
+    const value = await request('/api/v1/doctor/repair', authorized('POST', approvalId === undefined ? { diagnosis_kind: diagnosisKind } : { diagnosis_kind: diagnosisKind, approval_id: approvalId }));
     if (!isRecord(value) || !exact(value, ['repair']) || !isRepairReport(value.repair)) throw new Error('Invalid doctor repair response');
     return value.repair;
   }
   function authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): void {
     const target = new URL(url, baseUrl); const origin = new URL(baseUrl).origin;
     if (target.origin !== origin || target.username || target.password || target.search || target.hash || target.pathname.includes('%') || !/^\/api\/v1\/camera-sessions\/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/(?:playlist\.m3u8|segments\/[A-Za-z0-9_.-]{1,255})$/.test(target.pathname)) throw new Error('Camera media request rejected');
-    xhr.setRequestHeader('Authorization', `Bearer ${serviceToken}`);
+    const header = credential();
+    if (header !== null) xhr.setRequestHeader('Authorization', header);
+  }
+  const isPairPhoneResponse = (value: unknown): value is PairPhoneResponse => isRecord(value) && exact(value, ['session_id', 'secret', 'expires_at'])
+    && typeof value.session_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.session_id)
+    && typeof value.secret === 'string' && /^[0-9a-f]{64}$/.test(value.secret) && isDate(value.expires_at);
+  async function auditPage(options: { before?: number; limit?: number; category?: AuditCategory; actor?: AuditActor; signal?: AbortSignal } = {}): Promise<AuditPage> {
+    const params = new URLSearchParams();
+    if (options.before !== undefined) { if (!isId(options.before)) throw new Error('Invalid audit cursor'); params.set('before', String(options.before)); }
+    if (options.limit !== undefined) { if (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 512) throw new Error('Invalid audit page'); params.set('limit', String(options.limit)); }
+    if (options.category !== undefined) params.set('category', options.category);
+    if (options.actor !== undefined) params.set('actor', options.actor);
+    const query = params.toString();
+    const value = await request(`/api/v1/audit${query ? `?${query}` : ''}`, authorized('GET'), options.signal);
+    if (!isAuditPage(value)) throw new Error('Invalid audit page response');
+    return value;
+  }
+  async function auditVerify(tail?: number): Promise<AuditVerify> {
+    if (tail !== undefined && (!Number.isSafeInteger(tail) || tail < 1 || tail > 10_000)) throw new Error('Invalid verify window');
+    const value = await request(`/api/v1/audit/verify${tail === undefined ? '' : `?tail=${tail}`}`, authorized('GET'));
+    if (!isAuditVerify(value)) throw new Error('Invalid audit verify response');
+    return value;
+  }
+  async function doctorSettings(): Promise<DoctorSettings> {
+    const value = await request('/api/v1/doctor/settings', authorized('GET'));
+    if (!isDoctorSettings(value)) throw new Error('Invalid doctor settings response');
+    return value;
+  }
+  async function updateDoctorSettings(update: DoctorSettingsUpdate): Promise<DoctorSettingsOutcome> {
+    const response = await send('/api/v1/doctor/settings', authorized('PUT', update));
+    if (response.status === 400) {
+      const body: unknown = await response.json().catch(() => null);
+      return { status: 'rejected', error: isRecord(body) && typeof body.error === 'string' ? body.error : 'The collector rejected these settings.' };
+    }
+    if (!response.ok) throw new ApiError(response.status);
+    const value: unknown = await response.json();
+    if (!isDoctorSettings(value)) throw new Error('Invalid doctor settings response');
+    return { status: 'saved', settings: value };
+  }
+  async function remoteStatus(): Promise<RemoteStatus> {
+    const value = await request('/api/v1/remote/status', authorized('GET'));
+    if (!isRemoteStatus(value)) throw new Error('Invalid remote status response');
+    return value;
+  }
+  async function remoteServe(): Promise<RemoteServe> {
+    const value = await request('/api/v1/remote/serve', authorized('POST'));
+    if (!isRemoteServe(value)) throw new Error('Invalid remote serve response');
+    return value;
+  }
+  async function remoteSessions(): Promise<PhoneSession[]> {
+    const value = await request('/api/v1/remote/sessions', authorized('GET'));
+    if (!isItemList(value, isPhoneSession)) throw new Error('Invalid sessions response');
+    return value.items;
+  }
+  async function revokePhoneSession(sessionId: string): Promise<void> {
+    if (!UUID.test(sessionId)) throw new Error('Invalid session id');
+    const response = await send(`/api/v1/remote/sessions/${sessionId}`, authorized('DELETE'));
+    if (!response.ok) throw new ApiError(response.status);
+  }
+  async function integrationTokens(): Promise<IntegrationToken[]> {
+    const value = await request('/api/v1/integrations/tokens', authorized('GET'));
+    if (!isItemList(value, isIntegrationToken)) throw new Error('Invalid tokens response');
+    return value.items;
+  }
+  async function mintIntegrationToken(name: string, scopes: IntegrationScope[]): Promise<MintedIntegrationToken> {
+    if (name.length === 0 || new TextEncoder().encode(name).length > 128 || scopes.length === 0 || scopes.length > 4 || !scopes.every((scope) => INTEGRATION_SCOPES.includes(scope))) throw new Error('Invalid token request');
+    const value = await request('/api/v1/integrations/tokens', authorized('POST', { name, scopes }));
+    if (!isMintedIntegrationToken(value)) throw new Error('Invalid token response');
+    return value;
+  }
+  async function revokeIntegrationToken(id: string): Promise<void> {
+    if (!UUID.test(id)) throw new Error('Invalid token id');
+    const response = await send(`/api/v1/integrations/tokens/${id}`, authorized('DELETE'));
+    if (!response.ok) throw new ApiError(response.status);
+  }
+  async function pairPhone(deviceLabel: string, pin: string): Promise<PairPhoneResponse> {
+    if (deviceLabel.length === 0 || new TextEncoder().encode(deviceLabel).length > 128 || !/^[0-9]{6}$/.test(pin)) throw new Error('Invalid pairing request');
+    const value = await request('/api/v1/remote/pair', authorized('POST', { device_label: deviceLabel, pin }));
+    if (!isPairPhoneResponse(value)) throw new Error('Invalid pairing response');
+    return value;
+  }
+  async function stepUp(pin: string): Promise<StepupResult> {
+    if (!/^[0-9]{6}$/.test(pin)) throw new Error('Invalid PIN');
+    const value = await request('/api/v1/remote/stepup', authorized('POST', { pin }));
+    if (!isRecord(value) || !exact(value, ['expires_at']) || !isDate(value.expires_at)) throw new Error('Invalid step-up response');
+    return { expires_at: value.expires_at };
   }
 
-  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, doctorRun, doctorReport, doctorApprove, doctorRepair };
+  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, doctorRun, doctorReport, doctorApprove, doctorRepair, auditPage, auditVerify, doctorSettings, updateDoctorSettings, remoteStatus, remoteServe, remoteSessions, revokePhoneSession, integrationTokens, mintIntegrationToken, revokeIntegrationToken, pairPhone, stepUp };
 }

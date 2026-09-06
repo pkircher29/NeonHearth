@@ -154,7 +154,7 @@ async fn link_layer_identity_lookup_survives_reopen_and_migration_is_indexed() -
         sqlx::query_scalar::<_, i64>("SELECT schema_version FROM install_state WHERE singleton=1")
             .fetch_one(&pool)
             .await?,
-        18
+        lattice_store::latest_migration_version()
     );
     let indexes: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_index_list('evidence')")
         .fetch_all(&pool)
@@ -622,12 +622,15 @@ async fn migration_sets_current_version_and_enforces_m2_foreign_keys_and_indexes
     let install = lattice_store::InstallRepository::new(pool.clone())
         .initialize(time(0))
         .await?;
-    assert_eq!(install.schema_version, 18);
+    assert_eq!(
+        install.schema_version,
+        lattice_store::latest_migration_version()
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT schema_version FROM install_state WHERE singleton=1")
             .fetch_one(&pool)
             .await?,
-        18
+        lattice_store::latest_migration_version()
     );
     let indexes: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_index_list('evidence')")
         .fetch_all(&pool)
@@ -639,5 +642,50 @@ async fn migration_sets_current_version_and_enforces_m2_foreign_keys_and_indexes
     );
     let fk = sqlx::query("INSERT INTO presence_transitions(transition_id,device_id,from_state,to_state,occurred_at,reason,trigger_source,trigger_kind,evidence_observed_at,trigger_arrival_at) VALUES(99,'missing','unknown','online','2026-08-23T00:00:00Z','test','test','test','2026-08-23T00:00:00Z','2026-08-23T00:00:00Z')").execute(&pool).await;
     assert!(fk.is_err());
+    Ok(())
+}
+
+/// The checkpoint checksum moved from JSON-encoding the blob (as an integer
+/// array) to hashing the raw bytes. Rows written by earlier builds still carry
+/// the old checksum and must keep loading; a tampered blob must fail under
+/// both schemes.
+#[tokio::test]
+async fn legacy_json_checkpoint_checksum_still_loads_and_tampering_still_fails()
+-> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let pool = lattice_store::connect_memory().await?;
+    let repo = M2StateRepository::new(pool.clone());
+    let commit = input(1, [7; 32]);
+    repo.commit(commit.clone()).await?;
+    let fingerprint = commit.checkpoint.source_fingerprint.clone();
+    assert!(repo.load(&fingerprint).await?.is_some());
+
+    // Rewrite the stored checksum with the legacy scheme.
+    let cp = &commit.checkpoint;
+    let legacy = Sha256::digest(serde_json::to_vec(&serde_json::json!({
+        "checkpoint_bytes": cp.bytes,
+        "commit_sequence": cp.commit_sequence,
+        "format_version": cp.format_version,
+        "source_fingerprint": cp.source_fingerprint,
+        "written_at": cp.written_at.to_rfc3339(),
+    }))?)
+    .to_vec();
+    sqlx::query("UPDATE state_checkpoints SET sha256=? WHERE singleton=1")
+        .bind(&legacy)
+        .execute(&pool)
+        .await?;
+    let loaded = repo.load(&fingerprint).await?.expect("legacy row loads");
+    assert_eq!(loaded.bytes, cp.bytes);
+
+    // A blob edit is caught whichever scheme the row carries.
+    sqlx::query("UPDATE state_checkpoints SET checkpoint_bytes=? WHERE singleton=1")
+        .bind(br#"{"version":2}"#.as_slice())
+        .execute(&pool)
+        .await?;
+    let error = repo.load(&fingerprint).await.unwrap_err();
+    assert!(
+        matches!(error, CheckpointError::Corrupt(ref reason) if reason.contains("checksum")),
+        "{error:?}"
+    );
     Ok(())
 }

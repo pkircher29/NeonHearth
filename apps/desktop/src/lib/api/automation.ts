@@ -42,10 +42,10 @@ export function isAutomationSnapshot(v: unknown): v is AutomationSnapshot {
         && text(e.entity_id) && text(e.name) && text(e.state) && nullable(e.area) && nullable(e.platform)
         && nullable(e.last_changed) && nullable(e.last_updated) && typeof e.power_capable === 'boolean' && typeof e.control_enabled === 'boolean'));
 }
-export function createAutomationApi(serviceToken: string, fetchImpl: typeof fetch = fetch): AutomationApi {
+export function createAutomationApi(serviceToken: string | { header(): string | null }, fetchImpl: typeof fetch = fetch): AutomationApi {
   async function request(path: string, method = 'GET', body?: unknown): Promise<unknown> {
     const response = await fetchImpl(`/api/v1/automation${path}`, {
-      method, headers: { Authorization: `Bearer ${serviceToken}`, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
+      method, headers: { Authorization: typeof serviceToken === 'string' ? `Bearer ${serviceToken}` : serviceToken.header() ?? '', ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(path === '/commands' ? 25_000 : 10_000),
     });
     if (!response.ok) {

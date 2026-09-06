@@ -60,6 +60,7 @@ exceptions = [
     { name = "lattice-intelligence", allow = ["AGPL-3.0-or-later"] },
     { name = "lattice-policy", allow = ["AGPL-3.0-or-later"] },
     { name = "lattice-service", allow = ["AGPL-3.0-or-later"] },
+    { name = "lattice-launcher", allow = ["AGPL-3.0-or-later"] },
     { name = "lattice-advisory", allow = ["AGPL-3.0-or-later"] },
     { name = "lattice-audit-wasm", allow = ["AGPL-3.0-or-later"] },
     { name = "lattice-w6", allow = ["AGPL-3.0-or-later"] },

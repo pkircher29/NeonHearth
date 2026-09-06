@@ -1,10 +1,15 @@
 <script lang="ts">
   import type { DeviceSnapshot, PresenceState } from '../api/types';
   import type { NetworkDetails } from '../api/automation';
+  import type { ScanApi, ScanStatus } from '../api/networkScan';
+  import NetworkScanPanel from './NetworkScanPanel.svelte';
+  let scan = $state<ScanStatus | null>(null);
   import type { LiveState } from '../stores/live';
+  import { formatThroughput } from './networkFormat';
   import { compareIpKeys, deviceIpSortKey } from '../ipSort';
-  let { liveState = null, network = null }: { liveState?: LiveState | null; network?: NetworkDetails | null } = $props();
+  let { liveState = null, network = null, scanApi = null, initialQuery = '' }: { scanApi?: ScanApi | null; initialQuery?: string; liveState?: LiveState | null; network?: NetworkDetails | null } = $props();
   let query = $state('');
+  $effect(() => { query = initialQuery; });
   let tab = $state('all' as 'all' | 'confirmed' | 'needs-confirm');
   let sort = $state('ip-asc' as 'ip-asc' | 'ip-desc' | 'discovery');
   const details = $derived(new Map(network?.devices.map(device => [device.device_id, device]) ?? []));
@@ -26,15 +31,16 @@
     return 'Needs evidence';
   }
   function presenceLabel(value: PresenceState): string { return value === 'unknown' ? 'Presence unavailable' : value; }
-  function bytes(device: DeviceSnapshot): string { return device.bandwidth.available ? `${Math.round(((device.bandwidth.upload ?? 0) + (device.bandwidth.download ?? 0)) / 1_000_000)} Mbps` : 'Not measured'; }
+  function bytes(device: DeviceSnapshot): string { return device.bandwidth.available ? formatThroughput((device.bandwidth.upload ?? 0) + (device.bandwidth.download ?? 0)) : 'Not measured'; }
   function seen(value: string): string { return new Date(value).toLocaleString([], { dateStyle:'medium', timeStyle:'short' }); }
 </script>
 
 <section class="devices-view" aria-labelledby="devices-heading">
   <div class="view-heading"><div><p class="kicker">DEVICES / IDENTITY</p><h1 id="devices-heading">Know what is home.</h1><p class="muted">See network addresses, first observations, and device names reported by Home Assistant.</p></div></div>
+  {#if scanApi}<NetworkScanPanel api={scanApi} onchange={value => scan = value}/>{/if}
   <label class="search"><span>Search devices</span><input bind:value={query} placeholder="Name, IP, MAC address, or room" /></label>
   <div class="device-controls">
-    <div class="tabs" role="tablist">{#each [['all','All'],['confirmed','Confirmed'],['needs-confirm','Needs confirm']] as item}<button class:active={tab === item[0]} onclick={() => tab = item[0] as typeof tab} role="tab" aria-selected={tab === item[0]}>{item[1]}</button>{/each}</div>
+    <div class="tabs" role="group" aria-label="Filter devices">{#each [['all','All'],['confirmed','Confirmed'],['needs-confirm','Needs confirm']] as item}<button class:active={tab === item[0]} onclick={() => tab = item[0] as typeof tab} aria-pressed={tab === item[0]}>{item[1]}</button>{/each}</div>
     <label class="sort-control"><span>Sort by</span><select aria-label="Sort devices" bind:value={sort}><option value="ip-asc">IP address: low to high</option><option value="ip-desc">IP address: high to low</option><option value="discovery">Discovery order</option></select></label>
   </div>
   {#if network?.status === 'unavailable'}<p class="muted" role="status">Current IP addresses are unavailable. Saved hardware addresses remain visible.</p>{/if}
@@ -44,6 +50,7 @@
     <div class="device-table">{#each visible as device (device.device_id)}
       {@const info = details.get(device.device_id)}
       {@const hint = info?.home_assistant}
+      {@const findings = scan?.findings.filter(f => f.device_id === device.device_id) ?? []}
       <article class="device-card">
         <div class="device-name"><span class="presence-dot {device.presence.state}" aria-hidden="true"></span><div><strong>{device.owner_name ?? hint?.name ?? (info?.mac_addresses[0] ? `Device ${info.mac_addresses[0]}` : `Device …${device.device_id.slice(-8)}`)}</strong><span>{device.identity.classification ?? (hint ? [hint.manufacturer,hint.model].filter(Boolean).join(' · ') || 'Home Assistant device' : 'Type not yet identified')} · {presenceLabel(device.presence.state)}</span></div></div>
         <span class="confidence {device.owner_confirmed ? 'confirmed' : 'likely'}"><span aria-hidden="true">{device.owner_confirmed ? '✓' : '△'}</span> {confidence(device)}</span>
@@ -53,12 +60,19 @@
         <p><b>Evidence</b>{device.evidence ? `${device.evidence.family.replaceAll('_', ' ')} via ${device.evidence.source}` : 'No identity evidence'}</p>
         <p><b>Bandwidth</b>{bytes(device)}{device.bandwidth.coverage ? ` · ${device.bandwidth.coverage}` : ''}</p>
         <p><b>First / last seen</b>{seen(device.first_seen_at)} → {seen(device.last_seen_at)}</p>
+        {#if findings.length}
+          <details class="scan-findings"><summary>Discovery results · {findings.filter(f => f.status === 'open').length} open ports</summary>
+            {#each findings as finding}<p><b>{finding.protocol === 'tcp' ? `TCP ${finding.port}` : finding.protocol.replaceAll('_',' ')} · {finding.status.replaceAll('_',' ')}</b>{finding.service_hint ? `${finding.service_hint} (port hint)` : ''}{Object.entries(finding.facts).map(([key,value]) => `${key}: ${value}`).join(' · ')}</p>{/each}
+            <small>Observed {scan?.finished_at ? seen(scan.finished_at) : 'during the current scan'}. Reported metadata needs your verification.</small>
+          </details>
+        {/if}
         <p><b>Owner confirmation</b>{device.owner_confirmed ? 'Confirmed by you' : 'Needs your confirmation'}</p>
       </article>
     {/each}</div>
   {/if}
 </section>
 <style>
+  .scan-findings{overflow-wrap:anywhere;border-top:1px solid var(--line);padding-top:10px}.scan-findings summary{cursor:pointer}.scan-findings p{display:block}
   .addresses { overflow-wrap:anywhere }.device-name>div { min-width:0;overflow-wrap:anywhere }
   .device-controls { display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:1.5rem }
   .device-controls .tabs { margin-bottom:0 }

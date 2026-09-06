@@ -309,8 +309,9 @@ dedicated virtual account `NT SERVICE\NeonHearth` with restart-on-failure
 recovery (5s/5s/30s, 24h reset — both via `util:ServiceConfig` and mirrored
 with `sc.exe failure` in the configure script), then runs
 `configure-service.ps1` which generates the pairing token into the
-service-private `Environment` registry value, grants the state-dir ACL,
-detects Npcap (adding a service-local `PATH` entry when Npcap lacks
+service-private `Environment` registry value, sets explicit non-inherited
+ACLs on both the state directory and the service registry key, points the
+service at a bundled ffmpeg when present, detects Npcap (adding a service-local `PATH` entry when Npcap lacks
 WinPcap-compat DLLs in System32), and starts the service — or engages
 limited mode when Npcap is absent. Uninstall stops/deletes the service and
 removes program files; the state directory survives with a note.
@@ -322,6 +323,50 @@ hardened unit, the sysusers fragment, and UI assets;
 and enables/starts the unit. `StateDirectory=neonhearth` owns
 `/var/lib/neonhearth`; package removal never deletes it (note file written
 at install).
+
+## Audit remediation, 2026-09-03 (authored; not yet exercised on a real install)
+
+Changes made in response to the codebase audit. None of them has been run
+through `wix build`, an MSI install, or a package install yet, for the same
+reasons listed above; they are parser-checked only (`bash -n` / `sh -n`
+for shell, PyYAML for nfpm, XML well-formedness for the .wxs; no PowerShell
+parser was available on the Linux session that authored them).
+
+- **H-1, pairing token readable by every local user.** The service registry
+  key (`HKLM\SYSTEM\CurrentControlSet\Services\NeonHearth`) inherits
+  `BUILTIN\Users: Read`, and the token lives in its `Environment` value.
+  `configure-service.ps1` now disables inheritance on that key and sets an
+  explicit ACL: SYSTEM and Administrators full control, `NT SERVICE\NeonHearth`
+  read only. This closes the read path without changing how the service
+  receives the token (still the process environment, `main.rs` unchanged).
+  **Follow-up that needs a Rust change:** move the token out of the registry
+  entirely into a DPAPI-protected file (machine scope, or the service SID's
+  user scope) under the state directory, and have `main.rs` accept a
+  `LATTICE_SERVICE_TOKEN_FILE` path as an alternative to the env var. Until
+  then any process running as SYSTEM or an administrator can still read it,
+  which is the accepted boundary.
+- **H-2, state directory inherits ProgramData's ACL.** The script now calls
+  `SetAccessRuleProtection($true, $false)` on `%ProgramData%\NeonHearth` and
+  rebuilds the ACL from scratch on every run: SYSTEM / Administrators full,
+  service account modify, nothing else. Idempotent; re-running the script
+  repairs a hand-edited ACL.
+- **M-4, major upgrade regenerated the token.** `MajorUpgrade` is now
+  `Schedule="afterInstallExecute"`; see the comment in the .wxs for the
+  sequencing argument. Verify on the first real upgrade that the token in
+  the service `Environment` value is unchanged afterwards.
+- **M-18, ffmpeg not packaged.** `nfpm.yaml` declares a dependency on
+  `ffmpeg` (deb) / `/usr/bin/ffmpeg` (rpm, satisfied by `ffmpeg-free` or
+  RPM Fusion `ffmpeg`). The MSI gains an opt-in `BundledFfmpeg` component
+  group (`wix build ... -d BundleFfmpeg=1` with `ffmpeg.exe` staged in
+  `dist\windows\bin`) that installs the binary flat in the install folder,
+  and `configure-service.ps1` sets `NEONHEARTH_FFMPEG` in the service
+  environment when it finds one there. The service side reads
+  `NEONHEARTH_FFMPEG` (camera crate change made in the same remediation).
+  Shipping ffmpeg in the MSI means shipping its licence text too.
+- **LOW, `postinstall.sh`.** `systemctl enable` now runs only on a fresh
+  install (dpkg `configure ""` / rpm `1`, with a token-file fallback), so an
+  administrator's `disable` survives upgrades; sysusers and chown failures
+  abort the install with a message instead of being swallowed.
 
 ## What remains before RLS4 / RLS5 can be checked
 

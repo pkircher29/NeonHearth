@@ -1,4 +1,5 @@
 pub mod api;
+pub mod audit_api;
 mod auth;
 pub mod automation;
 pub mod cameras;
@@ -7,6 +8,7 @@ pub mod doctor;
 pub mod home;
 pub mod integrations;
 pub mod mqtt;
+pub mod network_scan;
 pub mod platform;
 pub mod policy;
 pub mod runtime;
@@ -25,7 +27,17 @@ use axum::{
 pub use platform::{Platform, PlatformPaths, platform_paths};
 use serde::Deserialize;
 pub use state::{AppState, InvalidServiceToken, ServiceRuntimeStatus};
-pub use vault::{CredentialRef, FakeVault, KeyringVault, Vault, VaultCapability, VaultError};
+use tower_http::timeout::TimeoutLayer;
+pub use vault::{
+    CredentialRef, FakeVault, FileVault, KeyringVault, Vault, VaultBackend, VaultCapability,
+    VaultError, platform_vault,
+};
+
+/// Upper bound on any single request. Comfortably above the 25s integration
+/// long-poll cap; everything else answers in milliseconds. A stalled handler
+/// (a wedged store, a client that never finishes sending) is answered with
+/// 408 instead of holding its task forever.
+const REQUEST_TIMEOUT_SECS: u64 = 60;
 pub fn app(state: AppState) -> Router {
     let doctor = doctor::DoctorState::for_service(&state);
     app_with_doctor(state, doctor)
@@ -74,6 +86,7 @@ pub fn app_with_parts(
     doctor: doctor::DoctorState,
     remote: tailscale::RemoteAccessState,
 ) -> Router {
+    let audit = audit_api::AuditApiState::for_service(&state);
     Router::new()
         .route("/api/v1/health", get(api::health))
         .route("/api/v1/state", get(api::state))
@@ -160,10 +173,16 @@ pub fn app_with_parts(
         )
         .merge(doctor::routes(doctor))
         .merge(automation::routes())
+        .merge(network_scan::routes())
+        .merge(audit_api::routes(audit))
         .layer(axum::Extension(remote.clone()))
         .layer(axum::middleware::from_fn_with_state(
             remote,
             tailscale::remote_access_layer,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ))
         .with_state(state)
         .layer(axum::middleware::from_fn(security::browser_boundary))

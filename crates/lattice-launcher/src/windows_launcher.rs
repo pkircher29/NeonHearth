@@ -111,8 +111,7 @@ pub(super) fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    Ok(serde_json::from_slice(&read_bounded(path, 16384)?)
-        .context("Local configuration is invalid")?)
+    serde_json::from_slice(&read_bounded(path, 16384)?).context("Local configuration is invalid")
 }
 pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if path.exists() {
@@ -454,8 +453,9 @@ pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
         let child = command
             .spawn()
             .context("Could not start the packaged collector")?;
-        let stamp = platform::process_stamp(child.id(), &binary)?;
+        let child_id = child.id();
         started.children.push(child);
+        let stamp = platform::process_stamp(child_id, &binary)?;
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             ensure!(

@@ -204,7 +204,7 @@ describe('createHomeApi', () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200 }));
     const api = createHomeApi({ ...options, fetchImpl });
     await expect(api.fetchHome()).resolves.toEqual(snapshot);
-    expect(fetchImpl).toHaveBeenCalledWith('https://collector.example/api/v1/home', { method: 'GET', headers: { Authorization: 'Bearer secret' } });
+    expect(fetchImpl).toHaveBeenCalledWith('https://collector.example/api/v1/home', { method: 'GET', headers: { Authorization: 'Bearer secret' }, signal: expect.any(AbortSignal) });
     const malformed = vi.fn(async () => new Response(JSON.stringify({ plan: { ...fixturePlan(), version: -1 }, placements: [], estimates: [] }), { status: 200 }));
     await expect(createHomeApi({ ...options, fetchImpl: malformed }).fetchHome()).rejects.toThrow('Invalid home response');
   });

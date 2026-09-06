@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 const require = createRequire(new URL('../apps/desktop/package.json', import.meta.url));
 const { chromium, expect } = require('@playwright/test');
 const root = fileURLToPath(new URL('../', import.meta.url));
-const connection = JSON.parse(await readFile(root + '.local/qa-runtime-v2/connection.json', 'utf8'));
+const connection = JSON.parse(await readFile(process.env.NEONHEARTH_QA_CONNECTION || root + '.local/qa-runtime-v2/connection.json', 'utf8'));
 const artifact = root + 'artifacts/home-hub-verification/';
 await mkdir(artifact, { recursive: true });
 async function api(path, method = 'GET', body) {

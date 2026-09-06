@@ -195,8 +195,9 @@ pub(super) fn ensure(
     let child = command
         .spawn()
         .context("Could not start the packaged MQTT hub")?;
-    let stamp = platform::process_stamp(child.id(), &binary)?;
+    let child_id = child.id();
     started.children.push(child);
+    let stamp = platform::process_stamp(child_id, &binary)?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         ensure!(

@@ -181,4 +181,58 @@ describe('HomeEditorView', () => {
     await fireEvent.keyDown(canvas, { key: 'ArrowRight' });
     expect(api.putPlacement).toHaveBeenCalledWith(expect.objectContaining({ device_id: deviceA, x: 1.6, y: 2.0 }));
   });
+
+  it('coalesces a burst of nudges into one in-flight write plus the newest position (M-29)', async () => {
+    const placements: Placement[] = [{ placement_id: placementId, device_id: deviceA, floor_id: groundId, x: 1.5, y: 2.0, height_m: 1.1, mounting: 'wall' }];
+    const resolvers: Array<() => void> = [];
+    const putPlacement = vi.fn(() => new Promise<void>((resolve) => { resolvers.push(resolve); }));
+    const api = apiStub({ putPlacement }, { placements });
+    const view = render(HomeEditorView, { api, devices });
+    await screen.findByRole('button', { name: /Ground/ });
+    await fireEvent.click(view.container.querySelector(`.placement[data-device-id="${deviceA}"]`)!);
+    const canvas = view.container.querySelector('.plan-canvas')!;
+    for (let step = 0; step < 6; step += 1) await fireEvent.keyDown(canvas, { key: 'ArrowRight' });
+
+    // Six nudges, one request on the wire while it is pending.
+    expect(putPlacement).toHaveBeenCalledTimes(1);
+    expect(putPlacement).toHaveBeenLastCalledWith(expect.objectContaining({ x: 1.6 }));
+    resolvers[0]!();
+    await Promise.resolve();
+    await Promise.resolve();
+    // The queued write carries the final position, not the five intermediate ones.
+    expect(putPlacement).toHaveBeenCalledTimes(2);
+    expect(putPlacement).toHaveBeenLastCalledWith(expect.objectContaining({ x: 2.1 }));
+    resolvers[1]!();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(putPlacement).toHaveBeenCalledTimes(2);
+  });
+
+  it('rolls a placement back to the last server-acknowledged position when the write fails', async () => {
+    const placements: Placement[] = [{ placement_id: placementId, device_id: deviceA, floor_id: groundId, x: 1.5, y: 2.0, height_m: 1.1, mounting: 'wall' }];
+    const api = apiStub({ putPlacement: vi.fn(async () => { throw new Error('Request failed with status 503'); }) }, { placements });
+    const onsnapshot = vi.fn();
+    const view = render(HomeEditorView, { api, devices, onsnapshot });
+    await screen.findByRole('button', { name: /Ground/ });
+    const marker = view.container.querySelector(`.placement[data-device-id="${deviceA}"]`)!;
+    await fireEvent.click(marker);
+    await fireEvent.keyDown(view.container.querySelector('.plan-canvas')!, { key: 'ArrowRight' });
+    expect(api.putPlacement).toHaveBeenCalledWith(expect.objectContaining({ x: 1.6 })); // the optimistic move went out
+    await screen.findByText(/could not be saved to the service/);
+    expect(view.container.querySelector(`.placement[data-device-id="${deviceA}"] circle`)!.getAttribute('cx')).toBe('60'); // back to 1.5 m
+    // The parent hears the optimistic move and the rollback.
+    expect(onsnapshot).toHaveBeenCalled();
+    expect(onsnapshot.mock.lastCall![0].placements[0]).toMatchObject({ device_id: deviceA, x: 1.5 });
+  });
+
+  it('adopts a parent-provided snapshot without fetching and reports committed saves (M-27)', async () => {
+    const api = apiStub({}, { placements: [] });
+    const onsnapshot = vi.fn();
+    render(HomeEditorView, { api, devices, snapshot: { plan: fixturePlan(), placements: [], estimates: [] }, onsnapshot });
+    await screen.findByRole('button', { name: /Ground/ });
+    expect(api.fetchHome).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Save plan' }));
+    await screen.findByText(/Plan saved as version 4/);
+    expect(onsnapshot).toHaveBeenCalledWith(expect.objectContaining({ plan: expect.objectContaining({ version: 4 }) }));
+  });
 });

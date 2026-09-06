@@ -266,7 +266,7 @@ impl RepairExecutor {
             }
         };
 
-        let baseline = match measure_symptom(transport, symptom).await {
+        let baseline = match measure_symptom(transport, symptom).await.and_then(finite) {
             Ok(measurement) => measurement,
             Err(error) => {
                 return finish(
@@ -291,7 +291,15 @@ impl RepairExecutor {
                 error: error.to_string(),
             });
             // A mid-apply failure may have left partial state: roll back.
-            let rollback = roll_back(transport, repair, &snapshot, &mut events).await;
+            let rollback = roll_back(
+                transport,
+                repair,
+                &snapshot,
+                symptom,
+                &baseline,
+                &mut events,
+            )
+            .await;
             return finish(
                 class,
                 description,
@@ -305,7 +313,9 @@ impl RepairExecutor {
         }
         events.push(RepairEventKind::Applied);
 
-        let after = match measure_symptom(transport, symptom).await {
+        // A non-finite re-measurement (NaN from a divide-by-zero, an infinite
+        // latency) is not "unchanged": it is unverifiable, so treat it as such.
+        let after = match measure_symptom(transport, symptom).await.and_then(finite) {
             Ok(measurement) => measurement,
             Err(error) => {
                 events.push(RepairEventKind::VerificationFailed {
@@ -313,7 +323,15 @@ impl RepairExecutor {
                 });
                 // Unverifiable state is unacceptable for a reversible action:
                 // return to the snapshot.
-                let rollback = roll_back(transport, repair, &snapshot, &mut events).await;
+                let rollback = roll_back(
+                    transport,
+                    repair,
+                    &snapshot,
+                    symptom,
+                    &baseline,
+                    &mut events,
+                )
+                .await;
                 return finish(
                     class,
                     description,
@@ -331,17 +349,25 @@ impl RepairExecutor {
             before: baseline.clone(),
             after: after.clone(),
         });
-        let verification = Verification {
-            verdict,
-            before: baseline,
-            after,
-        };
         let rollback = if verdict == Verdict::Regressed {
-            roll_back(transport, repair, &snapshot, &mut events).await
+            roll_back(
+                transport,
+                repair,
+                &snapshot,
+                symptom,
+                &baseline,
+                &mut events,
+            )
+            .await
         } else {
             RollbackOutcome::NotAttempted {
                 reason: RollbackSkipReason::NotNeeded,
             }
+        };
+        let verification = Verification {
+            verdict,
+            before: baseline,
+            after,
         };
         finish(
             class,
@@ -374,15 +400,46 @@ async fn measure_symptom<T: RepairTransport>(
         })
 }
 
+/// Rejects a measurement whose value cannot be compared.
+fn finite(measurement: Measurement) -> Result<Measurement, String> {
+    if measurement.value.is_finite() {
+        Ok(measurement)
+    } else {
+        Err(format!(
+            "symptom metric {:?} measured a non-finite value ({})",
+            measurement.metric, measurement.value
+        ))
+    }
+}
+
+/// Restores the snapshot and then *proves* it by re-measuring the symptom: a
+/// rollback whose restore call returned `Ok` but left the symptom regressed
+/// against the baseline is reported as failed, not succeeded.
 async fn roll_back<T: RepairTransport>(
     transport: &T,
     repair: &ExecutableRepair,
     snapshot: &[StateEntry],
+    symptom: &Symptom,
+    baseline: &Measurement,
     events: &mut EventLog,
 ) -> RollbackOutcome {
     let outcome = if repair.reversible() {
         match transport.restore(snapshot).await {
-            Ok(()) => RollbackOutcome::Succeeded,
+            Ok(()) => match measure_symptom(transport, symptom).await.and_then(finite) {
+                Ok(restored) => match compare(symptom, baseline.value, restored.value) {
+                    Verdict::Regressed => RollbackOutcome::Failed {
+                        error: format!(
+                            "restore succeeded but the symptom did not return to baseline: \
+                             before {} after rollback {}",
+                            baseline.value, restored.value
+                        ),
+                    },
+                    Verdict::Improved | Verdict::Unchanged => RollbackOutcome::Succeeded,
+                },
+                Err(error) => RollbackOutcome::Failed {
+                    error: format!("restore succeeded but could not be verified: {error}"),
+                },
+            },
             Err(error) => RollbackOutcome::Failed {
                 error: error.to_string(),
             },

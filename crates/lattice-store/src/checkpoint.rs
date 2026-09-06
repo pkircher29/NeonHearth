@@ -1020,6 +1020,9 @@ fn validate_checkpoint(
     }
     if checksum
         != checkpoint_checksum_fields(version, bytes, fingerprint, sequence, written_at).as_slice()
+        && checksum
+            != legacy_checkpoint_checksum_fields(version, bytes, fingerprint, sequence, written_at)
+                .as_slice()
     {
         return Err(error("checksum mismatch".into()));
     }
@@ -1075,7 +1078,37 @@ async fn verify_idempotent_checkpoint(
     }
     Ok(())
 }
+/// Domain separator for the current checkpoint checksum scheme.
+const CHECKPOINT_CHECKSUM_DOMAIN: &[u8] = b"neonhearth.state-checkpoint.checksum.v2";
+
+/// SHA-256 over a domain constant, the two integer fields big-endian, and the
+/// three byte fields length-prefixed. Hashing the raw blob (instead of a JSON
+/// integer array of it) keeps the cost proportional to the checkpoint size,
+/// not to ~3.5x its size in JSON text.
 fn checkpoint_checksum_fields(
+    version: i64,
+    bytes: &[u8],
+    fingerprint: &str,
+    sequence: i64,
+    written_at: DateTime<Utc>,
+) -> Vec<u8> {
+    let written_at = written_at.to_rfc3339();
+    let mut hasher = Sha256::new();
+    hasher.update(CHECKPOINT_CHECKSUM_DOMAIN);
+    hasher.update(version.to_be_bytes());
+    hasher.update(sequence.to_be_bytes());
+    for field in [fingerprint.as_bytes(), written_at.as_bytes(), bytes] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    hasher.finalize().to_vec()
+}
+/// The checksum scheme used before the length-prefixed one: every field
+/// JSON-encoded, with the checkpoint blob as an integer array. Rows written
+/// by earlier builds still carry it, so validation accepts it as a fallback
+/// (computed only when the current scheme does not match) and the next
+/// commit rewrites the row with the current scheme.
+fn legacy_checkpoint_checksum_fields(
     version: i64,
     bytes: &[u8],
     fingerprint: &str,

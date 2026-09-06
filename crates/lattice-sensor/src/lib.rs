@@ -20,7 +20,8 @@ pub mod passive;
 #[cfg(windows)]
 mod windows_interfaces;
 pub use passive::{
-    OfflinePassiveAdapter, PassiveAdapter, PassiveObservation, PassiveOptions, PassiveParseError,
+    MAX_SKIPPED_FRAMES, OfflinePassiveAdapter, PassiveAdapter, PassiveObservation, PassiveOptions,
+    PassiveParseError, PcapIngest,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

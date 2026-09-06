@@ -8,6 +8,8 @@ export interface TwinRenderer {
   setPixelRatio(ratio: number): void;
   render(scene: Scene, camera: Camera): void;
   dispose(): void;
+  /** Releases the GL context immediately; browsers cap live contexts (~16). */
+  forceContextLoss?(): void;
 }
 
 /** True when the environment can hand out a WebGL (or WebGL2) context. */

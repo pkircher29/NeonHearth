@@ -1,15 +1,20 @@
 # Network and home automation hub
 
-Open **Start-NeonHearth.cmd** from the repository folder. This local Windows
-release build opens the dashboard and starts the authenticated MQTT hub. It requires
-the built service, the desktop bundle, Python 3, and Npcap on this development
-machine. It is not yet a signed, independently audited customer installer.
+Open **NeonHearth.exe** in the Windows portable package. It starts the collector
+and authenticated MQTT hub and pairs your browser. The native launcher needs no
+Python, Node, administrator account, or packet-capture driver. Mosquitto needs
+the Microsoft Visual C++ x64 runtime; see the package's `Read me.txt`.
+The package is unsigned. Developers can still use **Start-NeonHearth.cmd**
+with Python and a locally built service and desktop bundle.
 
 The dashboard uses `http://127.0.0.1:58121`. The launcher pairs the browser;
 opening that address in an unpaired browser does not grant access to device
-data. Private configuration and observations are under `.local/`, excluded
-from Git. The existing installed NeonHearth service and its database are not
-used by this build.
+data. The native launcher stores private configuration and observations under
+`%LOCALAPPDATA%/NeonHearthHomeHub`, protects the owner credential with Windows
+DPAPI, and restricts directory access to the current user and SYSTEM. Development
+launchers use `.local/`, excluded from Git. Existing installed services keep
+their separate state. `NeonHearth.exe --status` checks this instance; `--stop`
+stops its verified processes while preserving data.
 
 ## Use the dashboard
 
@@ -18,7 +23,9 @@ used by this build.
    Wi-Fi association times require access-point telemetry. A host cannot see
    every packet on a switched network or discover an unobserved sleeping device.
    Unambiguous Home Assistant MAC matches supply name/model/room hints. They
-   never merge ownership records or enable control automatically.
+   never merge ownership records or enable control automatically. **Sort devices**
+   offers numeric IP order in either direction, or discovery order; devices
+   without an address appear last.
 2. **Automation** connects to Home Assistant. Enter its HTTPS address and a
    token from a dedicated account in the password field. Names, manufacturers,
    models, MAC addresses when reported, rooms, entities, and state changes are
@@ -32,6 +39,17 @@ used by this build.
    home and isolate floors. Home Assistant room names help placement; they do
    not supply physical coordinates. HA imports retain stable IDs across
    reconnects to the same server, so saved placements survive.
+5. Select **Measurement units** in Home to use metric or imperial measurements.
+   Length inputs show meters or decimal feet; imperial drawing snaps to one inch.
+   Changing units preserves the geometry and saves your display preference.
+   **Copy footprint** copies walls, openings, and rooms to a new floor above
+   or an existing empty floor. Devices stay on their original floor. Copies
+   have independent identifiers, can be edited separately, and support Undo.
+6. In **Devices**, expand **Identify devices with a network scan**. Choose common
+   ports, all TCP ports, specific ports, or protocol discovery only, then
+   **Scan all devices**. Progress and partial findings remain visible if you
+   cancel. Results are saved with timestamps. Timeouts do not prove absence;
+   service names inferred from port numbers are hints.
 
 Home Assistant must be reachable using a private LAN or Tailscale address
 with a certificate trusted by Windows. Certificate verification cannot be
@@ -46,6 +64,13 @@ HTTP-only HA installation before connecting it here.
 | Connection | Implemented behavior | Boundary |
 |---|---|---|
 | Local IP network | Bounded native neighbor discovery, persisted observations, live presence events | Visibility depends on this host and network topology; not an access-point join feed |
+| TCP identification | Owner-started common, custom, or all-port connection checks across observed local devices | Only unambiguous neighbor-backed addresses on eligible physical links; 12 devices concurrent, one request per device, 40 starts/second, 24-hour limit |
+| Multicast DNS / Bonjour | Local IPv4 service discovery with correlated, bounded replies | Uses the observed local links; advertised identities are untrusted hints |
+| Avahi | Linux adapter uses avahi-daemon through the fixed avahi-browse utility | Debian packages depend on avahi-daemon/avahi-utils; RPM packages use avahi/avahi-tools; daemon must be running |
+| ICMP | Echo reachability; native IPv4 on Windows | Other platforms and IPv6 depend on socket permissions |
+| SNMP | Read-only v2c or v3 SHA-256/AES-128 inventory | Requires credentials supplied for that scan; v2c sends its community unencrypted |
+| SMB / NetBIOS | SMB 2/3 negotiation and UDP node-status names | No sign-in, share access, or SMB1; SMB 3.1.1-only servers are not yet supported |
+| CDP / LLDP | Validated Ethernet PCAP import with captured timestamps and withdrawal/expiry status | Requires a capture from the relevant link; imported advertisements do not create trusted device identities |
 | Home Assistant WebSocket API | Device/entity/area registry import, live state subscription, reconnects | Requires a reachable HA instance and user-supplied credentials |
 | HA light/switch control | Explicit individual turn-on/off commands with permission, confirmation, stale-state check, durable deduplication, and audit | Groups, arbitrary services, locks, alarms, scripts, and broadcast targets are excluded |
 | Zigbee, Z-Wave, Matter/Thread, Bluetooth, ESPHome, vendor protocols | Devices already integrated into HA can appear and expose supported entities | HA's integrations, radios, bridges, and device capabilities determine support; no universal native radio implementation |
@@ -62,8 +87,9 @@ not claim those operations work on arbitrary devices.
 The launcher authenticates to an existing configured hub or starts the local
 broker. It refuses to replace an occupied listener that rejects its credentials.
 The default listener is `127.0.0.1:58183`, with anonymous access disabled.
-Credentials are generated randomly and stored under the private `.local/mqtt/`
-directory. Never put them in command arguments, Git, screenshots, or chat.
+Credentials are generated randomly and stored in the private state's `mqtt/`
+directory (`.local/mqtt/` for the development launcher). Never put them in command
+arguments, Git, screenshots, or chat.
 
 Advanced setup with an official Mosquitto installation:
 
@@ -114,6 +140,10 @@ automation routes require the actual local-owner bearer credential:
 | POST | `/api/v1/automation/disconnect` | Revoke permissions and close the HA session |
 | PUT | `/api/v1/automation/permissions` | Replace the exact `entity_ids` control allowlist |
 | POST | `/api/v1/automation/commands` | Confirm one power action with a unique command ID and observed state timestamp |
+| GET / POST | `/api/v1/network/scan` | Inspect or start a scan of observed device IDs; an empty selection scans all eligible devices |
+| POST | `/api/v1/network/scan/cancel` | Cancel the current scan and retain partial results |
+| GET | `/api/v1/network/capabilities` | Explain protocol and platform support |
+| GET / POST | `/api/v1/network/capture` | Read the last import or import an Ethernet PCAP up to 4 MiB |
 
 Command requests carry `command_id` (UUID), `entity_id`, `action`
 (`turn_on` or `turn_off`), `expected_last_changed`, `issued_at` (RFC3339), and

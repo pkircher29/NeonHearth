@@ -14,10 +14,14 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 use thiserror::Error;
+mod link_discovery;
 pub const MAX_FRAME_BYTES: usize = 65_535;
 pub const MAX_METADATA_BYTES: usize = 2_048;
 pub const MAX_PCAP_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PCAP_RECORDS: usize = 4_096;
+/// Upper bound on frames an offline ingest may skip for malformed or truncated
+/// protocol payloads before the capture as a whole is rejected.
+pub const MAX_SKIPPED_FRAMES: usize = 256;
 pub const MAX_OBSERVATIONS: usize = 4_096;
 pub const MAX_OBSERVATIONS_PER_FRAME: usize = 16;
 pub const MAX_FACTS_PER_OBSERVATION: usize = 32;
@@ -38,6 +42,14 @@ impl Default for PassiveOptions {
             metadata_enabled: true,
         }
     }
+}
+/// Outcome of an offline capture ingest: the observations that normalized plus
+/// the number of frames skipped because their protocol payload was malformed or
+/// truncated. Structural capture errors still fail the whole ingest.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PcapIngest {
+    pub observations: Vec<PassiveObservation>,
+    pub skipped_frames: usize,
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PassiveObservation {
@@ -86,6 +98,22 @@ impl OfflinePassiveAdapter {
         b: &[u8],
         o: &PassiveOptions,
     ) -> Result<Vec<PassiveObservation>, PassiveParseError> {
+        self.ingest_pcap_report(i, b, o)
+            .map(|report| report.observations)
+    }
+    /// Like [`Self::ingest_pcap`], but a frame whose payload is malformed
+    /// ([`PassiveParseError::Metadata`]) or truncated
+    /// ([`PassiveParseError::Truncated`]) is counted and skipped instead of
+    /// discarding every other frame in the capture. Real captures routinely
+    /// contain such frames (odd-length NetBIOS datagrams, non-UTF-8 SSDP
+    /// banners), and one of them must not hide the rest of the evidence. More
+    /// than [`MAX_SKIPPED_FRAMES`] skips still rejects the capture.
+    pub fn ingest_pcap_report(
+        &self,
+        i: &str,
+        b: &[u8],
+        o: &PassiveOptions,
+    ) -> Result<PcapIngest, PassiveParseError> {
         if b.len() > MAX_PCAP_BYTES {
             return Err(PassiveParseError::OversizedFrame);
         }
@@ -99,6 +127,7 @@ impl OfflinePassiveAdapter {
         }
         let mut out = Vec::new();
         let mut records = 0usize;
+        let mut skipped = 0usize;
         let mut value_bytes = 0usize;
         while let Some(next) = r.next_packet() {
             records += 1;
@@ -119,7 +148,17 @@ impl OfflinePassiveAdapter {
                 .timestamp_opt(secs, p.timestamp.subsec_nanos())
                 .single()
                 .ok_or(PassiveParseError::PcapHeader)?;
-            let observations = self.normalize(i, t, &p.data, o)?;
+            let observations = match self.normalize(i, t, &p.data, o) {
+                Ok(observations) => observations,
+                Err(PassiveParseError::Metadata | PassiveParseError::Truncated) => {
+                    skipped += 1;
+                    if skipped > MAX_SKIPPED_FRAMES {
+                        return Err(PassiveParseError::Metadata);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if out.len() + observations.len() > MAX_OBSERVATIONS {
                 return Err(PassiveParseError::Metadata);
             }
@@ -133,7 +172,10 @@ impl OfflinePassiveAdapter {
             }
             out.extend(observations)
         }
-        Ok(out)
+        Ok(PcapIngest {
+            observations: out,
+            skipped_frames: skipped,
+        })
     }
 }
 impl PassiveAdapter for OfflinePassiveAdapter {
@@ -149,6 +191,10 @@ impl PassiveAdapter for OfflinePassiveAdapter {
         }
         if f.len() < 14 {
             return Err(PassiveParseError::Truncated);
+        }
+        if let Some(observations) = link_discovery::decode(i, t, f, o)? {
+            validate_normalized(&observations, MAX_OBSERVATIONS_PER_FRAME)?;
+            return Ok(observations);
         }
         // Let a maintained wire codec validate the complete Ethernet/IP/transport
         // shape before the bounded protocol-specific extraction below.
@@ -952,6 +998,10 @@ fn dns(
             }
         }
     }
+    // One mDNS response can legitimately carry far more records than an
+    // observation may hold (Apple and Chromecast responders routinely exceed the
+    // cap), so keep the leading records rather than rejecting the whole frame.
+    v.truncate(MAX_FACTS_PER_OBSERVATION - usize::from(m.is_some()));
     observation(i, t, m, Some(src), p, v)
 }
 fn nbns(
@@ -1244,25 +1294,45 @@ fn text(b: &[u8]) -> Result<String, PassiveParseError> {
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
+/// Undoes hickory's presentation-format escaping of a DNS name so device names
+/// round-trip as bytes. A `\\` pair is a literal backslash; a `\DDD` triple is
+/// an octal byte. The escape is only honoured when the three digits are octal
+/// and the value fits in a byte; anything else is kept verbatim, so a label
+/// containing the raw bytes `\999` cannot overflow the decoder (the previous
+/// `u8` arithmetic wrapped in release and panicked in debug builds).
 fn trim_name(s: &str) -> String {
     let bytes = s.trim_end_matches('.').as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
+        if bytes[at] == b'\\' && bytes.get(at + 1) == Some(&b'\\') {
+            out.push(b'\\');
+            at += 2;
+            continue;
+        }
         if bytes[at] == b'\\'
-            && at + 3 < bytes.len()
-            && bytes[at + 1..at + 4].iter().all(u8::is_ascii_digit)
+            && let Some(value) = octal_escape(bytes.get(at + 1..at + 4))
         {
-            let value =
-                (bytes[at + 1] - b'0') * 64 + (bytes[at + 2] - b'0') * 8 + bytes[at + 3] - b'0';
             out.push(value);
             at += 4;
-        } else {
-            out.push(bytes[at]);
-            at += 1;
+            continue;
         }
+        out.push(bytes[at]);
+        at += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+/// Decodes exactly three octal digits into a byte, rejecting non-octal digits and
+/// values above 255 (`\400`..`\777`).
+fn octal_escape(digits: Option<&[u8]>) -> Option<u8> {
+    let digits = digits?;
+    if digits.len() != 3 || !digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
+        return None;
+    }
+    let value = digits.iter().try_fold(0u32, |acc, d| {
+        acc.checked_mul(8)?.checked_add(u32::from(d - b'0'))
+    })?;
+    u8::try_from(value).ok()
 }
 fn decode_plain_name(q: &[u8]) -> Result<String, PassiveParseError> {
     let (mut at, mut parts) = (0, Vec::new());
@@ -1279,4 +1349,31 @@ fn decode_plain_name(q: &[u8]) -> Result<String, PassiveParseError> {
         at += n
     }
     Err(PassiveParseError::Truncated)
+}
+
+#[cfg(test)]
+mod trim_name_tests {
+    use super::trim_name;
+
+    #[test]
+    fn octal_escapes_decode_to_bytes() {
+        assert_eq!(trim_name("Living\\040Room.local."), "Living Room.local");
+        assert_eq!(trim_name("caf\\303\\251.local."), "caf\u{e9}.local");
+    }
+
+    #[test]
+    fn escaped_backslash_is_literal_and_never_starts_an_escape() {
+        // hickory renders a raw backslash as `\\`; the digits after it are data.
+        assert_eq!(trim_name("a\\\\999b"), "a\\999b");
+    }
+
+    #[test]
+    fn non_octal_or_out_of_range_triples_are_kept_verbatim() {
+        // `\999` used to overflow u8 arithmetic (9 * 64 = 576).
+        assert_eq!(trim_name("x\\999y"), "x\\999y");
+        assert_eq!(trim_name("x\\400y"), "x\\400y");
+        assert_eq!(trim_name("x\\377y"), "x\u{fffd}y");
+        assert_eq!(trim_name("trailing\\12"), "trailing\\12");
+        assert_eq!(trim_name("end\\"), "end\\");
+    }
 }

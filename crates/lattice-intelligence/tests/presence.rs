@@ -708,3 +708,22 @@ fn capacity_retention_metadata_and_serialization_are_deterministic() {
     let two = serde_json::to_string(&tr).unwrap();
     assert_eq!(one, two);
 }
+
+#[test]
+fn chatty_traffic_never_fills_the_evidence_cap_or_blocks_later_leases() {
+    // online 10s, correction 30s, cap 16: one traffic sample every 10s for
+    // three hours is 1080 samples, far past the cap if traffic were retained
+    // for the full one-hour retention window.
+    let mut e = eng();
+    for n in 0..(3 * 360) {
+        let at = n * 10;
+        e.ingest(ev(PresenceEvidenceKind::Traffic, at, None), t(at))
+            .unwrap();
+    }
+    let at = 3 * 3600 + 10;
+    e.ingest(ev(PresenceEvidenceKind::Lease, at, Some(at + 600)), t(at))
+        .unwrap();
+    e.ingest(ev(PresenceEvidenceKind::Traffic, at + 1, None), t(at + 1))
+        .unwrap();
+    assert_eq!(e.state(id()), Some(PresenceState::Online));
+}

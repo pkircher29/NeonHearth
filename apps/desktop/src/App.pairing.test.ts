@@ -40,12 +40,12 @@ describe('App pairing recovery', () => {
 
     render(App);
 
-    await waitFor(() => expect(screen.getByText("This window's pairing expired.")).toBeTruthy());
-    expect(screen.getByText(/Open NeonHearth from the Start menu to re-pair/)).toBeTruthy();
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Unlock your home.' })).toBeTruthy());
+    expect(screen.getByText(/That credential was not accepted/)).toBeTruthy();
     // The dead token is gone: a reload will not retry a pairing that cannot heal.
     expect(sessionStorage.getItem(STORAGE_KEY)).toBeNull();
     // The action state replaces the live chrome instead of sitting beside a dead QUIET rail.
-    expect(screen.queryByText('Live thread')).toBeNull();
+    expect(sessionStorage.getItem('neonhearth.session')).toBeNull();
   });
 
   it('keeps the normal UI when the stored pairing is accepted', async () => {
@@ -62,7 +62,8 @@ describe('App pairing recovery', () => {
 
     await waitFor(() => expect(screen.getByText('Your network, breathing.')).toBeTruthy());
     expect(screen.queryByText("This window's pairing expired.")).toBeNull();
-    expect(sessionStorage.getItem(STORAGE_KEY)).toBe(STALE);
+    expect(sessionStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(JSON.parse(sessionStorage.getItem('neonhearth.session')!)).toEqual({ kind: 'owner', token: STALE });
   });
 
   it('a fresh #token fragment still pairs after a cleared token (bootstrap on mount)', async () => {
@@ -86,7 +87,8 @@ describe('App pairing recovery', () => {
     await waitFor(() => expect(authHeaders.length).toBeGreaterThan(0));
     expect(authHeaders[0]).toBe(`Bearer ${STALE}`);
     // The fragment was persisted and stripped by the bootstrap.
-    expect(sessionStorage.getItem(STORAGE_KEY)).toBe(STALE);
+    expect(sessionStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(JSON.parse(sessionStorage.getItem('neonhearth.session')!)).toEqual({ kind: 'owner', token: STALE });
     expect(window.location.hash).toBe('');
   });
 });

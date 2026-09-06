@@ -2,14 +2,18 @@
   import { onMount } from 'svelte';
   import {
     copyFloorFootprint, createEditorState, emptyHomePlan, reduceEditor, selectUncertain, selectUnplaced, snap, snapPoint, wallLength,
-    type EditorAction, type EditorState, type Estimate, type HomeApi, type HomeDeviceRef, type HomeDraft, type OpeningKind, type Placement, type PlanPoint, type Room, type Wall
+    type EditorAction, type EditorState, type Estimate, type HomeApi, type HomeDeviceRef, type HomeDraft, type HomeSnapshot, type OpeningKind, type Placement, type PlanPoint, type Room, type Wall
   } from '../stores/home';
   import HomeEditorFloorBar from './HomeEditorFloorBar.svelte';
   import HomeEditorInspector, { type InspectorTarget } from './HomeEditorInspector.svelte';
   import HomeEditorTray, { type EstimatedRow } from './HomeEditorTray.svelte';
   import { formatLength, gridStep, readHomeUnits, saveHomeUnits, type HomeUnits } from '../homeUnits';
 
-  let { api, devices = [] }: { api: HomeApi; devices?: HomeDeviceRef[] } = $props();
+  // `snapshot` is the already-loaded home when a parent owns it (HomeView
+  // shares one fetch with the 3D twin, audit M-27); without it the editor
+  // fetches on mount. `onsnapshot` reports every server-acknowledged change
+  // (committed plan, placements, reloads) so the parent's twin stays current.
+  let { api, devices = [], snapshot = undefined, onsnapshot }: { api: HomeApi; devices?: HomeDeviceRef[]; snapshot?: HomeSnapshot | null; onsnapshot?: (snapshot: HomeSnapshot) => void } = $props();
 
   const SCALE = 40; // pixels per meter
   const CANVAS_W_M = 18;
@@ -113,6 +117,51 @@
     autosaveTimer = setTimeout(() => { void persistDraft(); }, AUTOSAVE_DELAY_MS);
   }
 
+  // ---- Placement persistence (audit M-29) ----
+  // One in-flight write per device with a latest-value slot: a burst of
+  // nudges (key repeat, undo/redo) collapses to at most one queued write, and
+  // the server always ends on the newest position. A failed write rolls the
+  // device back to its last server-acknowledged placement.
+  type PlacementWrite = { kind: 'put'; placement: Placement } | { kind: 'delete' };
+  const confirmedPlacements = new Map<string, Placement>();
+  const inFlight = new Map<string, Promise<void>>();
+  const queued = new Map<string, PlacementWrite>();
+  function rememberConfirmed(placements: Placement[]) {
+    confirmedPlacements.clear();
+    for (const placement of placements) confirmedPlacements.set(placement.device_id, placement);
+  }
+  function emitSnapshot() {
+    onsnapshot?.({ plan: $state.snapshot(editor).doc.plan, placements: $state.snapshot(editor).doc.placements.map((placement) => ({ ...placement })), estimates: $state.snapshot(estimates) });
+  }
+  function rollbackPlacement(deviceId: string) {
+    const confirmed = confirmedPlacements.get(deviceId);
+    const placements = confirmed
+      ? (editor.doc.placements.some((candidate) => candidate.device_id === deviceId)
+        ? editor.doc.placements.map((candidate) => (candidate.device_id === deviceId ? { ...confirmed } : candidate))
+        : [...editor.doc.placements, { ...confirmed }])
+      : editor.doc.placements.filter((candidate) => candidate.device_id !== deviceId);
+    editor = { ...editor, doc: { ...editor.doc, placements } };
+    emitSnapshot();
+  }
+  function queuePlacementWrite(deviceId: string, write: PlacementWrite) {
+    if (inFlight.has(deviceId)) { queued.set(deviceId, write); return; }
+    const run = (async () => {
+      try {
+        if (write.kind === 'put') { await api.putPlacement({ ...write.placement }); confirmedPlacements.set(deviceId, write.placement); }
+        else { await api.deletePlacement(deviceId); confirmedPlacements.delete(deviceId); }
+      } catch {
+        queued.delete(deviceId);
+        notice = write.kind === 'put' ? 'The placement could not be saved to the service. It was put back where the service last saw it.' : 'The placement could not be removed from the service. It was restored.';
+        rollbackPlacement(deviceId);
+      } finally {
+        inFlight.delete(deviceId);
+        const next = queued.get(deviceId);
+        if (next) { queued.delete(deviceId); queuePlacementWrite(deviceId, next); }
+      }
+    })();
+    inFlight.set(deviceId, run);
+  }
+
   function dispatch(action: EditorAction): boolean {
     const previous = editor;
     const next = reduceEditor(previous, { ...action, grid_m: grid });
@@ -125,13 +174,12 @@
     if (nextPlacements !== previousPlacements) {
       for (const placement of nextPlacements) {
         const before = previousPlacements.find((candidate) => candidate.device_id === placement.device_id);
-        if (before !== placement) void api.putPlacement({ ...placement }).catch(() => { notice = 'The placement could not be saved to the service.'; });
+        if (before !== placement) queuePlacementWrite(placement.device_id, { kind: 'put', placement: { ...placement } });
       }
       for (const before of previousPlacements) {
-        if (!nextPlacements.some((candidate) => candidate.device_id === before.device_id)) {
-          void api.deletePlacement(before.device_id).catch(() => { notice = 'The placement could not be removed from the service.'; });
-        }
+        if (!nextPlacements.some((candidate) => candidate.device_id === before.device_id)) queuePlacementWrite(before.device_id, { kind: 'delete' });
       }
+      emitSnapshot();
     }
     return true;
   }
@@ -159,6 +207,7 @@
       editor = { ...editor, doc: { ...editor.doc, plan: { ...editor.doc.plan, version: result.version } } };
       autosaveState = 'idle';
       notice = `Plan saved as version ${result.version}.`;
+      emitSnapshot();
       void api.deleteDraft().catch(() => { /* A stale draft is harmless; the committed plan wins. */ });
     } catch { notice = 'The plan could not be saved. Try again shortly.'; }
     finally { committing = false; }
@@ -168,16 +217,21 @@
     loading = true;
     await loadHome();
   }
+  function adopt(loaded: HomeSnapshot) {
+    editor = createEditorState(loaded.plan, loaded.placements);
+    estimates = loaded.estimates;
+    version = loaded.plan.version;
+    activeFloorId = loaded.plan.floors[0]?.floor_id ?? null;
+    selection = null;
+    autosaveState = 'idle';
+    rememberConfirmed(loaded.placements);
+  }
   async function loadHome() {
     loadError = null;
     try {
-      const snapshot = await api.fetchHome();
-      editor = createEditorState(snapshot.plan, snapshot.placements);
-      estimates = snapshot.estimates;
-      version = snapshot.plan.version;
-      activeFloorId = snapshot.plan.floors[0]?.floor_id ?? null;
-      selection = null;
-      autosaveState = 'idle';
+      const loaded = await api.fetchHome();
+      adopt(loaded);
+      onsnapshot?.(loaded);
     } catch { loadError = 'The home plan is unavailable right now. Try again shortly.'; }
     finally { loading = false; }
   }
@@ -196,7 +250,8 @@
   onMount(() => {
     units = readHomeUnits();
     void (async () => {
-      await loadHome();
+      if (snapshot) { adopt(snapshot); loading = false; }
+      else await loadHome();
       if (loadError) return;
       try {
         const draft = await api.loadDraft();
@@ -436,7 +491,7 @@
       </div>
     </div>
 
-    <HomeEditorFloorBar floors={plan.floors} active={activeFloor?.floor_id ?? null} onselect={(floorId) => { activeFloorId = floorId; selection = { kind: 'floor' }; cancelPending(); }} onadd={addFloor} />
+    <HomeEditorFloorBar {units} floors={plan.floors} active={activeFloor?.floor_id ?? null} onselect={(floorId) => { activeFloorId = floorId; selection = { kind: 'floor' }; cancelPending(); }} onadd={addFloor} />
 
     {#if activeFloor}
       <div class="footprint-controls tool-palette">
@@ -522,60 +577,59 @@
 
 <style>
   .footprint-controls{margin:0 0 14px;gap:10px}
-  .editor-state{margin-top:28px;padding:18px;border:1px dashed var(--line);border-radius:var(--radius-card);color:var(--ink-mute);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-  .editor-state.error{border-color:var(--alert);color:var(--alert-text)}
-  .editor-state button{min-height:40px;padding:8px 14px;border:1px solid var(--ember);border-radius:8px;background:transparent;color:var(--ember);font:500 12.5px var(--font-body);cursor:pointer}
-  .banner{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:16px 0 0;padding:12px 14px;border-radius:var(--radius-card);border:1px solid var(--line);background:var(--panel);color:var(--ink);font-size:12.5px}
+  .grid-minor{stroke:var(--line)}
+  .grid-major{stroke:var(--line-strong)}
+  .editor-state{margin-top:28px;padding:18px;border:1px dashed var(--line-strong);color:var(--muted-strong);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .editor-state.error{border-color:var(--pink);color:#ffb4cc}
+  .editor-state button{min-height:40px;padding:8px 14px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
+  .banner{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:16px 0 0;padding:12px 14px;border-radius:8px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);font-size:12px}
   .banner strong{color:var(--ink)}
-  .banner button{min-height:38px;padding:7px 12px;border:1px solid var(--ember);border-radius:8px;background:transparent;color:var(--ember);font:500 12.5px var(--font-body);cursor:pointer}
-  .banner button.quiet{border-color:var(--line);color:var(--ink-mute)}
-  .banner.conflict{border-color:var(--alert)}
-  .banner.conflict strong{color:var(--alert-text)}
-  .banner.conflict button{border-color:var(--alert);color:var(--alert-text)}
-  .banner.draft{border-color:var(--ember)}
-  .banner.draft strong{color:var(--ink)}
-  .banner.uncertain{border-color:var(--ember);border-style:dashed}
-  .banner.uncertain strong{color:var(--ink)}
-  .banner.uncertain button{border-color:var(--ember);color:var(--ember)}
+  .banner button{min-height:38px;padding:7px 12px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
+  .banner button.quiet{border-color:var(--line-strong);color:var(--muted-strong)}
+  .banner.conflict{border-color:var(--pink)}
+  .banner.conflict strong{color:var(--pink)}
+  .banner.conflict button{border-color:var(--pink);color:var(--pink)}
+  .banner.draft{border-color:var(--gold)}
+  .banner.draft strong{color:var(--gold)}
+  .banner.uncertain{border-color:var(--gold);border-style:dashed}
+  .banner.uncertain strong{color:var(--gold)}
+  .banner.uncertain button{border-color:var(--gold);color:var(--gold)}
   .editor-toolbar{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;margin:22px 0 0}
-  .tool-palette{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-  .tool-palette button{min-height:44px;padding:9px 14px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--ink);font:500 12.5px var(--font-body);cursor:pointer}
-  .tool-palette button.active{border-color:var(--ember);color:var(--ember);background:var(--panel)}
-  .tool-palette button.finish{border-color:transparent;color:var(--ink);background:var(--fire-edge-bg)}
-  .tool-palette button.quiet{border-color:var(--line);color:var(--ink-mute)}
+  .tool-palette{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
+  .tool-palette button{min-height:44px;padding:9px 13px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
+  .tool-palette button.active{border-color:var(--accent);color:var(--accent);box-shadow:inset 0 0 14px var(--accent)14}
+  .tool-palette button.finish{border-color:var(--accent);color:var(--accent-ink);background:var(--accent)}
+  .tool-palette button.quiet{border-color:var(--line-strong);color:var(--muted-strong)}
   .tool-palette button:disabled{opacity:.4;cursor:not-allowed}
-  .opening-kind{display:flex;gap:7px;align-items:center;color:var(--ink-mute);font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.1em}
-  .opening-kind select{min-height:38px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--surface-2);color:var(--ink);font:12.5px var(--font-body)}
-  .placing-hint{color:var(--ink);font:11px var(--font-mono)}
+  .opening-kind{display:flex;gap:7px;align-items:center;color:var(--muted-strong);font:10px var(--font-mono);text-transform:uppercase}
+  .opening-kind select{min-height:38px;padding:6px 8px;border:1px solid var(--line-strong);border-radius:5px;background:#0e2430;color:var(--ink);font:12px var(--font-display)}
+  .placing-hint{color:var(--accent);font:11px var(--font-mono)}
   .history-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-  .history-actions button{min-height:44px;padding:9px 14px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--ink);font:500 12.5px var(--font-body);cursor:pointer}
+  .history-actions button{min-height:44px;padding:9px 14px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
   .history-actions button:disabled{opacity:.4;cursor:not-allowed}
-  .history-actions button.save{border-color:transparent;background:var(--fire-edge-bg);color:var(--ink);font-weight:600;box-shadow:var(--shadow)}
-  .history-actions button.save:hover:not(:disabled){background:var(--fire-edge-bg);filter:brightness(1.18)}
-  .autosave{color:var(--ink-mute);font:500 10px var(--font-mono);text-transform:uppercase;letter-spacing:.1em}
+  .history-actions button.save{border-color:var(--accent);background:var(--accent);color:var(--accent-ink)}
+  .autosave{color:var(--muted-strong);font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.07em}
   .editor-body{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:16px;align-items:start;margin-top:4px}
-  .canvas-frame{overflow:auto;border:1px solid var(--line);border-radius:var(--radius-card);background:var(--ground)}
-  .plan-canvas{display:block;background:var(--ground);outline:none}
-  .plan-canvas:focus-visible{box-shadow:inset 0 0 0 2px var(--ember)}
+  .canvas-frame{overflow:auto;border:1px solid var(--line-mid);border-radius:10px;background:var(--bg)}
+  .plan-canvas{display:block;background:#081722;outline:none}
+  .plan-canvas:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
   .grid{pointer-events:none}
-  .grid-minor{stroke:color-mix(in srgb,var(--line) 45%,transparent)}
-  .grid-major{stroke:var(--line)}
-  .room{fill:var(--surface);fill-opacity:.85;stroke:var(--line);stroke-width:1.5;cursor:pointer}
-  .room.selected{stroke:var(--ember);stroke-width:2;fill:var(--surface-2)}
-  .room-label{fill:var(--ink-mute);font:11px var(--font-mono);text-anchor:middle;pointer-events:none}
+  .room{fill:#123641;fill-opacity:.55;stroke:var(--line-strong);stroke-width:1.5;cursor:pointer}
+  .room.selected{stroke:var(--accent);stroke-width:2;fill-opacity:.75}
+  .room-label{fill:var(--muted-strong);font:11px var(--font-mono);text-anchor:middle;pointer-events:none}
   .wall{stroke:var(--ink);stroke-width:6;stroke-linecap:round;cursor:pointer}
-  .wall.selected{stroke:var(--ember)}
+  .wall.selected{stroke:var(--accent)}
   .wall-opening{stroke-width:6;stroke-linecap:butt;pointer-events:none}
-  .wall-opening.door{stroke:var(--ember)}
-  .wall-opening.window{stroke:var(--safe)}
-  .wall-opening.stair{stroke:var(--ink-mute);stroke-dasharray:4 3}
-  .dimension{fill:var(--ember);font:500 12px var(--font-mono);text-anchor:middle;pointer-events:none}
+  .wall-opening.door{stroke:var(--gold)}
+  .wall-opening.window{stroke:var(--blue)}
+  .wall-opening.stair{stroke:var(--pink);stroke-dasharray:4 3}
+  .dimension{fill:var(--accent);font:700 12px var(--font-mono);text-anchor:middle;pointer-events:none}
   .placement{cursor:pointer}
-  .placement circle{fill:var(--surface-2);stroke:var(--ember);stroke-width:2}
-  .placement.selected circle{fill:var(--ember)}
+  .placement circle{fill:#0e2430;stroke:var(--accent);stroke-width:2}
+  .placement.selected circle{fill:var(--accent)}
   .placement text{fill:var(--ink);font:10px var(--font-mono);text-anchor:middle;pointer-events:none}
-  .pending-start{fill:var(--ember)}
-  .pending-room{fill:none;stroke:var(--ember);stroke-dasharray:5 4;stroke-width:1.5;pointer-events:none}
+  .pending-start{fill:var(--accent)}
+  .pending-room{fill:none;stroke:var(--accent);stroke-dasharray:5 4;stroke-width:1.5;pointer-events:none}
   .side-panel{display:grid;gap:14px;align-content:start}
   @media(max-width:1000px){.editor-body{grid-template-columns:1fr}.side-panel{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}}
 </style>

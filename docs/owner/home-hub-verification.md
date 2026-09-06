@@ -1,9 +1,35 @@
 # Home hub verification — 2026-09-06
 
+## Continued source validation
+
+The `codex/network-home-hub` branch now includes upstream `faf7455`, preserving
+its authentication, history, settings, editor persistence, and security fixes.
+It adds numeric IP sorting, metric/imperial editing, independent footprint
+copies, bounded device scans, mDNS/Bonjour, ICMP, SMB, NetBIOS, credentialed
+SNMP, Linux Avahi integration, and CDP/LLDP PCAP import. A native Windows
+launcher and portable package builder replace the development-only startup path.
+
+Current local checks: **914 Rust tests passed, one opt-in MQTT test ignored**;
+**266 desktop tests and seven Playwright tests passed**; Svelte checking and
+the production web build passed. Rust dependency advisories, licenses, bans,
+and sources passed without advisory exceptions. Workspace Clippy passed with
+warnings denied. The new Windows backup/restore regression from upstream was
+observed failing with an access error and passed after correcting the file
+handle's flush access. Existing SQL migration bytes were preserved.
+
+Current logs use the `artifacts/final-*` prefix. The native package and current
+live discovery acceptance are recorded separately from the earlier evidence
+below. CI and merge status belong to the linked GitHub pull request.
+
+## Earlier development-runtime acceptance
+
+The remaining measurements document the earlier development executable, before
+the continued changes above. Its dependency and startup limitations are historical.
+
 This is a working local Windows development release in
 `C:\Users\Paul\GITHUB\neonhearth-home-hub`, based on NeonHearth `a7f8883`,
 on the isolated branch `codex/network-home-hub`. Open `Start-NeonHearth.cmd`.
-Source changes remain local; no public release or production deployment was made.
+At that earlier acceptance, source changes were local and no production deployment was made.
 
 The optimized service executable is
 `artifacts/NeonHearth-home-hub-release/lattice-service.exe` (33,757,185 bytes).

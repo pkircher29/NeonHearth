@@ -27,7 +27,10 @@ use zeroize::Zeroizing;
 use crate::{AuthorizedBinding, InterfaceId, TargetGuard};
 
 mod active_udp;
+pub mod mdns_discovery;
 mod scheduler_runner;
+#[cfg(windows)]
+mod windows_icmp;
 pub use active_udp::{
     NonceSource, UdpProbe, build_udp_probe, build_udp_probe_with_nonce, parse_udp_reply,
 };
@@ -496,6 +499,8 @@ pub enum ActiveError {
     PermissionDenied,
     #[error("bounded network operation failed")]
     Network,
+    #[error("response violated the probe protocol")]
+    Protocol,
     #[error("internal probe execution failed")]
     Internal,
     #[error("response exceeded limit")]
@@ -780,7 +785,7 @@ async fn tls_attempt(
         .1
         .peer_certificates()
         .and_then(|certificates| certificates.first())
-        .ok_or(ActiveError::Network)?;
+        .ok_or(ActiveError::Protocol)?;
     certificate_metadata(cert.as_ref(), d.max_response_bytes)
 }
 
@@ -789,7 +794,7 @@ fn certificate_metadata(der: &[u8], max_bytes: usize) -> Result<TransportRespons
     if der.len() > max_bytes.min(MAX_RESPONSE_BYTES) {
         return Err(ActiveError::ResponseLimit);
     }
-    let (_, certificate) = parse_x509_certificate(der).map_err(|_| ActiveError::Network)?;
+    let (_, certificate) = parse_x509_certificate(der).map_err(|_| ActiveError::Protocol)?;
     let fingerprint = Sha256::digest(der)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -847,10 +852,10 @@ pub fn render_ip_san(value: &[u8]) -> Result<String, ActiveError> {
     match value.len() {
         4 => Ok(Ipv4Addr::new(value[0], value[1], value[2], value[3]).to_string()),
         16 => Ok(
-            Ipv6Addr::from(<[u8; 16]>::try_from(value).map_err(|_| ActiveError::Network)?)
+            Ipv6Addr::from(<[u8; 16]>::try_from(value).map_err(|_| ActiveError::Protocol)?)
                 .to_string(),
         ),
-        _ => Err(ActiveError::Network),
+        _ => Err(ActiveError::Protocol),
     }
 }
 
@@ -865,6 +870,10 @@ async fn icmp_attempt(
     let binding = guard
         .authorized_binding(request.interface, ip)
         .map_err(|_| ActiveError::Unauthorized)?;
+    #[cfg(windows)]
+    if ip.is_ipv4() {
+        return windows_icmp::echo(binding, timeout).await;
+    }
     let config = Config::builder()
         .kind(if ip.is_ipv4() { ICMP::V4 } else { ICMP::V6 })
         .bind(binding.source_socket())
@@ -933,10 +942,15 @@ async fn tcp_attempt(
     // Quiet services often wait for the client; waiting for a banner here would
     // incorrectly turn a successful port check into the engine's outer timeout.
     if d.id.starts_with("full.tcp.") {
-        return Ok(TransportResponse::Success(vec![("tcp_state".into(), "open".into())]));
+        return Ok(TransportResponse::Success(vec![(
+            "tcp_state".into(),
+            "open".into(),
+        )]));
     }
     if d.id == "tcp.smb.445" {
-        guard.authorize(probe_request.interface, ip).map_err(|_| ActiveError::Unauthorized)?;
+        guard
+            .authorize(probe_request.interface, ip)
+            .map_err(|_| ActiveError::Unauthorized)?;
         return smb::negotiate(&mut stream).await;
     }
     let request = if d.id.contains("http") || d.id.contains("camera") || d.id.contains("web") {
@@ -960,7 +974,10 @@ async fn tcp_attempt(
     }
     let mut buf = vec![0; d.max_response_bytes.min(MAX_RESPONSE_BYTES)];
     let n = tokio::time::timeout(Duration::from_millis(300), stream.read(&mut buf))
-        .await.ok().and_then(Result::ok).unwrap_or(0);
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(0);
     buf.truncate(n);
     let metadata = if d.id.contains("http") || d.id.contains("camera") || d.id.contains("web") {
         parse_http_metadata(&buf)?
@@ -991,7 +1008,7 @@ pub fn parse_http_metadata(bytes: &[u8]) -> Result<Vec<(String, String)>, Active
     let mut facts = Vec::new();
     for (index, raw) in head.enumerate() {
         let line = std::str::from_utf8(raw)
-            .map_err(|_| ActiveError::Network)?
+            .map_err(|_| ActiveError::Protocol)?
             .trim_end_matches('\r');
         if index == 0 {
             if let Some(status) = line
@@ -1507,14 +1524,14 @@ fn ber_int(value: i32) -> Vec<u8> {
 }
 fn tlv<'a>(input: &mut &'a [u8], expected: u8) -> Result<&'a [u8], ActiveError> {
     if input.len() < 2 || input[0] != expected {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     let first = input[1];
     let (mut header, mut len) = (2usize, usize::from(first));
     if first & 0x80 != 0 {
         let count = usize::from(first & 0x7f);
         if count == 0 || count > 2 || input.len() < 2 + count {
-            return Err(ActiveError::Network);
+            return Err(ActiveError::Protocol);
         }
         header += count;
         len = 0;
@@ -1532,13 +1549,13 @@ fn tlv<'a>(input: &mut &'a [u8], expected: u8) -> Result<&'a [u8], ActiveError> 
 fn integer(input: &mut &[u8]) -> Result<i32, ActiveError> {
     let value = tlv(input, 0x02)?;
     if value.is_empty() || value.len() > 5 {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     let mut out = 0i64;
     for byte in value {
         out = (out << 8) | i64::from(*byte)
     }
-    i32::try_from(out).map_err(|_| ActiveError::Network)
+    i32::try_from(out).map_err(|_| ActiveError::Protocol)
 }
 fn parse_snmp_community_response(
     bytes: &[u8],
@@ -1563,11 +1580,11 @@ fn parse_snmp_community_response(
         return Err(ActiveError::Correlation);
     }
     if integer(&mut pdu)? != 0 || integer(&mut pdu)? != 0 {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     let mut list = tlv(&mut pdu, 0x30)?;
     if !pdu.is_empty() {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     let mut facts = vec![];
     let (mut seen_descr, mut seen_object_id) = (false, false);
@@ -1604,16 +1621,16 @@ fn parse_snmp_community_response(
             return Err(ActiveError::Correlation);
         }
         if !binding.is_empty() {
-            return Err(ActiveError::Network);
+            return Err(ActiveError::Protocol);
         }
     }
     if !seen_descr || !seen_object_id {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     Ok(facts)
 }
 fn decode_oid(bytes: &[u8]) -> Result<String, ActiveError> {
-    let first = *bytes.first().ok_or(ActiveError::Network)?;
+    let first = *bytes.first().ok_or(ActiveError::Protocol)?;
     let mut parts = vec![(first / 40).to_string(), (first % 40).to_string()];
     let mut value = 0u32;
     let mut open = false;
@@ -1630,7 +1647,7 @@ fn decode_oid(bytes: &[u8]) -> Result<String, ActiveError> {
         }
     }
     if open {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     Ok(parts.join("."))
 }
@@ -1776,7 +1793,7 @@ pub fn normalize_snmp_inventory(
     response: async_snmp::FixedCardinalityResponse,
 ) -> Result<Vec<(String, String)>, ActiveError> {
     if !response.anomalies.is_empty() || response.varbinds.len() != 2 {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     let mut facts = vec![];
     for binding in response.varbinds {
@@ -1800,7 +1817,7 @@ pub fn normalize_snmp_inventory(
         }
     }
     if facts.len() != 2 {
-        return Err(ActiveError::Network);
+        return Err(ActiveError::Protocol);
     }
     Ok(facts)
 }
