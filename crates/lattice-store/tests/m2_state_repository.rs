@@ -22,6 +22,32 @@ fn link() -> LinkAddress {
 }
 
 #[tokio::test]
+async fn discovery_waits_for_a_competing_writer_before_reading_checkpoint() -> anyhow::Result<()> {
+    let directory = tempdir()?;
+    let pool = connect_path(directory.path().join("writer-contention.db")).await?;
+    let repository = M2StateRepository::new(pool.clone());
+    let blocker = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let mut write = tokio::spawn(async move {
+        let _ = started.send(());
+        repository.commit(input(1, [99; 32])).await
+    });
+    ready.await?;
+    let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut write).await;
+    assert!(
+        early.is_err(),
+        "discovery must wait for the writer instead of failing a read-to-write lock upgrade: {early:?}"
+    );
+    blocker.commit().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), write).await???;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM discovery_commits")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn link_layer_identity_lookup_returns_none_for_no_match() -> anyhow::Result<()> {
     let repo = M2StateRepository::new(lattice_store::connect_memory().await?);
     assert_eq!(repo.lookup_link_layer_device(link(), "mdns").await?, None);

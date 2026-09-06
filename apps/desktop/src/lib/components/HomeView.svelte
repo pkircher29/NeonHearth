@@ -4,13 +4,14 @@
   import { bootstrapServiceToken } from '../pairing';
   import { createHomeApi, type HomeApi, type HomeSnapshot } from '../stores/home';
   import type { LiveState } from '../stores/live';
+  import type { AutomationSnapshot, NetworkDetails } from '../api/automation';
   import HomeEditorView from './HomeEditorView.svelte';
   import HomeTwin3D from './HomeTwin3D.svelte';
   import { toBandwidthMap, toHomeDeviceRefs, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
 
   // `api` is a test seam: when absent, the view builds the real loopback client on mount
   // exactly the way App builds the camera client.
-  let { liveState, api = null }: { liveState: LiveState; api?: HomeApi | null } = $props();
+  let { liveState, api = null, automation = null, network = null }: { liveState: LiveState; api?: HomeApi | null; automation?: AutomationSnapshot | null; network?: NetworkDetails | null } = $props();
 
   type HomeTab = 'editor' | 'twin';
   let tab = $state<HomeTab>('editor');
@@ -22,19 +23,24 @@
   let selectedDeviceId = $state<string | null>(null);
   let reducedMotion = $state(false);
 
-  const deviceRefs = $derived(toHomeDeviceRefs(liveState.devices));
-  const twinDevices = $derived(toTwinDevices(liveState.devices));
+  const addresses = $derived(new Map(network?.devices.map(device => [device.device_id, device]) ?? []));
+  function knownName(id: string): string | null {
+    const info = addresses.get(id);
+    return liveState.devices[id]?.owner_name ?? info?.home_assistant?.name ?? info?.mac_addresses[0] ?? null;
+  }
+  const deviceRefs = $derived([...toHomeDeviceRefs(liveState.devices).map(d => ({...d, name: knownName(d.device_id) ?? d.name})), ...(automation?.devices ?? []).map(d => ({ device_id: d.device_id, name: `${d.name}${d.area ? ` · ${d.area}` : ''} (Home Assistant)` }))]);
+  const twinDevices = $derived([...toTwinDevices(liveState.devices).map(d => ({...d, label: knownName(d.device_id) ?? d.label})), ...(automation?.devices ?? []).map(d => ({ device_id: d.device_id, label: d.name, is_camera: d.entities.some(e => e.entity_id.startsWith('camera.')) }))]);
   const presence = $derived(toPresenceMap(liveState.devices));
   const bandwidth = $derived(toBandwidthMap(liveState.devices));
   const selectedName = $derived(
     selectedDeviceId === null
       ? null
-      : liveState.devices[selectedDeviceId]?.owner_name ?? `Device ${selectedDeviceId.slice(0, 8)}`
+      : knownName(selectedDeviceId) ?? automation?.devices.find(d => d.device_id === selectedDeviceId)?.name ?? `Device ${selectedDeviceId.slice(0, 8)}`
   );
 
   function openTab(next: HomeTab) {
     tab = next;
-    if (next === 'twin') twinVisited = true;
+    if (next === 'twin') { twinVisited = true; void loadSnapshot(); }
   }
   function onTwinSelect(device_id: string) {
     selectedDeviceId = device_id;
@@ -86,6 +92,9 @@
   {/if}
 
   {#if homeApi}
+    {#if automation?.devices.length}
+      <p class="home-banner">{automation.devices.length} Home Assistant devices are available in the placement tray. Reported rooms: {automation.areas.join(', ') || 'none'}. Draw the rooms to match your home, then place each device. Room names do not establish physical coordinates.</p>
+    {/if}
     <div id="home-panel-editor" role="tabpanel" aria-labelledby="home-tab-editor" hidden={tab !== 'editor'}>
       <HomeEditorView api={homeApi} devices={deviceRefs} />
     </div>

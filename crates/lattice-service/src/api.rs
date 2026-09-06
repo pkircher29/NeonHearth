@@ -908,5 +908,7 @@ impl Modify for SecurityAddon {
     }
 }
 pub async fn openapi() -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+    let mut document = ApiDoc::openapi();
+    document.merge(crate::automation::AutomationApiDoc::openapi());
+    Json(document)
 }

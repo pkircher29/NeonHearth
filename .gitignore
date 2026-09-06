@@ -13,4 +13,7 @@
 *.pcapng
 /artifacts/
 /dist/
+/.local/
 
+
+__pycache__/

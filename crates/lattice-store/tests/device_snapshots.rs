@@ -311,9 +311,11 @@ async fn snapshot_corrupt_base_rows_and_migration_indexes_are_detected() -> anyh
     let device = ids()[0];
     insert_device(&pool, &device, 1, 9).await?;
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
-            .fetch_one(&pool)
-            .await?,
+        sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM _sqlx_migrations WHERE version=23 AND success=1"
+        )
+        .fetch_one(&pool)
+        .await?,
         23
     );
     for index in ["presence_transitions_snapshot_idx", "evidence_snapshot_idx"] {

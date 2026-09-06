@@ -25,8 +25,8 @@ const MAX_COORDINATE_M = 10_000;
 const EPSILON = 1e-6;
 
 // ---- Geometry ----
-export function snap(value: number): number { return Number((Math.round(value / GRID_M) * GRID_M).toFixed(1)); }
-export function snapPoint(point: PlanPoint): PlanPoint { return { x: snap(point.x), y: snap(point.y) }; }
+export function snap(value: number, grid = GRID_M): number { return Number((Math.round(value / grid) * grid).toFixed(6)); }
+export function snapPoint(point: PlanPoint, grid = GRID_M): PlanPoint { return { x: snap(point.x, grid), y: snap(point.y, grid) }; }
 export function wallLength(wall: Pick<Wall, 'start' | 'end'>): number { return Math.hypot(wall.end.x - wall.start.x, wall.end.y - wall.start.y); }
 const samePoint = (a: PlanPoint, b: PlanPoint) => Math.abs(a.x - b.x) < EPSILON && Math.abs(a.y - b.y) < EPSILON;
 
@@ -43,7 +43,7 @@ export function createEditorState(plan: HomePlan, placements: Placement[]): Edit
   return { doc: { plan, placements }, past: [], future: [] };
 }
 
-export type EditorAction =
+export type EditorAction = (
   | { type: 'add_wall'; floor_id: string; wall_id: string; start: PlanPoint; end: PlanPoint }
   | { type: 'move_wall'; floor_id: string; wall_id: string; start: PlanPoint; end: PlanPoint }
   | { type: 'delete_wall'; floor_id: string; wall_id: string }
@@ -57,12 +57,25 @@ export type EditorAction =
   | { type: 'rename_floor'; floor_id: string; name: string }
   | { type: 'set_ceiling_height'; floor_id: string; ceiling_height_m: number }
   | { type: 'delete_floor'; floor_id: string }
+  | { type: 'copy_footprint'; floor: Floor }
   | { type: 'place_device'; placement: Placement }
   | { type: 'move_placement'; device_id: string; x: number; y: number }
   | { type: 'configure_placement'; device_id: string; height_m?: number; mounting?: Mounting }
   | { type: 'remove_placement'; device_id: string }
   | { type: 'undo' }
-  | { type: 'redo' };
+  | { type: 'redo' }) & { grid_m?: number };
+
+export function copyFloorFootprint(source: Floor, destination: Floor, newId: () => string): Floor {
+  return { ...destination,
+    walls: source.walls.map(wall => ({ ...wall, wall_id: newId(), start: { ...wall.start }, end: { ...wall.end },
+      openings: wall.openings.map(opening => ({ ...opening, opening_id: newId() })) })),
+    rooms: source.rooms.map(room => ({ ...room, room_id: newId(), polygon: room.polygon.map(point => ({ ...point })) }))
+  };
+}
+
+function geometryIds(floor: Floor): string[] {
+  return [...floor.walls.flatMap(wall => [wall.wall_id, ...wall.openings.map(opening => opening.opening_id)]), ...floor.rooms.map(room => room.room_id)];
+}
 
 const validName = (name: string) => name.trim().length > 0 && name.length <= 64;
 const validCoordinate = (value: number) => Number.isFinite(value) && Math.abs(value) <= MAX_COORDINATE_M;
@@ -88,18 +101,19 @@ function withWall(doc: EditorDoc, floorId: string, wallId: string, edit: (wall: 
 }
 
 function applyEdit(doc: EditorDoc, action: Exclude<EditorAction, { type: 'undo' } | { type: 'redo' }>): EditorDoc | null {
+  const grid = action.grid_m === 0.0254 ? 0.0254 : GRID_M;
   switch (action.type) {
     case 'add_wall': {
       if (!validPoint(action.start) || !validPoint(action.end)) return null;
-      const start = snapPoint(action.start);
-      const end = snapPoint(action.end);
+      const start = snapPoint(action.start, grid);
+      const end = snapPoint(action.end, grid);
       if (samePoint(start, end)) return null;
       return withFloor(doc, action.floor_id, (floor) => ({ ...floor, walls: [...floor.walls, { wall_id: action.wall_id, start, end, openings: [] }] }));
     }
     case 'move_wall': {
       if (!validPoint(action.start) || !validPoint(action.end)) return null;
-      const start = snapPoint(action.start);
-      const end = snapPoint(action.end);
+      const start = snapPoint(action.start, grid);
+      const end = snapPoint(action.end, grid);
       if (samePoint(start, end)) return null;
       // Openings that no longer fit the moved wall are removed with the move (undo restores them).
       return withWall(doc, action.floor_id, action.wall_id, (wall) => {
@@ -115,7 +129,7 @@ function applyEdit(doc: EditorDoc, action: Exclude<EditorAction, { type: 'undo' 
         const length = wallLength(wall);
         if (length < EPSILON) return null;
         const t = ((action.at.x - wall.start.x) * (wall.end.x - wall.start.x) + (action.at.y - wall.start.y) * (wall.end.y - wall.start.y)) / (length * length);
-        const split = snapPoint({ x: wall.start.x + t * (wall.end.x - wall.start.x), y: wall.start.y + t * (wall.end.y - wall.start.y) });
+        const split = snapPoint({ x: wall.start.x + t * (wall.end.x - wall.start.x), y: wall.start.y + t * (wall.end.y - wall.start.y) }, grid);
         if (samePoint(split, wall.start) || samePoint(split, wall.end)) return null;
         const distance = Math.hypot(split.x - wall.start.x, split.y - wall.start.y);
         // A split landing inside an opening is rejected rather than truncating it.
@@ -123,13 +137,13 @@ function applyEdit(doc: EditorDoc, action: Exclude<EditorAction, { type: 'undo' 
         const first: Wall = { ...wall, end: split, openings: wall.openings.filter((opening) => opening.offset_m + opening.width_m <= distance + EPSILON) };
         const second: Wall = {
           wall_id: action.new_wall_id, start: split, end: wall.end,
-          openings: wall.openings.filter((opening) => opening.offset_m >= distance - EPSILON).map((opening) => ({ ...opening, offset_m: snap(opening.offset_m - distance) }))
+          openings: wall.openings.filter((opening) => opening.offset_m >= distance - EPSILON).map((opening) => ({ ...opening, offset_m: Number((opening.offset_m - distance).toFixed(6)) }))
         };
         return [first, second];
       });
     }
     case 'add_opening': {
-      const opening = { ...action.opening, offset_m: snap(action.opening.offset_m), width_m: snap(action.opening.width_m) };
+      const opening = { ...action.opening, offset_m: snap(action.opening.offset_m, grid), width_m: snap(action.opening.width_m, grid) };
       return withWall(doc, action.floor_id, action.wall_id, (wall) => (openingFits(wall, opening) ? [{ ...wall, openings: [...wall.openings, opening] }] : null));
     }
     case 'delete_opening':
@@ -139,7 +153,7 @@ function applyEdit(doc: EditorDoc, action: Exclude<EditorAction, { type: 'undo' 
       });
     case 'add_room': {
       if (!validName(action.name) || action.polygon.length < 3 || !action.polygon.every(validPoint)) return null;
-      const polygon = action.polygon.map(snapPoint);
+      const polygon = action.polygon.map(point => snapPoint(point, grid));
       return withFloor(doc, action.floor_id, (floor) => ({ ...floor, rooms: [...floor.rooms, { room_id: action.room_id, name: action.name.trim(), polygon }] }));
     }
     case 'rename_room': {
@@ -164,6 +178,19 @@ function applyEdit(doc: EditorDoc, action: Exclude<EditorAction, { type: 'undo' 
     case 'rename_floor':
       if (!validName(action.name)) return null;
       return withFloor(doc, action.floor_id, (floor) => (floor.name === action.name.trim() ? null : { ...floor, name: action.name.trim() }));
+    case 'copy_footprint': {
+      const floor = action.floor;
+      if (!isFloor(floor) || (!floor.walls.length && !floor.rooms.length)) return null;
+      const existing = doc.plan.floors.find(item => item.floor_id === floor.floor_id);
+      if (existing && (existing.walls.length || existing.rooms.length)) return null;
+      if (existing && (existing.level !== floor.level || existing.name !== floor.name || existing.ceiling_height_m !== floor.ceiling_height_m)) return null;
+      if (!existing && (doc.plan.floors.length >= 64 || doc.plan.floors.some(item => item.level === floor.level))) return null;
+      const used = new Set(doc.plan.floors.flatMap(item => [item.floor_id, ...geometryIds(item)]));
+      const ids = geometryIds(floor);
+      if (ids.some(id => used.has(id) || id === floor.floor_id) || new Set(ids).size !== ids.length) return null;
+      const floors = existing ? doc.plan.floors.map(item => item.floor_id === floor.floor_id ? floor : item) : [...doc.plan.floors, floor];
+      return { ...doc, plan: { ...doc.plan, floors: floors.sort((a, b) => a.level - b.level) } };
+    }
     case 'set_ceiling_height':
       if (!validCeiling(action.ceiling_height_m)) return null;
       return withFloor(doc, action.floor_id, (floor) => (floor.ceiling_height_m === action.ceiling_height_m ? null : { ...floor, ceiling_height_m: action.ceiling_height_m }));
@@ -178,7 +205,7 @@ function applyEdit(doc: EditorDoc, action: Exclude<EditorAction, { type: 'undo' 
       const raw = action.placement;
       const floor = doc.plan.floors.find((candidate) => candidate.floor_id === raw.floor_id);
       if (!floor || !validPoint(raw) || !Number.isFinite(raw.height_m) || raw.height_m < 0 || raw.height_m > floor.ceiling_height_m) return null;
-      const placement: Placement = { ...raw, x: snap(raw.x), y: snap(raw.y) };
+      const placement: Placement = { ...raw, x: snap(raw.x, grid), y: snap(raw.y, grid) };
       const existing = doc.placements.find((candidate) => candidate.device_id === placement.device_id);
       const placements = existing
         ? doc.placements.map((candidate) => (candidate.device_id === placement.device_id ? { ...placement, placement_id: existing.placement_id } : candidate))
@@ -188,8 +215,8 @@ function applyEdit(doc: EditorDoc, action: Exclude<EditorAction, { type: 'undo' 
     case 'move_placement': {
       const placement = doc.placements.find((candidate) => candidate.device_id === action.device_id);
       if (!placement || !validCoordinate(action.x) || !validCoordinate(action.y)) return null;
-      const x = snap(action.x);
-      const y = snap(action.y);
+      const x = snap(action.x, grid);
+      const y = snap(action.y, grid);
       if (placement.x === x && placement.y === y) return null;
       return { ...doc, placements: doc.placements.map((candidate) => (candidate.device_id === action.device_id ? { ...candidate, x, y } : candidate)) };
     }

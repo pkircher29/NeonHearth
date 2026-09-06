@@ -657,6 +657,7 @@ fn normalize(
 
 /// Bounded numeric-target transport. It never resolves names and never follows redirects.
 pub struct SystemTransport;
+mod smb;
 #[async_trait]
 impl AttemptTransport for SystemTransport {
     async fn attempt(
@@ -928,6 +929,16 @@ async fn tcp_attempt(
         }
         Err(_) => return Err(ActiveError::Network),
     };
+    // A completed handshake is sufficient evidence that a TCP port is open.
+    // Quiet services often wait for the client; waiting for a banner here would
+    // incorrectly turn a successful port check into the engine's outer timeout.
+    if d.id.starts_with("full.tcp.") {
+        return Ok(TransportResponse::Success(vec![("tcp_state".into(), "open".into())]));
+    }
+    if d.id == "tcp.smb.445" {
+        guard.authorize(probe_request.interface, ip).map_err(|_| ActiveError::Unauthorized)?;
+        return smb::negotiate(&mut stream).await;
+    }
     let request = if d.id.contains("http") || d.id.contains("camera") || d.id.contains("web") {
         format!("HEAD / HTTP/1.0\r\nHost: {ip}\r\nConnection: close\r\n\r\n").into_bytes()
     } else {
@@ -948,7 +959,8 @@ async fn tcp_attempt(
             .map_err(|_| ActiveError::Network)?;
     }
     let mut buf = vec![0; d.max_response_bytes.min(MAX_RESPONSE_BYTES)];
-    let n = stream.read(&mut buf).await.unwrap_or(0);
+    let n = tokio::time::timeout(Duration::from_millis(300), stream.read(&mut buf))
+        .await.ok().and_then(Result::ok).unwrap_or(0);
     buf.truncate(n);
     let metadata = if d.id.contains("http") || d.id.contains("camera") || d.id.contains("web") {
         parse_http_metadata(&buf)?

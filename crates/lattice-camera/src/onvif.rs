@@ -965,18 +965,18 @@ fn node_from_start(
         let raw_name = attribute.key.as_ref();
         if raw_name == b"xmlns" || raw_name.starts_with(b"xmlns:") {
             let value = attribute
-                .decode_and_unescape_value(reader.decoder())
+                .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
                 .map_err(|_| OnvifError::InvalidResponse)?;
             if value.len() > max_retained || std::str::from_utf8(value.as_bytes()).is_err() {
                 return Err(OnvifError::InvalidResponse);
             }
             continue;
         }
-        let (resolved, local) = reader.resolve_attribute(attribute.key);
+        let (resolved, local) = reader.resolver().resolve_attribute(attribute.key);
         let namespace = owned_namespace(resolved)?;
         let local = bounded_utf8(local.as_ref(), MAX_XML_NAME_BYTES)?;
         let value = attribute
-            .decode_and_unescape_value(reader.decoder())
+            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
             .map_err(|_| OnvifError::InvalidResponse)?;
         if value.len() > max_retained {
             return Err(OnvifError::InvalidResponse);

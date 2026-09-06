@@ -900,7 +900,7 @@ fn dns(
     let msg = Message::from_vec(q).map_err(|_| PassiveParseError::Metadata)?;
     let mut v = Vec::new();
     if o.metadata_enabled {
-        for x in msg.queries() {
+        for x in &msg.queries {
             v.push((
                 "query",
                 trim_name(&x.name().to_utf8()),
@@ -911,14 +911,14 @@ fn dns(
     }
     if p == "mdns-dns-sd" {
         for r in msg
-            .answers()
+            .answers
             .iter()
-            .chain(msg.name_servers())
-            .chain(msg.additionals())
+            .chain(&msg.authorities)
+            .chain(&msg.additionals)
         {
-            let ttl = i64::from(r.ttl()).clamp(1, 86400);
-            let owner = trim_name(&r.name().to_utf8());
-            match r.data() {
+            let ttl = i64::from(r.ttl).clamp(1, 86400);
+            let owner = trim_name(&r.name.to_utf8());
+            match &r.data {
                 RData::PTR(x) => v.push((
                     "service_instance",
                     format!("{owner} -> {}", trim_name(&x.0.to_utf8())),
@@ -927,12 +927,12 @@ fn dns(
                 )),
                 RData::SRV(x) => v.push((
                     "service_target",
-                    format!("{}:{}", trim_name(&x.target().to_utf8()), x.port()),
+                    format!("{}:{}", trim_name(&x.target.to_utf8()), x.port),
                     EvidenceFamily::Service,
                     ttl,
                 )),
                 RData::TXT(x) => {
-                    for z in x.iter() {
+                    for z in &x.txt_data {
                         v.push(("txt", text(z)?, EvidenceFamily::Service, ttl))
                     }
                 }

@@ -1,12 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
-    createEditorState, emptyHomePlan, reduceEditor, selectUncertain, selectUnplaced, snap, snapPoint, wallLength,
+    copyFloorFootprint, createEditorState, emptyHomePlan, reduceEditor, selectUncertain, selectUnplaced, snap, snapPoint, wallLength,
     type EditorAction, type EditorState, type Estimate, type HomeApi, type HomeDeviceRef, type HomeDraft, type OpeningKind, type Placement, type PlanPoint, type Room, type Wall
   } from '../stores/home';
   import HomeEditorFloorBar from './HomeEditorFloorBar.svelte';
   import HomeEditorInspector, { type InspectorTarget } from './HomeEditorInspector.svelte';
   import HomeEditorTray, { type EstimatedRow } from './HomeEditorTray.svelte';
+  import { formatLength, gridStep, readHomeUnits, saveHomeUnits, type HomeUnits } from '../homeUnits';
 
   let { api, devices = [] }: { api: HomeApi; devices?: HomeDeviceRef[] } = $props();
 
@@ -30,6 +31,8 @@
   let autosaveState = $state<'idle' | 'dirty' | 'saving' | 'saved' | 'error'>('idle');
   let committing = $state(false);
   let tool = $state<Tool>('select');
+  let units = $state<HomeUnits>('metric');
+  let copyTarget = $state('new');
   let openingKind = $state<OpeningKind>('door');
   let activeFloorId = $state<string | null>(null);
   let selection = $state<Selection>(null);
@@ -41,6 +44,9 @@
 
   const doc = $derived(editor.doc);
   const plan = $derived(doc.plan);
+  const grid = $derived(gridStep(units));
+  const majorGrid = $derived(units === 'imperial' ? 0.3048 : 1);
+  const copyTargets = $derived(plan.floors.filter(floor => floor.floor_id !== activeFloorId && !floor.walls.length && !floor.rooms.length));
   const activeFloor = $derived(plan.floors.find((floor) => floor.floor_id === activeFloorId) ?? plan.floors[0] ?? null);
   const floorPlacements = $derived(activeFloor ? doc.placements.filter((placement) => placement.floor_id === activeFloor.floor_id) : []);
   const unplaced = $derived(selectUnplaced(devices, doc.placements));
@@ -109,7 +115,7 @@
 
   function dispatch(action: EditorAction): boolean {
     const previous = editor;
-    const next = reduceEditor(previous, action);
+    const next = reduceEditor(previous, { ...action, grid_m: grid });
     if (next === previous) return false;
     const previousPlacements = previous.doc.placements;
     const nextPlacements = next.doc.placements;
@@ -188,6 +194,7 @@
   }
 
   onMount(() => {
+    units = readHomeUnits();
     void (async () => {
       await loadHome();
       if (loadError) return;
@@ -203,7 +210,7 @@
   // ---- Canvas interactions ----
   function canvasPoint(event: { clientX: number; clientY: number }): PlanPoint {
     const rect = svgEl?.getBoundingClientRect();
-    return snapPoint({ x: (event.clientX - (rect?.left ?? 0)) / SCALE, y: (event.clientY - (rect?.top ?? 0)) / SCALE });
+    return snapPoint({ x: (event.clientX - (rect?.left ?? 0)) / SCALE, y: (event.clientY - (rect?.top ?? 0)) / SCALE }, grid);
   }
   function onCanvasClick(event: MouseEvent) {
     if (!activeFloor) return;
@@ -229,8 +236,8 @@
     const point = canvasPoint(event);
     const length = wallLength(wall);
     const t = length === 0 ? 0 : ((point.x - wall.start.x) * (wall.end.x - wall.start.x) + (point.y - wall.start.y) * (wall.end.y - wall.start.y)) / (length * length);
-    const width = OPENING_WIDTHS[openingKind];
-    const offset = snap(Math.min(Math.max(t * length - width / 2, 0), Math.max(length - width, 0)));
+    const width = units === 'imperial' ? (openingKind === 'window' ? 0.8128 : 0.9144) : OPENING_WIDTHS[openingKind];
+    const offset = snap(Math.min(Math.max(t * length - width / 2, 0), Math.max(length - width, 0)), grid);
     if (!dispatch({ type: 'add_opening', floor_id: activeFloor.floor_id, wall_id: wall.wall_id, opening: { opening_id: newId(), kind: openingKind, offset_m: offset, width_m: width } })) {
       notice = `That wall is too short for a ${openingKind}.`;
     }
@@ -293,11 +300,11 @@
     if (current?.kind !== 'placement') return;
     const placement = doc.placements.find((candidate) => candidate.device_id === current.id);
     if (!placement) return;
-    const step: Record<string, [number, number]> = { ArrowLeft: [-0.1, 0], ArrowRight: [0.1, 0], ArrowUp: [0, -0.1], ArrowDown: [0, 0.1] };
+    const step: Record<string, [number, number]> = { ArrowLeft: [-grid, 0], ArrowRight: [grid, 0], ArrowUp: [0, -grid], ArrowDown: [0, grid] };
     const nudge = step[event.key];
     if (!nudge) return;
     event.preventDefault();
-    dispatch({ type: 'move_placement', device_id: placement.device_id, x: snap(placement.x + nudge[0]), y: snap(placement.y + nudge[1]) });
+    dispatch({ type: 'move_placement', device_id: placement.device_id, x: snap(placement.x + nudge[0], grid), y: snap(placement.y + nudge[1], grid) });
   }
   function onWindowKeydown(event: KeyboardEvent) {
     if (!(event.ctrlKey || event.metaKey)) return;
@@ -311,6 +318,24 @@
     const level = plan.floors.length > 0 ? Math.max(...plan.floors.map((floor) => floor.level)) + 1 : 0;
     const floor_id = newId();
     if (dispatch({ type: 'add_floor', floor_id, level, name: `Floor ${level}`, ceiling_height_m: 2.4 })) activeFloorId = floor_id;
+  }
+
+  function copyFootprint() {
+    if (!activeFloor) return;
+    const level = Math.max(...plan.floors.map(floor => floor.level)) + 1;
+    const destination = copyTarget === 'new'
+      ? { floor_id: newId(), level, name: `Floor ${level}`, ceiling_height_m: activeFloor.ceiling_height_m, walls: [], rooms: [] }
+      : copyTargets.find(floor => floor.floor_id === copyTarget);
+    if (!destination) { notice = 'Choose a new or empty floor for the footprint.'; return; }
+    const sourceName = activeFloor.name;
+    const floor = copyFloorFootprint(activeFloor, destination, newId);
+    if (dispatch({ type: 'copy_footprint', floor })) {
+      activeFloorId = floor.floor_id;
+      selection = { kind: 'floor' };
+      copyTarget = 'new';
+      cancelPending();
+      notice = `Copied ${sourceName} to ${floor.name}. Edit each floor separately; Undo removes this copy.`;
+    } else notice = 'The footprint could not be copied. Choose an empty floor within the plan limits.';
   }
 
   function openingSegment(wall: Wall, offset: number, width: number) {
@@ -380,6 +405,11 @@
 
     <div class="editor-toolbar">
       <div class="tool-palette" role="toolbar" aria-label="Editor tools">
+        <label class="opening-kind">Units
+          <select aria-label="Measurement units" value={units} onchange={event => { units = event.currentTarget.value as HomeUnits; saveHomeUnits(units); cancelPending(); }}>
+            <option value="metric">Metric (meters)</option><option value="imperial">Imperial (feet / inches)</option>
+          </select>
+        </label>
         {#each tools as entry (entry.id)}
           <button type="button" class:active={tool === entry.id} aria-pressed={tool === entry.id} onclick={() => { tool = entry.id; if (entry.id !== 'place') placingDevice = null; }}>{entry.label}</button>
         {/each}
@@ -408,6 +438,19 @@
 
     <HomeEditorFloorBar floors={plan.floors} active={activeFloor?.floor_id ?? null} onselect={(floorId) => { activeFloorId = floorId; selection = { kind: 'floor' }; cancelPending(); }} onadd={addFloor} />
 
+    {#if activeFloor}
+      <div class="footprint-controls tool-palette">
+        <label class="opening-kind">Copy footprint to
+          <select aria-label="Footprint destination" bind:value={copyTarget}>
+            <option value="new">New floor above</option>
+            {#each copyTargets as floor (floor.floor_id)}<option value={floor.floor_id}>{floor.name}</option>{/each}
+          </select>
+        </label>
+        <button type="button" disabled={!activeFloor.walls.length && !activeFloor.rooms.length} onclick={copyFootprint}>Copy footprint</button>
+        <span class="placing-hint">Copies walls, openings, and rooms. Devices keep their locations.</span>
+      </div>
+    {/if}
+
     <div class="editor-body">
       <div class="canvas-frame">
         {#if activeFloor}
@@ -415,14 +458,14 @@
           <!-- role=application is the ARIA drawing-canvas role; every tool is also reachable through real buttons. -->
           <svg class="plan-canvas" bind:this={svgEl} width={CANVAS_W_M * SCALE} height={CANVAS_H_M * SCALE}
             viewBox={`0 0 ${CANVAS_W_M * SCALE} ${CANVAS_H_M * SCALE}`} role="application" tabindex="0"
-            aria-label={`Floor plan for ${activeFloor.name}. Grid squares are 0.5 meters.`}
+            aria-label={`Floor plan for ${activeFloor.name}. Grid squares are ${units === 'imperial' ? '6 inches' : '0.5 meters'}. Snap ${units === 'imperial' ? '1 inch' : '0.1 meter'}.`}
             onclick={onCanvasClick} onkeydown={onCanvasKeydown} ondragover={(event) => event.preventDefault()} ondrop={onCanvasDrop}>
             <defs>
-              <pattern id="home-grid-minor" width={SCALE / 2} height={SCALE / 2} patternUnits="userSpaceOnUse">
-                <path class="grid-minor" d={`M ${SCALE / 2} 0 L 0 0 0 ${SCALE / 2}`} fill="none" stroke-width="1" />
+              <pattern id="home-grid-minor" width={SCALE * majorGrid / 2} height={SCALE * majorGrid / 2} patternUnits="userSpaceOnUse">
+                <path class="grid-minor" d={`M ${SCALE * majorGrid / 2} 0 L 0 0 0 ${SCALE * majorGrid / 2}`} fill="none" stroke-width="1" />
               </pattern>
-              <pattern id="home-grid-major" width={SCALE} height={SCALE} patternUnits="userSpaceOnUse">
-                <path class="grid-major" d={`M ${SCALE} 0 L 0 0 0 ${SCALE}`} fill="none" stroke-width="1" />
+              <pattern id="home-grid-major" width={SCALE * majorGrid} height={SCALE * majorGrid} patternUnits="userSpaceOnUse">
+                <path class="grid-major" d={`M ${SCALE * majorGrid} 0 L 0 0 0 ${SCALE * majorGrid}`} fill="none" stroke-width="1" />
               </pattern>
             </defs>
             <rect class="grid" width="100%" height="100%" fill="url(#home-grid-minor)" />
@@ -436,7 +479,7 @@
             {#each activeFloor.walls as wall (wall.wall_id)}
               <line class="wall" class:selected={selection?.kind === 'wall' && selection.id === wall.wall_id} data-wall-id={wall.wall_id}
                 x1={wall.start.x * SCALE} y1={wall.start.y * SCALE} x2={wall.end.x * SCALE} y2={wall.end.y * SCALE}
-                role="button" tabindex="0" aria-label={`Wall, ${wallLength(wall).toFixed(2)} meters`}
+                role="button" tabindex="0" aria-label={`Wall, ${formatLength(wallLength(wall), units)}`}
                 onclick={(event) => onWallClick(event, wall)} onkeydown={(event) => keyActivate(event, () => (selection = { kind: 'wall', id: wall.wall_id }))} />
               {#each wall.openings as opening (opening.opening_id)}
                 {@const segment = openingSegment(wall, opening.offset_m, opening.width_m)}
@@ -444,7 +487,7 @@
               {/each}
             {/each}
             {#if selectedWall}
-              <text class="dimension" x={((selectedWall.start.x + selectedWall.end.x) / 2) * SCALE} y={((selectedWall.start.y + selectedWall.end.y) / 2) * SCALE - 10}>{wallLength(selectedWall).toFixed(2)} m</text>
+              <text class="dimension" x={((selectedWall.start.x + selectedWall.end.x) / 2) * SCALE} y={((selectedWall.start.y + selectedWall.end.y) / 2) * SCALE - 10}>{formatLength(wallLength(selectedWall), units)}</text>
             {/if}
             {#each floorPlacements as placement (placement.device_id)}
               <g class="placement" class:selected={selection?.kind === 'placement' && selection.id === placement.device_id} data-device-id={placement.device_id}
@@ -470,7 +513,7 @@
       <div class="side-panel">
         <HomeEditorTray {unplaced} placing={placingDevice} estimated={estimatedRows} onpick={armPlacement} />
         {#if target}
-          <HomeEditorInspector {target} onaction={apply} onclose={() => (selection = null)} />
+          <HomeEditorInspector {target} {units} onaction={apply} onclose={() => (selection = null)} />
         {/if}
       </div>
     </div>
@@ -478,6 +521,7 @@
 </section>
 
 <style>
+  .footprint-controls{margin:0 0 14px;gap:10px}
   .editor-state{margin-top:28px;padding:18px;border:1px dashed var(--line);border-radius:var(--radius-card);color:var(--ink-mute);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   .editor-state.error{border-color:var(--alert);color:var(--alert-text)}
   .editor-state button{min-height:40px;padding:8px 14px;border:1px solid var(--ember);border-radius:8px;background:transparent;color:var(--ember);font:500 12.5px var(--font-body);cursor:pointer}

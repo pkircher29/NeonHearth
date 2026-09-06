@@ -1,13 +1,16 @@
 pub mod api;
 mod auth;
+pub mod automation;
 pub mod cameras;
 pub mod discovery;
 pub mod doctor;
 pub mod home;
 pub mod integrations;
+pub mod mqtt;
 pub mod platform;
 pub mod policy;
 pub mod runtime;
+mod security;
 mod state;
 pub mod tailscale;
 pub mod vault;
@@ -46,7 +49,9 @@ pub fn app(state: AppState) -> Router {
 /// is unchanged.
 pub fn with_ui_assets(router: Router, ui_dir: &std::path::Path) -> Router {
     let index = tower_http::services::ServeFile::new(ui_dir.join("index.html"));
-    router.fallback_service(tower_http::services::ServeDir::new(ui_dir).fallback(index))
+    router
+        .fallback_service(tower_http::services::ServeDir::new(ui_dir).fallback(index))
+        .layer(axum::middleware::from_fn(security::browser_boundary))
 }
 
 /// Like [`app`], but with an explicitly assembled Doctor state — the seam
@@ -154,12 +159,14 @@ pub fn app_with_parts(
             get(integrations::events_route),
         )
         .merge(doctor::routes(doctor))
+        .merge(automation::routes())
         .layer(axum::Extension(remote.clone()))
         .layer(axum::middleware::from_fn_with_state(
             remote,
             tailscale::remote_access_layer,
         ))
         .with_state(state)
+        .layer(axum::middleware::from_fn(security::browser_boundary))
 }
 
 #[derive(Deserialize)]

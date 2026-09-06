@@ -138,6 +138,9 @@ pub(crate) async fn serve(
         .await
         .context("initialize install state")?;
     let state = AppState::new(token, M2StateRepository::new(pool.clone()))?;
+    if let Some(path) = std::env::var_os("LATTICE_MQTT_CREDENTIAL_FILE") {
+        lattice_service::mqtt::start(state.clone(), PathBuf::from(path), shutdown_rx.clone());
+    }
     let startup =
         lattice_service::runtime::build(state.clone(), M2StateRepository::new(pool.clone())).await;
     let bind_var = std::env::var("LATTICE_BIND").ok();
