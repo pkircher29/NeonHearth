@@ -315,6 +315,7 @@ impl Drop for StartedChildren {
 }
 
 pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
+    platform::prevent_stdio_inheritance()?;
     let options = Options::parse(arguments)?;
     if options.help {
         println!(

@@ -13,7 +13,8 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, LocalFree,
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
     },
     NetworkManagement::IpHelper::{
         GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
@@ -22,9 +23,10 @@ use windows_sys::Win32::{
     Networking::WinSock::AF_INET,
     Security::{Authorization::*, Cryptography::*, *},
     Storage::FileSystem::{
-        CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+        CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_TYPE_PIPE, GetFileAttributesW,
+        GetFileType, INVALID_FILE_ATTRIBUTES,
     },
-    System::{Com::CoTaskMemFree, Threading::*},
+    System::{Com::CoTaskMemFree, Console::*, Threading::*},
     UI::{
         Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, ShellExecuteW},
         WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW, SW_SHOWNORMAL},
@@ -82,6 +84,25 @@ pub fn default_state() -> Result<PathBuf> {
         path.context("Windows application data path exceeds the supported length")?
     };
     Ok(result.join("NeonHearthHomeHub"))
+}
+
+/// Background components have their own log handles. Inherited caller pipes
+/// must not keep a scripting client's read open after the launcher exits.
+pub fn prevent_stdio_inheritance() -> Result<()> {
+    for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: borrowed handles stay open and retain their read/write access.
+        let handle = unsafe { GetStdHandle(kind) };
+        if !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+            && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE
+        {
+            ensure!(
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0,
+                "Cannot isolate launcher output from background processes"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn user_sid() -> Result<String> {

@@ -20,7 +20,7 @@ def main():
     if output.exists():
         raise ValueError('Choose a new empty package destination; existing packages are preserved')
     ui = ROOT / 'apps' / 'desktop' / 'dist'
-    for path in [args.target / 'NeonHearth.exe', args.target / 'lattice-service.exe', ui / 'index.html', args.mosquitto / 'mosquitto.exe', args.mosquitto / 'mosquitto_passwd.exe']:
+    for path in [args.target / 'NeonHearth.exe', args.target / 'lattice-service.exe', ui / 'index.html', args.mosquitto / 'mosquitto.exe', args.mosquitto / 'mosquitto_passwd.exe', ROOT / 'LICENSE']:
         if not path.is_file():
             raise ValueError(f'Build or supply the required component: {path.name}')
     output.mkdir(parents=True)
@@ -95,7 +95,8 @@ Third-party notices are in licenses/.
     archive = output.with_suffix('.zip')
     if archive.exists():
         raise ValueError('Archive already exists')
-    with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as bundle:
+    # Dependency archives can carry Unix-epoch timestamps, outside ZIP's range.
+    with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,strict_timestamps=False) as bundle:
         for path in sorted(output.rglob('*')):
             if path.is_file(): bundle.write(path,path.relative_to(output.parent))
     print(json.dumps({'package':str(output),'archive':str(archive),'files':len(files),'sha256':hashlib.file_digest(archive.open('rb'),'sha256').hexdigest()}))
