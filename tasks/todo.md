@@ -14,15 +14,15 @@
 
 ## Continued delivery
 
-- [ ] Remove the unnecessary Windows packet-driver dependency from interface inventory.
-- [ ] Add a native launcher with protected per-user state and authenticated startup.
-- [ ] Build a portable package containing the UI, service, launcher, MQTT hub, and license notices.
-- [ ] Verify relocated startup, missing components, occupied ports, repeat launch, private files, and actual browser use.
-- [ ] Preserve the development instance's observations in the runnable package and record the handoff.
-- [ ] Recheck reachable Home Assistant configuration without changing household devices.
+- [x] Remove the unnecessary Windows packet-driver dependency from interface inventory.
+- [x] Add a native launcher with protected per-user state and authenticated startup.
+- [x] Build a portable package containing the UI, service, launcher, MQTT hub, and license notices.
+- [x] Verify relocated startup, missing components, occupied ports, repeat launch, private files, and actual browser use.
+- [x] Preserve the development instance's observations in the runnable package and record the handoff.
+- [x] Recheck reachable Home Assistant configuration without changing household devices (reported host unreachable; physical connection remains unverified).
 - [x] Add numeric IP sorting in both directions, with unknown addresses last; verify in the running UI.
-- [ ] Add Avahi integration for Linux and bounded mDNS/Bonjour discovery for Windows.
-- [ ] Expose bounded discovery jobs for mDNS/Bonjour, ICMP, SNMP, SMB, and NetBIOS; require explicit owner selection and supplied SNMP credentials.
-- [ ] Add validated CDP/LLDP parsing and capture import with truthful local-link visibility.
-- [ ] Scan ports across all observed devices with bounded jobs, cancellation, and identification results.
-- [ ] Add metric/imperial house-editor units and copy footprints between floors; verify saved geometry, undo, and browser use.
+- [x] Add Avahi integration for Linux and bounded mDNS/Bonjour discovery for Windows.
+- [x] Expose bounded discovery jobs for mDNS/Bonjour, ICMP, SNMP, SMB, and NetBIOS; require explicit owner selection and supplied SNMP credentials.
+- [x] Add validated CDP/LLDP parsing and capture import with truthful local-link visibility.
+- [x] Scan ports across all observed devices with bounded jobs, cancellation, and identification results.
+- [x] Add metric/imperial house-editor units and copy footprints between floors; verify saved geometry, undo, and browser use.

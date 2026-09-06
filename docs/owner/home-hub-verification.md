@@ -9,7 +9,7 @@ copies, bounded device scans, mDNS/Bonjour, ICMP, SMB, NetBIOS, credentialed
 SNMP, Linux Avahi integration, and CDP/LLDP PCAP import. A native Windows
 launcher and portable package builder replace the development-only startup path.
 
-Current local checks: **914 Rust tests passed, one opt-in MQTT test ignored**;
+Current local checks: **917 Rust tests passed, one opt-in MQTT test ignored**;
 **266 desktop tests and seven Playwright tests passed**; Svelte checking and
 the production web build passed. Rust dependency advisories, licenses, bans,
 and sources passed without advisory exceptions. Workspace Clippy passed with
@@ -17,9 +17,75 @@ warnings denied. The new Windows backup/restore regression from upstream was
 observed failing with an access error and passed after correcting the file
 handle's flush access. Existing SQL migration bytes were preserved.
 
-Current logs use the `artifacts/final-*` prefix. The native package and current
-live discovery acceptance are recorded separately from the earlier evidence
-below. CI and merge status belong to the linked GitHub pull request.
+Current logs use the `artifacts/final-*` prefix. GitHub runs the full Linux Rust
+suite, desktop checks, Playwright, dependency policy and SBOM generation, plus
+native Windows launcher/inventory/socket tests. CI and merge status are in
+[pull request #4](https://github.com/pkircher29/NeonHearth/pull/4).
+
+### Current native acceptance
+
+The packaged Windows executable and real Mosquitto broker ran from a folder
+containing spaces with separate private QA state. Restart and repeat launch
+used the same protected owner credential. Unauthenticated API requests returned
+401, foreign browser origins returned 403, occupied ports received no owner
+connection, startup failures cleaned up newly started broker processes, unrelated
+data was preserved, and missing/changed package components were rejected.
+Native PE imports contain no Npcap/Packet dependency. The launcher pipe regression
+was reproduced through a scripting caller and verified fixed.
+
+The owner-started live scan completed **4,620 checks across 66 eligible devices**
+and found **89 open TCP ports**. Real responses included mDNS/Bonjour, IPv4 ICMP,
+SMB negotiation and NetBIOS names. All-port cancellation retained partial results.
+There were 4,329 no-response checks and 57 unavailable/failed checks, recorded as
+such. This was a common-port scan of eligible observed addresses, not proof of
+every port or device on the network. SNMP credentials and physical SNMP devices
+were not supplied; that protocol has automated fixture coverage.
+
+Native browser acceptance confirmed eight feet is stored as 2.4384 meters,
+unit preferences survive reload, footprint copies have independent IDs, copying
+to existing/new floors and Undo work, and three rooms/three device placements
+remain saved. Three floors render in 3D. A withdrawn LLDP capture imports with
+its original timestamp. At desktop and 390-pixel mobile widths there were no
+page exceptions or horizontal overflow. The same local HA fixture imported
+three devices, cleared token input and verified permission/confirmation/state
+behavior; no household device was switched.
+
+Live validation also reproduced a plan-save failure competing with discovery's
+database writer. The added regression passed after reserving the writer before
+reading the plan version. Native testing caught and fixed Winsock's asymmetric
+byte order for setting/getting the interface index. A Windows CI regression now
+covers it. The editor recognizes the service's 204 no-draft response correctly.
+
+Evidence: `artifacts/home-hub-verification/continued-ui.json`, `scan-results.json`,
+`native-launcher.json`, `launcher-boundaries.json`, and current screenshots.
+The package builder writes a SHA-256 manifest and ZIP; package hashes are local
+evidence, not publisher signatures. Current npm audit reports zero known
+vulnerabilities. Linux runtime/Avahi daemon behavior, physical HA controls,
+remote phone access, clean-machine prerequisites and signing remain unverified.
+
+### Preserved-data handoff
+
+The final native package is `artifacts/NeonHearth Home Hub Ready/NeonHearth.exe`.
+Its ZIP SHA-256 is `3301c38965c29a9288a22551faa33988dba99b348880cb0c9a570286a81fce69`.
+It runs the user's dashboard at `127.0.0.1:58121` and authenticated MQTT at
+`127.0.0.1:58183`. The previous development database is retained unchanged in
+`.local/runtime/data/NeonHearth/`; an integrity-checked SQLite backup supplied
+the new private state under `%LOCALAPPDATA%/NeonHearthHomeHub`.
+
+All **74 observed device records** were preserved. The new instance contains
+no simulated HA devices or QA floorplan. Four live samples stayed ready while
+the latest observation advanced every five seconds; MQTT was connected.
+The native browser passed sorting, pairing, saved unit preference, and desktop/
+mobile checks, and the launcher opened the dashboard. `native-handoff.json`
+records the result without credentials; verification passed credentials only
+through process stdin. QA service and broker instances were stopped.
+
+The retained history exposed another runtime failure: expired neighbor samples
+filled the bounded presence cache, preventing new observations. A three-hour
+polling regression reproduced it. Samples now expire after their support and
+correction windows, while stored device history and cache capacity bounds remain
+intact. All intelligence tests and three real discovery cycles on a disposable
+copy passed; the actual preserved-data instance then resumed live monitoring.
 
 ## Earlier development-runtime acceptance
 
