@@ -70,7 +70,13 @@ pub struct ScanRequest {
     pub ports: Vec<u16>,
     #[serde(default)]
     pub protocols: Vec<Protocol>,
+    /// Fetch a bounded root page on open, recognized web ports.
+    #[serde(default = "default_web_identification")]
+    pub web_identification: bool,
     pub snmp: Option<SnmpInput>,
+}
+fn default_web_identification() -> bool {
+    true
 }
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -222,6 +228,27 @@ struct Target {
     ip: IpAddr,
     interface: InterfaceId,
     guard: Arc<TargetGuard>,
+}
+
+struct ScanPacer {
+    next: Mutex<Instant>,
+    cancel: CancellationToken,
+    deadline: Instant,
+}
+impl ScanPacer {
+    async fn ready(&self) -> bool {
+        let due = {
+            let mut next = self.next.lock().await;
+            let due = (*next).max(Instant::now());
+            *next = due + Duration::from_millis(25);
+            due
+        };
+        tokio::select! { biased;
+            () = self.cancel.cancelled() => false,
+            () = tokio::time::sleep_until(self.deadline) => false,
+            () = tokio::time::sleep_until(due) => true,
+        }
+    }
 }
 
 impl ScanHub {
@@ -389,8 +416,15 @@ impl ScanHub {
         };
         let hub = self.clone();
         tokio::spawn(async move {
-            hub.run(targets, ports, input.protocols, credential, cancel)
-                .await;
+            hub.run(
+                targets,
+                ports,
+                input.protocols,
+                credential,
+                cancel,
+                input.web_identification,
+            )
+            .await;
         });
         Ok(status)
     }
@@ -406,6 +440,7 @@ impl ScanHub {
         protocols: Vec<Protocol>,
         credential: Option<Arc<ProbeCredential>>,
         cancel: CancellationToken,
+        web_identification: bool,
     ) {
         if protocols.contains(&Protocol::Mdns) {
             #[cfg(target_os = "linux")]
@@ -475,22 +510,29 @@ impl ScanHub {
                 }
             }
         }
-        let rate = Arc::new(Mutex::new(Instant::now()));
         let deadline = Instant::now() + Duration::from_secs(24 * 3600);
+        let pacer = Arc::new(ScanPacer {
+            next: Mutex::new(Instant::now()),
+            cancel: cancel.clone(),
+            deadline,
+        });
         stream::iter(targets).for_each_concurrent(12, |target| {
-            let ports = ports.clone(); let rate = rate.clone(); let cancel = cancel.clone(); let credential = credential.clone(); let protocols = &protocols;
+            let ports = ports.clone(); let pacer = pacer.clone(); let cancel = cancel.clone(); let credential = credential.clone(); let protocols = &protocols;
             async move {
                 let Ok(catalog) = active::catalog() else { return; };
                 let engine = ActiveEngine::new(target.guard.clone(), Arc::new(SystemTransport), catalog);
                 let extra = protocols.iter().filter(|p| **p != Protocol::Mdns).map(|p| match p { Protocol::Icmp => if target.ip.is_ipv4() {"icmp.echo.v4"} else {"icmp.echo.v6"}, Protocol::Mdns => "udp.mdns.5353", Protocol::Smb => "tcp.smb.445", Protocol::Netbios => "udp.nbns.137", Protocol::Snmp => "udp.snmp.161" }.to_owned());
                 let probes = extra.chain(ports.iter().map(|port| format!("full.tcp.{port}")));
                 for probe in probes {
-                    let due = { let mut next = rate.lock().await; let due = (*next).max(Instant::now()); *next = due + Duration::from_millis(25); due };
-                    tokio::select! { biased; () = cancel.cancelled() => break, () = tokio::time::sleep_until(deadline) => break, () = tokio::time::sleep_until(due) => {} }
+                    if !pacer.ready().await { break; }
                     let port = probe.strip_prefix("full.tcp.").and_then(|p| p.parse::<u16>().ok());
                     let request = ProbeRequest { interface: target.interface, target: target.ip, probe_id: probe.clone(), mode: if port.is_some() {ProbeMode::OwnerFullPort} else {ProbeMode::OwnerInventory}, owner_approved: true };
                     let result = tokio::select! { biased; () = cancel.cancelled() => break, result = tokio::time::timeout(Duration::from_millis(if port.is_some() {750} else {3500}), engine.execute(request,credential.as_deref())) => result.unwrap_or(Ok(ProbeOutcome::Timeout { source: probe.clone() })) };
+                    let open = matches!(result, Ok(ProbeOutcome::Success { .. }));
                     self.record(&target, &probe, port, result).await;
+                    if web_identification && open && let Some(port) = port {
+                        self.identify_web(&target, port, &engine, &pacer).await;
+                    }
                 }
             }
         }).await;
@@ -507,13 +549,89 @@ impl ScanHub {
             }
             .into();
             running.status.finished_at = Some(Utc::now().to_rfc3339());
-            running.status.detail = "Results describe this scan only. A timeout does not prove a device or service is absent. Port-based names are hints, not verified device identities.".into();
+            running.status.detail = "Results describe this scan only. Web follow-up checks are included in progress. Titles and product clues are reported by the device and need your verification. A timeout does not prove a device or service is absent.".into();
             running.status.clone()
         };
         if self.persist(&status).await.is_err() {
             self.inner.lock().await.status.detail =
                 "Scan finished, but results could not be saved. They remain visible until restart."
                     .into();
+        }
+    }
+    async fn identify_web<T: active::AttemptTransport>(
+        &self,
+        target: &Target,
+        port: u16,
+        engine: &ActiveEngine<T>,
+        pacer: &ScanPacer,
+    ) {
+        let Some(probes) = active::web_probe_ids(port) else {
+            return;
+        };
+        for probe in probes {
+            if !pacer.ready().await {
+                break;
+            }
+            self.inner.lock().await.status.total += 1;
+            let request = ProbeRequest {
+                interface: target.interface,
+                target: target.ip,
+                probe_id: probe,
+                mode: ProbeMode::OwnerInventory,
+                owner_approved: true,
+            };
+            let result = tokio::select! { biased;
+                () = pacer.cancel.cancelled() => break,
+                () = tokio::time::sleep_until(pacer.deadline) => break,
+                result = engine.execute(request, None) => result,
+            };
+            let mut inner = self.inner.lock().await;
+            let status = &mut inner.status;
+            status.completed += 1;
+            let mut identified = false;
+            let (facts, outcome) = match result {
+                Ok(ProbeOutcome::Success { facts }) => {
+                    identified = facts.iter().any(|f| f.key == "web_status");
+                    (
+                        facts,
+                        if identified {
+                            "Web response received"
+                        } else {
+                            "TLS responded; no readable HTTP response"
+                        },
+                    )
+                }
+                Ok(ProbeOutcome::Timeout { .. }) => {
+                    status.no_response += 1;
+                    (vec![], "No web response before the time limit")
+                }
+                Ok(ProbeOutcome::Refused { .. }) => {
+                    status.refused += 1;
+                    (vec![], "Web follow-up connection refused")
+                }
+                Err(_) => {
+                    status.errors += 1;
+                    (vec![], "Web identification unavailable")
+                }
+            };
+            if let Some(finding) = status.findings.iter_mut().find(|finding| {
+                finding.device_id.as_deref() == Some(&target.device)
+                    && finding.protocol == "tcp"
+                    && finding.port == Some(port)
+            }) {
+                for fact in facts.into_iter().take(24) {
+                    if finding.facts.len() < 24 || finding.facts.contains_key(&fact.key) {
+                        finding.facts.insert(fact.key, bounded_text(&fact.value));
+                    }
+                }
+                finding
+                    .facts
+                    .insert("web_probe_status".into(), outcome.into());
+                // Port openness survives a failed identification attempt.
+            }
+            if identified {
+                break;
+            }
         }
     }
     async fn record(
@@ -686,6 +804,200 @@ pub struct ScanApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use active::{AttemptTransport, ProbeDescriptor, TransportResponse};
+    use lattice_sensor::{Interface, InterfaceClass, InterfaceInventory};
+    use std::collections::VecDeque;
+
+    struct ScriptedWeb {
+        calls: std::sync::Mutex<Vec<String>>,
+        responses: std::sync::Mutex<VecDeque<Result<TransportResponse, active::ActiveError>>>,
+    }
+    #[async_trait::async_trait]
+    impl AttemptTransport for ScriptedWeb {
+        async fn attempt(
+            &self,
+            _: &TargetGuard,
+            request: &ProbeRequest,
+            _: &ProbeDescriptor,
+            credential: Option<&ProbeCredential>,
+        ) -> Result<TransportResponse, active::ActiveError> {
+            assert!(credential.is_none());
+            self.calls.lock().unwrap().push(request.probe_id.clone());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(TransportResponse::Timeout))
+        }
+    }
+    fn web_target() -> Target {
+        let ip = "192.168.50.3".parse().unwrap();
+        let interface = InterfaceId::new(7);
+        let guard = TargetGuard::new(
+            InterfaceInventory::new(vec![Interface {
+                id: interface,
+                name: "fixture".into(),
+                description: None,
+                up: true,
+                class: InterfaceClass::PhysicalWired,
+                addresses: vec![Address {
+                    ip: "192.168.50.2".parse().unwrap(),
+                    prefix: 24,
+                }],
+                owner_role: None,
+            }]),
+            [],
+            [TargetApproval {
+                interface,
+                prefix: Address { ip, prefix: 32 },
+            }],
+        )
+        .unwrap();
+        Target {
+            device: "11111111-1111-4111-8111-111111111111".into(),
+            ip,
+            interface,
+            guard: Arc::new(guard),
+        }
+    }
+    fn pacer() -> ScanPacer {
+        ScanPacer {
+            next: Mutex::new(Instant::now()),
+            cancel: CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_identification_fallback_enriches_and_persists_one_open_port() {
+        let pool = lattice_store::connect_memory().await.unwrap();
+        let hub = ScanHub::new(pool.clone());
+        let target = web_target();
+        let transport = Arc::new(ScriptedWeb {
+            calls: Default::default(),
+            responses: std::sync::Mutex::new(VecDeque::from([
+                Err(active::ActiveError::Protocol),
+                Ok(TransportResponse::Success(vec![
+                    ("web_status".into(), "200".into()),
+                    ("web_title".into(), "Home Assistant".into()),
+                    ("web_scheme".into(), "https".into()),
+                    ("certificate_trust".into(), "unverified".into()),
+                ])),
+            ])),
+        });
+        let engine = ActiveEngine::new(
+            target.guard.clone(),
+            transport.clone(),
+            active::catalog().unwrap(),
+        );
+        {
+            let mut inner = hub.inner.lock().await;
+            inner.status.job_id = Some("fixture".into());
+            inner.status.total = 1;
+        }
+        hub.record(
+            &target,
+            "full.tcp.8123",
+            Some(8123),
+            Ok(ProbeOutcome::Success { facts: vec![] }),
+        )
+        .await;
+        hub.identify_web(&target, 8123, &engine, &pacer()).await;
+        let status = hub.status().await.unwrap();
+        assert_eq!(
+            *transport.calls.lock().unwrap(),
+            vec!["web.http.8123", "web.https.8123"]
+        );
+        assert_eq!(
+            (status.total, status.completed, status.open_ports),
+            (3, 3, 1)
+        );
+        assert_eq!(status.findings.len(), 1);
+        assert_eq!(status.findings[0].status, "open");
+        assert_eq!(status.findings[0].facts["web_title"], "Home Assistant");
+        hub.persist(&status).await.unwrap();
+        let restored = ScanHub::new(pool).status().await.unwrap();
+        assert_eq!(restored.findings[0].facts, status.findings[0].facts);
+    }
+
+    #[tokio::test]
+    async fn web_identification_failures_and_cancellation_preserve_port_openness() {
+        let hub = ScanHub::new(lattice_store::connect_memory().await.unwrap());
+        let target = web_target();
+        let transport = Arc::new(ScriptedWeb {
+            calls: Default::default(),
+            responses: Default::default(),
+        });
+        let engine = ActiveEngine::new(
+            target.guard.clone(),
+            transport.clone(),
+            active::catalog().unwrap(),
+        );
+        hub.record(
+            &target,
+            "full.tcp.80",
+            Some(80),
+            Ok(ProbeOutcome::Success { facts: vec![] }),
+        )
+        .await;
+        let cancelled = pacer();
+        cancelled.cancel.cancel();
+        hub.identify_web(&target, 80, &engine, &cancelled).await;
+        hub.identify_web(&target, 9100, &engine, &pacer()).await;
+        assert!(transport.calls.lock().unwrap().is_empty());
+        hub.identify_web(&target, 80, &engine, &pacer()).await;
+        let inner = hub.inner.lock().await;
+        assert_eq!(inner.status.open_ports, 1);
+        assert_eq!(inner.status.findings[0].status, "open");
+        assert!(!inner.status.findings[0].facts.contains_key("web_title"));
+        assert_eq!(inner.status.no_response, 2);
+    }
+
+    #[tokio::test]
+    async fn web_identification_engine_rejects_non_owner_modes_and_unauthorized_targets() {
+        let target = web_target();
+        let transport = Arc::new(ScriptedWeb {
+            calls: Default::default(),
+            responses: Default::default(),
+        });
+        let engine = ActiveEngine::new(
+            target.guard.clone(),
+            transport.clone(),
+            active::catalog().unwrap(),
+        );
+        let mut request = ProbeRequest {
+            interface: target.interface,
+            target: target.ip,
+            probe_id: "web.http.80".into(),
+            mode: ProbeMode::Default,
+            owner_approved: true,
+        };
+        assert_eq!(
+            engine.execute(request.clone(), None).await,
+            Err(active::ActiveError::OwnerApprovalRequired)
+        );
+        request.mode = ProbeMode::OwnerInventory;
+        request.target = "8.8.8.8".parse().unwrap();
+        assert_eq!(
+            engine.execute(request, None).await,
+            Err(active::ActiveError::Unauthorized)
+        );
+        assert!(transport.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn web_identification_defaults_on_and_can_be_disabled() {
+        assert!(
+            serde_json::from_str::<ScanRequest>("{}")
+                .unwrap()
+                .web_identification
+        );
+        assert!(
+            !serde_json::from_str::<ScanRequest>(r#"{"web_identification":false}"#)
+                .unwrap()
+                .web_identification
+        );
+    }
     #[test]
     fn rejects_unbounded_or_unauthenticated_snmp_scan_inputs() {
         let mut request: ScanRequest =

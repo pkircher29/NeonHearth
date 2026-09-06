@@ -50,6 +50,28 @@ stops its verified processes while preserving data.
    **Scan all devices**. Progress and partial findings remain visible if you
    cancel. Results are saved with timestamps. Timeouts do not prove absence;
    service names inferred from port numbers are hints.
+   **Identify open web ports with HTTP / HTTPS** is enabled by default. When a
+   common web port is open, the scanner reads its root page and adds searchable
+   titles, server metadata, and conservative product clues to its device card.
+   Confirmed device names and control permissions remain owner-managed.
+
+Web identification sends only an unauthenticated `GET /`, using the scanned
+numeric address and pinned local interface. It does not follow redirects, resolve
+advertised names, use proxies, send credentials or cookies, execute page scripts,
+or fetch images or links. Both HTTP and HTTPS can be tried, at most twice per open
+web port; the attempts share the scan's rate limit, cancellation and deadline.
+HTTP responses are capped at 16 KiB with an 8 KiB/64-header limit, a 1.5-second response
+read limit, and a 3-second overall probe timeout. Compressed bodies are skipped.
+Raw page bodies, cookies, redirect locations and authentication challenge tokens
+are not retained. Only bounded identification fields are saved.
+
+HTTPS discovery accepts private/self-signed certificates solely for this
+credential-free probe, verifies TLS handshake signatures, and marks certificate
+identity **unverified**. A reported title, product clue or certificate is not
+proof of the physical device's identity. Devices requiring a redirect, sign-in,
+JavaScript, an unsupported TLS version, or an unrecognized web port may supply
+only partial clues. Raw printer and other non-web ports receive no HTTP request.
+The root-page request follows the [HTTP safe-method semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.1).
 
 Home Assistant must be reachable using a private LAN or Tailscale address
 with a certificate trusted by Windows. Certificate verification cannot be
@@ -65,6 +87,7 @@ HTTP-only HA installation before connecting it here.
 |---|---|---|
 | Local IP network | Bounded native neighbor discovery, persisted observations, live presence events | Visibility depends on this host and network topology; not an access-point join feed |
 | TCP identification | Owner-started common, custom, or all-port connection checks across observed local devices | Only unambiguous neighbor-backed addresses on eligible physical links; 12 devices concurrent, one request per device, 40 starts/second, 24-hour limit |
+| HTTP / HTTPS identification | Root-page title, Server, X-Powered-By, generator, authentication realm, product clues and certificate metadata on open web ports | No credentials, scripts, redirects or additional resources; reported hints and certificate identity are unverified |
 | Multicast DNS / Bonjour | Local IPv4 service discovery with correlated, bounded replies | Uses the observed local links; advertised identities are untrusted hints |
 | Avahi | Linux adapter uses avahi-daemon through the fixed avahi-browse utility | Debian packages depend on avahi-daemon/avahi-utils; RPM packages use avahi/avahi-tools; daemon must be running |
 | ICMP | Echo reachability; native IPv4 on Windows | Other platforms and IPv6 depend on socket permissions |

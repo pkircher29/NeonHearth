@@ -27,6 +27,8 @@ use zeroize::Zeroizing;
 use crate::{AuthorizedBinding, InterfaceId, TargetGuard};
 
 mod active_udp;
+mod web;
+pub use web::web_probe_ids;
 pub mod mdns_discovery;
 mod scheduler_runner;
 #[cfg(windows)]
@@ -183,6 +185,9 @@ impl ProbeCatalog {
     fn resolve(&self, id: &str) -> Option<ProbeDescriptor> {
         if let Some(descriptor) = self.descriptors.get(id) {
             return Some(descriptor.clone());
+        }
+        if id.starts_with("web.") {
+            return web::descriptor(id);
         }
         let port = id.strip_prefix("full.tcp.")?.parse::<u16>().ok()?;
         if port == 0 {
@@ -673,6 +678,9 @@ impl AttemptTransport for SystemTransport {
         _credential: Option<&ProbeCredential>,
     ) -> Result<TransportResponse, ActiveError> {
         let port = *descriptor.ports.first().ok_or(ActiveError::Unavailable)?;
+        if descriptor.id.starts_with("web.") {
+            return web::attempt(guard, request, descriptor).await;
+        }
         match descriptor.transport {
             ProbeTransport::Tcp => tcp_attempt(guard, request, port, descriptor).await,
             ProbeTransport::Udp => udp_attempt(guard, request, port, descriptor, _credential).await,

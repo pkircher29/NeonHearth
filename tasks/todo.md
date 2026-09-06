@@ -26,3 +26,10 @@
 - [x] Add validated CDP/LLDP parsing and capture import with truthful local-link visibility.
 - [x] Scan ports across all observed devices with bounded jobs, cancellation, and identification results.
 - [x] Add metric/imperial house-editor units and copy footprints between floors; verify saved geometry, undo, and browser use.
+
+## Web device identification
+
+- [x] Add bounded, credential-free HTTP / HTTPS follow-ups on open web ports.
+- [x] Show searchable reported titles and product clues without changing confirmed identity.
+- [x] Verify hostile responses, cancellation, persistence, and the running Windows app.
+- GitHub delivery: merge after the required checks pass; the pull request records the final status.

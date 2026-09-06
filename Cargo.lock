@@ -2162,6 +2162,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hickory-proto",
+ "httparse",
  "lattice-camera",
  "lattice-domain",
  "netlink-packet-route",
