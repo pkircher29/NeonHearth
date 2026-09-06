@@ -3,10 +3,13 @@ pub mod audit_api;
 mod auth;
 pub mod automation;
 pub mod cameras;
+pub mod device_labels;
 pub mod discovery;
 pub mod doctor;
 pub mod home;
+pub mod host_monitor;
 pub mod integrations;
+pub mod mac_vendor;
 pub mod mqtt;
 pub mod network_scan;
 pub mod platform;
@@ -88,6 +91,8 @@ pub fn app_with_parts(
 ) -> Router {
     let audit = audit_api::AuditApiState::for_service(&state);
     Router::new()
+        .merge(device_labels::routes())
+        .merge(host_monitor::api::routes())
         .route("/api/v1/health", get(api::health))
         .route("/api/v1/state", get(api::state))
         .route("/api/v1/cameras", get(api::cameras))

@@ -39,6 +39,8 @@ def main():
         copy(args.mosquitto / name, 'licenses/mosquitto/' + name)
     for name in ['LICENSE', 'docs/owner/home-automation.md']:
         copy(ROOT / name, 'licenses/NeonHearth.txt' if name == 'LICENSE' else 'Home automation.md')
+    copy(ROOT / 'docs/owner/traffic-monitor.md', 'Traffic and devices.md')
+    copy(ROOT / 'crates/lattice-service/data/mac-assignments.json', 'licenses/ieee-assignment-sources.json')
     # Include dependency notices from the installed, locked source trees.
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--format-version', '1', '--locked'], cwd=ROOT))
     packages = []
@@ -75,6 +77,8 @@ Keep the complete package folder together. Extract a new version to a new folder
 PACKAGE-MANIFEST.json detects missing or damaged components. This development package is unsigned.
 
 Devices > Identify devices with a network scan starts bounded discovery across observed devices.
+Traffic shows this computer's applications, connections, usage history, and local alerts. See Traffic and devices.md for measurement coverage and OS permission requirements.
+Devices and Guard support owner-confirmed names and links to observed web ports. Naming a device does not approve network access.
 Home > Measurement units selects meters or feet/inches. Copy footprint transfers geometry to a new or empty floor.
 Automation connects Home Assistant and enables individual approved light/switch controls.
 CDP and LLDP require an Ethernet PCAP from the relevant link. Avahi integration is available in the Linux service.

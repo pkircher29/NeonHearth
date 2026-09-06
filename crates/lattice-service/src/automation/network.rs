@@ -32,6 +32,7 @@ pub struct NetworkDeviceDetails {
     pub mac_addresses: Vec<String>,
     pub ip_addresses: Vec<String>,
     pub home_assistant: Option<NetworkIdentityHint>,
+    pub mac_assignments: Vec<crate::mac_vendor::MacAssignment>,
 }
 #[derive(Clone, Serialize, ToSchema)]
 pub struct NetworkDetails {
@@ -123,6 +124,7 @@ impl AutomationHub {
                     mac_addresses: vec![],
                     ip_addresses: vec![],
                     home_assistant: None,
+                    mac_assignments: vec![],
                 });
             if !device.mac_addresses.contains(&mac) && device.mac_addresses.len() < 32 {
                 device.mac_addresses.push(mac);
@@ -172,6 +174,13 @@ impl AutomationHub {
             }
         }
         let mut devices: Vec<_> = devices.into_values().collect();
+        for device in &mut devices {
+            device.mac_assignments = device
+                .mac_addresses
+                .iter()
+                .map(|mac| crate::mac_vendor::lookup(mac))
+                .collect();
+        }
         let snapshot = self.snapshot().await?;
         if snapshot.status == "connected" {
             enrich(&mut devices, &snapshot.devices);
@@ -211,6 +220,7 @@ mod tests {
             mac_addresses: vec!["AA:BB:CC:DD:EE:FF".into()],
             ip_addresses: vec![],
             home_assistant: None,
+            mac_assignments: vec![],
         };
         let mut devices = vec![original.clone()];
         enrich(&mut devices, std::slice::from_ref(&imported));
