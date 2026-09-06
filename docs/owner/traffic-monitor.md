@@ -1,6 +1,6 @@
 # Traffic, device recognition, and Guard
 
-Open **NeonHearth.exe**, then choose **Traffic**. The collector observes this computer every two seconds. It continues to collect while you use other pages.
+Open **NeonHearth.exe**, then choose **Traffic**. **Entire network** shows the household inventory and W6 router feed; see [network monitoring and discovery](network-monitor.md). Choose **This computer · applications** for the host features described below. The host collector samples every two seconds and continues while you use other pages.
 
 The graph shows upload and download separately. Choose a time range or application, click a reading (or use the reading selector), and pause/resume the graph. Pausing freezes the view; collection continues. CSV export is available for traffic, application usage, and connection history. The compact graph stays visible within the Traffic page.
 
@@ -38,7 +38,7 @@ Guard shows the device's IP and MAC addresses beside its policy. **Open HTTP/HTT
 
 ## Privacy and present limits
 
-Storage stays local. No device inventory, process list, application file, or destination list is uploaded to a recognition/reputation service. Disabling history stops subsequent history writes while preserving existing history and live readings. Retention removes expired records, with hard limits of 500,000 minute buckets, 20,000 endpoints, and 2,000 alerts.
+Storage stays local. No device inventory, process list, application file, or destination list is uploaded to a recognition/reputation service. Disabling history in the computer preferences stops subsequent host-history writes while preserving existing history and live readings. Host retention removes expired records, with hard limits of 500,000 minute buckets, 20,000 endpoints, and 2,000 alerts. Router-rate and discovery retention are described in the network-monitoring guide; disconnect the router feed to stop its collection.
 
 This implements the core local-monitoring workflow inspired by [GlassWire](https://www.glasswire.com/features/). It does not yet provide full packet/event attribution, ask-before-connect enforcement, global lockdown, firewall profiles, geolocation, reputation scanning, Wi-Fi evil-twin detection, remote-collector management, or system-wide CPU/disk/GPU instrumentation. Existing NeonHearth Home Assistant, MQTT, Guard, and 3D home-map features remain separate capabilities.
 
