@@ -81,6 +81,31 @@ fn estimate(confidence: f32) -> LocationEstimate {
 }
 
 #[tokio::test]
+async fn plan_save_waits_for_a_competing_writer_without_losing_geometry() -> anyhow::Result<()> {
+    let directory = tempdir()?;
+    let pool = connect_path(directory.path().join("home-contention.db")).await?;
+    let repository = HomeRepository::new(pool.clone());
+    let writer = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let pending = repository.clone();
+    let mut saving = tokio::spawn(async move {
+        pending
+            .save_plan(0, &plan("Owner home"), at(1_700_000_000))
+            .await
+    });
+    let early = tokio::time::timeout(std::time::Duration::from_millis(150), &mut saving).await;
+    writer.commit().await?;
+    assert!(
+        early.is_err(),
+        "Saving must wait for the writer instead of failing a lock upgrade: {early:?}"
+    );
+    assert_eq!(saving.await??, 1);
+    let stored = repository.load_plan().await?.unwrap().plan;
+    assert_eq!(stored.floors, plan("Owner home").floors);
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn plan_save_and_load_round_trips_after_reopen() -> anyhow::Result<()> {
     let directory = tempdir()?;
     let path = directory.path().join("home.db");
