@@ -1185,7 +1185,10 @@ pub fn pin_socket_to_interface<S: std::os::windows::io::AsRawSocket>(
             &mut len,
         )
     };
-    if result == SOCKET_ERROR || len != size_of::<u32>() as i32 || actual != configured {
+    // Winsock accepts IPv4's index in network byte order but returns it in
+    // host byte order. IPv6 uses host order for both operations.
+    if result == SOCKET_ERROR || len != size_of::<u32>() as i32 || actual != binding.interface_index
+    {
         return Err(ActiveError::Unavailable);
     }
     Ok(())
