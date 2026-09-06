@@ -40,6 +40,7 @@ def main():
     for name in ['LICENSE', 'docs/owner/home-automation.md']:
         copy(ROOT / name, 'licenses/NeonHearth.txt' if name == 'LICENSE' else 'Home automation.md')
     copy(ROOT / 'docs/owner/traffic-monitor.md', 'Traffic and devices.md')
+    copy(ROOT / 'docs/owner/network-monitor.md', 'network-monitor.md')
     copy(ROOT / 'crates/lattice-service/data/mac-assignments.json', 'licenses/ieee-assignment-sources.json')
     # Include dependency notices from the installed, locked source trees.
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--format-version', '1', '--locked'], cwd=ROOT))
@@ -77,7 +78,9 @@ Keep the complete package folder together. Extract a new version to a new folder
 PACKAGE-MANIFEST.json detects missing or damaged components. This development package is unsigned.
 
 Devices > Identify devices with a network scan starts bounded discovery across observed devices.
-Traffic shows this computer's applications, connections, usage history, and local alerts. See Traffic and devices.md for measurement coverage and OS permission requirements.
+Traffic opens on Entire network: all observed devices and a configurable Predator Connect W6 household WAN graph.
+Use Discover devices now to find previously unseen LAN devices. Network preferences enables periodic discovery and the W6 read-only feed.
+This computer > applications shows local programs, connections, usage history, and alerts. See network-monitor.md and Traffic and devices.md for coverage and OS permission requirements.
 Devices and Guard support owner-confirmed names and links to observed web ports. Naming a device does not approve network access.
 Home > Measurement units selects meters or feet/inches. Copy footprint transfers geometry to a new or empty floor.
 Automation connects Home Assistant and enables individual approved light/switch controls.

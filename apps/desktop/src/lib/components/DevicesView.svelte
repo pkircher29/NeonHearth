@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { DeviceSnapshot, PresenceState } from '../api/types';
   import type { NetworkDetails } from '../api/automation';
+  import type {NetworkSnapshot} from '../api/networkMonitor';
+  import {responseLabel} from '../networkInventory';
   import type { ScanApi, ScanFinding, ScanStatus } from '../api/networkScan';
   import Icon from './Icon.svelte';
   import DeviceNameConfirmation from './DeviceNameConfirmation.svelte';
@@ -12,7 +14,7 @@
   import type { LiveState } from '../stores/live';
   import { formatThroughput } from './networkFormat';
   import { compareIpKeys, deviceIpSortKey } from '../ipSort';
-  let { liveState = null, network = null, scanApi = null, initialQuery = '', labelsApi = null, onsaved }: { labelsApi?: DeviceLabelsApi | null; onsaved?: (label: DeviceLabel) => void; scanApi?: ScanApi | null; initialQuery?: string; liveState?: LiveState | null; network?: NetworkDetails | null } = $props();
+  let { discovery = null, ondiscover, liveState = null, network = null, scanApi = null, initialQuery = '', labelsApi = null, onsaved }: { discovery?: NetworkSnapshot | null; ondiscover?: () => void; labelsApi?: DeviceLabelsApi | null; onsaved?: (label: DeviceLabel) => void; scanApi?: ScanApi | null; initialQuery?: string; liveState?: LiveState | null; network?: NetworkDetails | null } = $props();
   let query = $state('');
   $effect(() => { query = initialQuery; });
   let tab = $state('all' as 'all' | 'confirmed' | 'needs-confirm');
@@ -30,6 +32,7 @@
   });
   const devices = $derived(liveState ? liveState.deviceOrder.map(id => liveState.devices[id]).filter((device): device is DeviceSnapshot => Boolean(device)) : []);
   const recognition = $derived(new Map(devices.map(device => [device.device_id, recognizeDevice(device, details.get(device.device_id), findingsByDevice.get(device.device_id))])));
+  const responses = $derived(discovery?.devices.filter(r => responseLabel(r,discovery.settings.interval_seconds) === 'Responding').length ?? null);
   const counts = $derived({ online: devices.filter(d => d.presence.state === 'online').length, confirmed: devices.filter(d => d.owner_confirmed).length, named: [...recognition.values()].filter(r => r.suggestion).length });
   const filtered = $derived(devices.filter(device => {
     const info = details.get(device.device_id);
@@ -54,7 +57,8 @@
 
 <section class="devices-view" aria-labelledby="devices-heading">
   <div class="view-heading"><div><p class="kicker">DEVICES / IDENTITY</p><h1 id="devices-heading">Know what is home.</h1><p class="muted">Live presence, reported identities, and the first time each device was observed.</p></div></div>
-  <div class="inventory-summary" aria-label="Network overview"><div><strong>{devices.length}</strong><span>devices observed</span></div><div><strong>{counts.online}</strong><span>online now</span></div><div><strong>{counts.named}</strong><span>reported names</span></div><div><strong>{counts.confirmed}</strong><span>names confirmed</span></div></div>
+  {#if ondiscover}<button class="discovery-launch" type="button" onclick={ondiscover}>Find devices across the LAN</button>{/if}
+  <div class="inventory-summary" aria-label="Network overview"><div><strong>{devices.length}</strong><span>devices observed</span></div><div><strong>{discovery?.devices.length ? responses : counts.online}</strong><span>{discovery?.devices.length ? 'responding to discovery' : 'online now'}</span></div><div><strong>{counts.named}</strong><span>reported names</span></div><div><strong>{counts.confirmed}</strong><span>names confirmed</span></div></div>
   {#if scanApi}<NetworkScanPanel api={scanApi} onchange={value => scan = value}/>{/if}
   <label class="search"><span>Search devices</span><input bind:value={query} placeholder="Name, IP, MAC, room, or web identity" /></label>
   <div class="device-controls">
@@ -70,6 +74,7 @@
       {@const hint = info?.home_assistant}
       {@const findings = findingsByDevice.get(device.device_id) ?? []}
       {@const identity = recognition.get(device.device_id)!}
+      {@const response = discovery?.devices.find(r => info?.mac_addresses.includes(r.mac)) ?? null}
       {@const webFindings = findings.filter(f => f.facts.web_status)}
       <article class="device-card">
         <div class="device-name"><span class="device-glyph {device.presence.state}"><Icon name={identity.icon} size={26}/><span class="presence-dot {device.presence.state}" aria-hidden="true"></span></span><div><strong>{identity.name}</strong><span>{identity.kind} · {presenceLabel(device.presence.state)}</span></div></div>
@@ -90,6 +95,7 @@
         <p><b>Identification sources</b>{identity.sources.join(' · ') || 'Waiting for reported identity'}</p>
         <p><b>Evidence</b>{device.evidence ? `${device.evidence.family.replaceAll('_', ' ')} via ${device.evidence.source}` : 'No identity evidence'}</p>
         <p><b>Bandwidth</b>{bytes(device)}{device.bandwidth.coverage ? ` · ${device.bandwidth.coverage}` : ''}</p>
+        {#if response}<p><b>Active LAN discovery</b>{responseLabel(response,discovery?.settings.interval_seconds ?? 120)} · last response {seen(response.last_seen)}</p>{/if}
         <p><b>First / last seen</b>{seen(device.first_seen_at)} → {seen(device.last_seen_at)}</p>
         {#if findings.length}
           <details class="scan-findings"><summary>Discovery results · {findings.filter(f => f.status === 'open').length} open ports</summary>
@@ -103,6 +109,7 @@
   {/if}
 </section>
 <style>
+  .discovery-launch{padding:10px 14px;margin:0 0 18px;border:1px solid var(--line-strong);border-radius:7px;background:var(--surface);color:var(--accent);font:inherit;cursor:pointer}
   .inventory-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:20px 0}.inventory-summary div{padding:18px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}.inventory-summary strong{display:block;font:600 28px var(--font-display);color:var(--accent)}.inventory-summary span{font-size:11px;color:var(--muted-strong)}.device-glyph{position:relative;width:44px;height:44px;display:grid;place-items:center;background:var(--surface);border:1px solid var(--line-strong);border-radius:10px;color:var(--accent);flex:none}.device-glyph .presence-dot{position:absolute;right:-3px;bottom:-3px}.device-card{min-width:0}.device-name{align-items:center}@media(max-width:650px){.inventory-summary{grid-template-columns:repeat(2,1fr)}}
   .scan-findings{overflow-wrap:anywhere;border-top:1px solid var(--line);padding-top:10px}.scan-findings summary{cursor:pointer}.scan-findings p{display:block}
   .web-identity{overflow-wrap:anywhere}.web-identity small{display:block;color:var(--muted-strong,var(--ink-mute))}

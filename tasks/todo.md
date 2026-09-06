@@ -43,3 +43,13 @@
 - [x] Local connection alerts and application firewall controls (privileged enforcement still requires OS validation).
 - [x] Security regression tests, actual Windows UI verification, and native package activation.
 - GitHub delivery: merge after all pull-request checks pass; the pull request records the final status.
+
+## Entire-network traffic and active discovery
+
+- [x] Make the full device inventory the default Traffic scope and keep host applications separate.
+- [x] Read and graph the owner's W6 household WAN feed with explicit coverage and stale-data handling.
+- [x] Discover previously unseen LAN addresses using bounded native probes; retain response history and cautious departure events.
+- [x] Preserve confirmed names, Guard authority, web findings, and device identities across discovery and restart.
+- [x] Verify Windows native collection, database contention recovery, desktop/phone UI, and package activation.
+- [ ] Per-device byte attribution and LAN-to-LAN traffic require a capable gateway or mirrored-port collector; the W6 feed does not provide them.
+- GitHub delivery: merge after every pull-request check passes; the pull request records the final status.
