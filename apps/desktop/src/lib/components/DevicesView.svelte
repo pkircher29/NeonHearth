@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { DeviceSnapshot, PresenceState } from '../api/types';
   import type { NetworkDetails } from '../api/automation';
-  import type { ScanApi, ScanStatus } from '../api/networkScan';
+  import type { ScanApi, ScanFinding, ScanStatus } from '../api/networkScan';
   import NetworkScanPanel from './NetworkScanPanel.svelte';
   let scan = $state<ScanStatus | null>(null);
   import type { LiveState } from '../stores/live';
@@ -14,11 +14,21 @@
   let sort = $state('ip-asc' as 'ip-asc' | 'ip-desc' | 'discovery');
   const details = $derived(new Map(network?.devices.map(device => [device.device_id, device]) ?? []));
   const ipKeys = $derived(new Map(network?.devices.map(device => [device.device_id, deviceIpSortKey(device.ip_addresses)]) ?? []));
+  const findingsByDevice = $derived.by(() => {
+    const grouped = new Map<string, ScanFinding[]>();
+    for (const finding of scan?.findings ?? []) {
+      if (!finding.device_id) continue;
+      const rows = grouped.get(finding.device_id) ?? [];
+      rows.push(finding); grouped.set(finding.device_id, rows);
+    }
+    return grouped;
+  });
   const devices = $derived(liveState ? liveState.deviceOrder.map(id => liveState.devices[id]).filter((device): device is DeviceSnapshot => Boolean(device)) : []);
   const filtered = $derived(devices.filter(device => {
     const info = details.get(device.device_id);
     const hint = info?.home_assistant;
-    const text = `${device.owner_name ?? ''} ${device.identity.classification ?? ''} ${device.device_id} ${info?.mac_addresses.join(' ') ?? ''} ${info?.ip_addresses.join(' ') ?? ''} ${hint?.name ?? ''} ${hint?.manufacturer ?? ''} ${hint?.model ?? ''} ${hint?.area ?? ''}`.toLowerCase();
+    const webClues = findingsByDevice.get(device.device_id)?.flatMap(f => Object.values(f.facts)).join(' ') ?? '';
+    const text = `${device.owner_name ?? ''} ${device.identity.classification ?? ''} ${device.device_id} ${info?.mac_addresses.join(' ') ?? ''} ${info?.ip_addresses.join(' ') ?? ''} ${hint?.name ?? ''} ${hint?.manufacturer ?? ''} ${hint?.model ?? ''} ${hint?.area ?? ''} ${webClues}`.toLowerCase();
     const matchesTab = tab === 'all' || (tab === 'confirmed' ? device.owner_confirmed : !device.owner_confirmed);
     return matchesTab && text.includes(query.toLowerCase());
   }));
@@ -38,7 +48,7 @@
 <section class="devices-view" aria-labelledby="devices-heading">
   <div class="view-heading"><div><p class="kicker">DEVICES / IDENTITY</p><h1 id="devices-heading">Know what is home.</h1><p class="muted">See network addresses, first observations, and device names reported by Home Assistant.</p></div></div>
   {#if scanApi}<NetworkScanPanel api={scanApi} onchange={value => scan = value}/>{/if}
-  <label class="search"><span>Search devices</span><input bind:value={query} placeholder="Name, IP, MAC address, or room" /></label>
+  <label class="search"><span>Search devices</span><input bind:value={query} placeholder="Name, IP, MAC, room, or web identity" /></label>
   <div class="device-controls">
     <div class="tabs" role="group" aria-label="Filter devices">{#each [['all','All'],['confirmed','Confirmed'],['needs-confirm','Needs confirm']] as item}<button class:active={tab === item[0]} onclick={() => tab = item[0] as typeof tab} aria-pressed={tab === item[0]}>{item[1]}</button>{/each}</div>
     <label class="sort-control"><span>Sort by</span><select aria-label="Sort devices" bind:value={sort}><option value="ip-asc">IP address: low to high</option><option value="ip-desc">IP address: high to low</option><option value="discovery">Discovery order</option></select></label>
@@ -50,13 +60,20 @@
     <div class="device-table">{#each visible as device (device.device_id)}
       {@const info = details.get(device.device_id)}
       {@const hint = info?.home_assistant}
-      {@const findings = scan?.findings.filter(f => f.device_id === device.device_id) ?? []}
+      {@const findings = findingsByDevice.get(device.device_id) ?? []}
+      {@const webFindings = findings.filter(f => f.facts.web_status)}
       <article class="device-card">
         <div class="device-name"><span class="presence-dot {device.presence.state}" aria-hidden="true"></span><div><strong>{device.owner_name ?? hint?.name ?? (info?.mac_addresses[0] ? `Device ${info.mac_addresses[0]}` : `Device …${device.device_id.slice(-8)}`)}</strong><span>{device.identity.classification ?? (hint ? [hint.manufacturer,hint.model].filter(Boolean).join(' · ') || 'Home Assistant device' : 'Type not yet identified')} · {presenceLabel(device.presence.state)}</span></div></div>
         <span class="confidence {device.owner_confirmed ? 'confirmed' : 'likely'}"><span aria-hidden="true">{device.owner_confirmed ? '✓' : '△'}</span> {confidence(device)}</span>
         <p class="addresses"><b>IP address</b>{info?.ip_addresses.length ? info.ip_addresses.join(' · ') : 'Not currently observed'}</p>
         <p class="addresses"><b>Hardware address</b>{info?.mac_addresses.length ? info.mac_addresses.join(' · ') : 'Details unavailable'}</p>
         {#if hint}<p><b>Home Assistant match</b>{hint.area ?? 'Room unassigned'} · matched by reported MAC; verify the physical device</p>{/if}
+        {#each webFindings as web}
+          <p class="web-identity"><b>Web identification · {web.facts.web_scheme?.toUpperCase()} {web.port}</b>
+            {web.facts.web_identity_hint ? `${web.facts.web_identity_hint} · ` : ''}{web.facts.web_title ?? web.facts.web_auth_realm ?? web.facts.web_server ?? `HTTP ${web.facts.web_status}`}
+            <small>Reported by device · {web.facts.certificate_trust === 'unverified' ? 'certificate unverified · ' : ''}needs your verification</small>
+          </p>
+        {/each}
         <p><b>Evidence</b>{device.evidence ? `${device.evidence.family.replaceAll('_', ' ')} via ${device.evidence.source}` : 'No identity evidence'}</p>
         <p><b>Bandwidth</b>{bytes(device)}{device.bandwidth.coverage ? ` · ${device.bandwidth.coverage}` : ''}</p>
         <p><b>First / last seen</b>{seen(device.first_seen_at)} → {seen(device.last_seen_at)}</p>
@@ -73,6 +90,7 @@
 </section>
 <style>
   .scan-findings{overflow-wrap:anywhere;border-top:1px solid var(--line);padding-top:10px}.scan-findings summary{cursor:pointer}.scan-findings p{display:block}
+  .web-identity{overflow-wrap:anywhere}.web-identity small{display:block;color:var(--muted-strong,var(--ink-mute))}
   .addresses { overflow-wrap:anywhere }.device-name>div { min-width:0;overflow-wrap:anywhere }
   .device-controls { display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:1.5rem }
   .device-controls .tabs { margin-bottom:0 }

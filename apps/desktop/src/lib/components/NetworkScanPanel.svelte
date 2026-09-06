@@ -6,6 +6,7 @@
   let mode = $state<ScanInput['port_mode']>('common');
   let protocols = $state(['icmp','mdns','smb','netbios']);
   let customPorts = $state('');
+  let webIdentification = $state(true);
   let error = $state('');
   let statusError = $state('');
   let busy = $state(false);
@@ -22,7 +23,7 @@
     try {
       const ports = mode === 'custom' ? customPorts.split(',').map(p => Number(p.trim())) : [];
       if (mode === 'custom' && (!ports.length || ports.some(p => !Number.isInteger(p) || p < 1 || p > 65535))) throw new Error('Enter port numbers from 1 to 65535, separated by commas.');
-      const input: ScanInput = { port_mode: mode, protocols, ports };
+      const input: ScanInput = { port_mode: mode, protocols, ports, web_identification: webIdentification };
       if (protocols.includes('snmp')) input.snmp = { version: snmpVersion, community, username, authentication_password: authPassword, privacy_password: privacyPassword };
       const pending = api.start(input);
       community = ''; authPassword = ''; privacyPassword = '';
@@ -51,6 +52,10 @@
     <label>TCP ports <select aria-label="TCP scan ports" bind:value={mode}><option value="common">Common device and automation ports</option><option value="all">All TCP ports (1–65535)</option><option value="custom">Specific TCP ports</option><option value="none">Protocol discovery only</option></select></label>
     {#if mode === 'custom'}<label>Port numbers <input bind:value={customPorts} placeholder="22, 80, 443, 445, 8123" maxlength="24000" /></label>{/if}
     {#if mode === 'all'}<p>All-port scans can take many hours. One connection per device runs at a time; you can cancel and keep partial results.</p>{/if}
+    {#if mode !== 'none'}
+      <label><input type="checkbox" bind:checked={webIdentification} />Identify open web ports with HTTP / HTTPS</label>
+      <p>Reads the home page on common web ports for a title, server name, and product clues. No sign-in or redirects. Web checks are added to progress as open ports are found.</p>
+    {/if}
     <div class="protocols">{#each choices as [value,label]}<label><input type="checkbox" checked={protocols.includes(value)} onchange={() => toggle(value)} />{label}</label>{/each}</div>
     {#if protocols.includes('snmp')}
       <div class="credentials">
