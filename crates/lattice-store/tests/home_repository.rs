@@ -36,6 +36,7 @@ fn plan(name: &str) -> HomePlan {
                 wall_id: WallId::parse("018f0000-0000-7000-8000-0000000000ad").unwrap(),
                 start: Point { x: 0.0, y: 0.0 },
                 end: Point { x: 4.2, y: 0.0 },
+                thickness_m: 0.1,
                 openings: vec![Opening {
                     opening_id: OpeningId::parse("018f0000-0000-7000-8000-0000000000ae").unwrap(),
                     kind: OpeningKind::Door,
