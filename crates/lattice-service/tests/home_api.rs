@@ -189,6 +189,63 @@ async fn committed_save_round_trips_through_the_snapshot() {
 }
 
 #[tokio::test]
+async fn wall_thickness_round_trips_and_legacy_plans_gain_the_default() {
+    let (router, _, _) = fixture().await;
+    // `sample_plan` carries no thickness — exactly what a pre-v2 editor sent.
+    save_plan(&router, 0, "Home").await;
+    let snapshot = json_body(send(&router, "GET", "/api/v1/home", None).await).await;
+    assert_eq!(
+        snapshot["plan"]["floors"][0]["walls"][0]["thickness_m"], 0.1,
+        "a plan saved without thickness must read back with the default"
+    );
+
+    let mut thick = sample_plan("Home");
+    thick["floors"][0]["walls"][0]["thickness_m"] = serde_json::json!(0.35);
+    let response = send(
+        &router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(save_request(1, thick)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshot = json_body(send(&router, "GET", "/api/v1/home", None).await).await;
+    assert_eq!(
+        snapshot["plan"]["floors"][0]["walls"][0]["thickness_m"], 0.35,
+        "an explicit thickness must survive the store unchanged"
+    );
+}
+
+#[tokio::test]
+async fn out_of_range_wall_thickness_is_rejected_with_400_and_a_reason() {
+    let (router, _, _) = fixture().await;
+    for thickness in [
+        serde_json::json!(0.0),
+        serde_json::json!(1.5),
+        serde_json::json!(-0.1),
+    ] {
+        let mut invalid = sample_plan("Home");
+        invalid["floors"][0]["walls"][0]["thickness_m"] = thickness.clone();
+        let response = send(
+            &router,
+            "PUT",
+            "/api/v1/home/plan",
+            Some(save_request(0, invalid)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{thickness}");
+        let reason = json_body(response).await;
+        assert!(
+            reason["error"].as_str().unwrap().contains("thickness"),
+            "{reason}"
+        );
+    }
+    // Nothing was committed by any rejected write.
+    let snapshot = json_body(send(&router, "GET", "/api/v1/home", None).await).await;
+    assert_eq!(snapshot["plan"]["version"], 0);
+}
+
+#[tokio::test]
 async fn stale_writer_gets_409_with_actual_version_and_recovers_by_refetching() {
     let (router, _, _) = fixture().await;
     save_plan(&router, 0, "Home").await;

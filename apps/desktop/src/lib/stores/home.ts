@@ -5,7 +5,8 @@
 export interface PlanPoint { x: number; y: number }
 export type OpeningKind = 'door' | 'window' | 'stair';
 export interface Opening { opening_id: string; kind: OpeningKind; offset_m: number; width_m: number }
-export interface Wall { wall_id: string; start: PlanPoint; end: PlanPoint; openings: Opening[] }
+/** `thickness_m` is optional on read (older plans predate it) and always written back. */
+export interface Wall { wall_id: string; start: PlanPoint; end: PlanPoint; thickness_m?: number; openings: Opening[] }
 export interface Room { room_id: string; name: string; polygon: PlanPoint[] }
 export interface Floor { floor_id: string; level: number; name: string; ceiling_height_m: number; walls: Wall[]; rooms: Room[] }
 export interface HomePlan { home_id: string; version: number; name: string; floors: Floor[] }
@@ -18,6 +19,9 @@ export interface HomeSnapshot { plan: HomePlan; placements: Placement[]; estimat
 export const GRID_M = 0.1;
 export const MIN_CEILING_M = 1.8;
 export const MAX_CEILING_M = 6.0;
+export const DEFAULT_THICKNESS_M = 0.1;
+export const MIN_THICKNESS_M = 0.02;
+export const MAX_THICKNESS_M = 1.0;
 export const HISTORY_LIMIT = 200;
 export const UNCERTAIN_BELOW = 0.6;
 export const DRAFT_MAX_BYTES = 512 * 1024;
