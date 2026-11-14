@@ -29,6 +29,9 @@ $PackagingRoot = $PSScriptRoot
 $RepoRoot = Split-Path -Parent $PackagingRoot
 $DistRoot = Join-Path $PackagingRoot 'dist\windows'
 $Desktop = Join-Path $RepoRoot 'apps\desktop'
+if ($env:CARGO_BUILD_TARGET -and $env:CARGO_BUILD_TARGET -notmatch '^[A-Za-z0-9_-]+$') {
+    throw 'Expected a Cargo target triple'
+}
 
 if (Test-Path 'C:\msys64\mingw64\bin') {
     $env:PATH = 'C:\msys64\mingw64\bin;' + $env:PATH
@@ -37,7 +40,9 @@ if (-not $SkipRust) {
     Write-Host '== cargo build --release -p lattice-service =='
     Push-Location $RepoRoot
     try {
-        cargo build --locked --release -p lattice-service
+        $cargoArgs = @('build', '--locked', '--release', '-p', 'lattice-service')
+        if ($env:CARGO_BUILD_TARGET) { $cargoArgs += @('--target', $env:CARGO_BUILD_TARGET) }
+        cargo @cargoArgs
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
     } finally { Pop-Location }
 }
@@ -55,6 +60,10 @@ if (-not $SkipUi) {
 $targetRoot = if ($env:CARGO_TARGET_DIR) {
     if ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR } else { Join-Path $RepoRoot $env:CARGO_TARGET_DIR }
 } else { Join-Path $RepoRoot 'target' }
+if ($env:CARGO_BUILD_TARGET) {
+    # Explicit targets nest release output even when CARGO_TARGET_DIR is custom.
+    $targetRoot = Join-Path $targetRoot $env:CARGO_BUILD_TARGET
+}
 $exe = Join-Path $targetRoot 'release\lattice-service.exe'
 $uiDist = Join-Path $Desktop 'dist'
 if (-not (Test-Path $exe)) { throw "Missing $exe - run without -SkipRust first" }
