@@ -54,6 +54,27 @@ class PackageTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
         self.assertEqual(archive.read_bytes(), b'existing release')
 
+    def test_dotted_release_name_keeps_full_version_in_archive_and_members(self):
+        import zipfile
+        self.complete_inputs()
+        self.output = self.root/'NeonHearth-0.1.0-beta.1-windows-x64'
+        self.run_package()
+        archive = self.root/'NeonHearth-0.1.0-beta.1-windows-x64.zip'
+        self.assertTrue(archive.is_file(), 'The published ZIP must retain the entire versioned folder name')
+        self.assertFalse((self.root/'NeonHearth-0.1.0-beta.zip').exists())
+        with zipfile.ZipFile(archive) as bundle:
+            self.assertIn('NeonHearth-0.1.0-beta.1-windows-x64/NeonHearth.exe', bundle.namelist())
+
+    def test_dotted_release_archive_is_preserved_before_creating_output(self):
+        self.complete_inputs()
+        self.output = self.root/'NeonHearth-0.1.0-beta.1-windows-x64'
+        archive = self.root/'NeonHearth-0.1.0-beta.1-windows-x64.zip'
+        archive.write_bytes(b'existing versioned release')
+        with self.assertRaisesRegex(ValueError,'Archive already exists'):
+            self.run_package()
+        self.assertFalse(self.output.exists())
+        self.assertEqual(archive.read_bytes(), b'existing versioned release')
+
     def complete_inputs(self):
         import hashlib
         for name in package.BROKER_FILES + package.BROKER_NOTICES:

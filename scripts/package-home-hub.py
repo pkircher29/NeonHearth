@@ -28,7 +28,7 @@ def main():
     parser.add_argument('--version', help='Release tag version without v; defaults to Cargo workspace version')
     args = parser.parse_args()
     output = args.output.resolve()
-    archive = output.with_suffix('.zip')
+    archive = output.with_name(output.name + '.zip')
     if output.exists():
         raise ValueError('Choose a new empty package destination; existing packages are preserved')
     if archive.exists():
