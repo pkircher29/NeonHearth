@@ -4,10 +4,6 @@ name: Signing check
 # without waiting for a full release build.
 on:
   workflow_dispatch:
-  # Temporary: proves the trust link before this workflow exists on main.
-  push:
-    branches: [ci/windows-signing]
-    paths: [".github/workflows/signing-check.yml"]
 
 permissions:
   contents: read
