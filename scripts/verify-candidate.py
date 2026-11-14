@@ -167,8 +167,9 @@ class LauncherFailure(RuntimeError):
             ('Cannot identify the current Windows user','user_identity'),
             ('Select an empty data folder','state_not_empty'),
             ('reparse','reparse_path'),
-            ('Cannot query the legacy NeonHearth service','legacy_service_query'),
-            ('Private data belongs to another Windows user','state_owner'),
+            ('Could not check the installed NeonHearth service','legacy_service_query'),
+            ('Could not read installed NeonHearth service status','legacy_service_query'),
+            ('The data folder belongs to another Windows account','state_owner'),
         ]:
             if text in stderr:
                 reason=category
