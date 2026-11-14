@@ -202,16 +202,9 @@ To remove all NeonHearth data after uninstalling, delete this folder.
 "@
 Set-Content -Path (Join-Path $stateDir 'README-UNINSTALL.txt') -Value $uninstallNote
 
-# --- 7. Launch URL ----------------------------------------------------------
-# Print (console only) the pre-paired dashboard URL. Deliberately NOT written
-# through Write-Log: install-configure.log lives under %ProgramData% where
-# non-admin local users can read it, and the URL embeds the pairing token.
-# The Start-menu "NeonHearth" shortcut (open-neonhearth.ps1) reproduces this
-# URL on demand from the registry value.
-$tokenEntry = $entries | Where-Object { $_ -like 'LATTICE_SERVICE_TOKEN=*' } | Select-Object -First 1
-if ($tokenEntry) {
-    $tokenValue = $tokenEntry.Substring('LATTICE_SERVICE_TOKEN='.Length)
-    Write-Host "NeonHearth dashboard (pre-paired): http://127.0.0.1:58120/#token=$tokenValue"
-}
-Write-Log 'Dashboard URL printed to console (token kept out of this log); the Start-menu "NeonHearth" shortcut opens it any time.'
+# --- 7. Open through the protected pairing shortcut ------------------------
+# WiX QuietExec can copy custom-action stdout into the Windows Installer log.
+# Never print the owner token or a paired URL here. The Start-menu shortcut
+# reads the protected registry value on demand and opens the paired dashboard.
+Write-Log 'Use the NeonHearth Start-menu shortcut to open the paired dashboard.'
 Write-Log 'Configuration complete.'
