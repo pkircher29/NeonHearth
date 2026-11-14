@@ -30,3 +30,5 @@ foreach ($file in $files) {
     }
 }
 if ($failed) { exit 1 }
+# Explicit, so callers that test $LASTEXITCODE never read a stale or empty value.
+exit 0
