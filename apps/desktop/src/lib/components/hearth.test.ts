@@ -96,10 +96,16 @@ describe('hearth layout', () => {
       device({ device_id: 'two', presence: { state: 'blocked', observed_at: null, source: null, kind: null } })
     ]);
     expect(describeHearth({ connected: false, upload: null, download: null, sparks, format: formatThroughput }))
-      .toMatch(/unavailable until the collector is paired/);
+      .toMatch(/collector connection unavailable/);
     const text = describeHearth({ connected: true, upload: 125_000, download: 1_250_000, sparks, format: formatThroughput });
     expect(text).toContain('1 of 2 devices online');
     expect(text).toContain('1 blocked');
     expect(text).toContain('11 Mbps total');
+  });
+
+  it('does not announce a measured zero when connected without counters', () => {
+    const text=describeHearth({connected:true,upload:null,download:null,sparks:[],format:formatThroughput});
+    expect(text).toContain('unavailable total');
+    expect(text).not.toContain('0 kbps total');
   });
 });

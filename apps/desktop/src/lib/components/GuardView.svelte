@@ -110,6 +110,8 @@
     </div>
   </div>
 
+  <p class="muted capability-note">This collector records network decisions; router blocking requires manual action. Reject or Quarantine does not by itself block a device. A block is confirmed only by a Verified enforcement result. Device naming and Home Assistant power permissions are separate.</p>
+
   <div class="guard-meter" class:active={attention > 0}>
     <div class="guard-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
     <div><strong>{attention}</strong><span>need attention</span></div>
