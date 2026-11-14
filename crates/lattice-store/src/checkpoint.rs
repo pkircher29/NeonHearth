@@ -11,6 +11,10 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::collections::HashSet;
 use thiserror::Error;
 
+#[cfg(test)]
+#[path = "checkpoint_digest_tests.rs"]
+mod digest_tests;
+
 pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_BATCH: usize = 4096;
 /// Bounds the per-device snapshot follow-up reads to a small home-network page.
@@ -1139,6 +1143,26 @@ fn logical_commit_digest_extra(
     input: &CommitInput,
     flow: Option<Vec<serde_json::Value>>,
 ) -> Result<Vec<u8>, CheckpointError> {
+    // Preserve the legacy canonical JSON byte order, without expanding the
+    // checkpoint blob into one heap-backed serde_json::Value per byte.
+    // Field order is intentionally lexical, matching json!'s sorted maps.
+    #[derive(serde::Serialize)]
+    struct CanonicalCheckpoint<'a> {
+        bytes: &'a [u8],
+        commit_sequence: i64,
+        format_version: i64,
+        source_fingerprint: &'a str,
+        written_at: String,
+    }
+    #[derive(serde::Serialize)]
+    struct CanonicalCommit<'a> {
+        checkpoint: CanonicalCheckpoint<'a>,
+        devices: Vec<serde_json::Value>,
+        discovery: Option<serde_json::Value>,
+        evidence: Vec<serde_json::Value>,
+        flow: Option<Vec<serde_json::Value>>,
+        transitions: Vec<serde_json::Value>,
+    }
     let mut devices: Vec<_> = input.devices.iter().map(|d| json!({"device_id":d.device_id.to_string(),"first_seen_at":d.first_seen_at.to_rfc3339(),"last_seen_at":d.last_seen_at.to_rfc3339(),"owner_name":d.owner_name,"owner_type":d.owner_type,"owner_confirmed":d.owner_confirmed})).collect();
     let mut evidence: Vec<_> = input.evidence.iter().map(|e| { let f=&e.fact; json!({"device_id":e.device_id.to_string(),"family":evidence_family(f.family),"source":f.source,"key":f.key,"value":f.value,"confidence":f.confidence,"observed_at":f.observed_at.to_rfc3339(),"expires_at":f.expires_at.map(|x|x.to_rfc3339()),"owner_confirmed":f.owner_confirmed}) }).collect();
     let mut transitions: Vec<_> = input.transitions.iter().map(|t| json!({"transition_id":t.transition_id,"device_id":t.device_id.to_string(),"from":presence_state(t.from),"to":presence_state(t.to),"occurred_at":t.occurred_at.to_rfc3339(),"reason":t.reason,"trigger_source":t.trigger_source,"trigger_kind":t.trigger_kind,"evidence_observed_at":t.evidence_observed_at.to_rfc3339(),"evidence_valid_until":t.evidence_valid_until.map(|x|x.to_rfc3339()),"trigger_arrival_at":t.trigger_arrival_at.to_rfc3339(),"correction_of":t.correction_of})).collect();
@@ -1146,7 +1170,20 @@ fn logical_commit_digest_extra(
     sort_json_values(&mut evidence);
     sort_json_values(&mut transitions);
     let c = &input.checkpoint;
-    let canonical = json!({"checkpoint":{"format_version":c.format_version,"bytes":c.bytes,"source_fingerprint":c.source_fingerprint,"commit_sequence":c.commit_sequence,"written_at":c.written_at.to_rfc3339()},"devices":devices,"evidence":evidence,"transitions":transitions,"discovery":input.discovery.as_ref().map(|d|json!({"input_hash":d.input_hash,"source":d.source,"result_summary":d.result_summary,"committed_at":d.committed_at.to_rfc3339()})),"flow":flow});
+    let canonical = CanonicalCommit {
+        checkpoint: CanonicalCheckpoint {
+            bytes: &c.bytes,
+            commit_sequence: c.commit_sequence,
+            format_version: c.format_version,
+            source_fingerprint: &c.source_fingerprint,
+            written_at: c.written_at.to_rfc3339(),
+        },
+        devices,
+        discovery: input.discovery.as_ref().map(|d|json!({"input_hash":d.input_hash,"source":d.source,"result_summary":d.result_summary,"committed_at":d.committed_at.to_rfc3339()})),
+        evidence,
+        flow,
+        transitions,
+    };
     Ok(Sha256::digest(serde_json::to_vec(&canonical).map_err(|e| {
         CheckpointError::Invalid(format!("canonical commit serialization failed: {e}"))
     })?)
