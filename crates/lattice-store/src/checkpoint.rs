@@ -15,6 +15,10 @@ use thiserror::Error;
 #[path = "checkpoint_digest_tests.rs"]
 mod digest_tests;
 
+#[cfg(test)]
+#[path = "checkpoint_json_tests.rs"]
+mod json_tests;
+
 pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_BATCH: usize = 4096;
 /// Bounds the per-device snapshot follow-up reads to a small home-network page.
@@ -1030,9 +1034,61 @@ fn validate_checkpoint(
     {
         return Err(error("checksum mismatch".into()));
     }
-    serde_json::from_slice::<serde_json::Value>(bytes)
+    serde_json::from_slice::<JsonSyntax>(bytes)
         .map_err(|e| error(format!("checkpoint bytes are not JSON: {e}")))?;
     Ok(())
+}
+
+/// Consume the ordinary JSON parser's scalars and containers without retaining a
+/// tree. Unlike IgnoredAny, deserialize_any still parses numbers (including its
+/// overflow checks); from_slice retains the normal depth and trailing-data checks.
+struct JsonSyntax;
+impl<'de> serde::Deserialize<'de> for JsonSyntax {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SyntaxVisitor;
+        impl<'de> serde::de::Visitor<'de> for SyntaxVisitor {
+            type Value = JsonSyntax;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("any valid JSON value")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<JsonSyntax, E> {
+                Ok(JsonSyntax)
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<JsonSyntax, E> {
+                Ok(JsonSyntax)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<JsonSyntax, E> {
+                Ok(JsonSyntax)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<JsonSyntax, E> {
+                Ok(JsonSyntax)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<JsonSyntax, E> {
+                Ok(JsonSyntax)
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<JsonSyntax, E> {
+                Ok(JsonSyntax)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<JsonSyntax, A::Error> {
+                while sequence.next_element::<JsonSyntax>()?.is_some() {}
+                Ok(JsonSyntax)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<JsonSyntax, A::Error> {
+                while map.next_key::<JsonSyntax>()?.is_some() {
+                    map.next_value::<JsonSyntax>()?;
+                }
+                Ok(JsonSyntax)
+            }
+        }
+        deserializer.deserialize_any(SyntaxVisitor)
+    }
 }
 fn checkpoint_checksum(checkpoint: &CheckpointInput) -> Vec<u8> {
     checkpoint_checksum_fields(
