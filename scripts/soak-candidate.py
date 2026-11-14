@@ -61,7 +61,10 @@ def preflight(args):
         with socket.socket() as reservation:
             reservation.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
             reservation.bind(('127.0.0.1',port))
-    state.mkdir(parents=True,exist_ok=True)
+    # The native launcher creates this directory with an explicit user owner
+    # and protected ACL. Elevated default mkdir can assign Administrators as
+    # owner, which the launcher's private-state boundary correctly rejects.
+    state.parent.mkdir(parents=True,exist_ok=True)
     return root,state,package
 
 

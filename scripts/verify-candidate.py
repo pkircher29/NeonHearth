@@ -168,6 +168,7 @@ class LauncherFailure(RuntimeError):
             ('Select an empty data folder','state_not_empty'),
             ('reparse','reparse_path'),
             ('Cannot query the legacy NeonHearth service','legacy_service_query'),
+            ('Private data belongs to another Windows user','state_owner'),
         ]:
             if text in stderr:
                 reason=category

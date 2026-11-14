@@ -62,6 +62,17 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(raised.exception.diagnostic,{'exit_code':1,'reason':'stdio_isolation'})
         self.assertNotIn('private-test-token',str(raised.exception))
 
+    def test_preflight_leaves_private_state_creation_to_the_native_launcher(self):
+        soak=load('candidate_preflight_test','soak-candidate.py')
+        state=self.root/'qa-parent'/'private-state'
+        args=SimpleNamespace(package=self.root/'package',state=state,output=self.root/'evidence.json',port=58131,mqtt_port=58193)
+        # Elevated Windows directory creation may assign Administrators as owner.
+        # The launcher must create its final state with its explicit user SID.
+        with patch.object(soak,'os',SimpleNamespace(name='nt',environ={})),patch.object(soak.verify,'verify_package',return_value={}),patch.object(soak.socket,'socket'),patch.dict('sys.modules',{'psutil':SimpleNamespace()}):
+            soak.preflight(args)
+        self.assertTrue(state.parent.is_dir())
+        self.assertFalse(state.exists())
+
     def test_changed_payload_fails_before_any_runtime_is_started(self):
         self.package()
         (self.root/'bin/lattice-service.exe').write_bytes(b'changed')
