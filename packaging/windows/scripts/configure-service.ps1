@@ -1,7 +1,7 @@
 # NeonHearth service post-install configuration.
 #
 # Run elevated. Invoked by the installer after the service is registered, and
-# safe to re-run manually (for example after installing Npcap later). Every
+# safe to re-run manually. Every
 # step is idempotent: ACLs are rebuilt from scratch each run, the token is
 # generated once and preserved thereafter.
 #
@@ -21,20 +21,7 @@
 #      local account read the token that is the API's entire authorization
 #      boundary (audit H-1). See docs/build/installers.md for the DPAPI
 #      file-backed follow-up that needs a service-side change.
-#   3. Detects Npcap. The service executable is linked against Npcap's
-#      Packet.dll (via pnet_datalink), so:
-#        - Npcap present in WinPcap-compatible mode (System32\Packet.dll):
-#          nothing extra needed.
-#        - Npcap present only under System32\Npcap: a PATH entry pointing at
-#          that directory is added to the service's private environment so the
-#          loader can resolve Packet.dll.
-#        - Npcap absent: the executable CANNOT load at all (load-time DLL
-#          import), so "limited mode" on Windows means: the service is left
-#          registered with start type Manual and a clear notice is written to
-#          the state directory. Re-run this script after installing Npcap to
-#          switch the service to Automatic and start it. The in-process
-#          Degraded mode (runtime.rs) only covers failures after the process
-#          has loaded.
+#   3. Uses native Windows discovery; no packet-capture driver is needed.
 #   4. Detects a bundled ffmpeg.exe next to the service executable (opt-in
 #      MSI component, see NeonHearth.wxs) and, when present, points the
 #      service at it via NEONHEARTH_FFMPEG so camera media does not depend
@@ -108,15 +95,7 @@ $dirAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
 Set-Acl -Path $stateDir -AclObject $dirAcl
 Write-Log "State directory ACL set explicitly: SYSTEM/Administrators full, NT SERVICE\$ServiceName modify, inheritance off."
 
-# --- 2. Npcap detection ----------------------------------------------------
-$npcapDir = Join-Path $env:SystemRoot 'System32\Npcap'
-$compatDll = Join-Path $env:SystemRoot 'System32\Packet.dll'
-$npcapCompat = Test-Path $compatDll
-$npcapDirPresent = Test-Path (Join-Path $npcapDir 'Packet.dll')
-$npcapUsable = $npcapCompat -or $npcapDirPresent
-Write-Log "Npcap: WinPcap-compat Packet.dll=$npcapCompat, System32\Npcap\Packet.dll=$npcapDirPresent"
-
-# --- 3. Service-private environment (token, ffmpeg, optional Npcap PATH) ---
+# --- 2. Service-private environment (token, ffmpeg, UI) ---
 $existing = @()
 $existingProp = Get-ItemProperty -Path $serviceKey -Name 'Environment' -ErrorAction SilentlyContinue
 if ($null -ne $existingProp) { $existing = @($existingProp.Environment) }
@@ -170,14 +149,6 @@ for ($i = 0; $i -lt $entries.Count; $i++) { if ($entries[$i] -like 'LATTICE_UI_D
 if ($uiIdx -ge 0) { $entries[$uiIdx] = $uiEntry } else { $entries.Add($uiEntry) }
 Write-Log "Service will serve the dashboard UI from $uiDir on http://127.0.0.1:58120/."
 
-if ($npcapDirPresent -and -not $npcapCompat) {
-    # The loader resolves the Packet.dll load-time import through the service's
-    # PATH; System32\Npcap is not on the default search path.
-    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    Set-EnvEntry -List $entries -Name 'PATH' -Value "$npcapDir;$machinePath"
-    Write-Log "Service PATH prefixed with $npcapDir for Packet.dll resolution."
-}
-
 Set-ItemProperty -Path $serviceKey -Name 'Environment' `
     -Value ([string[]]$entries) -Type MultiString
 Write-Log 'Service Environment registry value written.'
@@ -207,28 +178,15 @@ Write-Log "Service registry key ACL set explicitly: SYSTEM/Administrators full, 
 & sc.exe failureflag $ServiceName 1 | Out-Null
 Write-Log 'Recovery: restart after 5s/5s/30s, counter reset after 24h, apply on non-crash failures too.'
 
-# --- 5. Start type: Automatic with Npcap, Manual (limited mode) without ----
-if ($npcapUsable) {
-    & sc.exe config $ServiceName start= auto | Out-Null
-    Write-Log 'Npcap present: service start type set to Automatic.'
-    if ($Start) {
-        Start-Service -Name $ServiceName
-        Write-Log 'Service started.'
-    }
-} else {
-    & sc.exe config $ServiceName start= demand | Out-Null
-    $notice = @"
-NeonHearth is installed but Npcap was not found, so the collector service is
-registered with start type Manual and has NOT been started. The service
-executable links against Npcap's Packet.dll and cannot load without it.
-
-To enable NeonHearth:
-  1. Install Npcap from https://npcap.com/ (WinPcap-compatible mode is fine).
-  2. Re-run (elevated):
-     powershell -ExecutionPolicy Bypass -File "$PSScriptRoot\configure-service.ps1" -Start
-"@
-    Set-Content -Path (Join-Path $stateDir 'NPCAP-REQUIRED.txt') -Value $notice
-    Write-Log 'Npcap absent: limited mode - service left Manual/stopped; NPCAP-REQUIRED.txt written.'
+# --- 5. Start the native collector without a packet driver ----------------
+& sc.exe config $ServiceName start= auto | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Could not configure service startup" }
+Write-Log 'Native Windows collector configured for Automatic startup; no Npcap required.'
+$obsoleteNotice = Join-Path $stateDir 'NPCAP-REQUIRED.txt'
+if (Test-Path -LiteralPath $obsoleteNotice) { Remove-Item -LiteralPath $obsoleteNotice }
+if ($Start) {
+    Start-Service -Name $ServiceName
+    Write-Log 'Service started.'
 }
 
 # --- 6. Uninstall data note ------------------------------------------------

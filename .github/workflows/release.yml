@@ -1,6 +1,6 @@
 name: Release
 
-# Tagged-release pipeline: builds the Windows MSI and Linux deb/rpm packages
+# Tagged release: native Windows Home Hub, compatibility MSI, and Linux packages
 # from the packaging/ scaffolding and publishes them on a GitHub pre-release.
 #
 # Version flow: the tag (vX.Y.Z[-pre]) is the single source of truth.
@@ -11,6 +11,12 @@ name: Release
 #     prerelease itself (deb: 0.1.0~alpha.1, rpm: version/release fields).
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Candidate version (manual builds never publish)
+        required: true
+        default: "0.1.0-candidate"
   push:
     tags:
       - "v*"
@@ -22,8 +28,102 @@ permissions:
   contents: read
 
 jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+
+  windows-home-hub:
+    name: Windows native Home Hub (recommended ZIP)
+    runs-on: windows-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-09-03
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Resolve candidate version
+        id: version
+        shell: pwsh
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          $full = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME -replace '^v','' } else { $env:MANUAL_VERSION }
+          if ($full -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw 'Invalid release version' }
+          "full=$full" | Add-Content $env:GITHUB_OUTPUT
+      - name: Verify packaging boundaries
+        run: python packaging/test_home_hub_package.py
+      - name: Build locked native launcher and collector
+        run: cargo build --locked --release -p lattice-service -p lattice-launcher
+      - name: Build dashboard
+        shell: pwsh
+        run: |
+          npm --prefix apps/desktop ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+          npm --prefix apps/desktop run build
+          if ($LASTEXITCODE -ne 0) { throw 'UI build failed' }
+      - name: Prepare checksum-pinned broker without installing it
+        run: python packaging/windows/prepare-mosquitto.py --output "${{ runner.temp }}/neonhearth-mosquitto"
+      - name: Assemble native Home Hub ZIP
+        shell: pwsh
+        run: |
+          python scripts/package-home-hub.py --target target/release --mosquitto "${{ runner.temp }}/neonhearth-mosquitto" --output "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-x64" --version "${{ steps.version.outputs.full }}"
+          if ($LASTEXITCODE -ne 0) { throw 'Home Hub packaging failed' }
+      - name: Validate exact payload and executable loading
+        shell: pwsh
+        run: |
+          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-x64"
+          $manifest = Get-Content -Raw "$hub/PACKAGE-MANIFEST.json" | ConvertFrom-Json
+          foreach ($file in $manifest.files) {
+            $path = Join-Path $hub $file.path
+            if ((Get-Item $path).Length -ne $file.bytes) { throw "Size mismatch: $($file.path)" }
+            if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLower() -ne $file.sha256) { throw "Hash mismatch: $($file.path)" }
+          }
+          $info = Get-Content -Raw "$hub/BUILD-INFO.json" | ConvertFrom-Json
+          if ($info.source_commit -ne $env:GITHUB_SHA -or $info.source_dirty) { throw 'Candidate source does not match the clean checkout' }
+          $process = Start-Process -FilePath "$PWD/$hub/NeonHearth.exe" -ArgumentList '--help' -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Native launcher could not load' }
+          $archive = "$hub.zip"
+          "$((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower())  $(Split-Path -Leaf $archive)" | Set-Content "$archive.sha256"
+      - name: Validate candidate and run isolated native smoke
+        shell: pwsh
+        run: |
+          python -m pip install psutil==7.2.2
+          if ($LASTEXITCODE -ne 0) { throw 'Smoke test dependency install failed' }
+          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-x64"
+          python scripts/verify-candidate.py --package $hub --output "${{ runner.temp }}/home-hub-verify.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate verification failed' }
+          # Hosted VMs may have no eligible physical adapter. This checks the
+          # authenticated local transport, not physical discovery or a soak.
+          python scripts/soak-candidate.py --package $hub --state "${{ runner.temp }}/home-hub-smoke-state" --output "${{ runner.temp }}/home-hub-smoke.json" --port 58131 --mqtt-port 58193 --duration-seconds 15 --interval-seconds 3 --allow-degraded-collector
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated native smoke failed' }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: windows-home-hub-verification
+          path: |
+            ${{ runner.temp }}/home-hub-verify.json
+            ${{ runner.temp }}/home-hub-smoke.json
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-home-hub
+          path: |
+            packaging/dist/NeonHearth-Home-Hub-*.zip
+            packaging/dist/NeonHearth-Home-Hub-*.zip.sha256
+          if-no-files-found: error
+
   windows-installer:
-    name: Windows installer (MSI)
+    name: Windows service compatibility installer (MSI)
+    needs: quality
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,6 +141,8 @@ jobs:
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head, 2026-09-03
+        with:
+          toolchain: 1.96.0
 
       - name: Record resolved toolchain versions
         shell: pwsh
@@ -55,26 +157,6 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
-
-      # Hosted Windows runners have no Npcap installed, but compiling the
-      # workspace needs Npcap's Packet.lib import library at link time
-      # (pnet_datalink). The freely redistributable Npcap SDK provides it;
-      # RUSTFLAGS points the linker at its x64 import libraries. The SDK is
-      # only a build input - the MSI does not ship any Npcap component and
-      # end users still install Npcap themselves (see configure-service.ps1
-      # limited mode).
-      - name: Install Npcap SDK (import libraries for linking)
-        shell: pwsh
-        run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'npcap-sdk-1.13.zip'
-          Invoke-WebRequest -Uri 'https://npcap.com/dist/npcap-sdk-1.13.zip' -OutFile $zip
-          $expected = 'DAD1F2BF1B02B787BE08CA4862F99E39A876C1F274BAC4AC0CEDC9BBC58F94FD'
-          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash
-          if ($actual -ne $expected) { throw "npcap-sdk-1.13.zip SHA-256 mismatch: got $actual, expected $expected" }
-          $sdk = Join-Path $env:RUNNER_TEMP 'npcap-sdk'
-          Expand-Archive $zip -DestinationPath $sdk -Force
-          if (-not (Test-Path (Join-Path $sdk 'Lib\x64\Packet.lib'))) { throw 'Packet.lib missing from extracted SDK' }
-          "RUSTFLAGS=-L $sdk\Lib\x64" | Add-Content $env:GITHUB_ENV
 
       - name: Stage Windows release layout (packaging/stage.ps1)
         shell: pwsh
@@ -187,6 +269,8 @@ jobs:
 
   linux-packages:
     name: Linux packages (deb, rpm)
+    needs: quality
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -220,6 +304,8 @@ jobs:
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head, 2026-09-03
+        with:
+          toolchain: 1.96.0
 
       - name: Record resolved toolchain versions
         run: |
@@ -288,7 +374,8 @@ jobs:
   release:
     name: Publish GitHub pre-release
     runs-on: ubuntu-latest
-    needs: [windows-installer, linux-packages]
+    needs: [windows-home-hub, windows-installer, linux-packages]
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
@@ -302,9 +389,10 @@ jobs:
         id: assets
         run: |
           mkdir -p release-assets
-          find artifacts -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
+          find artifacts -type f \( -name '*.zip' -o -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
           cd release-assets
           ls -la
+          [ -n "$(ls NeonHearth-Home-Hub-*.zip 2>/dev/null)" ] || { echo 'no native Home Hub artifact' >&2; exit 1; }
           [ -n "$(ls *.msi 2>/dev/null)" ] || { echo 'no MSI artifact' >&2; exit 1; }
           [ -n "$(ls *.exe 2>/dev/null)" ] || { echo 'no setup exe artifact' >&2; exit 1; }
           [ -n "$(ls *.deb 2>/dev/null)" ] || { echo 'no deb artifact' >&2; exit 1; }
@@ -322,6 +410,15 @@ jobs:
           body: |
             **Pre-release: unsigned, not clean-machine tested.**
 
+            **Recommended Windows download: NeonHearth-Home-Hub-...-windows-x64.zip.**
+            Extract the complete folder and open NeonHearth.exe. It includes the
+            native launcher, collector and authenticated local MQTT broker.
+            No Npcap, Python, Node or administrator rights are needed to run it;
+            the broker requires Microsoft's Visual C++ 2015–2022 x64 runtime.
+            The MSI/Setup EXE remain separate legacy-service compatibility assets.
+            Existing service users must back up and deliberately stop that service
+            before switching; private databases are not silently migrated.
+
             These installer artifacts are built and payload-validated in CI
             (MSI administrative extract, setup-exe bundle extraction, deb/rpm
             content listing), but:
@@ -331,9 +428,8 @@ jobs:
             - No clean-machine install/upgrade/uninstall acceptance has been
               performed, so RLS4 (Windows installer) and RLS5 (Linux packages)
               remain **not complete**.
-            - The Windows service requires [Npcap](https://npcap.com/) at
-              runtime; without it the service is registered in limited mode
-              (Manual/stopped) as described in the installer docs.
+            - Windows discovery uses native APIs; Npcap is not required by
+              either the Home Hub or current service compatibility package.
 
             See `docs/build/installers.md` for the full honest status of what
             is and is not verified.

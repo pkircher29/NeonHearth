@@ -21,6 +21,14 @@ use zeroize::Zeroizing;
 
 const MARKER: &str = "NeonHearth private home hub state, format 1\n";
 
+fn ensure_single_collector(legacy_active: bool) -> Result<()> {
+    ensure!(
+        !legacy_active,
+        "The installed NeonHearth service is active. Make a backup and stop that service before starting the Home Hub. Existing device history will not be migrated or replaced automatically."
+    );
+    Ok(())
+}
+
 #[derive(Default)]
 struct Options {
     state: Option<PathBuf>,
@@ -323,6 +331,9 @@ pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
         );
         return Ok(());
     }
+    if !options.status && !options.stop {
+        ensure_single_collector(platform::legacy_collector_active()?)?;
+    }
     let selected = options
         .state
         .clone()
@@ -493,6 +504,13 @@ pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn starting_a_second_collector_requires_stopping_the_legacy_service_first() {
+        let error = ensure_single_collector(true).unwrap_err().to_string();
+        assert!(error.contains("installed NeonHearth service"));
+        assert!(error.contains("backup"));
+        assert!(ensure_single_collector(false).is_ok());
+    }
     #[test]
     fn state_setup_refuses_unrelated_nonempty_directories() {
         let directory = tempfile::tempdir().unwrap();

@@ -20,6 +20,7 @@
 !/crates/lattice-sensor/tests/fixtures/pcap/*.pcapng
 /artifacts/
 /dist/
+/packaging/dist/
 /.local/
 
 

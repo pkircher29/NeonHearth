@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches:
       - main
@@ -133,6 +134,18 @@ jobs:
 
       - name: Unit tests
         run: npm test -- --run
+
+      - name: Dependency security regressions
+        run: npm run test:dependencies
+
+      - name: npm dependency advisories
+        run: npm audit
+
+      - name: Candidate tooling regression tests
+        working-directory: .
+        run: |
+          python packaging/test_home_hub_package.py
+          python -m unittest discover -s scripts/tests -p 'test_*.py'
 
       - name: Type/lint check
         run: npm run check

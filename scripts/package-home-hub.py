@@ -4,25 +4,58 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import tomllib
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+BROKER_SOURCE = json.loads((ROOT/'packaging/windows/mosquitto-source.json').read_text(encoding='utf-8'))
+BROKER_FILES = BROKER_SOURCE['files']
+BROKER_NOTICES = BROKER_SOURCE['notices']
+
+
+def digest(path):
+    with path.open('rb') as handle:
+        return hashlib.file_digest(handle, 'sha256').hexdigest()
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--target', type=Path, default=ROOT / 'target' / 'release')
     parser.add_argument('--mosquitto', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--version', help='Release tag version without v; defaults to Cargo workspace version')
     args = parser.parse_args()
     output = args.output.resolve()
+    archive = output.with_suffix('.zip')
     if output.exists():
         raise ValueError('Choose a new empty package destination; existing packages are preserved')
+    if archive.exists():
+        raise ValueError('Archive already exists')
     ui = ROOT / 'apps' / 'desktop' / 'dist'
-    for path in [args.target / 'NeonHearth.exe', args.target / 'lattice-service.exe', ui / 'index.html', args.mosquitto / 'mosquitto.exe', args.mosquitto / 'mosquitto_passwd.exe', ROOT / 'LICENSE']:
-        if not path.is_file():
+    inputs = [args.target / 'NeonHearth.exe', args.target / 'lattice-service.exe', ui / 'index.html', ROOT / 'LICENSE']
+    inputs += [args.mosquitto / name for name in BROKER_FILES + BROKER_NOTICES]
+    inputs += [ROOT / name for name in ['docs/owner/home-automation.md', 'docs/owner/traffic-monitor.md', 'docs/owner/network-monitor.md', 'docs/build/windows-delivery.md', 'crates/lattice-service/data/mac-assignments.json']]
+    for path in inputs:
+        if not path.is_file() or path.is_symlink():
             raise ValueError(f'Build or supply the required component: {path.name}')
+    broker = json.loads((args.mosquitto/'SOURCE-MANIFEST.json').read_text(encoding='utf-8'))
+    if broker.get('sha256') != BROKER_SOURCE['sha256'] or broker.get('version') != BROKER_SOURCE['version']:
+        raise ValueError('Prepare the pinned broker with packaging/windows/prepare-mosquitto.py')
+    for name in BROKER_FILES + BROKER_NOTICES:
+        if broker.get('file_sha256', {}).get(name) != digest(args.mosquitto/name):
+            raise ValueError('Broker component changed: '+name)
+    version = args.version or tomllib.loads((ROOT / 'Cargo.toml').read_text(encoding='utf-8'))['workspace']['package']['version']
+    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?', version):
+        raise ValueError('Invalid package version')
+    source_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    if not re.fullmatch(r'[0-9a-f]{40}', source_commit):
+        raise ValueError('Could not identify the source commit')
+    source_dirty = bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip())
+    # Resolve metadata before writing a customer-looking package directory.
+    metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--format-version', '1', '--locked'], cwd=ROOT))
+    lock = json.loads((ROOT / 'apps/desktop/package-lock.json').read_text(encoding='utf-8'))
     output.mkdir(parents=True)
     def copy(source, destination):
         target = output / destination
@@ -31,43 +64,57 @@ def main():
     copy(args.target / 'NeonHearth.exe', 'NeonHearth.exe')
     copy(args.target / 'lattice-service.exe', 'bin/lattice-service.exe')
     shutil.copytree(ui, output / 'ui')
-    for name in ['mosquitto.exe', 'mosquitto_passwd.exe', 'mosquitto_pub.exe', 'mosquitto_sub.exe',
-                 'mosquitto_common.dll', 'mosquitto.dll', 'mosquitto_acl_file.dll', 'mosquitto_password_file.dll',
-                 'libssl-3-x64.dll', 'libcrypto-3-x64.dll', 'libmicrohttpd-dll.dll', 'cjson.dll', 'pthreadVC3.dll']:
+    for name in BROKER_FILES:
         copy(args.mosquitto / name, 'mqtt/' + name)
-    for name in ['NOTICE.md', 'edl-v10', 'epl-v20', 'README-windows.txt']:
+    for name in BROKER_NOTICES:
         copy(args.mosquitto / name, 'licenses/mosquitto/' + name)
     for name in ['LICENSE', 'docs/owner/home-automation.md']:
         copy(ROOT / name, 'licenses/NeonHearth.txt' if name == 'LICENSE' else 'Home automation.md')
     copy(ROOT / 'docs/owner/traffic-monitor.md', 'Traffic and devices.md')
     copy(ROOT / 'docs/owner/network-monitor.md', 'network-monitor.md')
+    copy(ROOT / 'docs/build/windows-delivery.md', 'Windows delivery.md')
+    copy(args.mosquitto/'SOURCE-MANIFEST.json', 'licenses/mosquitto/SOURCE-MANIFEST.json')
     copy(ROOT / 'crates/lattice-service/data/mac-assignments.json', 'licenses/ieee-assignment-sources.json')
     # Include dependency notices from the installed, locked source trees.
-    metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--format-version', '1', '--locked'], cwd=ROOT))
     packages = []
     for package in metadata['packages']:
         packages.append({key:package.get(key) for key in ['name','version','license','repository']})
         directory = Path(package['manifest_path']).parent
         for path in directory.iterdir():
-            if path.is_file() and path.name.upper().startswith(('LICENSE','COPYING','NOTICE')) and path.stat().st_size <= 256 * 1024:
+            if path.is_file() and (path.name.upper().startswith(('LICENSE','COPYING','NOTICE')) or path.name == 'NEONHEARTH-PATCH.md') and path.stat().st_size <= 256 * 1024:
                 copy(path, f"licenses/rust/{package['name']}-{package['version']}/{path.name}")
     (output / 'licenses' / 'rust-components.json').write_text(json.dumps(packages,indent=2),encoding='utf-8')
-    lock = json.loads((ROOT / 'apps/desktop/package-lock.json').read_text(encoding='utf-8'))
     packages = []
     for location, package in lock['packages'].items():
         if not location:
             continue
-        directory = ROOT / 'apps/desktop' / location
-        packages.append({'name':location.removeprefix('node_modules/'),'version':package.get('version'),'license':package.get('license'),'integrity':package.get('integrity')})
+        source = package.get('resolved', location) if package.get('link') else location
+        info = lock['packages'].get(source, package) if package.get('link') else package
+        directory = (ROOT / 'apps/desktop' / source).resolve()
+        name = info.get('name') or location.rsplit('node_modules/',1)[-1]
+        component_version = info.get('version') or 'unversioned'
+        if not re.fullmatch(r'(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+', name) or name in ('.','..'):
+            raise ValueError('Unsupported npm component name: '+name)
+        if not isinstance(component_version,str) or not re.fullmatch(r'[A-Za-z0-9_.+-]+',component_version) or component_version in ('.','..'):
+            raise ValueError('Unsupported npm component version')
+        packages.append({'name':name,'version':component_version,'license':info.get('license'),'integrity':info.get('integrity'), 'source':source})
         if directory.is_dir():
             for path in directory.iterdir():
-                if path.is_file() and path.name.upper().startswith(('LICENSE','COPYING','NOTICE','OFL')) and path.stat().st_size <= 256 * 1024:
-                    copy(path, f"licenses/npm/{location.removeprefix('node_modules/')}/{path.name}")
+                if path.is_file() and (path.name.upper().startswith(('LICENSE','COPYING','NOTICE','OFL')) or path.name == 'PATCH.md') and path.stat().st_size <= 256 * 1024:
+                    copy(path, f"licenses/npm/{name}/{component_version}/{path.name}")
     (output / 'licenses' / 'npm-components.json').write_text(json.dumps(packages,indent=2),encoding='utf-8')
+    (output / 'BUILD-INFO.json').write_text(json.dumps({'format_version':1, 'source_commit':source_commit,
+        'source_dirty':source_dirty, 'version':version, 'platform':'windows-x64', 'delivery':'portable-home-hub',
+        'unsigned':True, 'broker':{'name':'mosquitto', 'version':BROKER_SOURCE['version'],
+        'installer_sha256':BROKER_SOURCE['sha256']}}, indent=2), encoding='utf-8')
     (output / 'Read me.txt').write_text('''NeonHearth Home Hub for Windows x64
 
 Open NeonHearth.exe. The launcher starts the local collector and authenticated MQTT hub, then opens your browser.
 No Python, Node, administrator account, or packet-capture driver is required by the launcher.
+If an older NeonHearth Windows service is installed, keep using its dashboard until you have
+backed up its database and deliberately stopped that service. Do not run both collectors.
+The legacy service's ProgramData database and this per-user hub are separate; this package
+does not silently import or delete either database. See Windows delivery.md for switching.
 Mosquitto requires the Microsoft Visual C++ 2015-2022 x64 runtime. If Windows reports VCRUNTIME140.dll missing, install it from Microsoft:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist
 
@@ -95,18 +142,15 @@ Third-party notices are in licenses/.
         if path.is_file():
             if path.is_symlink() or path.stat().st_size > 128 * 1024 * 1024:
                 raise ValueError('Unsupported package member')
-            files.append({'path':path.relative_to(output).as_posix(),'bytes':path.stat().st_size,'sha256':hashlib.file_digest(path.open('rb'),'sha256').hexdigest()})
+            files.append({'path':path.relative_to(output).as_posix(),'bytes':path.stat().st_size,'sha256':digest(path)})
     if len(files)>4096:
         raise ValueError('Package manifest exceeds the launcher limit')
     (output / 'PACKAGE-MANIFEST.json').write_text(json.dumps({'format_version':1,'files':files},indent=2),encoding='utf-8')
-    archive = output.with_suffix('.zip')
-    if archive.exists():
-        raise ValueError('Archive already exists')
     # Dependency archives can carry Unix-epoch timestamps, outside ZIP's range.
     with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,strict_timestamps=False) as bundle:
         for path in sorted(output.rglob('*')):
             if path.is_file(): bundle.write(path,path.relative_to(output.parent))
-    print(json.dumps({'package':str(output),'archive':str(archive),'files':len(files),'sha256':hashlib.file_digest(archive.open('rb'),'sha256').hexdigest()}))
+    print(json.dumps({'package':str(output),'archive':str(archive),'files':len(files),'sha256':digest(archive)}))
 
 if __name__ == '__main__':
     main()
