@@ -45,6 +45,23 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(len(result['manifest_sha256']),64)
         self.assertTrue(result['unsigned'])
 
+    def test_launcher_failure_retains_exit_code_without_private_output(self):
+        private='Bearer private-test-token C:/private/path'
+        result=SimpleNamespace(returncode=-1073741515,stdout=private,stderr=private)
+        with patch.object(self.verify.subprocess,'run',return_value=result):
+            with self.assertRaises(self.verify.LauncherFailure) as raised:
+                self.verify.launcher(self.root,self.root/'qa','--no-browser')
+        self.assertEqual(raised.exception.diagnostic,{'exit_code':-1073741515,'reason':'missing_dll'})
+        self.assertNotIn(private,str(raised.exception))
+
+    def test_launcher_failure_classifies_only_known_fixed_messages(self):
+        result=SimpleNamespace(returncode=1,stdout='private-test-token',stderr='Cannot isolate launcher output from background processes: private-test-token')
+        with patch.object(self.verify.subprocess,'run',return_value=result):
+            with self.assertRaises(self.verify.LauncherFailure) as raised:
+                self.verify.launcher(self.root,self.root/'qa','--stop')
+        self.assertEqual(raised.exception.diagnostic,{'exit_code':1,'reason':'stdio_isolation'})
+        self.assertNotIn('private-test-token',str(raised.exception))
+
     def test_changed_payload_fails_before_any_runtime_is_started(self):
         self.package()
         (self.root/'bin/lattice-service.exe').write_bytes(b'changed')

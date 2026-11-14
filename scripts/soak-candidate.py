@@ -110,6 +110,8 @@ def run(args):
         report.update(status='interrupted',failures=['Run interrupted; elapsed uptime is not acceptance'])
     except Exception as error:
         report.update(status='failed',failure_type=type(error).__name__)
+        if isinstance(error,verify.LauncherFailure):
+            report['launcher_failure']=error.diagnostic
     finally:
         if started:
             try:
@@ -118,6 +120,8 @@ def run(args):
                 report['isolated_instance_stopped']=True
             except Exception as error:
                 report.update(status='failed',isolated_instance_stopped=False,cleanup_failure_type=type(error).__name__)
+                if isinstance(error,verify.LauncherFailure):
+                    report['cleanup_launcher_failure']=error.diagnostic
         report['ended_at']=datetime.now(timezone.utc).isoformat()
         verify.atomic_report(args.output,report)
     # All private state and evidence are retained for inspection; nothing is deleted.

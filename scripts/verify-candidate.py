@@ -158,12 +158,30 @@ def atomic_report(path, report):
     os.replace(tmp,path)
 
 
+class LauncherFailure(RuntimeError):
+    """Only numeric status and fixed categories may leave private launcher output."""
+    def __init__(self, code, stderr):
+        reason={0xC0000135:'missing_dll',0xC000007B:'invalid_image'}.get(code & 0xffffffff,'unclassified')
+        for text,category in [
+            ('Cannot isolate launcher output from background processes','stdio_isolation'),
+            ('Cannot identify the current Windows user','user_identity'),
+            ('Select an empty data folder','state_not_empty'),
+            ('reparse','reparse_path'),
+            ('Cannot query the legacy NeonHearth service','legacy_service_query'),
+        ]:
+            if text in stderr:
+                reason=category
+                break
+        self.diagnostic={'exit_code':code,'reason':reason}
+        super().__init__('Candidate launcher failed: '+json.dumps(self.diagnostic))
+
+
 def launcher(root, state, *arguments):
     result=subprocess.run([str(Path(root)/'NeonHearth.exe'),*arguments,'--state',str(state)],
                           capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=50,
                           creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     if result.returncode:
-        raise RuntimeError('Candidate launcher did not succeed; inspect its private state log')
+        raise LauncherFailure(result.returncode,result.stderr)
     return json.loads(result.stdout)
 
 
