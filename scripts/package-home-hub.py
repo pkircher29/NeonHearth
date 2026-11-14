@@ -26,6 +26,7 @@ def main():
     parser.add_argument('--mosquitto', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--version', help='Release tag version without v; defaults to Cargo workspace version')
+    parser.add_argument('--signed-by', help='Publisher whose code signature the build already verified on NeonHearth.exe and lattice-service.exe; omit for an unsigned package')
     args = parser.parse_args()
     output = args.output.resolve()
     archive = output.with_name(output.name + '.zip')
@@ -105,8 +106,10 @@ def main():
     (output / 'licenses' / 'npm-components.json').write_text(json.dumps(packages,indent=2),encoding='utf-8')
     (output / 'BUILD-INFO.json').write_text(json.dumps({'format_version':1, 'source_commit':source_commit,
         'source_dirty':source_dirty, 'version':version, 'platform':'windows-x64', 'delivery':'portable-home-hub',
-        'unsigned':True, 'broker':{'name':'mosquitto', 'version':BROKER_SOURCE['version'],
+        'unsigned':not args.signed_by, **({'signed_by':args.signed_by} if args.signed_by else {}), 'broker':{'name':'mosquitto', 'version':BROKER_SOURCE['version'],
         'installer_sha256':BROKER_SOURCE['sha256']}}, indent=2), encoding='utf-8')
+    signing_note = (f'NeonHearth.exe and bin/lattice-service.exe are code-signed by {args.signed_by}.'
+                    if args.signed_by else 'This development package is unsigned.')
     (output / 'Read me.txt').write_text('''NeonHearth Home Hub for Windows x64
 
 Open NeonHearth.exe. The launcher starts the local collector and authenticated MQTT hub, then opens your browser.
@@ -124,7 +127,7 @@ Private per-user state is stored in %LOCALAPPDATA%\\NeonHearthHomeHub. The owner
 The dashboard uses http://127.0.0.1:58121; MQTT uses 127.0.0.1:58183. The launcher refuses unrelated listeners on those ports.
 Run NeonHearth.exe --status to check this instance; --stop stops its verified processes and preserves its data.
 Keep the complete package folder together. Extract a new version to a new folder after stopping the old version.
-PACKAGE-MANIFEST.json detects missing or damaged components. This development package is unsigned.
+PACKAGE-MANIFEST.json detects missing or damaged components. {signing_note}
 
 Devices > Identify devices with a network scan starts bounded discovery across observed devices.
 Traffic opens on Entire network: all observed devices and a configurable Predator Connect W6 household WAN graph.
@@ -138,7 +141,7 @@ CDP and LLDP require an Ethernet PCAP from the relevant link. Avahi integration 
 Source and license: https://github.com/pkircher29/NeonHearth (AGPL-3.0-or-later)
 Mosquitto: https://github.com/eclipse-mosquitto/mosquitto/tree/v2.1.2 (BSD-3-Clause or EPL-2.0)
 Third-party notices are in licenses/.
-''',encoding='utf-8')
+'''.replace('{signing_note}', signing_note),encoding='utf-8')
     files = []
     for path in sorted(output.rglob('*')):
         if path.is_file():
