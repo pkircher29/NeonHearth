@@ -1,0 +1,14 @@
+{
+  "name": "@neonhearth/deepmerge",
+  "version": "4.3.1-patch.1",
+  "private": true,
+  "description": "Explicit security backport of deepmerge 4.3.1 for NeonHearth build configuration",
+  "main": "index.cjs",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "neonhearthUpstream": {
+    "package": "deepmerge",
+    "version": "4.3.1",
+    "integrity": "sha512-3sUqbMEc77XqpdNO7FRyRog+eW3ph+GYCbj+rK+uYyRMuwsVy0rMiVtPn+QJlKFvWP/1PYpapqYn0Me2knFn+A=="
+  }
+}
