@@ -68,7 +68,7 @@ class CandidateTests(unittest.TestCase):
         args=SimpleNamespace(package=self.root/'package',state=state,output=self.root/'evidence.json',port=58131,mqtt_port=58193)
         # Elevated Windows directory creation may assign Administrators as owner.
         # The launcher must create its final state with its explicit user SID.
-        with patch.object(soak,'os',SimpleNamespace(name='nt',environ={})),patch.object(soak.verify,'verify_package',return_value={}),patch.object(soak.socket,'socket'),patch.dict('sys.modules',{'psutil':SimpleNamespace()}):
+        with patch.object(soak,'os',SimpleNamespace(name='nt',environ={})),patch.object(soak.verify,'verify_package',return_value={}),patch.object(soak.socket,'socket'),patch.object(soak.socket,'SO_EXCLUSIVEADDRUSE',1,create=True),patch.dict('sys.modules',{'psutil':SimpleNamespace()}):
             soak.preflight(args)
         self.assertTrue(state.parent.is_dir())
         self.assertFalse(state.exists())

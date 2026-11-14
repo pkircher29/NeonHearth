@@ -4,10 +4,13 @@ The recommended beta download is **NeonHearth-Home-Hub-<version>-windows-x64.zip
 Extract the entire ZIP to a new folder, then open `NeonHearth.exe`. It includes
 the native launcher, collector, UI, authenticated MQTT broker, license notices,
 build information and a file manifest. Running it needs no Python, Node,
-administrator rights or Npcap. The broker needs Microsoft's Visual C++ 2015–2022
-x64 runtime. If Windows reports `VCRUNTIME140.dll` missing, install that runtime
-from [Microsoft](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist),
-not replacement DLLs from third-party sites.
+administrator rights or Npcap. The broker needs Microsoft's Visual C++ v14
+Redistributable (x64). If startup reports a missing DLL (`0xC0000135`), install
+or repair the [official x64 runtime](https://aka.ms/vc14/vc_redist.x64.exe), then
+open NeonHearth again. Windows may request administrator approval to install
+this prerequisite. Existing NeonHearth data is preserved. See
+[Microsoft's instructions](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
+If the error persists, extract the complete ZIP again; avoid individual DLL downloads.
 
 The candidate remains unsigned unless its release explicitly says otherwise.
 Hashes detect changed bytes; they are not publisher signatures. Clean-machine

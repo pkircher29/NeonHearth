@@ -115,7 +115,9 @@ If an older NeonHearth Windows service is installed, keep using its dashboard un
 backed up its database and deliberately stopped that service. Do not run both collectors.
 The legacy service's ProgramData database and this per-user hub are separate; this package
 does not silently import or delete either database. See Windows delivery.md for switching.
-Mosquitto requires the Microsoft Visual C++ 2015-2022 x64 runtime. If Windows reports VCRUNTIME140.dll missing, install it from Microsoft:
+Mosquitto requires the Microsoft Visual C++ v14 Redistributable (x64). If startup reports a missing DLL (0xC0000135), install or repair this Microsoft prerequisite, then open NeonHearth again:
+https://aka.ms/vc14/vc_redist.x64.exe
+Windows may require administrator approval for this prerequisite. Your NeonHearth data is preserved. Microsoft instructions:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist
 
 Private per-user state is stored in %LOCALAPPDATA%\\NeonHearthHomeHub. The owner token is protected with Windows DPAPI.

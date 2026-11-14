@@ -414,7 +414,10 @@ jobs:
             Extract the complete folder and open NeonHearth.exe. It includes the
             native launcher, collector and authenticated local MQTT broker.
             No Npcap, Python, Node or administrator rights are needed to run it;
-            the broker requires Microsoft's Visual C++ 2015–2022 x64 runtime.
+            the broker requires Microsoft's Visual C++ v14 Redistributable (x64).
+            Install or repair it from https://aka.ms/vc14/vc_redist.x64.exe if
+            startup reports a missing DLL; Windows may request admin approval
+            for this prerequisite. Then open NeonHearth again.
             The MSI/Setup EXE remain separate legacy-service compatibility assets.
             Existing service users must back up and deliberately stop that service
             before switching; private databases are not silently migrated.

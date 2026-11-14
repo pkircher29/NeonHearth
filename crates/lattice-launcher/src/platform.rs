@@ -27,7 +27,7 @@ use windows_sys::Win32::{
         CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_TYPE_PIPE, GetFileAttributesW,
         GetFileType, INVALID_FILE_ATTRIBUTES,
     },
-    System::{Com::CoTaskMemFree, Console::*, Services::*, Threading::*},
+    System::{Com::CoTaskMemFree, Console::*, Diagnostics::Debug::*, Services::*, Threading::*},
     UI::{
         Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, ShellExecuteW},
         WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW, SW_SHOWNORMAL},
@@ -131,6 +131,16 @@ pub fn default_state() -> Result<PathBuf> {
 /// Background components have their own log handles. Inherited caller pipes
 /// must not keep a scripting client's read open after the launcher exits.
 pub fn prevent_stdio_inheritance() -> Result<()> {
+    // Child loader failures must return their status for our actionable error,
+    // rather than opening a blocking Windows DLL-error dialog behind the app.
+    unsafe {
+        SetErrorMode(
+            GetErrorMode()
+                | SEM_FAILCRITICALERRORS
+                | SEM_NOGPFAULTERRORBOX
+                | SEM_NOOPENFILEERRORBOX,
+        );
+    }
     for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         // SAFETY: borrowed handles stay open and retain their read/write access.
         let handle = unsafe { GetStdHandle(kind) };
