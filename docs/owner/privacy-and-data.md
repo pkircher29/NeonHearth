@@ -13,9 +13,13 @@ listener — the service accepts connections only from the same computer.
   confidence and expiry). No frame bytes or payloads survive normalization,
   and the traffic model has no payload field at all — there is nowhere to
   put packet contents even by mistake.
-- **Bandwidth rollups.** Byte counts per device/protocol/interface at
-  one-second, one-minute, and one-hour resolution, each labeled with its
-  honest coverage.
+- **Bandwidth rollups (storage only, not fed in this build).** The database
+  can hold byte counts per device/protocol/interface at one-second,
+  one-minute, and one-hour resolution, each labeled with its honest coverage.
+  Nothing in the running service produces per-device counts today, because
+  there is no traffic source with per-device counters, so these tables stay
+  empty. The router feed and the Traffic view's computer-level numbers are
+  stored separately.
 - **Destination privacy.** Destination IP/domain metadata is irreversibly
   stripped before storage unless you enable that option.
 - **Device, presence, and policy history.** Identity facts, presence
@@ -49,12 +53,28 @@ Nothing, by default. The only designed exceptions are:
 
 ## Retention
 
-- One-second bandwidth rows are compacted after 24 hours into minute rows.
-- Minute rows are compacted after 90 days into hour rows.
-- Hour rows are **never deleted automatically** — removing them is an
-  explicit owner action by design (not yet exposed in the app).
-- Evidence facts expire individually (lease/TTL-driven where the protocol
-  provides one); expired facts stop participating in identity.
+The service runs a cleanup pass in the background: the first one about two
+minutes after it starts, then every 15 minutes. It uses fixed defaults; there
+is no setting to change them yet. What it removes:
+
+- **Audit log:** entries older than 365 days, and anything beyond the newest
+  1,000,000 entries.
+- **Evidence:** older non-identity evidence is removed after 90 days. The
+  newest value for each fact is always kept, and link-layer and
+  owner-confirmed evidence is never removed.
+- **Presence history:** transitions older than 365 days. Each device's latest
+  transition is always kept.
+- **Discovery commit records:** 30 days.
+- **Camera evidence:** 90 days.
+- **Advisory fetch records:** 30 days (the newest per source is kept).
+- **Phone sessions** that expired or were revoked, and **revoked integration
+  tokens:** 30 days after they ended.
+- **Home-plan drafts** left over from a different home plan: 30 days.
+- **Bandwidth rollups** (if any exist; see below): one-second rows are
+  compacted into minute rows after 24 hours, minute rows into hour rows after
+  90 days, and hour rows are deleted after 2 years.
+- Evidence facts also expire individually (lease/TTL-driven where the
+  protocol provides one); expired facts stop participating in identity.
 - Owner-confirmed values never expire; only your explicit clearing removes
   them.
 
@@ -108,7 +128,7 @@ backup was taken: the restored database no longer knows about them.
   backup file (for example one made with `VACUUM INTO`) is supported; see
   "Restoring a backup".
 - A guided uninstaller (removal is the manual procedure above).
-- Retention and destination-metadata settings in the app (the underlying
-  policies exist in the service; the Settings view is not built).
+- Retention and destination-metadata settings in the app. Retention uses
+  the fixed defaults listed above; the Settings view has no control for it.
 - Support-export redaction tooling (no export feature exists yet).
 - Tailscale phone access (see above; not implemented).
