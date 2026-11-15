@@ -796,6 +796,119 @@ async fn a_duplicate_ip_repair_is_refused_until_the_owner_has_chosen_a_device() 
     assert_eq!(body["repair"]["outcome"]["outcome"], "apply_failed");
 }
 
+const CLAIMANT_A: &str = "aa:aa:aa:aa:aa:01";
+const CLAIMANT_B: &str = "ba:bb:bb:bb:bb:02";
+
+async fn mint_duplicate_ip_approval(
+    fixture: &Fixture,
+    kind: &serde_json::Value,
+    chosen: Option<&str>,
+) -> axum::response::Response {
+    let mut body = serde_json::json!({ "diagnosis_kind": kind });
+    if let Some(chosen) = chosen {
+        body["chosen"] = serde_json::json!(chosen);
+    }
+    send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/approvals",
+        Some(body),
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_duplicate_ip_repair_with_a_chosen_claimant_succeeds() {
+    let repairs = FakeRepairTransport::new()
+        .push_measurements(vec![measurement(Metric::ConflictingMacCount, 2.0)])
+        .push_measurements(vec![measurement(Metric::ConflictingMacCount, 0.0)]);
+    let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(repairs)).await;
+    let run = run_doctor(&fixture.router).await;
+    let kind = finding_kind(&run, "duplicate_ip");
+    let approval = json_body(mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await).await;
+    let response = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/repair",
+        Some(serde_json::json!({
+            "diagnosis_kind": kind,
+            "approval_id": approval["approval_id"],
+            "chosen": CLAIMANT_A,
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["repair"]["outcome"]["outcome"], "completed");
+    assert_eq!(body["repair"]["outcome"]["verdict"], "improved");
+    // The choice is on the audit trail.
+    let rows = doctor_audit_rows(&fixture.pool).await;
+    assert!(rows.iter().all(|row| row.detail["chosen"] == CLAIMANT_A));
+}
+
+#[tokio::test]
+async fn a_chosen_device_that_is_not_a_claimant_is_rejected() {
+    let fixture = mixed_fixture().await;
+    let run = run_doctor(&fixture.router).await;
+    let kind = finding_kind(&run, "duplicate_ip");
+    let stranger = "cc:cc:cc:cc:cc:03";
+    let response = mint_duplicate_ip_approval(&fixture, &kind, Some(stranger)).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // A valid approval cannot be used with a stranger either.
+    let approval = json_body(mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await).await;
+    let response = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/repair",
+        Some(serde_json::json!({
+            "diagnosis_kind": kind,
+            "approval_id": approval["approval_id"],
+            "chosen": stranger,
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // A malformed address never reaches the plan.
+    let response = mint_duplicate_ip_approval(&fixture, &kind, Some("not-a-mac")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn an_approval_for_one_claimant_cannot_execute_for_another() {
+    let fixture = mixed_fixture().await;
+    let run = run_doctor(&fixture.router).await;
+    let kind = finding_kind(&run, "duplicate_ip");
+    let approval = json_body(mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await).await;
+    for chosen in [Some(CLAIMANT_B), None] {
+        let mut body = serde_json::json!({
+            "diagnosis_kind": kind,
+            "approval_id": approval["approval_id"],
+        });
+        if let Some(chosen) = chosen {
+            body["chosen"] = serde_json::json!(chosen);
+        }
+        let response = send(&fixture.router, "POST", "/api/v1/doctor/repair", Some(body), true).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{chosen:?}");
+    }
+    // The refused attempts did not spend the token: the right choice still works.
+    let response = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/repair",
+        Some(serde_json::json!({
+            "diagnosis_kind": kind,
+            "approval_id": approval["approval_id"],
+            "chosen": CLAIMANT_A,
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 // ---------------------------------------------------------------------------
 // OpenAPI registration.
 // ---------------------------------------------------------------------------

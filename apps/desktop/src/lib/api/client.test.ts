@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createApiClient, isSequence, type AuthSource } from './client';
+import { createApiClient, isSequence, type AuthSource, type DiagnosisKind } from './client';
 
 describe('createApiClient credentials (M-25)', () => {
   it('omits the Authorization header entirely when no credential is held, never sending an empty bearer', async () => {
@@ -708,6 +708,26 @@ describe('createApiClient', () => {
     const noFetch = vi.fn();
     const strict = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: noFetch });
     await expect(strict.doctorApprove({ kind: 'invented' } as never)).rejects.toThrow('Invalid doctor approval request');
+    expect(noFetch).not.toHaveBeenCalled();
+  });
+
+  it('binds the owner choice into the approval and repair bodies and rejects a malformed address', async () => {
+    const approval = { approval_id: 'appr-0001', expires_at: '2026-08-24T00:10:00Z' };
+    const duplicateKind: DiagnosisKind = { kind: 'duplicate_ip', address: '10.0.0.5', macs: ['aa:aa:aa:aa:aa:01', 'ba:bb:bb:bb:bb:02'] };
+    const approveFetch = vi.fn(async () => new Response(JSON.stringify(approval), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: approveFetch });
+    await expect(client.doctorApprove(duplicateKind, 'ba:bb:bb:bb:bb:02')).resolves.toEqual(approval);
+    expect((approveFetch.mock.calls as unknown[][])[0][1]).toMatchObject({ body: JSON.stringify({ diagnosis_kind: duplicateKind, chosen: 'ba:bb:bb:bb:bb:02' }) });
+
+    const repairFetch = vi.fn(async () => new Response(JSON.stringify({ repair: repairReport }), { status: 200 }));
+    const repairing = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: repairFetch });
+    await expect(repairing.doctorRepair(duplicateKind, 'appr-0001', 'ba:bb:bb:bb:bb:02')).resolves.toEqual(repairReport);
+    expect((repairFetch.mock.calls as unknown[][])[0][1]).toMatchObject({ body: JSON.stringify({ diagnosis_kind: duplicateKind, approval_id: 'appr-0001', chosen: 'ba:bb:bb:bb:bb:02' }) });
+
+    const noFetch = vi.fn();
+    const strict = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: noFetch });
+    await expect(strict.doctorApprove(duplicateKind, 'not-a-mac')).rejects.toThrow('Invalid doctor approval request');
+    await expect(strict.doctorRepair(duplicateKind, 'appr-0001', 'not-a-mac')).rejects.toThrow('Invalid doctor repair request');
     expect(noFetch).not.toHaveBeenCalled();
   });
 

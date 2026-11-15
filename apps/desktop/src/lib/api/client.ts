@@ -112,7 +112,7 @@ export interface SafeAction { action: 'restart_collector_worker' | 'refresh_app_
 export type ApprovalAction =
   | { action: 'reset_adapter'; interface: string }
   | { action: 'change_dns_servers'; servers: string[] }
-  | { action: 'set_dhcp_reservation'; device: string; address: string }
+  | { action: 'set_dhcp_reservation'; address: string; claimants: string[]; chosen: string | null }
   | { action: 'block_device'; device: string }
   | { action: 'unblock_device'; device: string }
   | { action: 'reboot_router' }
@@ -285,8 +285,9 @@ export interface ApiClient {
   acknowledgeClock(): Promise<ClockStatus>;
   doctorRun(): Promise<DoctorRunOutcome>;
   doctorReport(): Promise<DoctorRun | null>;
-  doctorApprove(diagnosisKind: DiagnosisKind): Promise<DoctorApproval>;
-  doctorRepair(diagnosisKind: DiagnosisKind, approvalId?: string): Promise<RepairReport>;
+  /** `chosen` is the claimant MAC the owner picked for a duplicate-address finding; it is bound into the approval. */
+  doctorApprove(diagnosisKind: DiagnosisKind, chosen?: string): Promise<DoctorApproval>;
+  doctorRepair(diagnosisKind: DiagnosisKind, approvalId?: string, chosen?: string): Promise<RepairReport>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -605,7 +606,7 @@ function isApprovalAction(value: unknown): value is ApprovalAction {
   switch (value.action) {
     case 'reset_adapter': case 'renew_dhcp_lease': return exact(value, ['action', 'interface']) && isBoundedText(value.interface, 128);
     case 'change_dns_servers': return exact(value, ['action', 'servers']) && boundedArray(value.servers, 16) && value.servers.every((server) => isBoundedText(server, 128));
-    case 'set_dhcp_reservation': return exact(value, ['action', 'device', 'address']) && isBoundedText(value.device, 128) && isBoundedText(value.address, 128);
+    case 'set_dhcp_reservation': return exact(value, ['action', 'address', 'claimants', 'chosen']) && isBoundedText(value.address, 128) && boundedArray(value.claimants, 16) && value.claimants.every((mac) => isBoundedText(mac, 128)) && (value.chosen === null || isBoundedText(value.chosen, 128));
     case 'block_device': case 'unblock_device': return exact(value, ['action', 'device']) && isBoundedText(value.device, 128);
     case 'reboot_router': return exact(value, ['action']);
     case 'set_interface_mtu': return exact(value, ['action', 'interface', 'mtu']) && isBoundedText(value.interface, 128) && isU16(value.mtu);
@@ -824,17 +825,21 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
     if (!isDoctorRun(value)) throw new Error('Invalid doctor report response');
     return value;
   }
-  async function doctorApprove(diagnosisKind: DiagnosisKind): Promise<DoctorApproval> {
-    if (!isDiagnosisKind(diagnosisKind)) throw new Error('Invalid doctor approval request');
-    const value = await request('/api/v1/doctor/approvals', authorized('POST', { diagnosis_kind: diagnosisKind }));
+  const isChosenMac = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/i.test(value);
+  async function doctorApprove(diagnosisKind: DiagnosisKind, chosen?: string): Promise<DoctorApproval> {
+    if (!isDiagnosisKind(diagnosisKind) || (chosen !== undefined && !isChosenMac(chosen))) throw new Error('Invalid doctor approval request');
+    const value = await request('/api/v1/doctor/approvals', authorized('POST', chosen === undefined ? { diagnosis_kind: diagnosisKind } : { diagnosis_kind: diagnosisKind, chosen }));
     if (!isDoctorApproval(value)) throw new Error('Invalid doctor approval response');
     return value;
   }
-  async function doctorRepair(diagnosisKind: DiagnosisKind, approvalId?: string): Promise<RepairReport> {
-    if (!isDiagnosisKind(diagnosisKind) || (approvalId !== undefined && !isApprovalIdToken(approvalId))) {
+  async function doctorRepair(diagnosisKind: DiagnosisKind, approvalId?: string, chosen?: string): Promise<RepairReport> {
+    if (!isDiagnosisKind(diagnosisKind) || (approvalId !== undefined && !isApprovalIdToken(approvalId)) || (chosen !== undefined && !isChosenMac(chosen))) {
       throw new Error('Invalid doctor repair request');
     }
-    const value = await request('/api/v1/doctor/repair', authorized('POST', approvalId === undefined ? { diagnosis_kind: diagnosisKind } : { diagnosis_kind: diagnosisKind, approval_id: approvalId }));
+    const body: Record<string, unknown> = { diagnosis_kind: diagnosisKind };
+    if (approvalId !== undefined) body.approval_id = approvalId;
+    if (chosen !== undefined) body.chosen = chosen;
+    const value = await request('/api/v1/doctor/repair', authorized('POST', body));
     if (!isRecord(value) || !exact(value, ['repair']) || !isRepairReport(value.repair)) throw new Error('Invalid doctor repair response');
     return value.repair;
   }

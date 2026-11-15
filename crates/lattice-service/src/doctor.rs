@@ -36,8 +36,9 @@ use lattice_doctor::{
     probe::{LeaseState, Probe, ProbeError, ProbeRequest, ProbeResponse, ProbeTransport},
     repair::{
         ApprovalId, ApprovedRepair, ExecutableRepair, RepairContext, RepairPlan, StateKey,
-        plan_repair,
+        plan_dhcp_reservation, plan_repair,
     },
+    types::MacAddr,
 };
 use lattice_store::{AuditCategory, AuditLog, NewAuditEntry};
 use serde::{Deserialize, Serialize};
@@ -92,6 +93,12 @@ pub struct DoctorRun {
 #[serde(deny_unknown_fields)]
 pub struct DoctorApprovalRequest {
     pub diagnosis_kind: DiagnosisKind,
+    /// For a duplicate-address finding: the claimant the owner chose to keep
+    /// the address. It must be one of the finding's claimants and is bound
+    /// into the approval, so the approval cannot be spent for another device.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "aa:bb:cc:dd:ee:ff")]
+    pub chosen: Option<MacAddr>,
 }
 
 /// A minted single-use approval token with its expiry.
@@ -108,6 +115,12 @@ pub struct DoctorRepairRequest {
     pub diagnosis_kind: DiagnosisKind,
     #[serde(default)]
     pub approval_id: Option<String>,
+    /// For a duplicate-address finding: the claimant that keeps the address.
+    /// Must match the choice the approval was minted for. Without it the
+    /// repair is refused as undecided.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "aa:bb:cc:dd:ee:ff")]
+    pub chosen: Option<MacAddr>,
 }
 
 /// `POST /doctor/repair` response envelope.
@@ -975,7 +988,7 @@ pub(crate) async fn report_route(
     }
 }
 
-#[utoipa::path(post, path = "/api/v1/doctor/approvals", request_body = DoctorApprovalRequest, responses((status = 200, body = DoctorApproval), (status = 400), (status = 401), (status = 404, description = "the latest run has no approval-required plan for this diagnosis"), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(post, path = "/api/v1/doctor/approvals", request_body = DoctorApprovalRequest, responses((status = 200, body = DoctorApproval), (status = 400, description = "the chosen device is not a claimant of this finding"), (status = 401), (status = 404, description = "the latest run has no approval-required plan for this diagnosis"), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn approvals_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -986,7 +999,13 @@ pub(crate) async fn approvals_route(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let shared = &doctor.shared;
-    let Ok(fingerprint) = kind_fingerprint(&request.diagnosis_kind) else {
+    if let Some(chosen) = request.chosen {
+        // The choice must be one of the finding's claimants.
+        if plan_dhcp_reservation(&request.diagnosis_kind, chosen).is_err() {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    }
+    let Ok(fingerprint) = approval_fingerprint(&request.diagnosis_kind, request.chosen) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let now = shared.clock.now();
@@ -1027,6 +1046,7 @@ pub(crate) async fn approvals_route(
             detail: principal.annotate(serde_json::json!({
                 "approval_id": approval_id,
                 "diagnosis_kind": request.diagnosis_kind,
+                "chosen": request.chosen,
                 "expires_at": expires_at,
             })),
         },
@@ -1044,7 +1064,7 @@ pub(crate) async fn approvals_route(
     .into_response()
 }
 
-#[utoipa::path(post, path = "/api/v1/doctor/repair", request_body = DoctorRepairRequest, responses((status = 200, body = DoctorRepairResponse), (status = 400, description = "guided/observation plans are never executable"), (status = 401), (status = 403, description = "missing, expired, used, or mismatched approval"), (status = 404, description = "the latest run has no plan for this diagnosis"), (status = 409, description = "a diagnostic run or another repair is in progress"), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(post, path = "/api/v1/doctor/repair", request_body = DoctorRepairRequest, responses((status = 200, body = DoctorRepairResponse), (status = 400, description = "guided/observation plans are never executable, or the chosen device is not a claimant"), (status = 401), (status = 403, description = "missing, expired, used, or mismatched approval"), (status = 404, description = "the latest run has no plan for this diagnosis"), (status = 409, description = "a diagnostic run or another repair is in progress"), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn repair_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -1082,12 +1102,27 @@ pub(crate) async fn repair_route(
         finding.plan.clone()
     };
     let (executable, spend_approval) = match plan {
-        RepairPlan::SafeAutomatic { action, .. } => (ExecutableRepair::Safe { action }, None),
+        RepairPlan::SafeAutomatic { action, .. } => {
+            if request.chosen.is_some() {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            (ExecutableRepair::Safe { action }, None)
+        }
         RepairPlan::ApprovalRequiredReversible { action, .. } => {
+            // The owner's choice turns the undecided plan into a decided one;
+            // a choice that is not a claimant is rejected outright.
+            let action = match request.chosen {
+                Some(chosen) => match plan_dhcp_reservation(&request.diagnosis_kind, chosen) {
+                    Ok(decided) => decided,
+                    Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+                },
+                None => action,
+            };
             let Some(approval_id) = request.approval_id.as_deref() else {
                 return StatusCode::FORBIDDEN.into_response();
             };
-            let Ok(fingerprint) = kind_fingerprint(&request.diagnosis_kind) else {
+            let Ok(fingerprint) = approval_fingerprint(&request.diagnosis_kind, request.chosen)
+            else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
             let now = shared.clock.now();
@@ -1132,6 +1167,7 @@ pub(crate) async fn repair_route(
             detail: principal.annotate(serde_json::json!({
                 "diagnosis_kind": request.diagnosis_kind,
                 "approval_id": request.approval_id,
+                "chosen": request.chosen,
             })),
         },
     )
@@ -1156,6 +1192,7 @@ pub(crate) async fn repair_route(
     // through snapshot/apply/restore. The task owns the single-flight guard.
     let diagnosis_kind = request.diagnosis_kind.clone();
     let approval_id = request.approval_id.clone();
+    let chosen = request.chosen;
     let task = tokio::spawn(async move {
         let _guard = guard;
         let executor = RepairExecutor::with_clock(SharedClock(Arc::clone(&shared.clock)))
@@ -1182,6 +1219,7 @@ pub(crate) async fn repair_route(
                     "outcome": repair.outcome,
                     "rollback": repair.rollback,
                     "approval_id": approval_id,
+                    "chosen": chosen,
                 })),
             },
         )
@@ -1272,6 +1310,19 @@ pub(crate) async fn update_settings_route(
 /// Canonical JSON fingerprint of a diagnosis kind for approval matching.
 fn kind_fingerprint(kind: &DiagnosisKind) -> Result<String, serde_json::Error> {
     serde_json::to_string(kind)
+}
+
+/// Approval fingerprint: the diagnosis kind plus the owner's chosen claimant,
+/// so an approval minted for one device cannot be spent for another.
+fn approval_fingerprint(
+    kind: &DiagnosisKind,
+    chosen: Option<MacAddr>,
+) -> Result<String, serde_json::Error> {
+    let base = kind_fingerprint(kind)?;
+    Ok(match chosen {
+        Some(mac) => format!("{base}#chosen={mac}"),
+        None => base,
+    })
 }
 
 /// The serde tag of a diagnosis kind, used as the audit-log subject.
