@@ -837,7 +837,10 @@ async fn more_than_the_evidence_bound_no_longer_makes_the_network_endpoint_unava
     let (status, body) = call(&router, "GET", "/network", None, Some(OWNER)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["devices"].as_array().unwrap().len(), 4096);
-    assert_ne!(body["status"], "ready", "a cut answer is never reported as complete");
+    assert_ne!(
+        body["status"], "ready",
+        "a cut answer is never reported as complete"
+    );
 }
 
 #[tokio::test]
@@ -869,7 +872,11 @@ async fn rejected_request_bodies_get_the_problem_shape_and_their_own_status() {
             .body(Body::from("{}"))
             .unwrap();
         let response = router.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{path}");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{path}"
+        );
     }
 }
 

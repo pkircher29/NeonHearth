@@ -219,7 +219,8 @@ mod tests {
         let good = serde_json::json!({"port": 40000, "username": "neonhearth", "password": "p".repeat(40)});
         std::fs::write(&path, good.to_string()).unwrap();
         assert!(load_credentials(&path).await.is_some());
-        let weak = serde_json::json!({"port": 40000, "username": "neonhearth", "password": "short"});
+        let weak =
+            serde_json::json!({"port": 40000, "username": "neonhearth", "password": "short"});
         std::fs::write(&path, weak.to_string()).unwrap();
         assert!(load_credentials(&path).await.is_none());
         std::fs::write(&path, vec![b' '; 5000]).unwrap();
