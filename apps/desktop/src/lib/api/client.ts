@@ -65,8 +65,16 @@ export interface Measurement { metric: Metric; value: number; unit: Unit; observ
 export type SkipReason =
   | { reason: 'dependency_failed'; dependency: CheckKind }
   | { reason: 'dependency_skipped'; dependency: CheckKind }
-  | { reason: 'budget_exhausted' };
+  | { reason: 'budget_exhausted' }
+  // The service cannot perform this check's probe in this build; not a fault.
+  | { reason: 'probe_unsupported' }
+  | { reason: 'dependency_unavailable'; dependency: CheckKind };
 export type CheckStatus = { state: 'passed' } | { state: 'failed' } | { state: 'skipped'; because: SkipReason };
+/** True when a check was never assessed because its probe is unsupported (directly or via a parent). */
+export function isCheckUnavailable(check: { status: CheckStatus }): boolean {
+  return check.status.state === 'skipped'
+    && (check.status.because.reason === 'probe_unsupported' || check.status.because.reason === 'dependency_unavailable');
+}
 export type LeaseState = 'static' | 'valid' | 'expired' | 'missing';
 export type DnsFailureReason = 'timeout' | 'refused' | 'serv_fail' | 'no_answer';
 export interface RouteEntry { interface: string; gateway: string; is_vpn: boolean; metric: number }
@@ -506,8 +514,8 @@ function isDoctorMeasurement(value: unknown): value is Measurement {
 }
 function isSkipReason(value: unknown): value is SkipReason {
   if (!isRecord(value)) return false;
-  if (value.reason === 'budget_exhausted') return exact(value, ['reason']);
-  return (value.reason === 'dependency_failed' || value.reason === 'dependency_skipped')
+  if (value.reason === 'budget_exhausted' || value.reason === 'probe_unsupported') return exact(value, ['reason']);
+  return (value.reason === 'dependency_failed' || value.reason === 'dependency_skipped' || value.reason === 'dependency_unavailable')
     && exact(value, ['reason', 'dependency']) && checkKinds.has(String(value.dependency));
 }
 function isCheckStatus(value: unknown): value is CheckStatus {

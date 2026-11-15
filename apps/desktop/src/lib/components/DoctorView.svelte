@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { isCheckUnavailable } from '../api/client';
   import type { ApiClient, CheckResult, Confidence, DiagnosisKind, DoctorApproval, DoctorRun, GuidedAction, Measurement, RepairReport, RollbackOutcome } from '../api/client';
 
   type DoctorClient = Pick<ApiClient, 'doctorRun' | 'doctorReport' | 'doctorApprove' | 'doctorRepair'>;
@@ -126,13 +127,21 @@
     if (check.status.state === 'passed') return 'Passed';
     if (check.status.state === 'failed') return 'Failed';
     const because = check.status.because;
+    if (because.reason === 'probe_unsupported' || because.reason === 'dependency_unavailable') return 'Not available in this build';
     if (because.reason === 'budget_exhausted') return 'Skipped — probe budget exhausted';
     const relation = because.reason === 'dependency_failed' ? 'dependency failed' : 'dependency skipped';
     return `Skipped — ${relation}: ${label(because.dependency)}`;
   }
   function statusIcon(check: CheckResult): string {
+    if (isCheckUnavailable(check)) return '–';
     return check.status.state === 'passed' ? '✓' : check.status.state === 'failed' ? '!' : '◇';
   }
+  // The collector check is the only one this build can answer; when every
+  // other check is unavailable the whole network side was never assessed.
+  const networkUnavailable = $derived.by(() => {
+    const network = run?.report.checks.filter((check) => check.kind !== 'collector_health') ?? [];
+    return network.length > 0 && network.every(isCheckUnavailable);
+  });
   const planClassLabel = { safe_automatic: 'Safe automatic repair', approval_required_reversible: 'Reversible repair — approval required', guided_physical: 'Guided physical repair', observation_only: 'Observation only' } as const;
   const expiry = (at: string) => new Date(at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 
@@ -220,13 +229,14 @@
     <section class="doctor-checks" aria-labelledby="doctor-checks-heading">
       <h2 id="doctor-checks-heading">Diagnostic checks</h2>
       <p class="muted run-facts">Run started {new Date(run.report.started_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} · {run.report.probes_used} probes used</p>
+      {#if networkUnavailable}<p class="doctor-notice" role="note">Doctor can currently check only that the collector is healthy. Network checks (adapter, address, gateway, DNS, internet) are not available in this build yet.</p>{/if}
       {#if run.report.budget_exhausted}<p class="budget-warning"><span aria-hidden="true">△</span> The probe budget ran out — these results are partial.</p>{/if}
       <ul class="check-list">
         {#each run.report.checks as check (check.kind)}
-          <li class="check-row state-{check.status.state}">
+          <li class="check-row state-{check.status.state}" class:unavailable={isCheckUnavailable(check)}>
             <h3>{label(check.kind)}</h3>
             <p class="check-status"><span class="status-mark" aria-hidden="true">{statusIcon(check)}</span> {statusText(check)}</p>
-            <p class="check-confidence">{confidencePercent(check.confidence)} confidence</p>
+            {#if !isCheckUnavailable(check)}<p class="check-confidence">{confidencePercent(check.confidence)} confidence</p>{/if}
             {#if check.evidence.length > 0}
               <ul class="measurements" aria-label="Measurements for {label(check.kind)}">
                 {#each check.evidence as measurement}<li>{formatMeasurement(measurement)}</li>{/each}
@@ -240,7 +250,7 @@
     <section class="doctor-findings" aria-labelledby="doctor-findings-heading">
       <h2 id="doctor-findings-heading">Findings</h2>
       {#if run.findings.length === 0}
-        <p class="muted no-findings">No faults were found. Every completed check passed.</p>
+        <p class="muted no-findings">{networkUnavailable ? 'No faults were found by the checks that could run.' : 'No faults were found. Every completed check passed.'}</p>
       {:else}
         <ul class="finding-list">
           {#each run.findings as finding, index (`${run.run_id}:${index}`)}
@@ -338,6 +348,8 @@
   .doctor-load-error p{margin:0;color:#ffb4cc;font-size:12px}
   .doctor-checks h2,.doctor-findings h2{margin:30px 0 6px;font:600 17px var(--font-display)}
   .run-facts{font-size:12px}
+  .doctor-notice{margin:12px 0 0;padding:9px;border:1px dashed var(--line-strong);border-radius:5px;color:var(--muted);font:11px var(--font-mono)}
+  .check-row.unavailable{opacity:.85}
   .budget-warning{margin:12px 0 0;padding:9px;border:1px dashed var(--gold);color:var(--gold);font:11px var(--font-mono)}
   .check-list{margin:14px 0 0;padding:0;list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
   .check-row{padding:13px;border:1px solid var(--line-mid);border-left:4px solid var(--accent);border-radius:7px;background:var(--surface)}

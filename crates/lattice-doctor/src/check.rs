@@ -155,6 +155,24 @@ pub enum SkipReason {
     DependencyFailed { dependency: CheckKind },
     DependencySkipped { dependency: CheckKind },
     BudgetExhausted,
+    /// The probe transport cannot perform this check's probe in this build or
+    /// on this platform. This is not a fault in the network, so it never
+    /// yields a diagnosis.
+    ProbeUnsupported,
+    /// A parent check was unavailable (see [`SkipReason::ProbeUnsupported`]),
+    /// so this one could not run either.
+    DependencyUnavailable { dependency: CheckKind },
+}
+
+impl SkipReason {
+    /// True when the check could not run because probing is unsupported, as
+    /// opposed to a failed dependency or an exhausted budget.
+    pub fn is_unavailable(self) -> bool {
+        matches!(
+            self,
+            SkipReason::ProbeUnsupported | SkipReason::DependencyUnavailable { .. }
+        )
+    }
 }
 
 /// Outcome state of one check.

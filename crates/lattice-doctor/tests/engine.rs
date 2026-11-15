@@ -571,6 +571,143 @@ async fn router_and_gateway_failures_are_diagnosed() {
     );
 }
 
+fn unavailable_status() -> CheckStatus {
+    CheckStatus::Skipped {
+        because: SkipReason::ProbeUnsupported,
+    }
+}
+
+fn dependency_unavailable(dependency: CheckKind) -> CheckStatus {
+    CheckStatus::Skipped {
+        because: SkipReason::DependencyUnavailable { dependency },
+    }
+}
+
+#[tokio::test]
+async fn unsupported_probes_leave_checks_unavailable_without_a_finding() {
+    // The production service shape: only the collector probe is answered.
+    let transport = FakeProbeTransport::new(|request| match request {
+        ProbeRequest::CollectorStatus => healthy(request),
+        _ => Err(ProbeError::Unsupported),
+    });
+    let report = engine_with(64).run(&transport).await;
+
+    assert_eq!(
+        report.check(CheckKind::CollectorHealth).unwrap().status,
+        CheckStatus::Passed
+    );
+    assert_eq!(
+        report.check(CheckKind::AdapterLink).unwrap().status,
+        unavailable_status()
+    );
+    assert_eq!(
+        report.check(CheckKind::AddressDhcp).unwrap().status,
+        dependency_unavailable(CheckKind::AdapterLink)
+    );
+    assert_eq!(
+        report.check(CheckKind::Gateway).unwrap().status,
+        dependency_unavailable(CheckKind::AddressDhcp)
+    );
+    assert_eq!(
+        report.check(CheckKind::Dns).unwrap().status,
+        dependency_unavailable(CheckKind::Gateway)
+    );
+    assert_eq!(
+        report
+            .check(CheckKind::InternetReachability)
+            .unwrap()
+            .status,
+        dependency_unavailable(CheckKind::AddressDhcp)
+    );
+    assert_eq!(report.checks.len(), 12);
+    // Only the collector and link probes were attempted.
+    assert_eq!(report.probes_used, 2);
+    assert!(!report.budget_exhausted);
+    assert!(
+        diagnose(&report).is_empty(),
+        "an unsupported probe is not a fault in the network"
+    );
+}
+
+#[tokio::test]
+async fn a_genuine_transport_error_is_still_a_failed_probe_finding() {
+    let transport = FakeProbeTransport::new(|request| match request {
+        ProbeRequest::LinkStatus { .. } => Err(ProbeError::Transport("socket closed".into())),
+        other => healthy(other),
+    });
+    let report = engine_with(64).run(&transport).await;
+
+    assert_eq!(
+        report.check(CheckKind::AdapterLink).unwrap().status,
+        CheckStatus::Failed
+    );
+    assert_eq!(
+        report.check(CheckKind::AddressDhcp).unwrap().status,
+        CheckStatus::Skipped {
+            because: SkipReason::DependencyFailed {
+                dependency: CheckKind::AdapterLink
+            }
+        }
+    );
+    let diagnoses = diagnose(&report);
+    assert_eq!(diagnoses.len(), 1);
+    assert!(matches!(
+        &diagnoses[0].kind,
+        DiagnosisKind::DiagnosticProbeFailure {
+            check: CheckKind::AdapterLink,
+            error
+        } if error.contains("socket closed")
+    ));
+}
+
+#[tokio::test]
+async fn unsupported_pings_make_gateway_unavailable_not_failed() {
+    let transport = FakeProbeTransport::new(|request| match request {
+        ProbeRequest::Ping { .. } => Err(ProbeError::Unsupported),
+        other => healthy(other),
+    });
+    let report = engine_with(64).run(&transport).await;
+
+    assert_eq!(
+        report.check(CheckKind::Gateway).unwrap().status,
+        unavailable_status()
+    );
+    assert_eq!(
+        report.check(CheckKind::LossLatency).unwrap().status,
+        dependency_unavailable(CheckKind::Gateway)
+    );
+    assert!(diagnose(&report).is_empty());
+}
+
+#[tokio::test]
+async fn unsupported_dns_queries_make_dns_unavailable_but_a_real_error_still_fails() {
+    let transport = FakeProbeTransport::new(|request| match request {
+        ProbeRequest::DnsQuery { .. } => Err(ProbeError::Unsupported),
+        other => healthy(other),
+    });
+    let report = engine_with(64).run(&transport).await;
+    assert_eq!(
+        report.check(CheckKind::Dns).unwrap().status,
+        unavailable_status()
+    );
+    assert_eq!(
+        report.check(CheckKind::RouteVpn).unwrap().status,
+        dependency_unavailable(CheckKind::Dns)
+    );
+    assert!(diagnose(&report).is_empty());
+
+    // A transport error on every query is a genuine, diagnosable failure.
+    let transport = FakeProbeTransport::new(|request| match request {
+        ProbeRequest::DnsQuery { .. } => Err(ProbeError::Transport("resolver down".into())),
+        other => healthy(other),
+    });
+    let report = engine_with(64).run(&transport).await;
+    assert_eq!(
+        report.check(CheckKind::Dns).unwrap().status,
+        CheckStatus::Failed
+    );
+}
+
 #[test]
 fn engine_rejects_invalid_configuration() {
     let budget = DiagnosticBudget::new(10, 100).unwrap();

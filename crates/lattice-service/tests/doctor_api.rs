@@ -1472,3 +1472,56 @@ async fn a_failed_settings_audit_leaves_the_settings_untouched_and_unsafe_interf
     .await;
     assert_eq!(before, after);
 }
+
+// ---------------------------------------------------------------------------
+// Production transport shape: only the collector probe is answerable.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_production_probe_transport_reports_network_checks_as_unavailable_not_failed() {
+    let pool = connect_memory().await.unwrap();
+    let state = AppState::new(TOKEN, M2StateRepository::new(pool)).unwrap();
+    let doctor = DoctorState::for_service(&state);
+    let router = app_with_doctor(state, doctor);
+
+    let run = run_doctor(&router).await;
+
+    assert_eq!(check(&run, "collector_health")["status"]["state"], "passed");
+    assert_eq!(
+        check(&run, "adapter_link")["status"],
+        serde_json::json!({ "state": "skipped", "because": { "reason": "probe_unsupported" } }),
+        "{run}"
+    );
+    assert_eq!(
+        check(&run, "address_dhcp")["status"],
+        serde_json::json!({
+            "state": "skipped",
+            "because": { "reason": "dependency_unavailable", "dependency": "adapter_link" }
+        }),
+        "{run}"
+    );
+    for kind in [
+        "duplicate_ip",
+        "wifi_quality",
+        "gateway",
+        "router_health",
+        "loss_latency",
+        "mtu",
+        "dns",
+        "route_vpn",
+        "internet_reachability",
+    ] {
+        let status = &check(&run, kind)["status"];
+        assert_eq!(status["state"], "skipped", "{kind}: {run}");
+        assert_eq!(
+            status["because"]["reason"], "dependency_unavailable",
+            "{kind}: {run}"
+        );
+    }
+    // An unsupported probe is not a fault: no finding, least of all a
+    // "diagnostic probe failure".
+    assert_eq!(run["findings"], serde_json::json!([]), "{run}");
+    // The report still deserializes into the domain types.
+    let report: DiagnosticReport = serde_json::from_value(run["report"].clone()).unwrap();
+    assert_eq!(report.checks.len(), 12);
+}

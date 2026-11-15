@@ -92,6 +92,36 @@ describe('DoctorView', () => {
     expect(screen.getByText('No faults were found. Every completed check passed.')).toBeTruthy();
   });
 
+  it('renders unavailable checks neutrally and explains that network checks are not built yet', async () => {
+    const collector: CheckResult = { kind: 'collector_health', status: { state: 'passed' }, evidence: [], confidence: { basis_points: 9500 }, detail: null };
+    const adapter: CheckResult = { kind: 'adapter_link', status: { state: 'skipped', because: { reason: 'probe_unsupported' } }, evidence: [], confidence: { basis_points: 9500 }, detail: null };
+    const address: CheckResult = { kind: 'address_dhcp', status: { state: 'skipped', because: { reason: 'dependency_unavailable', dependency: 'adapter_link' } }, evidence: [], confidence: { basis_points: 9500 }, detail: null };
+    const client = fakeClient({ doctorReport: vi.fn(async () => envelope([], [collector, adapter, address])) });
+    const { container } = render(DoctorView, { client });
+
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Diagnostic checks' })).toBeTruthy());
+    const notice = screen.getByRole('note');
+    expect(notice.textContent).toContain('Doctor can currently check only that the collector is healthy.');
+    expect(notice.textContent).toContain('not available in this build yet');
+    expect(screen.getAllByText(/Not available in this build/)).toHaveLength(2);
+    expect(screen.queryByText(/Failed/)).toBeNull();
+    expect(container.querySelectorAll('.state-failed')).toHaveLength(0);
+    expect(container.querySelectorAll('.check-row.unavailable')).toHaveLength(2);
+    // No "!" failure mark and no misleading confidence on unassessed checks.
+    expect(Array.from(container.querySelectorAll('.status-mark')).map((mark) => mark.textContent)).toEqual(['✓', '–', '–']);
+    expect(screen.getAllByText(/confidence/)).toHaveLength(1);
+    expect(screen.getByText('No faults were found by the checks that could run.')).toBeTruthy();
+  });
+
+  it('shows no unavailable notice for an older service response or a partly available run', async () => {
+    const client = fakeClient({ doctorReport: vi.fn(async () => envelope()) });
+    render(DoctorView, { client });
+
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Diagnostic checks' })).toBeTruthy());
+    expect(screen.queryByRole('note')).toBeNull();
+    expect(screen.getByText(/Skipped — dependency failed: gateway/)).toBeTruthy();
+  });
+
   it('executes a safe repair in one click with an in-flight state', async () => {
     let resolveRepair!: (report: RepairReport) => void;
     const client = fakeClient({
