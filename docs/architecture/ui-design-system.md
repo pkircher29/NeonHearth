@@ -1,93 +1,87 @@
-# NeonHearth visual design system v3 — "glass, chrome, and fire"
+# NeonHearth visual design system
 
-Locked 2026-08-25 (v3, supersedes v2). Owner's brief, verbatim intent: make
-it look like **glass and chrome and fire of all colors — make it cool.**
-This is a dark, premium, glassmorphic instrument: frosted panels floating
-over a near-black void, chrome-metal accents, and a full-spectrum flame —
-blue through violet, magenta, orange, gold — as the living element. Think
-high-end audio/gaming software, not a dashboard. The GlassWire lessons that
-survive: the hero fills the view, controls float over it, a bottom stat
-band with big numbers and a stacked-area timeline, one consistent two-ramp
-traffic language.
+Revised 2026-11-15 to describe the app as it is. The earlier "glass, chrome and fire" v3 (2026-08-25) was never
+implemented as written: the shipped UI is a matte blue-black instrument with one cyan accent, and this document now
+follows the code (`apps/desktop/src/app.css`, `ui.css`). The principles that still hold are kept below.
 
-## Palette (tokens in app.css; never hardcode in components)
+## Principles (unchanged)
+
+1. **Honesty first.** Missing data is never drawn or written as zero or as real. A value the collector did not report
+   is shown as "unavailable" or an em-dash; a one-sided reading (upload without download) is shown as one-sided and is
+   never summed into a total. Anything last-known (collector offline) is labelled as last-known, rate figures are
+   withheld, and owner actions are disabled. The single derived signal is `liveStatus()` in `stores/live.ts`.
+2. **Risk never uses the traffic ramps.** Orange to gold (download) and violet to magenta (upload) mean traffic only.
+   Blocked, quarantined and failed states use the flat risk colour (`--risk`) with a ring or an icon, never a gradient.
+3. **Motion is decoration.** Every animation honours `prefers-reduced-motion` and the in-app switch (Settings,
+   `data-motion="reduced"`). Canvas and WebGL loops pause when the tab is hidden or off-screen and stop painting when
+   nothing moves. Readings never depend on motion.
+4. **Colour is never the only cue.** Presence, risk and health also differ by shape (filled, hollow, dashed, ringed) and text.
+5. **Offline first.** Fonts and scripts are bundled; the page makes no third-party request (see CSP in `index.html`).
+
+## Tokens (defined in `app.css`; components use these, never raw hex)
 
 | Token | Value | Role |
 |---|---|---|
-| `--void` | `#0B0B10` | page ground — near-black with a violet breath |
-| `--void-glow` | radial washes of `#1A1030`/`#241137` at ~40% | ambient aurora behind everything, fixed, subtle |
-| `--glass` | `rgba(255,255,255,0.07)` + `backdrop-filter: blur(22px) saturate(1.5)` | every panel/card |
-| `--glass-strong` | `rgba(255,255,255,0.12)` | hover, active pill, inputs |
-| `--glass-line` | `rgba(255,255,255,0.16)` | 1px panel borders; top edge highlight `rgba(255,255,255,0.28)` |
-| `--chrome` | `linear-gradient(160deg,#E9EDF4 0%,#98A1B3 32%,#F5F8FD 50%,#7C8698 68%,#DADFE9 100%)` | metallic: wordmark, key bezels, gauge ring, slider thumbs |
-| `--fire-blue` | `#3D5AFE` | flame spectrum 1 |
-| `--fire-violet` | `#7C4DFF` | flame spectrum 2 |
-| `--fire-magenta` | `#E040FB` | flame spectrum 3 |
-| `--fire-orange` | `#FF6D3B` | flame spectrum 4 |
-| `--fire-gold` | `#FFC53D` | flame spectrum 5 |
-| `--ink` | `#F2F4F8` | primary text |
-| `--ink-mute` | `#9BA3B0` | secondary text (AA on --void and glass) |
-| `--alert` | `#FF4757` | danger/quarantine/blocked ONLY — flat, never gradient |
-| `--safe` | `#39E6B0` | verified/OK/enabled |
+| `--bg` | `#061019` | page ground (blue-black, cyan bias) |
+| `--surface`, `--surface-raised` | `#0b1c26`, `#102a35` | panels and raised controls |
+| `--line`, `--line-mid`, `--line-strong` | `#17323d`, `#20424b`, `#28505a` | borders, three steps |
+| `--ink` | `#e9fbfc` | primary text |
+| `--muted-strong`, `--muted`, `--faint` | `#9bb7bb`, `#77959d`, `#64838b` | secondary text, three steps (`--ink-mute` is an alias of `--muted-strong`) |
+| `--accent`, `--accent-ink` | `#63f3f0`, `#063a3c` | brand accent, text on it |
+| `--blue`, `--gold`, `--pink` | `#548cff`, `#ffcd66`, `#ff5c9b` | palette colours; `--gold` is the focus ring |
+| `--tier-blue/cyan/gold/pink` | blue, accent, gold, pink | the four bandwidth tiers, shared with `twin/heat.ts` |
+| `--ok`, `--watch`, `--risk`, `--info` | accent, gold, pink, blue | semantic status, separate from the tier ramp |
+| `--risk-ink` | `#ffb4cc` | text on a risk-tinted surface |
+| `--fire-blue/violet/magenta/orange/gold`, `--alert` | `#3d5afe`, `#7c4dff`, `#e040fb`, `#ff6d3b`, `#ffc53d`, `#ff4757` | Flow Map ramps and its blocked ring; read by `FlowMap.svelte` |
+| `--radius-sm`, `--radius`, `--radius-lg` | 5, 8, 12 px | shape |
+| `--focus` | `3px solid var(--gold)` | focus ring (non-gradient) |
 
-**The fire** is the identity: `--flame-ramp` =
-`linear-gradient(90deg, var(--fire-blue), var(--fire-violet),
-var(--fire-magenta), var(--fire-orange), var(--fire-gold))`. It appears as:
-the Pulse hearth (layered animated radial flames cycling through the
-spectrum), the active-tab underline, the gauge sweep, focus rings, and the
-primary-button edge. Traffic keeps two distinguishable ramps drawn FROM the
-fire: `--down-ramp` = orange→gold, `--up-ramp` = violet→magenta. Risk never
-touches fire (H9): flat `--alert` badges/outlines. `twin/heat.ts` data
-values untouched.
+A vitest scan (`src/css-tokens.test.ts`) fails on any `var(--name)` that nothing defines and on hex alpha glued to a
+`var()`; use `color-mix(in srgb, var(--x) N%, transparent)` for translucency.
 
-## Type (bundled @fontsource, zero external requests)
+## Type (bundled with `@fontsource`, zero external requests)
 
-- **Display — Space Grotesk** (500/700): view titles, stat numbers, the
-  wordmark (wordmark gets the chrome gradient via background-clip). Cool,
-  technical, characterful.
-- **Body — IBM Plex Sans** (400/500/600).
-- **Data — IBM Plex Mono** (400/500): readings, ids, timestamps, eyebrows
-  (11px caps +0.12em, `--ink-mute`).
-Drop Fraunces (remove the dependency).
+- **Instrument Sans (variable)**: UI text and display (`--font-body`, `--font-display`).
+- **IBM Plex Mono** (400, 500): readings, ids, timestamps, eyebrows and anything that lines up (`--font-mono`).
 
 ## Structure
 
-- Top glass nav bar (blur over the aurora), chrome wordmark, tab pills:
-  inactive = ghost text; active = `--glass-strong` pill with a 2px
-  `--flame-ramp` underline and `--ink` text. Mobile bottom nav same
-  treatment.
-- Heroes fill the view over the aurora void; controls are floating glass
-  pills. Panels: 16px radius, glass + line + top-edge highlight + soft
-  black ambient shadow (`0 8px 32px rgb(0 0 0 / 0.45)`).
-- Pulse stat band: glass slab; big Space Grotesk numbers; arc gauge with a
-  chrome outer ring and flame-ramp sweep; stacked soft-area timeline using
-  the down/up ramps at 65% opacity with glow; scrubber thumb = chrome.
-  Honesty rule stands: unavailable coverage = em-dash + label, never fake
-  zeros.
-- Empty states: cool, not dead — the flame idles low (small dim animated
-  ember) with the inviting copy; never a blank grey box.
+- **Left rail** (170 px) with the wordmark and the ten destinations; a **right events rail** (260 px) with the Live
+  thread and the collector status; the main column between them. Below 850 px the rails collapse to a top bar and a
+  bottom navigation with a "More" drawer.
+- Destinations: Pulse, Devices, Traffic, Guard, Cameras, Home, Automation, Doctor, History, Settings.
+- Panels are flat `--surface` with a 1 px `--line` border. There are no glass or blur surfaces in the design; the few
+  overlays that blur (`backdrop-filter`) are cosmetic and not relied on for legibility.
+- Sign-in is a full-page state, not a modal: after a 401 with no credential the app shows the sign-in view (owner token
+  or phone pairing code). The PIN step-up is a modal dialog that traps focus and closes on Escape.
 
-## Signature: flames of all colors
+## Pulse
 
-Presence language = flame dots: **online** = live flame dot (orange-gold
-gradient, soft glow); **quiet** = blue-violet ember, faint glow; **offline**
-= glass ring, no fill; **blocked** = glass ring in flat `--alert`;
-**unknown** = dashed glass ring. The Pulse hearth is the showpiece: layered
-radial gradients of all five fire colors slowly breathing and drifting hue
-(CSS only, GPU-cheap), intensity tied to activity tier; paused/reduced
-motion = static flame at current tier.
+The **Flow Map** is the default Pulse hero and the **Hearth** is the alternative (switch in the panel, remembered per
+browser). Both are canvas drawings fed by per-device counters; neither invents data.
 
-## Resilience copy (part of this pass — the "not working" fix)
+- Flow Map: the gateway sits in the centre; devices are grouped into sectors by confirmed type, then by MAC maker
+  (inferred sectors are drawn with a dashed rail and a trailing `~`, never like a confirmed type), then "Unclassified".
+  Download particles run orange to gold, upload violet to magenta. A 60 s ring around the core shows complete readings
+  only and breaks across gaps. Without per-device counters it can show this computer's traffic, labelled as such.
+- Nodes: online is a filled disc, quiet a violet ember, offline a hollow ring, blocked a flat `--alert` ring, unknown a
+  dashed ring, online-without-counters a dim disc with no stream.
+- When the collector is offline every node is last-known: no rate, no stream, and tooltips and the screen-reader list say
+  "last known".
+- Hearth: arcs for download and upload, one spark per device.
+- Below the hero: throughput, coverage, the throughput curve (breaks across time gaps), top devices, recent events.
 
-When stored pairing is rejected (401/auth-failed on API or WS), the app
-must clear the stored token and show a single glass panel action state:
-"This window's pairing expired. Open NeonHearth from the Start menu to
-re-pair." — no dead spinners, no silent QUIET state while broken.
+## Home
 
-## Floor
+A plan editor (walls, rooms, openings, floors, owner-confirmed device placement) and a 3D twin that shares one
+snapshot. The editor enforces the storage limits (2048 walls, 256 rooms, 256 corners, 64 openings, 64 floors) and keeps
+ids unique; a draft is flushed on leaving the view; keyboard shortcuts act only while the editor tab is visible and the
+single-letter ones can be switched off in Settings. The plan canvas has one tab stop and arrow keys move between items.
+The twin shows pins as "unknown" and says so while the collector is offline.
 
-Responsive to 390px; `--flame-ramp` focus ring (2px) with a non-gradient
-fallback; `prefers-reduced-motion` = no flame drift/breathing (static);
-`prefers-reduced-transparency`/no-backdrop-filter fallback = solid
-`#15151D` panels; AA contrast for all text on glass-over-void; fire colors
-never used for body text.
+## Accessibility floor
+
+- Responsive down to 390 px with no horizontal page scroll.
+- Focus ring is always visible (`--focus`); tab lists use roving tabindex with arrow, Home and End keys.
+- Text on `--bg` and `--surface` meets WCAG AA at the sizes used; the faint step is for non-essential captions.
+- Reduced motion is honoured in CSS and in every canvas loop.
