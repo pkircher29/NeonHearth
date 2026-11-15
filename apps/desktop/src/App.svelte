@@ -27,6 +27,8 @@
   import Icon, { type IconName } from './lib/components/Icon.svelte';
   import { formatThreadTime, threadEntries } from './lib/components/liveThread';
 
+  import { createLabelMerger } from './lib/stores/labels';
+  import { createPoller, type Poller } from './lib/polling';
   import { createDeviceLabelsApi, type DeviceLabelsApi, type DeviceLabel } from './lib/api/deviceLabels';
   let labelsApi = $state<DeviceLabelsApi | null>(null);
   let labels = $state<Record<string, DeviceLabel>>({});
@@ -41,10 +43,14 @@
   let networkDetails = $state<NetworkDetails | null>(null);
   async function refreshAutomation() { if (automationApi) automationSnapshot = await automationApi.snapshot(); }
 
+
   type Destination = 'traffic' | 'pulse' | 'devices' | 'guard' | 'cameras' | 'home' | 'doctor' | 'history' | 'settings' | 'automation';
   const nav: Array<[Destination, string, IconName]> = [['pulse', 'Pulse', 'pulse'], ['devices', 'Devices', 'devices'], ['traffic', 'Traffic', 'pulse'], ['guard', 'Guard', 'guard'], ['cameras', 'Cameras', 'cameras'], ['home', 'Home', 'home'], ['automation', 'Automation', 'home'], ['doctor', 'Doctor', 'doctor'], ['history', 'History', 'history'], ['settings', 'Settings', 'settings']];
   let view: Destination = $state('pulse'); let liveState: LiveState = $state(initialLiveState); let moreOpen = $state(false);
-  const namedState = $derived({...liveState, devices: Object.fromEntries(Object.entries(liveState.devices).map(([id, device]) => [id, {...device, ...labels[id]}]))});
+  // Owner labels are overlaid per device: unchanged devices keep their identity, so a bandwidth frame does not rebuild the whole map.
+  const mergeLabels = createLabelMerger();
+  const namedDevices = $derived(mergeLabels(liveState.devices, labels));
+  const namedState = $derived(namedDevices === liveState.devices ? liveState : { ...liveState, devices: namedDevices });
   let moreButton: HTMLButtonElement;
   function dismissMore(event: KeyboardEvent) { if (event.key === 'Escape' && moreOpen) { moreOpen = false; moreButton?.focus(); } }
   let deviceQuery = $state('');
@@ -65,7 +71,10 @@
   function restartConnection() { connection?.stop(); void connection?.start(); }
   function signInOwner(token: string, remember: boolean) { if (session?.signInOwner(token, remember)) restartConnection(); }
   function signInPhone(code: string, remember: boolean) { if (session?.signInPhone(code, remember)) restartConnection(); }
-  function signOut() { networkSnapshot = null; labels = {}; guardScan = null; automationSnapshot = null; networkDetails = null; session?.signOut(); connection?.stop(); liveState = initialLiveState; }
+  function signOut() { networkSnapshot = null; labels = {}; guardScan = null; automationSnapshot = null; networkDetails = null; session?.signOut(); connection?.stop(); connection?.reset(); liveState = initialLiveState; }
+  // Re-run the pollers that care about the current view the moment it changes.
+  let kickPollers: (() => void) | null = null;
+  $effect(() => { void view; kickPollers?.(); });
   async function stepUp(pin: string) { if (!cameraClient) return; const result = await cameraClient.stepUp(pin); session?.stepupGranted(result.expires_at); }
 
   onMount(() => {
@@ -77,6 +86,8 @@
     // Local pairing: the installed service serves this page and the Start-menu
     // launcher passes the owner token in the URL fragment (never sent over the
     // network). It becomes a remembered owner sign-in for this tab.
+    // Deliberate choice: a launcher pairing is kept in this tab's sessionStorage (so a reload does not
+    // sign the owner out) and the sign-in and Settings screens say so. Sign out clears it.
     const launcherToken = bootstrapServiceToken(window);
     if (launcherToken) { auth.signInOwner(launcherToken, true); clearStoredToken(window); }
     const unsubscribe = auth.subscribe((next) => { if (active) authState = next; });
@@ -88,35 +99,47 @@
     labelsApi = createDeviceLabelsApi(auth);
     hostApi = createHostApi(auth);
     networkApi = createNetworkApi(auth);
-    let automationTimer: ReturnType<typeof setTimeout>;
-    async function pollAutomation() {
+    const isOwner = () => auth.state.credential?.kind === 'owner';
+    const clearOwnerData = () => { networkSnapshot = null; automationSnapshot = null; networkDetails = null; labels = {}; guardScan = null; };
+    // Home Assistant inventory and addresses are heavy and slow-moving: every 15 s, only on views that show them.
+    async function pollInventory() {
       if (!active) return;
-      if (auth.state.credential?.kind === 'owner' && ['automation', 'home', 'devices', 'guard', 'traffic'].includes(view)) {
-        const result = await Promise.allSettled([automationApi!.snapshot(), automationApi!.network(), labelsApi!.list(), ['guard','traffic'].includes(view) ? scanApi!.status() : Promise.resolve(null)]);
-        if (active && auth.state.credential?.kind === 'owner') {
-          automationSnapshot = result[0].status === 'fulfilled' ? result[0].value : null;
-          networkDetails = result[1].status === 'fulfilled' ? result[1].value : null;
-          if (result[2].status === 'fulfilled') labels = Object.fromEntries(result[2].value.map(label => [label.device_id,label]));
-          guardScan = result[3].status === 'fulfilled' ? result[3].value : null;
-        }
-      } else if (auth.state.credential?.kind !== 'owner') { networkSnapshot = null; automationSnapshot = null; networkDetails = null; labels = {}; guardScan = null; }
-      if (active) automationTimer = setTimeout(() => void pollAutomation(), 2000);
+      if (!isOwner()) { clearOwnerData(); return; }
+      if (!['automation', 'home', 'devices', 'guard', 'traffic'].includes(view)) return;
+      const result = await Promise.allSettled([automationApi!.snapshot(), automationApi!.network()]);
+      if (active && isOwner()) {
+        automationSnapshot = result[0].status === 'fulfilled' ? result[0].value : null;
+        networkDetails = result[1].status === 'fulfilled' ? result[1].value : null;
+      }
     }
-    let networkTimer: ReturnType<typeof setTimeout>;
+    // Owner labels only change when the owner saves one (applied locally on save) or from another window: slow refresh.
+    async function pollLabels() {
+      if (!active || !isOwner() || !['home', 'devices', 'guard', 'traffic', 'pulse'].includes(view)) return;
+      const result = await Promise.allSettled([labelsApi!.list()]);
+      if (active && isOwner() && result[0].status === 'fulfilled') {
+        const next = Object.fromEntries(result[0].value.map(label => [label.device_id, label]));
+        const same = Object.keys(next).length === Object.keys(labels).length && Object.entries(next).every(([id, label]) => { const old = labels[id]; return old && old.owner_name === label.owner_name && old.owner_confirmed === label.owner_confirmed; });
+        if (!same) labels = next;
+      }
+    }
+    async function pollScan() {
+      if (!active || !isOwner() || !['guard', 'traffic'].includes(view)) return;
+      try { const value = await scanApi!.status(); if (active && isOwner()) guardScan = value; } catch { if (active) guardScan = null; }
+    }
     async function pollNetwork() {
       if (!active) return;
-      if (auth.state.credential?.kind === 'owner' && ['pulse', 'devices'].includes(view)) {
+      if (isOwner() && ['pulse', 'devices'].includes(view)) {
         try {
           const value = await networkApi!.snapshot();
-          if (active && auth.state.credential?.kind === 'owner') networkSnapshot = value;
+          if (active && isOwner()) networkSnapshot = value;
         } catch { if (active) networkSnapshot = null; }
       } else { networkSnapshot = null; }
-      if (active) networkTimer = setTimeout(() => void pollNetwork(), 2000);
     }
-    void pollAutomation();
-    void pollNetwork();
+    // Every poller pauses while the tab is hidden and resumes with one immediate run.
+    const pollers: Poller[] = [createPoller(pollInventory, 15_000), createPoller(pollLabels, 30_000), createPoller(pollScan, 2_000), createPoller(pollNetwork, 2_000)];
+    kickPollers = () => pollers.forEach((poller) => poller.kick());
     void connection.start();
-    return () => { active = false; clearTimeout(automationTimer); clearTimeout(networkTimer); unsubscribe(); connection?.stop(); };
+    return () => { active = false; kickPollers = null; pollers.forEach((poller) => poller.stop()); unsubscribe(); connection?.stop(); };
   });
 </script>
 <svelte:window onkeydown={dismissMore}/><svelte:head><title>NeonHearth — {view}</title></svelte:head>

@@ -41,6 +41,19 @@
   --risk: var(--pink);
   --info: var(--blue);
 
+  /* Aliases kept for older component styles; they resolve to the tokens above. */
+  --ink-mute: var(--muted-strong);
+  --ground: var(--bg);
+  --risk-ink: #ffb4cc;
+
+  /* Flow Map ramps (read by FlowMap.svelte): download orange to gold, upload violet to magenta. Risk never uses them. */
+  --fire-blue: #3d5afe;
+  --fire-violet: #7c4dff;
+  --fire-magenta: #e040fb;
+  --fire-orange: #ff6d3b;
+  --fire-gold: #ffc53d;
+  --alert: #ff4757;
+
   /* Type. */
   --font-body: 'Instrument Sans Variable', 'Instrument Sans', 'Segoe UI', Helvetica, Arial, sans-serif;
   --font-display: var(--font-body);

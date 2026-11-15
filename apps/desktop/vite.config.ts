@@ -13,10 +13,15 @@ export const collectorProxy = {
   '/api': createCollectorProxyOptions(process.env.NEONHEARTH_DEV_SERVICE_TOKEN)
 };
 
+// Only loopback names may reach the dev and preview servers. This is the DNS-rebinding defence: a page on another
+// name that resolves to 127.0.0.1 is refused by Vite before the proxy can attach the collector credential, and the
+// proxy re-checks the Host header itself (vite.proxy-auth.ts).
+export const allowedHosts = ['localhost', '127.0.0.1', '[::1]'];
+
 export default defineConfig({
   // Use the OS-native path consistently across Windows drive aliases and junctions.
   root: normalizePath(projectRoot),
   plugins: [svelte(), svelteTesting()],
-  server: { proxy: collectorProxy },
-  preview: { proxy: collectorProxy }
+  server: { proxy: collectorProxy, allowedHosts },
+  preview: { proxy: collectorProxy, allowedHosts }
 });

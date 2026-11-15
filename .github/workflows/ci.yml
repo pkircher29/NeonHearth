@@ -16,6 +16,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Read-only by default: no job here needs to write to the repository, and a
+# fork PR must never receive a writable token. (release.yml grants more to the
+# individual jobs that need it.)
+permissions:
+  contents: read
+
 # Supply-chain note (audit M-22): every third-party action is pinned to a full
 # commit SHA with the resolved tag in a trailing comment. Bump by resolving the
 # new tag's commit (`gh api repos/<owner>/<repo>/tags`) and updating both the
@@ -109,6 +115,19 @@ jobs:
           # CI gate checks exactly what `cargo deny check` checks locally.
           arguments: ""
 
+  vendor:
+    name: Vendored crate matches its documented upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Fetches sqlx-sqlite 0.8.6 from crates.io, verifies the SHA-256 recorded
+      # in vendor/sqlx-sqlite/NEONHEARTH-PATCH.md and diffs every file: only the
+      # libsqlite3-sys version pin and the patch note may differ.
+      - name: Check vendor/sqlx-sqlite against upstream
+        run: python3 scripts/check-vendor-sqlx.py
+
   web:
     name: Web (desktop app)
     runs-on: ubuntu-latest
@@ -144,7 +163,9 @@ jobs:
       - name: Candidate tooling regression tests
         working-directory: .
         run: |
+          pip install pyyaml==6.0.2
           python packaging/test_home_hub_package.py
+          python packaging/test_linux_scripts.py
           python -m unittest discover -s scripts/tests -p 'test_*.py'
 
       - name: Type/lint check

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { EventEnvelope } from '../api/types';
-import { applySnapshot, bandwidthTier, initialLiveState, reduceLiveMessage, topDevices } from './live';
+import { applySnapshot, bandwidthTier, initialLiveState, liveStatus, reduceLiveMessage, topDevices } from './live';
 
 const serviceStatus = (sequence: number, state = 'ready'): EventEnvelope => ({
   sequence,
@@ -56,7 +56,7 @@ describe('reduceLiveMessage', () => {
   it('starts with a complete empty dashboard state and exact bandwidth tiers', () => {
     expect(initialLiveState.devices).toEqual({});
     expect(initialLiveState.coverage).toBe('unavailable');
-    expect(initialLiveState.protocolMix).toBeNull();
+    expect(initialLiveState.aggregate).toEqual({ upload: null, download: null });
     // Bytes per second in; thresholds are 1 / 10 / 30 megabits per second.
     expect(bandwidthTier(124_999)).toBe('blue');
     expect(bandwidthTier(125_000)).toBe('cyan');
@@ -133,12 +133,6 @@ describe('reduceLiveMessage', () => {
     expect(result.deviceOrder).toEqual([device.device_id]);
     expect(result.coverage).toBe('complete');
     expect(result.aggregate).toEqual({ upload: 2_000_000, download: 1_000_000 });
-  });
-
-  it('keeps protocol mix unavailable for canonical bandwidth samples', () => {
-    const result = reduceLiveMessage(initialLiveState, { type: 'event', data: bandwidth(1) });
-
-    expect(result.protocolMix).toBeNull();
   });
 
   it('projects the latest policy state by device for the Guard view', () => {
@@ -300,13 +294,71 @@ function resultDevice(device_id: string) {
   return { device_id, first_seen_at: '2026-08-23T00:00:00Z', last_seen_at: '2026-08-23T00:00:00Z', owner_name: null, owner_type: null, owner_confirmed: false, presence: { state: 'unknown' as const, observed_at: null, source: null, kind: null }, evidence: null, identity: { available: false, classification: null, confidence: null }, bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null }, policy: null };
 }
 
+const A = '0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6b';
+const B = '0198b9a7-cd5a-7e04-a7c4-7f8d5f5d6f6c';
+const frame = (sequence: number, at: string, samples: Array<[string, number, number]>): EventEnvelope => ({
+  sequence, occurred_at: at,
+  payload: { type: 'bandwidth_frame', data: { interval_ms: 1000, observed_at: at, emitted_at: at, samples: samples.map(([device_id, up, down]) => ({ device_id, delta: { upload: 1, download: 1 }, upload_bytes_per_second: up, download_bytes_per_second: down, coverage: 'complete' as const })) } }
+});
+
+describe('freshness in the live model', () => {
+  it('marks a device absent from a bandwidth frame unavailable and drops it from the aggregate', () => {
+    let state = reduceLiveMessage(initialLiveState, { type: 'event', data: frame(1, '2026-08-23T00:00:00Z', [[A, 5_000_000, 0], [B, 100, 200]]) });
+    expect(state.aggregate).toEqual({ upload: 5_000_100, download: 200 });
+    state = reduceLiveMessage(state, { type: 'event', data: frame(2, '2026-08-23T00:00:01Z', [[B, 100, 200]]) });
+    expect(state.devices[A]!.bandwidth.available).toBe(false);
+    expect(state.devices[A]!.bandwidth.upload).toBeNull();
+    expect(state.aggregate).toEqual({ upload: 100, download: 200 });
+    expect(topDevices(state).map((d) => d.device_id)).toEqual([B]);
+  });
+
+  it('derives aggregate and the throughput curve from the same readings', () => {
+    let state = reduceLiveMessage(initialLiveState, { type: 'event', data: frame(1, '2026-08-23T00:00:00Z', [[A, 10, 20], [B, 1, 2]]) });
+    state = reduceLiveMessage(state, { type: 'event', data: frame(2, '2026-08-23T00:00:01Z', [[B, 1, 2]]) });
+    expect(state.throughput.map((p) => [p.upload, p.download])).toEqual([[11, 22], [1, 2]]);
+    expect(state.aggregate).toEqual({ upload: 1, download: 2 });
+  });
+
+  it('expires readings older than the stale threshold on any later event', () => {
+    let state = reduceLiveMessage(initialLiveState, { type: 'event', data: frame(1, '2026-08-23T00:00:00Z', [[A, 10, 20]]) });
+    state = reduceLiveMessage(state, { type: 'event', data: { ...serviceStatus(2), occurred_at: '2026-08-23T00:00:40Z' } });
+    expect(state.devices[A]!.bandwidth.available).toBe(false);
+    expect(state.aggregate).toEqual({ upload: null, download: null });
+  });
+
+  it('keeps nulls null: no fake zero for an unreported direction', () => {
+    const device = { ...reduceLiveMessage(initialLiveState, { type: 'event', data: frame(1, '2026-08-23T00:00:00Z', [[A, 1, 1]]) }).devices[A]!, bandwidth: { available: true, upload: 7, download: null, coverage: 'complete' as const, observed_at: '2026-08-23T00:00:00Z' } };
+    const state = applySnapshot(initialLiveState, { sequence: 1, devices: [device], next_after: null, service_status: 'ready' });
+    expect(state.aggregate).toEqual({ upload: 7, download: null });
+  });
+
+  it('keeps the timeline and throughput across a contiguous resync, and drops them when the sequence goes backwards', () => {
+    let state = reduceLiveMessage(initialLiveState, { type: 'event', data: frame(1, '2026-08-23T00:00:00Z', [[A, 1, 1]]) });
+    state = reduceLiveMessage(state, { type: 'event', data: frame(2, '2026-08-23T00:00:01Z', [[A, 2, 2]]) });
+    const resynced = applySnapshot(state, { sequence: 2, devices: [state.devices[A]!], next_after: null, service_status: 'ready' });
+    expect(resynced.timeline).toHaveLength(2);
+    expect(resynced.throughput).toHaveLength(2);
+    const restarted = applySnapshot(state, { sequence: 1, devices: [], next_after: null, service_status: 'ready' });
+    expect(restarted.timeline).toEqual([]);
+    expect(restarted.throughput).toEqual([]);
+  });
+
+  it('exposes one live/stale/offline signal', () => {
+    expect(liveStatus(null)).toBe('offline');
+    expect(liveStatus(initialLiveState)).toBe('offline');
+    const known = reduceLiveMessage(initialLiveState, { type: 'event', data: frame(1, '2026-08-23T00:00:00Z', [[A, 1, 1]]) });
+    expect(liveStatus(known)).toBe('live');
+    expect(liveStatus({ ...known, connected: false })).toBe('stale');
+  });
+});
+
 it('clears omitted readings from the next interval', () => {
  const first = reduceLiveMessage(initialLiveState, { type: 'event', data: bandwidth(1) });
  const empty = bandwidth(2);
  if (empty.payload.type !== 'bandwidth_frame') throw new Error('fixture');
  empty.payload.data.samples = [];
  const next = reduceLiveMessage(first, { type: 'event', data: empty });
- expect(next.aggregate).toEqual({ upload: 0, download: 0 });
+ expect(next.aggregate).toEqual({ upload: null, download: null });
  expect(topDevices(next)).toEqual([]);
  expect(next.throughput).toEqual([]);
  expect(first.aggregate.upload).toBe(2_000_000);

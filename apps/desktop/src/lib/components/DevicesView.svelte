@@ -19,6 +19,7 @@
   $effect(() => { query = initialQuery; });
   let tab = $state('all' as 'all' | 'confirmed' | 'needs-confirm');
   let sort = $state('ip-asc' as 'ip-asc' | 'ip-desc' | 'discovery');
+  const scanDevices = $derived(Object.values(liveState?.devices ?? {}).map(device => ({ id: device.device_id, label: recognizeDevice(device, network?.devices.find(item => item.device_id === device.device_id)).name })).sort((a, b) => a.label.localeCompare(b.label)));
   const details = $derived(new Map(network?.devices.map(device => [device.device_id, device]) ?? []));
   const ipKeys = $derived(new Map(network?.devices.map(device => [device.device_id, deviceIpSortKey(device.ip_addresses)]) ?? []));
   const findingsByDevice = $derived.by(() => {
@@ -57,9 +58,10 @@
 
 <section class="devices-view" aria-labelledby="devices-heading">
   <div class="view-heading"><div><p class="kicker">DEVICES / IDENTITY</p><h1 id="devices-heading">Know what is home.</h1><p class="muted">Live presence, reported identities, and the first time each device was observed.</p></div></div>
+  {#if liveState && liveState.deviceOrder.length > 0 && !liveState.connected}<p class="offline-note" role="alert">Collector offline. Presence and traffic below are the last known readings, not live.</p>{/if}
   {#if ondiscover}<button class="discovery-launch" type="button" onclick={ondiscover}>Find devices across the LAN</button>{/if}
   <div class="inventory-summary" aria-label="Network overview"><div><strong>{devices.length}</strong><span>devices observed</span></div><div><strong>{discovery?.devices.length ? responses : counts.online}</strong><span>{discovery?.devices.length ? 'responding to discovery' : 'online now'}</span></div><div><strong>{counts.named}</strong><span>reported names</span></div><div><strong>{counts.confirmed}</strong><span>names confirmed</span></div></div>
-  {#if scanApi}<NetworkScanPanel api={scanApi} onchange={value => scan = value}/>{/if}
+  {#if scanApi}<NetworkScanPanel api={scanApi} onchange={value => scan = value} devices={scanDevices}/>{/if}
   <label class="search"><span>Search devices</span><input type="search" bind:value={query} placeholder="Name, IP, MAC, room, or web identity" /></label>
   <p class="device-result-count" role="status">{visible.length} of {devices.length} devices</p>
   {#if query || tab !== 'all'}<button class="reset-filters" type="button" onclick={() => { query = ''; tab = 'all'; }}>Clear filters</button>{/if}
@@ -111,6 +113,7 @@
   {/if}
 </section>
 <style>
+  .offline-note{margin:0 0 14px;padding:10px 12px;border:1px solid var(--risk);border-radius:8px;font-size:13px}
   .discovery-launch{padding:10px 14px;margin:0 0 18px;border:1px solid var(--line-strong);border-radius:7px;background:var(--surface);color:var(--accent);font:inherit;cursor:pointer}
   .inventory-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:20px 0}.inventory-summary div{padding:18px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}.inventory-summary strong{display:block;font:600 28px var(--font-display);color:var(--accent)}.inventory-summary span{font-size:11px;color:var(--muted-strong)}.device-glyph{position:relative;width:44px;height:44px;display:grid;place-items:center;background:var(--surface);border:1px solid var(--line-strong);border-radius:10px;color:var(--accent);flex:none}.device-glyph .presence-dot{position:absolute;right:-3px;bottom:-3px}.device-card{min-width:0}.device-name{align-items:center}@media(max-width:650px){.inventory-summary{grid-template-columns:repeat(2,1fr)}}
   .scan-findings{overflow-wrap:anywhere;border-top:1px solid var(--line);padding-top:10px}.scan-findings summary{cursor:pointer}.scan-findings p{display:block}

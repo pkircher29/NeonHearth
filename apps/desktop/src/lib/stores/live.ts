@@ -3,7 +3,6 @@ import { heatTier } from '../twin/heat';
 
 export interface ThroughputPoint { at: string; upload: number; download: number }
 export type CoverageSummary = Coverage | 'unavailable' | 'mixed';
-export type ProtocolMix = Record<string, number>;
 export interface GuardPolicy {
   device_id: string;
   evaluation: PolicyEvaluation;
@@ -22,25 +21,61 @@ export interface LiveState {
   throughput: ThroughputPoint[];
   timeline: ServerMessage[];
   coverage: CoverageSummary;
-  aggregate: { upload: number; download: number };
-  protocolMix: ProtocolMix | null;
+  /** Sum of the fresh per-device readings; a direction is null when no fresh device reports it (never a fake zero). */
+  aggregate: { upload: number | null; download: number | null };
   policies: Record<string, GuardPolicy>;
 }
 
-export const initialLiveState: LiveState = { sequence: 0, connected: false, needsResync: false, serviceStatus: 'unknown', devices: {}, deviceOrder: [], throughput: [], timeline: [], coverage: 'unavailable', aggregate: { upload: 0, download: 0 }, protocolMix: null, policies: {} };
+export const initialLiveState: LiveState = { sequence: 0, connected: false, needsResync: false, serviceStatus: 'unknown', devices: {}, deviceOrder: [], throughput: [], timeline: [], coverage: 'unavailable', aggregate: { upload: null, download: null }, policies: {} };
 
 function hasVerifiedBlock(policy: DeviceSnapshot['policy']): boolean {
   return policy?.enforcement_result === 'verified'
     && (policy.evaluation.requested_action === 'quarantine' || policy.evaluation.requested_action === 'permanent_ban');
 }
 
+/** A reading older than this (relative to the newest event) is no longer a measurement of the present. */
+export const BANDWIDTH_STALE_MS = 15_000;
+const UNAVAILABLE_BANDWIDTH: DeviceSnapshot['bandwidth'] = { available: false, upload: null, download: null, coverage: null, observed_at: null };
+
+/** Single derived signal every view consumes: live, last-known (collector lost), or nothing known. */
+export type LiveStatus = 'live' | 'stale' | 'offline';
+export function liveStatus(state: Pick<LiveState, 'connected' | 'deviceOrder'> | null | undefined): LiveStatus {
+  if (!state) return 'offline';
+  if (state.connected) return 'live';
+  return state.deviceOrder.length > 0 ? 'stale' : 'offline';
+}
+
+function sumKnown(values: Array<number | null>): number | null {
+  let total: number | null = null;
+  for (const value of values) if (value !== null) total = (total ?? 0) + value;
+  return total;
+}
+
 function summarize(state: LiveState): LiveState {
   const bandwidth = Object.values(state.devices).map((device) => device.bandwidth).filter((value) => value.available);
   const coverages = new Set(bandwidth.map((value) => value.coverage).filter((value): value is Coverage => value !== null));
-  return { ...state, aggregate: { upload: bandwidth.reduce((sum, value) => sum + (value.upload ?? 0), 0), download: bandwidth.reduce((sum, value) => sum + (value.download ?? 0), 0) }, coverage: coverages.size === 0 ? 'unavailable' : coverages.size === 1 ? [...coverages][0]! : 'mixed' };
+  return { ...state, aggregate: { upload: sumKnown(bandwidth.map((value) => value.upload)), download: sumKnown(bandwidth.map((value) => value.download)) }, coverage: coverages.size === 0 ? 'unavailable' : coverages.size === 1 ? [...coverages][0]! : 'mixed' };
 }
 
-export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
+/**
+ * Readings whose observation is older than the threshold (against the newest
+ * event time) become unavailable instead of lingering as live numbers.
+ */
+function expireBandwidth(devices: Record<string, DeviceSnapshot>, nowIso: string, keep: ReadonlySet<string> = new Set()): Record<string, DeviceSnapshot> {
+  const now = Date.parse(nowIso);
+  if (!Number.isFinite(now)) return devices;
+  let next: Record<string, DeviceSnapshot> | null = null;
+  for (const [id, device] of Object.entries(devices)) {
+    if (keep.has(id) || !device.bandwidth.available) continue;
+    const observed = device.bandwidth.observed_at ? Date.parse(device.bandwidth.observed_at) : NaN;
+    if (Number.isFinite(observed) && now - observed <= BANDWIDTH_STALE_MS) continue;
+    next ??= { ...devices };
+    next[id] = { ...device, bandwidth: UNAVAILABLE_BANDWIDTH };
+  }
+  return next ?? devices;
+}
+
+export function applySnapshot(previous: LiveState, snapshot: Snapshot): LiveState {
   const devices: Record<string, DeviceSnapshot> = {};
   const deviceOrder: string[] = [];
   const policies: Record<string, GuardPolicy> = {};
@@ -60,7 +95,11 @@ export function applySnapshot(_: LiveState, snapshot: Snapshot): LiveState {
   }
   // A snapshot is a trustworthy baseline, but it is not evidence that the
   // event socket is open. The connection orchestrator marks it live on open.
-  const next = { sequence: snapshot.sequence, connected: false, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: [], timeline: [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: 0, download: 0 }, protocolMix: null, policies };
+  // A resync that does not go backwards continues the same history: the live
+  // thread and throughput curve survive routine stale-watchdog refreshes. A
+  // lower sequence means the service restarted, so the old history is dropped.
+  const continuous = previous.sequence > 0 && snapshot.sequence >= previous.sequence;
+  const next = { sequence: snapshot.sequence, connected: false, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: continuous ? previous.throughput : [], timeline: continuous ? previous.timeline : [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: null, download: null }, policies };
   return summarize(next);
 }
 
@@ -73,7 +112,7 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
   const event = message.data;
   if (event.sequence <= state.sequence) return state;
   if (event.sequence > state.sequence + 1) return { ...state, connected: false, needsResync: true };
-  const next: LiveState = { ...state, sequence: event.sequence, connected: true, devices: state.devices, deviceOrder: state.deviceOrder, throughput: state.throughput, timeline: [...state.timeline, message].slice(-120), coverage: state.coverage, aggregate: state.aggregate, protocolMix: state.protocolMix, policies: state.policies };
+  const next: LiveState = { ...state, sequence: event.sequence, connected: true, devices: state.devices, deviceOrder: state.deviceOrder, throughput: state.throughput, timeline: [...state.timeline, message].slice(-120), coverage: state.coverage, aggregate: state.aggregate, policies: state.policies };
   if (event.payload.type === 'service_status') next.serviceStatus = event.payload.data.state;
   if (event.payload.type === 'presence_changed') {
     const id = event.payload.data.device_id;
@@ -86,22 +125,26 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
     }
   }
   if (event.payload.type === 'bandwidth_frame') {
-    // Each frame describes the current collector interval, not a patch.
-    next.devices = Object.fromEntries(Object.entries(next.devices).map(([id, device]) => [id, {
-      ...device, bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null }
-    }]));
-    let upload = 0; let download = 0;
+    const framed = new Set<string>();
+    const devices = { ...next.devices };
     for (const sample of event.payload.data.samples) {
-      upload += sample.upload_bytes_per_second; download += sample.download_bytes_per_second;
-      const current = next.devices[sample.device_id] ?? placeholder(sample.device_id, event.occurred_at);
-      if (!(sample.device_id in next.devices)) next.deviceOrder = [...next.deviceOrder, sample.device_id];
-      next.devices[sample.device_id] = { ...current, last_seen_at: event.occurred_at, bandwidth: { available: true, upload: sample.upload_bytes_per_second, download: sample.download_bytes_per_second, coverage: sample.coverage, observed_at: event.payload.data.observed_at } };
+      framed.add(sample.device_id);
+      const current = devices[sample.device_id] ?? placeholder(sample.device_id, event.occurred_at);
+      if (!(sample.device_id in devices)) next.deviceOrder = [...next.deviceOrder, sample.device_id];
+      devices[sample.device_id] = { ...current, last_seen_at: event.occurred_at, bandwidth: { available: true, upload: sample.upload_bytes_per_second, download: sample.download_bytes_per_second, coverage: sample.coverage, observed_at: event.payload.data.observed_at } };
     }
-    next.aggregate = { upload, download };
-    next.throughput = event.payload.data.samples.length ? [...next.throughput, { at: event.occurred_at, upload, download }].slice(-240) : [];
-    // Rust's BandwidthSample intentionally has no protocol metadata, so this
-    // projection remains unavailable rather than inventing a protocol mix.
-    next.protocolMix = null;
+    // A device missing from the frame is not measured now: unavailable, not "still at its last rate".
+    for (const [id, device] of Object.entries(devices)) {
+      if (!framed.has(id) && device.bandwidth.available) devices[id] = { ...device, bandwidth: UNAVAILABLE_BANDWIDTH };
+    }
+    next.devices = devices;
+    const summary = summarize(next);
+    // One source: the curve point is the aggregate derived from the same readings.
+    if (summary.aggregate.upload !== null && summary.aggregate.download !== null) {
+      next.throughput = [...next.throughput, { at: event.occurred_at, upload: summary.aggregate.upload, download: summary.aggregate.download }].slice(-240);
+    } else { next.throughput = []; }
+  } else {
+    next.devices = expireBandwidth(next.devices, event.occurred_at);
   }
   if (event.payload.type === 'policy_changed') {
     const policy = event.payload.data;

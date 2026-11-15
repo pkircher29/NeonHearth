@@ -173,4 +173,47 @@ describe('FlowMap', () => {
     const texts = stub.fns.fillText!.mock.calls.map((call) => String(call[0]));
     expect(texts).not.toContain('chrome.exe');
   });
+
+  it('does not record a missing direction as a measured zero in the history ring', () => {
+    render(FlowMap, { devices: [device('a')], upload: null, download: 5_000_000, connected: true });
+    rafCallbacks[0]!(16);
+    // The core shows one side as unavailable and no total.
+    const texts = stub.fns.fillText!.mock.calls.map((call) => String(call[0]));
+    expect(texts).toContain('unavailable'); // the missing direction
+    expect(texts).toContain('—');            // no total from one side
+  });
+
+  it('labels a hovered node as last-known while the collector is offline, with no live rate', async () => {
+    const { container, queryByText } = render(FlowMap, { devices: [device('a', { owner_name: 'Studio Mac' })], upload: 1, download: 1, connected: false, onselect: vi.fn() });
+    const canvas = container.querySelector('canvas')!;
+    canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 760, height: 560, right: 760, bottom: 560, x: 0, y: 0, toJSON() {} });
+    const button = container.querySelector('.sr-only button') as HTMLButtonElement;
+    expect(button.textContent).toContain('last known online');
+    expect(button.textContent).toContain('collector offline');
+    expect(button.textContent).not.toMatch(/Mbps|kbps/);
+    button.focus();
+    await Promise.resolve();
+    expect(queryByText(/last known state, not live/)).toBeTruthy();
+  });
+
+  it('paints nothing on later frames when nothing moves and nothing changed, and skips frames while off screen', () => {
+    render(FlowMap, { devices: [device('a', { bandwidth: { available: true, upload: 0, download: 0, coverage: 'complete', observed_at: null } })], upload: 0, download: 0, connected: true });
+    const base = performance.now();
+    rafCallbacks[0]!(base + 16);                // first frame paints
+    const painted = stub.fns.clearRect!.mock.calls.length;
+    rafCallbacks.at(-1)!(base + 20_000);         // settled long ago, no particles, not dirty
+    rafCallbacks.at(-1)!(base + 20_100);
+    expect(stub.fns.clearRect!.mock.calls.length).toBe(painted);
+  });
+
+  it('caps the frame rate: a frame arriving sooner than ~33 ms after the last is skipped', () => {
+    render(FlowMap, { devices: [device('a')], upload: 125_000, download: 1_250_000, connected: true });
+    const base = performance.now();
+    rafCallbacks[0]!(base + 1_000);
+    const painted = stub.fns.clearRect!.mock.calls.length;
+    rafCallbacks.at(-1)!(base + 1_010);
+    expect(stub.fns.clearRect!.mock.calls.length).toBe(painted);
+    rafCallbacks.at(-1)!(base + 1_040);
+    expect(stub.fns.clearRect!.mock.calls.length).toBeGreaterThan(painted);
+  });
 });

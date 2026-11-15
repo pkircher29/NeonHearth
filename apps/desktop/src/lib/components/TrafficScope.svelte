@@ -2,14 +2,18 @@
   import type { ThroughputPoint } from '../stores/live';
   import { formatThroughput } from './networkFormat';
   let { points = [], connected = false }: { points?: ThroughputPoint[]; connected?: boolean } = $props();
-  const samples = $derived(connected ? points.slice(-60).filter(p => Number.isFinite(p.download) && Number.isFinite(p.upload) && p.download >= 0 && p.upload >= 0) : []);
+  const samples = $derived(connected ? points.slice(-60).filter(p => Number.isFinite(p.download) && Number.isFinite(p.upload) && p.download >= 0 && p.upload >= 0 && Number.isFinite(Date.parse(p.at))) : []);
   const latest = $derived(samples.at(-1));
   const ceiling = $derived(Math.max(125_000, ...samples.flatMap(p => [p.download, p.upload])));
+  const firstTime = $derived(Date.parse(samples[0]?.at ?? ''));
+  const duration = $derived(latest ? Date.parse(latest.at) - firstTime : 0);
   function trace(direction: 'download' | 'upload') {
     return samples.map((p, i) => {
-      const x = samples.length === 1 ? 900 : 20 + i / (samples.length - 1) * 880;
+      const x = duration > 0 ? 20 + (Date.parse(p.at) - firstTime) / duration * 880 : 900;
+      const previous = samples[i - 1];
+      const gap = previous ? Date.parse(p.at) - Date.parse(previous.at) : 0;
       const y = direction === 'download' ? 150 - p.download / ceiling * 110 : 190 + p.upload / ceiling * 110;
-      return `${i ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)}`;
+      return `${i && gap > 0 && gap <= 5000 ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)}`;
     }).join(' ');
   }
   function timeLabel(at?: string) {
@@ -36,7 +40,7 @@
     {#if !latest}<div class="scope-empty"><strong>{connected ? 'Waiting for device counters' : 'Signal unavailable'}</strong><p>{connected ? 'The collector is connected. Measured device traffic will appear here when available.' : 'Reconnect the collector to see download and upload activity.'}</p></div>{/if}
   </div>
   <footer><span>{latest ? timeLabel(samples[0]?.at) : 'NO CURRENT MEASUREMENTS'}</span><span>{latest ? `${samples.length} samples · ${timeLabel(latest.at)}` : 'Download and upload stay separate'}</span></footer>
-  <p class="scope-note">Measured devices only · household router totals are shown separately. Sharp segments connect samples; spacing represents sample order.</p>
+  <p class="scope-note">Measured devices only · household router totals are shown separately. Spacing represents elapsed time; gaps over five seconds break the trace.</p>
 </section>
 <style>
   .traffic-scope { margin:28px 0 0; border:1px solid #526269; border-top:3px solid #ff865f; background:#10191c; min-width:0; }

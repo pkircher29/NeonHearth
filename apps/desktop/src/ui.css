@@ -15,7 +15,7 @@
 .kicker,.metric-label { color:var(--accent); font:500 10px var(--font-mono); letter-spacing:.14em}
 .view-heading h1,.not-ready h1 { margin:9px 0 8px; font:700 clamp(2.2rem,4vw,4rem)/.95 var(--font-display); letter-spacing:-.035em}
 .muted { color:var(--muted); line-height:1.45}
-.metrics { display:grid; grid-template-columns:repeat(3,1fr); border-block:1px solid var(--line)}
+.metrics { display:grid; grid-template-columns:repeat(2,1fr); border-block:1px solid var(--line)}
 .metrics article { padding:17px 15px; border-right:1px solid var(--line); display:grid; gap:7px}
 .metrics strong { font:600 22px var(--font-display)}
 .metrics small,.metric-note { color:var(--muted); font:11px var(--font-mono)}

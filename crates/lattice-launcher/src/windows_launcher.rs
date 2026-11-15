@@ -35,6 +35,8 @@ struct Options {
     port: Option<u16>,
     mqtt_port: Option<u16>,
     no_browser: bool,
+    allow_elevated: bool,
+    allow_shared_package: bool,
     status: bool,
     stop: bool,
     help: bool,
@@ -65,6 +67,8 @@ impl Options {
                     }
                 }
                 "--no-browser" => out.no_browser = true,
+                "--allow-elevated" => out.allow_elevated = true,
+                "--allow-shared-package" => out.allow_shared_package = true,
                 "--status" => out.status = true,
                 "--stop" => out.stop = true,
                 "--help" | "-h" => out.help = true,
@@ -244,6 +248,7 @@ fn validate_package(root: &Path) -> Result<()> {
             entry.path
         );
     }
+    reject_unlisted_files(root, &seen)?;
     for required in [
         "bin/lattice-service.exe",
         "mqtt/mosquitto.exe",
@@ -258,17 +263,142 @@ fn validate_package(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Every file under the package root must be in the manifest. A DLL dropped
+/// next to mosquitto.exe or lattice-service.exe would otherwise be loaded by
+/// Windows (application directory first) without ever being hashed.
+fn reject_unlisted_files(root: &Path, listed: &std::collections::BTreeSet<String>) -> Result<()> {
+    let listed: std::collections::BTreeSet<String> =
+        listed.iter().map(|name| name.to_lowercase()).collect();
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            platform::reject_reparse(&path)?;
+            visited += 1;
+            ensure!(visited <= 16384, "The package contains too many entries");
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .context("Package entry is outside the package")?
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+                .collect::<Vec<_>>()
+                .join("/");
+            ensure!(
+                relative == "package-manifest.json" || listed.contains(&relative),
+                "The package folder contains a file that is not part of the package: {relative}. Extract a complete package again into a new empty folder."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Packaged programs must not be replaceable by other accounts. Checked on the
+/// package root, every directory, and every program or library.
+fn verify_package_permissions(root: &Path) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if let Some(writer) = platform::untrusted_writer(&directory)? {
+            bail!(
+                "The package folder {} can be changed by {writer}. Extract NeonHearth into a folder only you (and administrators) can write, such as a new folder under your profile. Use --allow-shared-package only if you accept this risk.",
+                directory.display()
+            );
+        }
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| {
+                let extension = extension.to_string_lossy().to_lowercase();
+                extension == "exe" || extension == "dll"
+            }) && let Some(writer) = platform::untrusted_writer(&path)?
+            {
+                bail!(
+                    "The package file {} can be changed by {writer}. Extract NeonHearth again into a private folder.",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// When the launcher itself carries a valid signature, the collector (which
+/// receives the owner credential) must be signed by the same publisher. An
+/// unsigned launcher (development build) leaves nothing to compare with.
+fn verify_collector_signature(launcher: &Path, collector: &Path) -> Result<()> {
+    let platform::Signature::Valid { signer } = platform::authenticode(launcher)? else {
+        return Ok(());
+    };
+    match platform::authenticode(collector)? {
+        platform::Signature::Valid { signer: other } if other == signer => Ok(()),
+        platform::Signature::Valid { signer: other } => bail!(
+            "The collector is signed by {other}, not {signer}. Extract a complete package again."
+        ),
+        platform::Signature::Unsigned => bail!(
+            "The launcher is signed by {signer} but the collector is not signed. Extract a complete package again."
+        ),
+    }
+}
+
+/// Known cloud-sync locations for the private state folder, if the chosen path is inside one.
+fn sync_folder_warning(path: &Path) -> Option<String> {
+    let lowered = path.to_string_lossy().to_lowercase().replace('/', "\\");
+    let by_name = [
+        "\\onedrive",
+        "\\dropbox",
+        "\\google drive",
+        "\\googledrive",
+        "\\icloud",
+        "\\box sync",
+        "\\nextcloud",
+        "\\pcloud",
+        "\\mega",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker));
+    let by_environment = ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .any(|root| {
+            let root = PathBuf::from(root).to_string_lossy().to_lowercase();
+            !root.is_empty() && lowered.starts_with(&root)
+        });
+    (by_name || by_environment).then(|| {
+        "The data folder looks like it is inside a cloud-sync folder. It holds your device history and MQTT passwords in plain files; choose a folder that is not synced.".to_owned()
+    })
+}
+
 fn load_owner(state: &Path) -> Result<SecretString> {
     let path = state.join("owner.dpapi");
     if !path.exists() {
         let secret = Zeroizing::new(random_secret()?);
-        write_atomic(&path, &platform::protect(secret.as_bytes(), false)?)?;
+        write_atomic(
+            &path,
+            &platform::protect(secret.as_bytes(), false, Some(platform::OWNER_ENTROPY))?,
+        )?;
     }
-    let decrypted = Zeroizing::new(platform::protect(&read_bounded(&path, 16384)?, true)?);
+    let blob = read_bounded(&path, 16384)?;
+    // Format 2 carries application entropy; format 1 files (no entropy) from
+    // earlier builds must still open, and are re-sealed in place afterwards.
+    let (decrypted, legacy) = match platform::protect(&blob, true, Some(platform::OWNER_ENTROPY)) {
+        Ok(value) => (Zeroizing::new(value), false),
+        Err(_) => (Zeroizing::new(platform::protect(&blob, true, None)?), true),
+    };
     ensure!(
         decrypted.len() == 96 && decrypted.iter().all(u8::is_ascii_hexdigit),
         "The saved owner credential is invalid"
     );
+    if legacy {
+        write_atomic(
+            &path,
+            &platform::protect(&decrypted, false, Some(platform::OWNER_ENTROPY))?,
+        )?;
+    }
     Ok(SecretString::from(String::from_utf8(decrypted.to_vec())?))
 }
 
@@ -323,6 +453,7 @@ impl Drop for StartedChildren {
 }
 
 pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
+    platform::restrict_dll_search();
     platform::prevent_stdio_inheritance()?;
     let options = Options::parse(arguments)?;
     if options.help {
@@ -331,6 +462,10 @@ pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
         );
         return Ok(());
     }
+    ensure!(
+        options.allow_elevated || !platform::is_elevated()?,
+        "NeonHearth must not run as administrator: the collector and broker would start with administrator rights and the private data folder would belong to the elevated account. Open NeonHearth.exe normally (not \"Run as administrator\"). Use --allow-elevated only for automated testing."
+    );
     if !options.status && !options.stop {
         ensure_single_collector(platform::legacy_collector_active()?)?;
     }
@@ -344,6 +479,10 @@ pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
         return Ok(());
     }
     let state = prepare_state(&selected)?;
+    let warning = sync_folder_warning(&state);
+    if let Some(text) = &warning {
+        eprintln!("{text}");
+    }
     let _lock = lock_state(&state)?;
     let config_path = state.join("config.json");
     let config: Configuration = if config_path.exists() {
@@ -423,6 +562,10 @@ pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
         .parent()
         .context("The executable has no package directory")?;
     validate_package(root)?;
+    if !options.allow_shared_package {
+        verify_package_permissions(root)?;
+    }
+    verify_collector_signature(&executable, &root.join("bin/lattice-service.exe"))?;
     let mut started = StartedChildren {
         children: vec![],
         keep: false,
@@ -496,7 +639,7 @@ pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
     }
     println!(
         "{}",
-        serde_json::json!({"status":"ready","url":format!("http://127.0.0.1:{}",config.port),"service_pid":runtime.service.map(|stamp|stamp.pid),"mqtt_pid":runtime.broker.map(|stamp|stamp.pid)})
+        serde_json::json!({"status":"ready","url":format!("http://127.0.0.1:{}",config.port),"service_pid":runtime.service.map(|stamp|stamp.pid),"mqtt_pid":runtime.broker.map(|stamp|stamp.pid),"warnings":warning.into_iter().collect::<Vec<_>>()})
     );
     Ok(())
 }
@@ -532,6 +675,115 @@ mod tests {
                 .windows(first.expose_secret().len())
                 .any(|bytes| bytes == first.expose_secret().as_bytes())
         );
+    }
+    fn sample_package(root: &Path) {
+        let mut files = Vec::new();
+        for name in [
+            "bin/lattice-service.exe",
+            "mqtt/mosquitto.exe",
+            "mqtt/mosquitto_passwd.exe",
+            "ui/index.html",
+        ] {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, name.as_bytes()).unwrap();
+            files.push(serde_json::json!({
+                "path": name,
+                "bytes": name.len(),
+                "sha256": format!("{:x}", Sha256::digest(name.as_bytes())),
+            }));
+        }
+        fs::write(
+            root.join("PACKAGE-MANIFEST.json"),
+            serde_json::to_vec(&serde_json::json!({"format_version": 1, "files": files})).unwrap(),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn a_complete_package_validates_and_an_unlisted_file_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        sample_package(directory.path());
+        validate_package(directory.path()).unwrap();
+        fs::write(directory.path().join("mqtt/vcruntime140.dll"), b"planted").unwrap();
+        let error = validate_package(directory.path()).unwrap_err().to_string();
+        assert!(error.contains("not part of the package"), "{error}");
+        assert!(error.contains("mqtt/vcruntime140.dll"));
+    }
+    #[test]
+    fn an_unlisted_file_in_a_new_folder_is_rejected_case_insensitively() {
+        let directory = tempfile::tempdir().unwrap();
+        sample_package(directory.path());
+        fs::create_dir(directory.path().join("extra")).unwrap();
+        fs::write(directory.path().join("extra/Readme.TXT"), b"x").unwrap();
+        assert!(validate_package(directory.path()).is_err());
+        // Differences in case from the manifest are the same Windows file.
+        let other = tempfile::tempdir().unwrap();
+        sample_package(other.path());
+        assert!(
+            reject_unlisted_files(
+                other.path(),
+                &[
+                    "BIN/Lattice-Service.exe",
+                    "mqtt/mosquitto.exe",
+                    "mqtt/mosquitto_passwd.exe",
+                    "ui/index.html"
+                ]
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
+            )
+            .is_ok()
+        );
+    }
+    #[test]
+    fn existing_format_one_credentials_still_open_and_are_resealed() {
+        let parent = tempfile::tempdir().unwrap();
+        let state = prepare_state(&parent.path().join("private")).unwrap();
+        let secret = random_secret().unwrap();
+        // Exactly what earlier builds wrote: DPAPI without entropy.
+        let legacy = platform::protect(secret.as_bytes(), false, None).unwrap();
+        fs::write(state.join("owner.dpapi"), &legacy).unwrap();
+        let opened = load_owner(&state).unwrap();
+        assert_eq!(opened.expose_secret(), secret);
+        let resealed = fs::read(state.join("owner.dpapi")).unwrap();
+        assert_ne!(resealed, legacy);
+        assert!(platform::protect(&resealed, true, None).is_err());
+        assert_eq!(
+            platform::protect(&resealed, true, Some(platform::OWNER_ENTROPY)).unwrap(),
+            secret.as_bytes()
+        );
+        assert_eq!(load_owner(&state).unwrap().expose_secret(), secret);
+    }
+    #[test]
+    fn a_new_credential_is_sealed_with_entropy() {
+        let parent = tempfile::tempdir().unwrap();
+        let state = prepare_state(&parent.path().join("private")).unwrap();
+        load_owner(&state).unwrap();
+        let blob = fs::read(state.join("owner.dpapi")).unwrap();
+        assert!(platform::protect(&blob, true, None).is_err());
+    }
+    #[test]
+    fn an_unsigned_launcher_does_not_demand_a_collector_signature() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(verify_collector_signature(&exe, &exe).is_ok());
+    }
+    #[test]
+    fn sync_folders_are_recognised() {
+        assert!(sync_folder_warning(Path::new(r"C:\Users\p\OneDrive\NeonHearth")).is_some());
+        assert!(sync_folder_warning(Path::new(r"D:\Dropbox\hub")).is_some());
+        assert!(
+            sync_folder_warning(Path::new(r"C:\Users\p\AppData\Local\NeonHearthHomeHub")).is_none()
+        );
+    }
+    #[test]
+    fn administrator_and_shared_package_flags_parse() {
+        let options = Options::parse(vec![
+            "--allow-elevated".into(),
+            "--allow-shared-package".into(),
+        ])
+        .unwrap();
+        assert!(options.allow_elevated && options.allow_shared_package);
+        assert!(!Options::parse(vec![]).unwrap().allow_elevated);
     }
     #[test]
     fn an_unrelated_listener_never_receives_the_owner_credential() {

@@ -6,7 +6,7 @@
   import type { ApiClient, DoctorSettings, IntegrationScope, IntegrationToken, PhoneSession, RemoteStatus } from '../api/client';
   import { INTEGRATION_SCOPES } from '../api/client';
   import { formatPairingCode, type AuthState } from '../auth/session';
-  import { applyMotion, readMotion, type MotionPreference } from '../stores/preferences';
+  import { applyLetterShortcuts, applyMotion, readLetterShortcuts, readMotion, type MotionPreference } from '../stores/preferences';
   import Icon from './Icon.svelte';
 
   type SettingsClient = Pick<ApiClient, 'pairPhone' | 'remoteStatus' | 'remoteServe' | 'remoteSessions' | 'revokePhoneSession' | 'integrationTokens' | 'mintIntegrationToken' | 'revokeIntegrationToken' | 'doctorSettings' | 'updateDoctorSettings'>;
@@ -19,6 +19,8 @@
   // --- appearance
   let motion = $state<MotionPreference>('auto');
   function setMotion(next: MotionPreference) { motion = next; applyMotion(next); }
+  let letterShortcuts = $state(true);
+  function setLetterShortcuts(next: boolean) { letterShortcuts = next; applyLetterShortcuts(next); }
 
   // --- phone pairing (owner)
   let deviceLabel = $state('');
@@ -151,6 +153,7 @@
 
   onMount(() => {
     motion = readMotion();
+    letterShortcuts = readLetterShortcuts();
     if (isOwner) { void loadRemote(); void loadSessions(); void loadTokens(); void loadDoctor(); }
   });
 </script>
@@ -162,7 +165,7 @@
     <h2 id="session-heading">This session</h2>
     <dl class="settings-facts">
       <div><dt>Signed in as</dt><dd>{principal}</dd></div>
-      <div><dt>Remembered</dt><dd>{auth.remembered ? 'Until this tab closes' : 'No'}</dd></div>
+      <div><dt>Remembered</dt><dd>{auth.remembered ? "Kept in this tab's session storage (a reload stays signed in) until the tab closes or you sign out" : 'No: held in memory only'}</dd></div>
       {#if auth.stepupUntil}<div><dt>PIN unlock until</dt><dd>{new Date(auth.stepupUntil).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</dd></div>{/if}
     </dl>
     {#if auth.credential}<button type="button" class="quiet" onclick={onsignout}>Sign out</button>{/if}
@@ -174,6 +177,11 @@
     <div class="choice-row" role="group" aria-label="Motion">
       <button type="button" class="choice" class:active={motion === 'auto'} aria-pressed={motion === 'auto'} onclick={() => setMotion('auto')}>Follow system</button>
       <button type="button" class="choice" class:active={motion === 'reduced'} aria-pressed={motion === 'reduced'} onclick={() => setMotion('reduced')}>Reduce motion</button>
+    </div>
+    <p class="muted">The Home plan editor has single-letter tool shortcuts (V, H, W, R, B, O, P) and Space to pan. Turn them off if they collide with speech input or assistive technology; Escape, Delete, arrows and Ctrl+Z are unaffected.</p>
+    <div class="choice-row" role="group" aria-label="Single-letter shortcuts">
+      <button type="button" class="choice" class:active={letterShortcuts} aria-pressed={letterShortcuts} onclick={() => setLetterShortcuts(true)}>On</button>
+      <button type="button" class="choice" class:active={!letterShortcuts} aria-pressed={!letterShortcuts} onclick={() => setLetterShortcuts(false)}>Off</button>
     </div>
   </section>
 

@@ -2,10 +2,11 @@
   // Home tab: 2D plan editor + 3D twin over one shared HomeApi and live state (M5 integration · H8).
   import { onMount } from 'svelte';
   import { createHomeApi, type HomeApi, type HomeSnapshot } from '../stores/home';
-  import type { LiveState } from '../stores/live';
+  import { liveStatus, type LiveState } from '../stores/live';
   import type { AutomationSnapshot, NetworkDetails } from '../api/automation';
   import type { TwinDevice } from '../twin/geometry';
   import { motionReduced } from '../stores/preferences';
+  import { onTablistKeydown } from '../a11y';
   import HomeEditorView from './HomeEditorView.svelte';
   import HomeTwin3D from './HomeTwin3D.svelte';
   import { buildDeviceRefs, sameTwinDevices, toBandwidthMap, toTwinDeviceInfo, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
@@ -40,10 +41,12 @@
     if (!sameTwinDevices(twinCache, next)) twinCache = next;
     return twinCache;
   });
-  const presence = $derived(toPresenceMap(liveState.devices));
+  // Pins only claim a presence or a heat colour while the collector is live; otherwise they show as unknown.
+  const live = $derived(liveStatus(liveState) === 'live');
+  const presence = $derived(live ? toPresenceMap(liveState.devices) : {});
   // Evidence and last-seen change with live frames; they feed the twin's detail card only, never its scene.
   const deviceInfo = $derived(toTwinDeviceInfo(liveState.devices));
-  const bandwidth = $derived(toBandwidthMap(liveState.devices));
+  const bandwidth = $derived(live ? toBandwidthMap(liveState.devices) : {});
   const selectedName = $derived(
     selectedDeviceId === null
       ? null
@@ -94,14 +97,19 @@
 
 <section class="home-view" aria-label="Home">
   <div class="home-topbar">
-    <div class="home-tabs" role="tablist" aria-label="Home views">
-      <button type="button" role="tab" id="home-tab-editor" aria-selected={tab === 'editor'} aria-controls="home-panel-editor" onclick={() => openTab('editor')}>Plan editor</button>
-      <button type="button" role="tab" id="home-tab-twin" aria-selected={tab === 'twin'} aria-controls="home-panel-twin" onclick={() => openTab('twin')}>3D view</button>
+    <!-- svelte-ignore a11y_interactive_supports_focus -->
+    <div class="home-tabs" role="tablist" aria-label="Home views" onkeydown={onTablistKeydown}>
+      <button type="button" role="tab" id="home-tab-editor" tabindex={tab === 'editor' ? 0 : -1} aria-selected={tab === 'editor'} aria-controls="home-panel-editor" onclick={() => openTab('editor')}>Plan editor</button>
+      <button type="button" role="tab" id="home-tab-twin" tabindex={tab === 'twin' ? 0 : -1} aria-selected={tab === 'twin'} aria-controls="home-panel-twin" onclick={() => openTab('twin')}>3D view</button>
     </div>
     {#if selectedName}
       <p class="home-selection" role="status">Selected device: <strong>{selectedName}</strong></p>
     {/if}
   </div>
+
+  {#if !live && liveState.deviceOrder.length > 0}
+    <div class="home-banner" role="status">Collector offline. Device presence and heat are not shown live; pins appear as unknown until the connection returns.</div>
+  {/if}
 
   {#if fallbackNotice}
     <div class="home-banner" role="status">
@@ -121,7 +129,7 @@
       <p class="home-banner">{automation.devices.length} Home Assistant devices are available in the placement tray. Reported rooms: {automation.areas.join(', ') || 'none'}. Draw the rooms to match your home, then place each device. Room names do not establish physical coordinates.</p>
     {/if}
     <div id="home-panel-editor" role="tabpanel" aria-labelledby="home-tab-editor" hidden={tab !== 'editor'}>
-      <HomeEditorView api={homeApi} devices={deviceRefs} {snapshot} onsnapshot={onSnapshot} />
+      <HomeEditorView api={homeApi} devices={deviceRefs} {snapshot} onsnapshot={onSnapshot} active={tab === 'editor'} />
     </div>
     {#if twinVisited}
       <div id="home-panel-twin" role="tabpanel" aria-labelledby="home-tab-twin" hidden={tab !== 'twin'}>
@@ -151,7 +159,7 @@
   .home-topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
   .home-tabs { display: flex; gap: 7px; }
   .home-tabs button { min-height: 44px; padding: 9px 15px; border: 1px solid var(--line-strong); border-radius: 5px; background: transparent; color: var(--ink); font: 600 12px var(--font-display); cursor: pointer; }
-  .home-tabs button[aria-selected='true'] { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 14px var(--accent)14; }
+  .home-tabs button[aria-selected='true'] { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 14px color-mix(in srgb, var(--accent) 8%, transparent); }
   .home-selection { margin: 0; color: var(--muted-strong); font: 11px var(--font-mono); }
   .home-selection strong { color: var(--accent); font-weight: 700; }
   .home-banner { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px 14px; border: 1px solid var(--gold); border-radius: 8px; background: var(--surface); color: var(--ink); font-size: 12px; }
