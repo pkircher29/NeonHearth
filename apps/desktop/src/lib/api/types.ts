@@ -79,8 +79,16 @@ export type ServerMessage =
   | { type: 'event'; data: EventEnvelope }
   | { type: 'resync_required' };
 
+/** Whether the service trusts the system clock for deadline-driven enforcement. */
+export interface ClockStatus {
+  status: 'trusted' | 'suspect';
+  detail: string | null;
+}
+
 export interface Snapshot {
   sequence: number;
+  /** Absent when talking to a service that predates the clock gate. */
+  clock?: ClockStatus;
   /** Identifies the service run `sequence` belongs to; presented as `epoch` when opening the event stream. */
   events_epoch?: string;
   devices: DeviceSnapshot[];

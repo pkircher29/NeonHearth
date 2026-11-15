@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ApiClient, OwnerActionInput } from '../api/client';
+  import type { ClockStatus } from '../api/types';
   import { liveStatus, type GuardPolicy, type LiveState } from '../stores/live';
 
   import type { NetworkDetails } from '../api/automation';
@@ -8,7 +9,7 @@
   import { findingsByDevice, recognizeDevice } from '../deviceRecognition';
   import DeviceNameConfirmation from './DeviceNameConfirmation.svelte';
   import DeviceWebLinks from './DeviceWebLinks.svelte';
-  type PolicyActionClient = Pick<ApiClient, 'policyAction'>;
+  type PolicyActionClient = Pick<ApiClient, 'policyAction'> & Partial<Pick<ApiClient, 'acknowledgeClock'>>;
   type Decision = 'approve' | 'reject' | 'quarantine';
 
   // The prop keeps its public name `state`; the local alias avoids shadowing
@@ -19,6 +20,26 @@
   // One freshness signal: while the collector is unreachable every card is last-known, and owner decisions are not sent into the void.
   const status = $derived(liveStatus(live));
   const offline = $derived(status !== 'live');
+  // The service pauses deadline-driven quarantine while its clock gate is suspect. A confirmed
+  // acknowledgement is shown at once; the next snapshot carries the same value.
+  let clockOverride = $state<ClockStatus | null>(null);
+  let clockBusy = $state(false);
+  let clockError = $state<string | null>(null);
+  const clock = $derived(clockOverride ?? live.clock);
+  // A newer snapshot is authoritative over the local acknowledgement.
+  $effect(() => { void live.clock; clockOverride = null; });
+  async function acknowledgeClock(): Promise<void> {
+    if (!client?.acknowledgeClock || offline) return;
+    clockBusy = true;
+    clockError = null;
+    try {
+      clockOverride = await client.acknowledgeClock();
+    } catch (cause) {
+      clockError = `Could not confirm the clock: ${cause instanceof Error ? cause.message : 'request failed'}`;
+    } finally {
+      clockBusy = false;
+    }
+  }
   const policies = $derived(Object.values(live.policies).sort((a, b) => rank(b) - rank(a)));
   const attention = $derived(policies.filter((policy) => policy.requested_action !== 'none').length);
   const verified = $derived(policies.filter((policy) => policy.enforcement_result === 'verified').length);
@@ -116,6 +137,14 @@
   <p class="muted capability-note">This collector records network decisions; router blocking requires manual action. Reject or Quarantine does not by itself block a device. A block is confirmed only by a Verified enforcement result. Device naming and Home Assistant power permissions are separate.</p>
 
   {#if offline}<div class="offline-banner" role="alert"><strong>Collector offline.</strong> These policy records are the last known, not live. Owner decisions are disabled until the connection returns.</div>{/if}
+  {#if clock?.status === 'suspect'}
+    <div class="offline-banner clock-notice" role="alert">
+      <strong>This computer's clock changed unexpectedly, so automatic quarantine deadlines are paused.</strong>
+      <p class="muted">Until you confirm the clock is right, a passed deadline will only ask for your attention instead of quarantining a device. Your own decisions still apply.{#if clock.detail} Detected: {clock.detail}.{/if}</p>
+      {#if client?.acknowledgeClock}<button type="button" class="act" disabled={clockBusy || offline} onclick={() => void acknowledgeClock()}>Confirm the clock is correct</button>{/if}
+      {#if clockError}<p class="action-error" role="alert">{clockError}</p>{/if}
+    </div>
+  {/if}
   <div class="guard-meter" class:active={attention > 0}>
     <div class="guard-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
     <div><strong>{attention}</strong><span>need attention</span></div>

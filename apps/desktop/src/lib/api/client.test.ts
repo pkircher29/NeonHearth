@@ -393,6 +393,22 @@ describe('createApiClient', () => {
     expect(sockets[0]).not.toContain('secret-service-token');
   });
 
+  it('parses the optional clock status, carries it through snapshotAll, and posts the acknowledgement', async () => {
+    const clock = { status: 'suspect', detail: 'system clock jumped far forward' };
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => String(input).endsWith('/api/v1/clock/acknowledge')
+      ? new Response(JSON.stringify({ status: 'trusted', detail: null }), { status: 200 })
+      : new Response(JSON.stringify({ sequence: 3, clock, devices: [], next_after: null, service_status: 'ready' }), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+
+    await expect(client.snapshotAll()).resolves.toMatchObject({ sequence: 3, clock });
+    await expect(client.acknowledgeClock()).resolves.toEqual({ status: 'trusted', detail: null });
+    const call = fetchImpl.mock.calls.find(([input]) => String(input).endsWith('/api/v1/clock/acknowledge'))!;
+    expect((call[1] as RequestInit).method).toBe('POST');
+
+    const bad = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify({ sequence: 1, clock: { status: 'odd' }, devices: [], next_after: null, service_status: 'ready' }), { status: 200 })) });
+    await expect(bad.snapshot()).rejects.toThrow('Invalid snapshot response');
+  });
+
   it('presents the snapshot events epoch when opening the event stream', async () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => String(input).includes('/api/v1/state')
       ? new Response(JSON.stringify({ sequence: 7, events_epoch: '1800000000123456789', devices: [], next_after: null, service_status: 'ready' }), { status: 200 })
