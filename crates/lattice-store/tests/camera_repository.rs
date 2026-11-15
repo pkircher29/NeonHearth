@@ -292,9 +292,10 @@ async fn writes_limits_schema_columns_checks_and_indexes_are_complete() -> anyho
             .iter()
             .any(|name| name == "camera_evidence_expiry_idx")
     );
-    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-        .fetch_one(&pool)
-        .await?;
+    let version: i64 =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version=23 AND success=1")
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(version, 23);
     Ok(())
 }

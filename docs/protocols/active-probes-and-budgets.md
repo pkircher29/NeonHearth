@@ -130,9 +130,13 @@ parks until that deadline, the next retry, enqueue/completion/stop, result capac
 receiver closure. There is no fixed-interval queue polling. Dropping the result receiver
 initiates shared stop, and `start()` returns a joinable coordinator handle.
 
-Only timeout outcomes and typed transient network failures retry. Unauthorized targets,
-missing approval or credentials, invalid configuration/protocol data, correlation and
-response-limit failures are terminal. Retry state is keyed by interface, numeric target,
+Only timeout outcomes and typed transient network failures (`ActiveError::Network`, reserved
+for socket-level failures such as connect, send, or receive errors) retry. A reply that is
+received but violates the probe's protocol (a malformed DNS, SSDP, SNMP, or WS-Discovery
+response) is reported as `ActiveError::Protocol` and is terminal, so a non-conforming device
+is probed once per schedule rather than once per retry. Unauthorized targets, missing
+approval or credentials, invalid configuration, correlation and response-limit failures are
+terminal. Retry state is keyed by interface, numeric target,
 and probe ID; exponential delay is capped at 60 seconds, jitter is bounded by policy, and
 the default permits at most five retries. Successful, refused, and terminal attempts reset
 their failure state. Host, subnet, retry, and failure maps have explicit capacities and a

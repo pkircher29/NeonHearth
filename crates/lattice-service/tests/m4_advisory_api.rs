@@ -436,6 +436,7 @@ async fn openapi_documents_advisory_route_and_security() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/openapi.json")
+                .header("authorization", format!("Bearer {TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )

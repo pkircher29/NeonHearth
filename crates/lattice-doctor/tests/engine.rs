@@ -12,6 +12,7 @@ use lattice_doctor::probe::{
     DnsFailureReason, FakeProbeTransport, LeaseState, ProbeError, ProbeRequest, ProbeResponse,
     RouteEntry,
 };
+use lattice_doctor::repair::{ApprovalAction, RepairContext, RepairPlan, plan_repair};
 use std::sync::Mutex;
 
 fn config() -> DoctorConfig {
@@ -375,19 +376,77 @@ async fn weak_wifi_and_route_conflict_and_wan_isolation_are_diagnosed() {
             .iter()
             .any(|d| matches!(&d.kind, DiagnosisKind::RouteVpnConflict { default_routes } if default_routes.len() == 2))
     );
-    // Route conflict fails RouteVpn, so internet reachability is skipped, not
-    // separately diagnosed.
+    // A route conflict is reported with its detail but gates nothing: a VPN
+    // user still learns whether the WAN is reachable (M-16).
     assert_eq!(
         report
             .check(CheckKind::InternetReachability)
             .unwrap()
             .status,
-        CheckStatus::Skipped {
-            because: SkipReason::DependencyFailed {
-                dependency: CheckKind::RouteVpn
-            }
-        }
+        CheckStatus::Passed
     );
+}
+
+/// M-16: a DNS-only outage must not hide a healthy WAN. The internet probe
+/// is by IP and runs even when every resolver fails.
+#[tokio::test]
+async fn dns_outage_does_not_skip_the_internet_check() {
+    let transport = FakeProbeTransport::new(|request| match request {
+        ProbeRequest::DnsQuery { .. } => Ok(ProbeResponse::DnsFailure {
+            reason: DnsFailureReason::Timeout,
+        }),
+        other => healthy(other),
+    });
+    let report = engine_with(64).run(&transport).await;
+    assert_eq!(
+        report.check(CheckKind::Dns).unwrap().status,
+        CheckStatus::Failed
+    );
+    assert_eq!(
+        report
+            .check(CheckKind::InternetReachability)
+            .unwrap()
+            .status,
+        CheckStatus::Passed
+    );
+}
+
+/// M-16: with the gateway down the internet probe still runs, so the
+/// "both sides down" diagnosis — and its approval-gated router reboot — is
+/// reachable instead of dead code.
+#[tokio::test]
+async fn gateway_and_internet_both_down_plan_a_router_reboot() {
+    let transport = FakeProbeTransport::new(|request| match request {
+        ProbeRequest::Ping {
+            dont_fragment: false,
+            ..
+        } => Ok(ProbeResponse::PingTimeout),
+        ProbeRequest::ReachIp { .. } => Ok(ProbeResponse::Unreachable),
+        other => healthy(other),
+    });
+    let report = engine_with(64).run(&transport).await;
+    let diagnoses = diagnose(&report);
+    assert!(
+        diagnoses
+            .iter()
+            .any(|d| d.kind == DiagnosisKind::GatewayUnreachable)
+    );
+    let both_down = diagnoses
+        .iter()
+        .find(|d| d.kind == DiagnosisKind::InternetUnreachable { lan_ok: false })
+        .expect("LAN-side outage is diagnosed");
+    let context = RepairContext {
+        interface: "eth0".into(),
+        lease_renewal_severs_only_management_path: false,
+        fallback_dns_servers: vec!["9.9.9.9".into()],
+    };
+    assert!(matches!(
+        plan_repair(&both_down.kind, &context),
+        RepairPlan::ApprovalRequiredReversible {
+            action: ApprovalAction::RebootRouter,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

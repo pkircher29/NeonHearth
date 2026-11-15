@@ -1,6 +1,6 @@
 # Supply-chain gates (RLS6)
 
-Status date: 2026-08-24. This document records the dependency vulnerability,
+Status date: 2026-09-06. This document records the dependency vulnerability,
 license, provenance/SBOM, and reproducible-build gates for the workspace, how
 to run them locally, and what is honestly in place versus not yet.
 
@@ -8,7 +8,7 @@ to run them locally, and what is honestly in place versus not yet.
 
 | Gate | Tool | Where it runs | Failure policy |
 |---|---|---|---|
-| Vulnerability advisories | `cargo deny check advisories` (RustSec DB) | CI `deny` job + local | Vulnerable/unsound/yanked crates fail; unmaintained warns; 20 triaged ignores pending upgrades (see "Action required") |
+| Vulnerability advisories | `cargo deny check advisories` (RustSec DB) | CI `deny` job + local | Vulnerable/unsound/yanked crates fail; unmaintained warns; no vulnerability exceptions |
 | License compliance | `cargo deny check licenses` | CI `deny` job + local | Any license outside the allowlist fails |
 | Banned crates / duplicate versions | `cargo deny check bans` | CI `deny` job + local | openssl/native-tls/git2/curl fail; duplicate versions and path wildcards warn |
 | Source provenance | `cargo deny check sources` | CI `deny` job + local | Anything not from crates.io fails (no git deps, no alternate registries) |
@@ -17,7 +17,14 @@ to run them locally, and what is honestly in place versus not yet.
 | Toolchain evidence | `rustc --version --verbose` printed in CI log | CI `rust` and `sbom` jobs | Informational (required by docs/build/toolchain.md) |
 
 Configuration lives in `deny.toml` at the repo root. CI is
-`.github/workflows/ci.yml` (jobs: `rust`, `deny`, `web`, `sbom`).
+`.github/workflows/ci.yml` (jobs: `rust`, `deny`, `web`, `e2e`, `sbom`).
+
+Since 2026-09-03 every third-party action in that workflow is pinned to a
+full commit SHA with the resolved tag in a trailing comment (a floating
+`@vN` tag made the gate itself mutable), and `cargo-cyclonedx` is installed
+at an exact version. The `e2e` job runs the Playwright specs under
+`apps/desktop/e2e` (the M5 browser gate) against the Vite dev server with
+route-mocked APIs; it was previously local-only.
 
 ## Running the gates locally
 
@@ -52,8 +59,14 @@ are not committed).
 
 ## License allowlist rationale
 
-The shipped product is proprietary; strong copyleft in third-party
-dependencies is a defect. Policy encoded in `deny.toml`:
+The workspace's own crates are licensed `AGPL-3.0-or-later` (`Cargo.toml`
+`[workspace.package].license`; `packaging/linux/nfpm.yaml` declares the same
+for the packages). An earlier revision of this section called the product
+"proprietary"; that was wrong and contradicted both files. The allowlist
+policy below is unchanged by the correction: it exists so that no
+*third-party* copyleft obligation can attach to the shipped binaries other
+than the project's own, and so that a permissive-only redistribution of
+individual components stays possible. Policy encoded in `deny.toml`:
 
 - **Allowed (permissive):** MIT, Apache-2.0 (incl. `WITH LLVM-exception`),
   BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0. Standard permissive
@@ -66,35 +79,44 @@ dependencies is a defect. Policy encoded in `deny.toml`:
   (cargo-deny warns on unused allowances, and the allowlist is kept exact).
   Policy if a dependency introduces it: MPL-2.0 is file-level copyleft —
   obligations attach to the MPL-licensed files themselves, not the combined
-  work — so an *unmodified* MPL crate is acceptable in a proprietary binary;
-  add it to the allowlist with a comment naming the crate.
+  work — so an *unmodified* MPL crate is acceptable alongside the project's
+  AGPL code; add it to the allowlist with a comment naming the crate.
 - **GPL family (GPL/LGPL/AGPL) — NOT allowed for dependencies.** The
   workspace's own crates carry `license = "AGPL-3.0-or-later"` in
   `Cargo.toml`; they are permitted via per-crate `exceptions` entries in
   `deny.toml` so that AGPL can never silently enter through a third-party
-  crate. (Note: the eventual outbound licensing of the product is a business
-  decision outside this gate's scope; the gate's job is that no *third-party*
-  copyleft obligations attach to the shipped binaries.)
+  crate. (The gate's job is that no *third-party* copyleft obligation
+  attaches to the shipped binaries; the project's own AGPL terms are the
+  outbound license.)
 
 Adding a new license to the allowlist requires: identifying which crate needs
-it, confirming the license text's obligations are compatible with proprietary
-distribution, and recording the rationale here in the same commit.
+it, confirming the license text's obligations are compatible with AGPL
+distribution of the combined work, and recording the rationale here in the
+same commit.
 
-## Action required: temporarily accepted advisories (2026-08-24)
+## Security dependency updates (2026-09-06)
 
-`cargo deny check` passes today only because 20 RustSec advisories are listed
-under `[advisories].ignore` in `deny.toml`. None of them can be fixed by a
-lockfile update — every fix requires a semver-incompatible version bump in
-`Cargo.toml`, which is owned by the affected feature lanes. These are open
-defects, not permanent acceptances:
+The home-hub branch removes all 20 historical advisory exceptions. The gate
+passes with an empty `[advisories].ignore` list. Resolved versions:
 
-| Crate (pinned) | Advisories | Fix |
+| Dependency | Version | Relevant remediation |
 |---|---|---|
-| `wasmtime = "27"` (only `lattice-audit-wasm`) | RUSTSEC-2025-0046, -2025-0118, -2026-0020/0021/0085–0089/0091–0096/0222 (16 total; includes sandbox-escape classes, several specific to Winch/aarch64/pooling-allocator/component-model configurations we do not use) | Upgrade to a maintained line (>=43.0.1, ideally >=47.0.3), then delete the wasmtime ignore block |
-| `hickory-proto = "0.25"` (DNS parsing, `lattice-sensor`) | RUSTSEC-2026-0118 (DNSSEC NSEC3 unbounded loop — no fixed release published; we do not enable `DnssecDnsHandle`), RUSTSEC-2026-0119 (encoder CPU amplification — fixed in 0.26.1) | Bump to 0.26.x; re-check -0118 for a fixed release |
-| `quick-xml = "0.38"` (SSDP/device XML) | RUSTSEC-2026-0194, -2026-0195 (quadratic/unbounded parsing DoS — fixed in 0.41.0) | Bump to 0.41.x |
+| Wasmtime | 36.0.14 | Maintained LTS patches, including RUSTSEC-2026-0269; the audit host now uses a bounded scoped request channel for the updated owned Store API |
+| hickory-proto | 0.26.2 | DNS encoding fix and removal of the affected DNSSEC handle from this crate |
+| quick-xml | 0.41.0 | Bounded namespace declarations and linear duplicate-attribute checks |
+| chacha20 | 0.10.2 | Replaces yanked 0.10.1 pulled by the new DNS dependency |
 
-New advisories against any other crate still fail CI immediately.
+Upstream sources:
+[Wasmtime advisory](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vqjp-4c8c-hfgg),
+[Hickory NSEC3](https://rustsec.org/advisories/RUSTSEC-2026-0118.html),
+[Hickory encoder](https://rustsec.org/advisories/RUSTSEC-2026-0119.html),
+[XML attributes](https://rustsec.org/advisories/RUSTSEC-2026-0194.html),
+[XML namespaces](https://rustsec.org/advisories/RUSTSEC-2026-0195.html).
+
+The new local audit returned `advisories ok, bans ok, licenses ok, sources ok`.
+This is a dependency gate, not proof of absence of application vulnerabilities.
+Fresh native runtime and browser evidence belongs in
+[home-hub verification](../owner/home-hub-verification.md).
 
 Also pending (warnings, not errors):
 
@@ -123,9 +145,12 @@ In place:
 
 - `Cargo.lock` and `apps/desktop/package-lock.json` are committed; CI builds
   from lockfiles (`npm ci`; cargo uses the lockfile by default).
-- `rust-toolchain.toml` pins the `stable` channel with pinned components, and
-  CI prints `rustc --version --verbose` so every run records the exact
-  resolved compiler (per `docs/build/toolchain.md`).
+- `rust-toolchain.toml` pins the exact release `1.96.0` (since 2026-09-03;
+  previously the floating `stable` channel) with pinned components, and CI
+  prints `rustc --version --verbose` so every run records the resolved
+  compiler (per `docs/build/toolchain.md`).
+- Every GitHub Action in CI is pinned to a commit SHA, and `cargo-cyclonedx`
+  to an exact version.
 - Node major version is pinned to 22 in CI, matching the recorded baseline.
 
 NOT yet in place — do not claim reproducibility beyond this:
@@ -134,16 +159,13 @@ NOT yet in place — do not claim reproducibility beyond this:
   have been compared. Rust binaries embed absolute paths and other host
   details by default; no `--remap-path-prefix`/`trim-paths`, `SOURCE_DATE_EPOCH`,
   or normalized-environment work has been done.
-- The `stable` channel pin resolves to *different* compiler versions over
-  time; exact-version reproduction requires reading the recorded version from
-  the CI log or release evidence and installing that toolchain explicitly.
 - Vite/npm build output has not been checked for determinism (hashing,
   timestamps).
 - SBOMs are generated per build but are not yet signed, and no attestation
   (SLSA provenance) is produced. Artifact signing is tracked separately as
   RLS7.
 
-## Local verification evidence (2026-08-24, Windows 11 dev box)
+## Historical verification evidence (2026-08-24, Windows 11 dev box)
 
 `cargo deny check` (cargo-deny 0.20.2), final output:
 
@@ -179,7 +201,7 @@ crates\lattice-audit-wasm\lattice-audit-wasm.cdx.json (218,210 bytes)
 The generated `*.cdx.json` files were deleted after verification — SBOMs are
 CI artifacts, not repo files.
 
-## Known local-run caveats (2026-08-24)
+## Historical local-run caveats (2026-08-24; not the current branch)
 
 - `cargo fmt --all -- --check` currently fails on in-flight files owned by
   concurrent work lanes (`crates/lattice-service/src/home.rs`,

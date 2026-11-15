@@ -33,6 +33,9 @@ Group=neonhearth
 ExecStart=/usr/libexec/neonhearth/lattice-service
 EnvironmentFile=/etc/neonhearth/service.env
 Environment=LATTICE_STATE_BASE=/var/lib
+# Serve the installed UI bundle at http://127.0.0.1:58120/ (read-only data
+# under /usr, reachable despite ProtectSystem=strict).
+Environment=LATTICE_UI_DIR=/usr/share/neonhearth/ui
 
 # State ownership
 StateDirectory=neonhearth

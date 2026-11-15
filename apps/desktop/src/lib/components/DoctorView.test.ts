@@ -191,6 +191,31 @@ describe('DoctorView', () => {
     expect(rollbackAlert?.textContent).toContain('restore timed out');
   });
 
+  it('shows a distinct reload state when the report cannot be loaded, never the empty state (M-30)', async () => {
+    const doctorReport = vi.fn().mockRejectedValueOnce(new Error('Request failed with status 503')).mockResolvedValue(envelope([routerFinding]));
+    render(DoctorView, { client: fakeClient({ doctorReport }) });
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Could not load the latest diagnostic'));
+    expect(screen.queryByText('No diagnostic has run yet')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    await waitFor(() => screen.getByRole('button', { name: 'Repair Router fault' }));
+    expect(doctorReport).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the run action disabled while a repair is in flight and keys repairs to the run', async () => {
+    let resolveRepair!: (report: RepairReport) => void;
+    const client = fakeClient({
+      doctorReport: vi.fn(async () => envelope([routerFinding])),
+      doctorRepair: vi.fn(() => new Promise<RepairReport>((resolve) => { resolveRepair = resolve; }))
+    });
+    render(DoctorView, { client });
+    await waitFor(() => screen.getByRole('button', { name: 'Repair Router fault' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Repair Router fault' }));
+    expect((screen.getByRole('button', { name: 'Run diagnostic' }) as HTMLButtonElement).disabled).toBe(true);
+    resolveRepair(verifiedRepair());
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run diagnostic' }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
   it('surfaces a concurrent diagnostic run as an inline alert', async () => {
     const client = fakeClient({ doctorRun: vi.fn(async () => ({ status: 'already_running' as const })) });
     render(DoctorView, { client });

@@ -31,8 +31,13 @@ impl PolicyEngine {
     }
 
     pub fn is_baseline_member(self, first_seen_at: DateTime<Utc>) -> bool {
-        first_seen_at >= self.baseline_started_at
-            && first_seen_at < self.baseline_started_at + BASELINE_WINDOW
+        // A baseline start so late that the window overflows the calendar is
+        // a corrupt install timestamp; nothing joins the baseline from it.
+        self.baseline_started_at
+            .checked_add_signed(BASELINE_WINDOW)
+            .is_some_and(|window_end| {
+                first_seen_at >= self.baseline_started_at && first_seen_at < window_end
+            })
     }
 
     pub fn evaluate(self, device: &DevicePolicy, now: DateTime<Utc>) -> Evaluation {
@@ -86,15 +91,21 @@ impl PolicyEngine {
         let (kind, original_due, expired_reason) = if automatically_identified {
             (
                 DeadlineKind::Automatic7Days,
-                device.first_seen_at + AUTOMATIC_DEADLINE,
+                device.first_seen_at.checked_add_signed(AUTOMATIC_DEADLINE),
                 PolicyReason::AutomaticDeadlineExpired,
             )
         } else {
             (
                 DeadlineKind::Unknown48Hours,
-                device.first_seen_at + UNKNOWN_DEADLINE,
+                device.first_seen_at.checked_add_signed(UNKNOWN_DEADLINE),
                 PolicyReason::UnknownDeadlineExpired,
             )
+        };
+        // A persisted `first_seen_at` near the end of the calendar cannot carry
+        // a deadline. Chrono's `+` would panic here and take the evaluator
+        // down; instead fail closed to the owner, who can decide by hand.
+        let Some(original_due) = original_due else {
+            return Evaluation::owner_attention();
         };
 
         let due_at = device

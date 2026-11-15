@@ -46,6 +46,10 @@ impl fmt::Display for InvalidServiceToken {
 impl std::error::Error for InvalidServiceToken {}
 #[derive(Clone)]
 pub struct AppState {
+    network_monitor: crate::network_monitor::NetworkMonitor,
+    host_monitor: crate::host_monitor::HostMonitor,
+    scans: crate::network_scan::ScanHub,
+    automation: crate::automation::AutomationHub,
     token: SecretString,
     events: EventBus,
     state_repository: M2StateRepository,
@@ -69,6 +73,12 @@ impl AppState {
             return Err(InvalidServiceToken);
         }
         Ok(Self {
+            network_monitor: crate::network_monitor::NetworkMonitor::new(
+                state_repository.pool().clone(),
+            ),
+            host_monitor: crate::host_monitor::HostMonitor::new(state_repository.pool().clone()),
+            scans: crate::network_scan::ScanHub::new(state_repository.pool().clone()),
+            automation: crate::automation::AutomationHub::new(state_repository.pool().clone()),
             token: SecretString::from(token),
             events: EventBus::new(4096, 1024),
             state_repository,
@@ -91,6 +101,18 @@ impl AppState {
     }
     pub fn events(&self) -> &EventBus {
         &self.events
+    }
+    pub fn host_monitor(&self) -> &crate::host_monitor::HostMonitor {
+        &self.host_monitor
+    }
+    pub fn network_monitor(&self) -> &crate::network_monitor::NetworkMonitor {
+        &self.network_monitor
+    }
+    pub fn automation(&self) -> &crate::automation::AutomationHub {
+        &self.automation
+    }
+    pub fn scans(&self) -> &crate::network_scan::ScanHub {
+        &self.scans
     }
     pub async fn service_status(&self) -> String {
         self.service_status.lock().await.as_str().to_owned()

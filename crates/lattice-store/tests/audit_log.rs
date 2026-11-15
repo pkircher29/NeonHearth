@@ -1,8 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use lattice_store::{
     AppendedEntry, AuditActor, AuditCategory, AuditFilter, AuditLog, AuditLogError, AuditPage,
-    ChainBreakKind, ChainScope, MAX_ACTION_BYTES, MAX_DETAIL_BYTES, NewAuditEntry, connect_memory,
-    connect_path, genesis_hash,
+    ChainBreakKind, ChainHead, ChainScope, MAX_ACTION_BYTES, MAX_DETAIL_BYTES, NewAuditEntry,
+    connect_memory, connect_path, genesis_hash,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -371,5 +371,137 @@ async fn oversized_fields_are_rejected_before_any_write() -> anyhow::Result<()> 
         .fetch_one(&pool)
         .await?;
     assert_eq!(count, 0);
+    Ok(())
+}
+
+/// H-3: an append that is cancelled (its future dropped) part-way through
+/// must not leave its pooled connection holding an open `BEGIN IMMEDIATE`.
+/// With a raw BEGIN on a `PoolConnection` the connection went back to the
+/// pool mid-transaction and the next writer failed ("cannot start a
+/// transaction within a transaction" on that connection, or "database is
+/// locked" on any other). An sqlx `Transaction` alone was not enough either:
+/// `begin_with` has a second await after BEGIN has executed, and a cancel in
+/// that window reproducibly left the lock held (step 3 of this sweep). The
+/// transactional section therefore runs on a detached task.
+///
+/// The cancellation point is swept with a growing delay so it lands before,
+/// inside, and after the transaction window; a correct implementation passes
+/// every iteration, so the test is deterministic on the passing side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_append_never_leaves_the_write_lock_held() -> anyhow::Result<()> {
+    let directory = tempdir()?;
+    let pool = connect_path(directory.path().join("audit.db")).await?;
+    let log = AuditLog::new(pool.clone());
+
+    for step in 0..48u64 {
+        let cancelled = tokio::spawn({
+            let log = log.clone();
+            async move { log.append(entry(i64::try_from(step).unwrap())).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_micros(step * 25)).await;
+        cancelled.abort();
+        let _ = cancelled.await;
+
+        // Whatever happened to the cancelled append, the next writer must go
+        // straight through on a clean connection.
+        log.append(entry(1_000 + i64::try_from(step).unwrap()))
+            .await?;
+    }
+
+    let report = log.verify_chain(ChainScope::All).await?;
+    assert!(report.is_valid(), "chain broke: {report:?}");
+    // Every append that committed is contiguous; every cancelled one left
+    // nothing behind.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(u64::try_from(count)?, report.checked);
+    Ok(())
+}
+
+/// M-14: the chain carries no secret, so a writer that rewrites it
+/// consistently is invisible to `verify_chain`. An out-of-band head
+/// commitment closes that gap: a chain truncated below the committed head,
+/// or carrying a different hash at the committed id, is reported as
+/// `HeadMismatch` even though every remaining link verifies.
+#[tokio::test]
+async fn out_of_band_head_commitment_detects_a_rewritten_chain() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    let log = AuditLog::new(pool.clone());
+
+    // An empty log commits to the genesis root.
+    let empty = log.head().await?;
+    assert_eq!(
+        empty,
+        ChainHead {
+            id: 0,
+            entry_hash: genesis_hash()
+        }
+    );
+    assert!(
+        log.verify_chain_against(ChainScope::All, Some(&empty))
+            .await?
+            .is_valid()
+    );
+
+    let mut fifth = None;
+    for index in 0..5 {
+        fifth = Some(log.append(entry(index)).await?);
+    }
+    let head = log.head().await?;
+    let fifth = fifth.unwrap();
+    assert_eq!(head.id, 5);
+    assert_eq!(head.entry_hash, fifth.entry_hash);
+
+    // The log growing past the commitment is fine: the committed entry is
+    // still there with the committed hash.
+    for index in 5..8 {
+        log.append(entry(index)).await?;
+    }
+    let grown = log
+        .verify_chain_against(ChainScope::All, Some(&head))
+        .await?;
+    assert!(grown.is_valid(), "{grown:?}");
+    assert_eq!(grown.checked, 8);
+
+    // A tail window that does not reach the committed id still checks it.
+    let tail = log
+        .verify_chain_against(ChainScope::Tail(2), Some(&head))
+        .await?;
+    assert!(tail.is_valid(), "{tail:?}");
+
+    // Truncate the chain below the commitment by raw SQL. The remaining
+    // prefix is internally consistent, so plain verification passes...
+    sqlx::query("DROP TRIGGER audit_log_no_delete")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM audit_log WHERE id >= 5")
+        .execute(&pool)
+        .await?;
+    let plain = log.verify_chain(ChainScope::All).await?;
+    assert!(plain.is_valid());
+    assert_eq!(plain.end_id, Some(4));
+
+    // ...but the commitment does not.
+    let against = log
+        .verify_chain_against(ChainScope::All, Some(&head))
+        .await?;
+    assert!(!against.is_valid());
+    let broke = against.first_break.unwrap();
+    assert_eq!(broke.id, 5);
+    assert_eq!(broke.kind, ChainBreakKind::HeadMismatch);
+
+    // A commitment with the right id but a different hash is also caught.
+    let forged = ChainHead {
+        id: 4,
+        entry_hash: fifth.entry_hash.clone(),
+    };
+    let against = log
+        .verify_chain_against(ChainScope::All, Some(&forged))
+        .await?;
+    assert_eq!(
+        against.first_break.map(|b| b.kind),
+        Some(ChainBreakKind::HeadMismatch)
+    );
     Ok(())
 }

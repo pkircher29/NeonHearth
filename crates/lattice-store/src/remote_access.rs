@@ -75,6 +75,15 @@ pub struct PhoneSessionRow {
     pub pin_locked_until: Option<DateTime<Utc>>,
 }
 
+/// The accounting that resulted from one atomically recorded PIN failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinFailureOutcome {
+    /// Failures charged inside the current window, this one included.
+    pub failed_count: u32,
+    /// Set when this failure locked the session.
+    pub locked_until: Option<DateTime<Utc>>,
+}
+
 /// The hash-free projection served to the owner session list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhoneSessionSummary {
@@ -291,26 +300,61 @@ impl RemoteAccessRepository {
         Ok(())
     }
 
-    /// Writes the caller-computed PIN failure accounting for one session.
+    /// Records one failed PIN attempt atomically and returns the resulting
+    /// accounting.
+    ///
+    /// The window check, the counter increment, and the lock decision all
+    /// happen inside a single `UPDATE ... RETURNING`, so concurrent failures
+    /// can never observe the same stale count: N parallel wrong guesses are
+    /// charged as N failures, not one. A window is live while it started less
+    /// than `window` ago; otherwise the failure opens a new window at `now`.
+    /// Reaching `max_failures` inside a live window locks the session until
+    /// `now + window`. Returns `None` when no such session exists.
     pub async fn record_pin_failure(
         &self,
         id: Uuid,
-        failed_count: u32,
-        window_started_at: DateTime<Utc>,
-        locked_until: Option<DateTime<Utc>>,
-    ) -> Result<(), RemoteAccessStoreError> {
-        sqlx::query(
-            "UPDATE phone_sessions SET pin_failed_count = ?, pin_window_started_at = ?, \
-             pin_locked_until = ? WHERE id = ?",
+        now: DateTime<Utc>,
+        window: chrono::Duration,
+        max_failures: u32,
+    ) -> Result<Option<PinFailureOutcome>, RemoteAccessStoreError> {
+        // Stored timestamps are fixed-width RFC 3339 (micros, `Z`), so a
+        // lexical comparison is a chronological one.
+        let window_floor = encode_time(now - window);
+        let now_text = encode_time(now);
+        let locked_until = encode_time(now + window);
+        let row: Option<(i64, Option<String>)> = sqlx::query_as(
+            "UPDATE phone_sessions SET \
+                pin_failed_count = CASE \
+                    WHEN pin_window_started_at IS NOT NULL AND pin_window_started_at > ?1 \
+                    THEN pin_failed_count + 1 ELSE 1 END, \
+                pin_window_started_at = CASE \
+                    WHEN pin_window_started_at IS NOT NULL AND pin_window_started_at > ?1 \
+                    THEN pin_window_started_at ELSE ?2 END, \
+                pin_locked_until = CASE \
+                    WHEN (CASE \
+                        WHEN pin_window_started_at IS NOT NULL AND pin_window_started_at > ?1 \
+                        THEN pin_failed_count + 1 ELSE 1 END) >= ?3 \
+                    THEN ?4 ELSE NULL END \
+             WHERE id = ?5 \
+             RETURNING pin_failed_count, pin_locked_until",
         )
-        .bind(i64::from(failed_count))
-        .bind(encode_time(window_started_at))
-        .bind(locked_until.map(encode_time))
+        .bind(window_floor)
+        .bind(now_text)
+        .bind(i64::from(max_failures))
+        .bind(locked_until)
         .bind(id.to_string())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(storage)?;
-        Ok(())
+        let Some((failed_count, locked_until)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(PinFailureOutcome {
+            failed_count: u32::try_from(failed_count).map_err(|_| {
+                RemoteAccessStoreError::Corrupt("negative pin failure count".into())
+            })?,
+            locked_until: decode_opt_time(locked_until)?,
+        }))
     }
 
     pub async fn insert_integration_token(

@@ -25,8 +25,9 @@ Locked 2026-08-24 for the Tailscale (T1–T4) and integrations (I1–I2) lanes.
   a client-generated `command_id` (uuid); the service keeps a bounded
   per-session response window and returns the original result for a replayed
   id instead of re-executing. SQLite reservations bind each id to the method,
-  URI and body and survive restart. Concurrent in-flight requests, changed
-  payloads, and reservations whose response is no longer cached return 409;
+  URI and body and survive restart. Concurrent in-flight duplicates wait for the original result when its handler
+  is already admitted. Changed payloads and reservations whose response is not
+  retained (including interrupted requests) return 409;
   clients must refresh state before deciding whether to issue a new command.
   Reservations remain for the session lifetime, even after response eviction. WebSocket reconnects resume the event stream
   by sequence (existing snapshot/resume protocol) and never re-deliver

@@ -24,6 +24,33 @@ describe('createCameraStore', () => {
     expect(store.state.items).toEqual([]);
   });
 
+  it('keeps the readable cameras when one detail fetch fails and counts the rest (M-28)', async () => {
+    const other = { ...item, camera_id: '018f47a0-9b5c-7a22-8a33-112233445588' };
+    const client = clientStub({
+      cameras: vi.fn(async () => ({ items: [item, other], next_after: null })),
+      camera: vi.fn(async (id: string) => { if (id === other.camera_id) throw new Error('Request failed with status 404'); return item; }) as unknown as ApiClient['camera']
+    });
+    const store = createCameraStore(client);
+    await store.load();
+    expect(store.state.items).toEqual([item]);
+    expect(store.state.unreadable).toBe(1);
+    expect(store.state.error).toBeNull();
+    expect(store.state.selected).toBe(cameraId);
+  });
+
+  it('reports an error only when every camera detail fails, and a retry recovers', async () => {
+    const camera = vi.fn<() => Promise<unknown>>(async () => { throw new Error('Request failed with status 503'); });
+    const store = createCameraStore(clientStub({ camera: camera as unknown as ApiClient['camera'] }));
+    await store.load();
+    expect(store.state.items).toEqual([]);
+    expect(store.state.error).toMatch(/Collector is unavailable/);
+    camera.mockImplementation(async () => item);
+    await store.load();
+    expect(store.state.items).toEqual([item]);
+    expect(store.state.error).toBeNull();
+    expect(store.state.unreadable).toBe(0);
+  });
+
   it('revokes a replaced snapshot and closes its session during disposal', async () => {
     const revoke = vi.fn(); const client = clientStub();
     const store = createCameraStore(client, { createObjectURL: vi.fn(() => 'blob:still'), revokeObjectURL: revoke });

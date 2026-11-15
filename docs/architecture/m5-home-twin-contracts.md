@@ -34,6 +34,7 @@ to a 0.1 m grid. `level` 0 is the ground floor; negative levels are basements.
       "wall_id": "uuid",
       "start": {"x": 0.0, "y": 0.0},
       "end":   {"x": 4.2, "y": 0.0},
+      "thickness_m": 0.1,        // 0.02..=1.0
       "openings": [{
         "opening_id": "uuid",
         "kind": "door" | "window" | "stair",
@@ -49,6 +50,9 @@ to a 0.1 m grid. `level` 0 is the ground floor; negative levels are basements.
   }]
 }
 ```
+
+`thickness_m` is optional on read and defaults to 0.1 m, so plans written
+before walls carried a thickness load unchanged; it is always emitted on write.
 
 ## Placement and location truth (H4, H5, H11)
 

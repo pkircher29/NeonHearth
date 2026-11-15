@@ -1,7 +1,132 @@
-/* Local fonts only. The shell theme owns the page background and layout. */
+/* NeonHearth design tokens.
+ *
+ * Offline-first: both typefaces are bundled from node_modules by Vite, never
+ * fetched at runtime. Instrument Sans (variable) carries UI text and display;
+ * IBM Plex Mono carries readings, labels and anything that lines up in columns.
+ */
+@import '@fontsource-variable/instrument-sans/index.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
 @import './ui.css';
-:root { font-synthesis: none; text-rendering: optimizeLegibility; color-scheme: dark; }
-body { min-width: 320px; min-height: 100svh; }
-.collector-status { position: relative; z-index: 2; display: grid; grid-template-columns: auto 1fr; gap: 1rem; width: min(600px,100%); padding: 1.1rem 0; border-top: 1px solid rgba(123,238,241,.68); border-bottom: 1px solid rgba(123,238,241,.22); } .signal { display: flex; gap: 3px; align-items: center; height: 2.6rem; padding-inline: .25rem; }.signal span { width: 3px; height: .5rem; background: #ff856f; animation: shimmer 1.4s ease-in-out infinite; }.signal span:nth-child(2) { height: 1.7rem; animation-delay: .15s; }.signal span:nth-child(3) { height: .9rem; animation-delay: .3s; }.ready .signal span { background: #7bf4f5; }.offline .signal span { background: #ff856f; animation-play-state: paused; } .status-copy p { margin: 0; }.status-label { color: #dffeff; font-weight: 600; }.status-detail { margin-top: .25rem !important; color: #8eafb4; font-size: .9rem; line-height: 1.4; }
+
+:root {
+  /* Ground and surfaces: a deep blue-black with a cyan bias, three steps. */
+  --bg: #061019;
+  --surface: #0b1c26;
+  --surface-raised: #102a35;
+  --line: #17323d;
+  --line-mid: #20424b;
+  --line-strong: #28505a;
+
+  /* Text. */
+  --ink: #e9fbfc;
+  --muted-strong: #9bb7bb;
+  --muted: #77959d;
+  --faint: #64838b;
+
+  /* Brand accent and the four bandwidth tiers (shared with twin/heat.ts). */
+  --accent: #63f3f0;
+  --accent-ink: #063a3c;
+  --blue: #548cff;
+  --tier-blue: var(--blue);
+  --tier-cyan: var(--accent);
+  --gold: #ffcd66;
+  --tier-gold: var(--gold);
+  --pink: #ff5c9b;
+  --tier-pink: var(--pink);
+
+  /* Semantic status, separate from the tier ramp. */
+  --ok: var(--accent);
+  --watch: var(--gold);
+  --risk: var(--pink);
+  --info: var(--blue);
+
+  /* Type. */
+  --font-body: 'Instrument Sans Variable', 'Instrument Sans', 'Segoe UI', Helvetica, Arial, sans-serif;
+  --font-display: var(--font-body);
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+
+  /* Shape and rhythm. */
+  --radius-sm: 5px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --focus: 3px solid var(--gold);
+
+  font-family: var(--font-body);
+  color: var(--ink);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100svh;
+  overflow-x: hidden;
+  background: var(--bg);
+}
+
+/* Faint drafting grid fading downward, then a whisper of grain: the "neon" is
+ * in the accents, the ground stays matte. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: .25;
+  background-image:
+    linear-gradient(rgba(103, 237, 241, .07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(103, 237, 241, .07) 1px, transparent 1px);
+  background-size: 40px 40px;
+  mask-image: linear-gradient(to bottom, black, transparent 78%);
+}
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: .1;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+button, input, select, textarea { font-family: inherit; }
+:focus-visible { outline: var(--focus); outline-offset: 3px; }
+
+/* Collector status block (CollectorStatus.svelte). */
+.collector-status {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1rem;
+  width: min(600px, 100%);
+  padding: 1.1rem 0;
+  border-top: 1px solid rgba(123, 238, 241, .68);
+  border-bottom: 1px solid rgba(123, 238, 241, .22);
+}
+.signal { display: flex; gap: 3px; align-items: center; height: 2.6rem; padding-inline: .25rem; }
+.signal span { width: 3px; height: .5rem; background: var(--gold); animation: shimmer 1.4s ease-in-out infinite; }
+.signal span:nth-child(2) { height: 1.7rem; animation-delay: .15s; }
+.signal span:nth-child(3) { height: .9rem; animation-delay: .3s; }
+.ready .signal span { background: var(--accent); }
+.offline .signal span { background: var(--pink); animation-play-state: paused; }
+.status-copy p { margin: 0; }
+.status-label { color: var(--ink); font-weight: 600; }
+.status-detail { margin-top: .25rem !important; color: var(--muted); font-size: .9rem; line-height: 1.4; }
+
 @keyframes shimmer { 50% { transform: scaleY(.35); opacity: .45; } }
-@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition: none !important; scroll-behavior: auto !important; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+}
+/* The in-app motion switch (Settings → Appearance) mirrors the OS preference. */
+:root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+
+/* Current angular theme tokens shared by every feature view. */
+:root { --bg:#0c1011; --surface:#161d20; --surface-raised:#222d31; --line:#354348; --line-mid:#526269; --line-strong:#617178; --ink:#f2f5f3; --muted-strong:#d2dcd9; --muted:#a8b8b7; --faint:#a8b8b7; --accent:#ff865f; --accent-ink:#101514; --radius-sm:0px; --radius:0px; --radius-lg:0px; }
+body::before, body::after { display:none; }
+:root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after { transition:none !important; }

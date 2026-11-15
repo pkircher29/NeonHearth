@@ -57,12 +57,13 @@ describe('reduceLiveMessage', () => {
     expect(initialLiveState.devices).toEqual({});
     expect(initialLiveState.coverage).toBe('unavailable');
     expect(initialLiveState.protocolMix).toBeNull();
+    // Bytes per second in; thresholds are 1 / 10 / 30 megabits per second.
     expect(bandwidthTier(124_999)).toBe('blue');
     expect(bandwidthTier(125_000)).toBe('cyan');
-    expect(bandwidthTier(1_250_000)).toBe('cyan');
-    expect(bandwidthTier(1_250_001)).toBe('gold');
-    expect(bandwidthTier(3_750_000)).toBe('gold');
-    expect(bandwidthTier(3_750_001)).toBe('pink');
+    expect(bandwidthTier(1_249_999)).toBe('cyan');
+    expect(bandwidthTier(1_250_000)).toBe('gold');
+    expect(bandwidthTier(3_749_999)).toBe('gold');
+    expect(bandwidthTier(3_750_000)).toBe('pink');
   });
   it('returns the identical state for duplicate or out-of-order events', () => {
     const current = { ...initialLiveState, sequence: 4, connected: true, serviceStatus: 'ready' };
@@ -307,5 +308,6 @@ it('clears omitted readings from the next interval', () => {
  const next = reduceLiveMessage(first, { type: 'event', data: empty });
  expect(next.aggregate).toEqual({ upload: 0, download: 0 });
  expect(topDevices(next)).toEqual([]);
+ expect(next.throughput).toEqual([]);
  expect(first.aggregate.upload).toBe(2_000_000);
 });

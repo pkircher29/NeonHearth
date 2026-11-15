@@ -769,7 +769,7 @@ async fn openapi_documents_the_integration_routes() {
         "GET",
         "/api/v1/openapi.json",
         None,
-        &Auth::None,
+        &Auth::Owner,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -789,4 +789,61 @@ async fn openapi_documents_the_integration_routes() {
             "missing {method} {path}"
         );
     }
+}
+
+/// A token may hold a bounded number of long-polls open; a misbehaving
+/// client cannot pile up parked broadcast receivers.
+#[tokio::test]
+async fn a_token_may_hold_at_most_four_long_polls_open() {
+    let fixture = fixture().await;
+    let (_, token) = mint(&fixture, "ha", &["presence:read"]).await;
+    let auth = Auth::Bearer(token);
+    let waiting = "/api/v1/integrations/v1/events?after_sequence=0&wait_ms=1500";
+    let polls: Vec<_> = (0..4)
+        .map(|_| {
+            let router = fixture.router.clone();
+            let poll_auth = auth.clone();
+            tokio::spawn(async move { send(&router, "GET", waiting, None, &poll_auth).await })
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The fifth waiting poll is refused; an immediate read still works.
+    let response = send(&fixture.router, "GET", waiting, None, &auth).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let response = send(
+        &fixture.router,
+        "GET",
+        "/api/v1/integrations/v1/events?after_sequence=0",
+        None,
+        &auth,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Another token has its own budget.
+    let (_, other) = mint(&fixture, "other", &["presence:read"]).await;
+    let response = send(
+        &fixture.router,
+        "GET",
+        "/api/v1/integrations/v1/events?after_sequence=0&wait_ms=100",
+        None,
+        &Auth::Bearer(other),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The parked polls time out normally and release their permits.
+    for poll in polls {
+        assert_eq!(poll.await.unwrap().status(), StatusCode::OK);
+    }
+    let response = send(
+        &fixture.router,
+        "GET",
+        "/api/v1/integrations/v1/events?after_sequence=0&wait_ms=100",
+        None,
+        &auth,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 }

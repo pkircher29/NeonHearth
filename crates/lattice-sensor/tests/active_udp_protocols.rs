@@ -299,12 +299,67 @@ fn dhcp_inform_and_nbns_parse_only_correlated_bounded_metadata() {
     node[..4].copy_from_slice(b"HOME");
     let mut rdata = vec![1];
     rdata.extend_from_slice(&node);
-    rdata.extend_from_slice(&[0, 0, 0]);
+    rdata.extend_from_slice(&[0, 4, 0]);
     rdata.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
     response.extend_from_slice(&[0xc0, 0x0c, 0, 0x21, 0, 1, 0, 0, 0, 1]);
     response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
     response.extend_from_slice(&rdata);
     roundtrip_case("udp.nbns.137", response, "node_name");
+
+    // RFC 1002 node-status replies commonly omit the question section entirely.
+    let mut no_question = nbns.bytes[..12].to_vec();
+    no_question[2..4].copy_from_slice(&[0x85, 0]);
+    no_question[4..6].copy_from_slice(&[0, 0]);
+    no_question[6..8].copy_from_slice(&[0, 1]);
+    no_question.extend_from_slice(&nbns.bytes[12..nbns.bytes.len() - 4]);
+    no_question.extend_from_slice(&[0, 0x21, 0, 1, 0, 0, 0, 1]);
+    no_question.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    no_question.extend_from_slice(&rdata);
+    let facts = parse_udp_reply(
+        "udp.nbns.137",
+        &nbns,
+        SocketAddr::new(target, 137),
+        &no_question,
+    )
+    .unwrap();
+    assert!(
+        facts
+            .iter()
+            .any(|(key, value)| key == "node_name" && value == "HOME")
+    );
+    assert!(
+        facts
+            .iter()
+            .any(|(key, value)| key == "node_name_kind" && value == "unique")
+    );
+    let flags_at = no_question.len() - rdata.len() + 17;
+    let mut group = no_question.clone();
+    group[flags_at] |= 0x80;
+    let group_facts =
+        parse_udp_reply("udp.nbns.137", &nbns, SocketAddr::new(target, 137), &group).unwrap();
+    assert!(!group_facts.iter().any(|(key, _)| key == "node_name"));
+    let mut conflicting = no_question.clone();
+    conflicting[flags_at] |= 0x08;
+    assert!(
+        parse_udp_reply(
+            "udp.nbns.137",
+            &nbns,
+            SocketAddr::new(target, 137),
+            &conflicting
+        )
+        .unwrap()
+        .is_empty()
+    );
+    no_question[0] ^= 1;
+    assert!(
+        parse_udp_reply(
+            "udp.nbns.137",
+            &nbns,
+            SocketAddr::new(target, 137),
+            &no_question,
+        )
+        .is_err()
+    );
 }
 
 #[test]

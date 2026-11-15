@@ -5,7 +5,7 @@ use lattice_store::{
 };
 use serde_json::json;
 use std::io::{Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 fn at(second: i64) -> DateTime<Utc> {
@@ -85,6 +85,9 @@ async fn backup_verify_restore_round_trip_preserves_data() -> anyhow::Result<()>
     let path = directory.path().join("state.db");
     let pool = seeded_db(&path, 10).await?;
     let maintenance = DbMaintenance::new(pool.clone(), &path);
+    let source_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
 
     let backup_path = directory.path().join("backups").join("snapshot.db");
     std::fs::create_dir_all(backup_path.parent().unwrap())?;
@@ -93,7 +96,7 @@ async fn backup_verify_restore_round_trip_preserves_data() -> anyhow::Result<()>
     assert!(!backup_path.with_extension("db.tmp").exists());
 
     let verification = DbMaintenance::verify_backup(&backup_path).await?;
-    assert_eq!(verification.migration_version, 23);
+    assert_eq!(verification.migration_version, source_version);
 
     // Diverge the live database after the snapshot.
     let log = AuditLog::new(pool.clone());
@@ -107,7 +110,7 @@ async fn backup_verify_restore_round_trip_preserves_data() -> anyhow::Result<()>
 
     // Restore consumes the maintenance handle (and with it the open pool).
     let report = maintenance.restore_from(&backup_path).await?;
-    assert_eq!(report.verification.migration_version, 23);
+    assert_eq!(report.verification.migration_version, source_version);
     assert!(report.previous_database.is_some());
 
     let pool = connect_path(&path).await?;
@@ -339,5 +342,60 @@ async fn disk_pressure_report_math_is_exact() -> anyhow::Result<()> {
 
     let missing = DbMaintenance::disk_pressure(&directory.path().join("nope"), 1);
     assert!(matches!(missing, Err(MaintenanceError::Io(_))));
+    Ok(())
+}
+
+/// M-13: a backup destination that resolves to the live database or one of
+/// its sidecars is refused before anything is written, and a restore refuses
+/// the live database as its source.
+#[tokio::test]
+async fn backup_and_restore_refuse_the_live_database_paths() -> anyhow::Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.db");
+    let pool = seeded_db(&path, 3).await?;
+    let maintenance = DbMaintenance::new(pool.clone(), &path);
+
+    for candidate in [
+        path.clone(),
+        directory.path().join(".").join("state.db"),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        let error = maintenance.backup_to(&candidate).await.unwrap_err();
+        assert!(
+            matches!(error, MaintenanceError::InvalidPath(_)),
+            "{candidate:?}: {error:?}"
+        );
+    }
+    // The refusal happened before any file was touched.
+    assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(live, 3);
+
+    let error = maintenance.restore_from(&path).await.unwrap_err();
+    assert!(
+        matches!(error, MaintenanceError::InvalidPath(_)),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+/// M-13: backups carry session and token hashes, so they are created with
+/// owner-only permissions rather than whatever the umask allows.
+#[cfg(unix)]
+#[tokio::test]
+async fn backup_file_is_private() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempdir()?;
+    let path = directory.path().join("state.db");
+    let pool = seeded_db(&path, 2).await?;
+    let maintenance = DbMaintenance::new(pool.clone(), &path);
+    let backup_path = directory.path().join("snapshot.db");
+    maintenance.backup_to(&backup_path).await?;
+    let mode = std::fs::metadata(&backup_path)?.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "backup mode was {mode:o}");
+    assert!(DbMaintenance::verify_backup(&backup_path).await.is_ok());
     Ok(())
 }

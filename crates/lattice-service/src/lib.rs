@@ -1,13 +1,22 @@
 pub mod api;
+pub mod audit_api;
 mod auth;
+pub mod automation;
 pub mod cameras;
+pub mod device_labels;
 pub mod discovery;
 pub mod doctor;
 pub mod home;
+pub mod host_monitor;
 pub mod integrations;
+pub mod mac_vendor;
+pub mod mqtt;
+pub mod network_monitor;
+pub mod network_scan;
 pub mod platform;
 pub mod policy;
 pub mod runtime;
+mod security;
 mod state;
 pub mod tailscale;
 pub mod vault;
@@ -22,10 +31,43 @@ use axum::{
 pub use platform::{Platform, PlatformPaths, platform_paths};
 use serde::Deserialize;
 pub use state::{AppState, InvalidServiceToken, ServiceRuntimeStatus};
-pub use vault::{CredentialRef, FakeVault, KeyringVault, Vault, VaultCapability, VaultError};
+use tower_http::timeout::TimeoutLayer;
+pub use vault::{
+    CredentialRef, FakeVault, FileVault, KeyringVault, Vault, VaultBackend, VaultCapability,
+    VaultError, platform_vault,
+};
+
+/// Upper bound on any single request. Comfortably above the 25s integration
+/// long-poll cap; everything else answers in milliseconds. A stalled handler
+/// (a wedged store, a client that never finishes sending) is answered with
+/// 408 instead of holding its task forever.
+const REQUEST_TIMEOUT_SECS: u64 = 60;
 pub fn app(state: AppState) -> Router {
     let doctor = doctor::DoctorState::for_service(&state);
     app_with_doctor(state, doctor)
+}
+
+/// Attach the built UI bundle (the Vite output the installer stages under
+/// `ui\`) as the router's fallback so the service serves the dashboard at `/`.
+///
+/// Contract (docs/architecture/privilege-boundary.md still holds):
+/// - Static assets are served WITHOUT bearer auth: the bundle is public build
+///   output, not a secret, and the listener is loopback-only. Every `/api/*`
+///   and `/ws` route keeps its existing auth untouched because routed paths
+///   never reach a fallback.
+/// - Unknown non-API paths fall back to `index.html` so client-side routes
+///   deep-link correctly (SPA behavior).
+/// - `ServeDir` percent-decodes and rejects `..` traversal, never renders
+///   directory listings, and sets Content-Type from the file extension.
+///
+/// Only called when `LATTICE_UI_DIR` is configured (main.rs); without it the
+/// service keeps its historical API-only surface and the Vite dev proxy flow
+/// is unchanged.
+pub fn with_ui_assets(router: Router, ui_dir: &std::path::Path) -> Router {
+    let index = tower_http::services::ServeFile::new(ui_dir.join("index.html"));
+    router
+        .fallback_service(tower_http::services::ServeDir::new(ui_dir).fallback(index))
+        .layer(axum::middleware::from_fn(security::browser_boundary))
 }
 
 /// Like [`app`], but with an explicitly assembled Doctor state — the seam
@@ -48,7 +90,11 @@ pub fn app_with_parts(
     doctor: doctor::DoctorState,
     remote: tailscale::RemoteAccessState,
 ) -> Router {
+    let audit = audit_api::AuditApiState::for_service(&state);
     Router::new()
+        .merge(device_labels::routes())
+        .merge(host_monitor::api::routes())
+        .merge(network_monitor::api::routes())
         .route("/api/v1/health", get(api::health))
         .route("/api/v1/state", get(api::state))
         .route("/api/v1/cameras", get(api::cameras))
@@ -133,12 +179,20 @@ pub fn app_with_parts(
             get(integrations::events_route),
         )
         .merge(doctor::routes(doctor))
+        .merge(automation::routes())
+        .merge(network_scan::routes())
+        .merge(audit_api::routes(audit))
         .layer(axum::Extension(remote.clone()))
         .layer(axum::middleware::from_fn_with_state(
             remote,
             tailscale::remote_access_layer,
         ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ))
         .with_state(state)
+        .layer(axum::middleware::from_fn(security::browser_boundary))
 }
 
 #[derive(Deserialize)]

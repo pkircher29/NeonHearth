@@ -53,6 +53,63 @@ async fn enrollment_uses_the_immutable_install_baseline_once() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn policy_transactions_wait_for_a_competing_writer() -> anyhow::Result<()> {
+    for operation in ["enroll", "publication", "reservation", "baseline"] {
+        let directory = tempfile::tempdir()?;
+        let pool =
+            lattice_store::connect_path(directory.path().join("policy-contention.db")).await?;
+        InstallRepository::new(pool.clone())
+            .initialize(at(0))
+            .await?;
+        let repo = PolicyRepository::new(pool.clone());
+        repo.mark_successful_service_start(at(0)).await?;
+        let id = DeviceId::new();
+        insert_device(&pool, id, at(60)).await?;
+        if operation != "enroll" {
+            repo.enroll(id).await?;
+        }
+        let blocker = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut write = tokio::spawn(async move {
+            let _ = started.send(());
+            match operation {
+                "enroll" => {
+                    repo.enroll(id).await?;
+                }
+                "publication" => {
+                    repo.prepare_decision_publication(id, "pending-decision")
+                        .await?;
+                }
+                "reservation" => {
+                    repo.reserve_actuation_with_decision(
+                        id,
+                        1,
+                        RequestedAction::None,
+                        at(60),
+                        None,
+                    )
+                    .await?;
+                }
+                "baseline" => {
+                    repo.mark_successful_service_start(at(0)).await?;
+                }
+                _ => unreachable!(),
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        ready.await?;
+        let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut write).await;
+        assert!(
+            early.is_err(),
+            "{operation} must wait for the writer instead of failing a read-to-write lock upgrade: {early:?}"
+        );
+        blocker.commit().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), write).await???;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn lifecycle_facts_round_trip_and_extension_is_single_use() -> anyhow::Result<()> {
     let pool = connect_memory().await?;
     InstallRepository::new(pool.clone())

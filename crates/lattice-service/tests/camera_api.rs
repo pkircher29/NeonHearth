@@ -92,6 +92,7 @@ async fn openapi_truthfully_documents_camera_and_media_routes() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/openapi.json")
+                .header("authorization", format!("Bearer {TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )

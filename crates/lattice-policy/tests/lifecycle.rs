@@ -212,3 +212,20 @@ fn malformed_future_extension_and_low_confidence_danger_fail_closed_to_normal_po
         Evaluation::quarantine(PolicyReason::UnknownDeadlineExpired)
     );
 }
+
+/// A persisted `first_seen_at` too close to the end of the calendar to carry
+/// a deadline must not panic the evaluator (chrono's `+` would); it fails
+/// closed to owner attention.
+#[test]
+fn out_of_range_first_seen_fails_closed_to_owner_attention() {
+    let engine = PolicyEngine::new(at(0));
+    let mut device = device(0);
+    device.first_seen_at = chrono::DateTime::<Utc>::MAX_UTC - chrono::Duration::hours(1);
+    let evaluation = engine.evaluate(&device, at(1));
+    assert_eq!(evaluation.requested_action, RequestedAction::OwnerAttention);
+    assert_eq!(evaluation.reason, PolicyReason::ProtectedDevice);
+    assert!(!engine.is_baseline_member(device.first_seen_at));
+    // The baseline window itself must not overflow either.
+    let late = PolicyEngine::new(chrono::DateTime::<Utc>::MAX_UTC - chrono::Duration::hours(1));
+    assert!(!late.is_baseline_member(late.baseline_started_at()));
+}

@@ -498,9 +498,10 @@ async fn schema_has_migration_and_advisory_uniqueness() -> anyhow::Result<()> {
     let a = advisory("CVE-2026-0003");
     let repository = AdvisoryRepository::new(pool.clone());
     repository.upsert_advisory(&a).await?;
-    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-        .fetch_one(&pool)
-        .await?;
+    let version: i64 =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version=23 AND success=1")
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(version, 23);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM advisories")
         .fetch_one(&pool)

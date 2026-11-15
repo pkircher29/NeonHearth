@@ -897,13 +897,23 @@ fn semantically_retained(e: &PresenceEvidence, arrival: DateTime<Utc>, c: &Prese
         PresenceEvidenceKind::Lease
         | PresenceEvidenceKind::RouterAssociation
         | PresenceEvidenceKind::NeighborCache
-        | PresenceEvidenceKind::ProbeSuccess
-            if e.valid_until.is_some_and(|until| until >= arrival) =>
-        {
-            true
-        }
+        | PresenceEvidenceKind::ProbeSuccess => e.valid_until.map_or_else(
+            || arrival.signed_duration_since(e.observed_at) <= c.retention,
+            // An expired sample can only support a correction until this window
+            // closes. Retaining every poll for 24 hours fills the bounded cache
+            // and prevents subsequent observations, even after a restart.
+            |until| arrival.signed_duration_since(until) <= c.correction_window,
+        ),
         PresenceEvidenceKind::ConfirmationFailure => {
             arrival.signed_duration_since(e.observed_at) <= c.confirmation_window
+        }
+        // Traffic only supports presence through its online window and can only
+        // be corrected within the correction window, so keeping it for the full
+        // retention period would let a chatty device fill its evidence cap and
+        // then reject every later lease or neighbour observation.
+        PresenceEvidenceKind::Traffic => {
+            arrival.signed_duration_since(e.observed_at)
+                <= std::cmp::max(c.online_window, c.correction_window)
         }
         _ => arrival.signed_duration_since(e.observed_at) <= c.retention,
     }

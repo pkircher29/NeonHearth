@@ -794,8 +794,14 @@ impl PersistentDiscoveryPipeline {
         }
         let facts = input.facts.clone();
         let source_name = input.presence_source.clone();
-        let mut staged_pipeline = self.pipeline.clone();
-        let result = staged_pipeline.observe(input, arrival)?;
+        // stage already clones identity and presence for rollback. Reuse those
+        // staged engines instead of cloning the entire pipeline a second time.
+        let (identity, presence, result) = self.pipeline.stage(input, arrival)?;
+        let staged_pipeline = DiscoveryPipeline {
+            identity,
+            presence,
+            sources: self.pipeline.sources.clone(),
+        };
         if changes.iter().any(|c| match c {
             RollupChange::Upsert(r) | RollupChange::Correction(r) => {
                 r.key.device_id != result.device_id

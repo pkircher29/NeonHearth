@@ -4,7 +4,8 @@
 //! [`CheckKind::EXECUTION_ORDER`] is a fixed topological order over that DAG:
 //! a failed or skipped parent short-circuits every descendant into
 //! [`CheckStatus::Skipped`] so the Doctor never diagnoses DNS while the
-//! adapter is down.
+//! adapter is down. A failed check with no descendants (such as a route
+//! conflict) is reported with its detail and gates nothing.
 
 use crate::DoctorError;
 use crate::probe::{DnsFailureReason, LeaseState, MAX_PROBE_TIMEOUT_MS, RouteEntry};
@@ -58,7 +59,12 @@ impl CheckKind {
                 &[CheckKind::Gateway]
             }
             CheckKind::RouteVpn => &[CheckKind::Dns],
-            CheckKind::InternetReachability => &[CheckKind::RouteVpn],
+            // The internet probe is by IP, so it needs an address but neither
+            // DNS nor a single default route: a DNS-only outage or a VPN
+            // user's second default route must not hide whether the WAN is
+            // reachable. It reads the Gateway result for `lan_ok` rather than
+            // depending on it, so "both sides down" is a reachable diagnosis.
+            CheckKind::InternetReachability => &[CheckKind::AddressDhcp],
         }
     }
 }

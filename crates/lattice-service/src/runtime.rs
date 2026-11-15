@@ -257,7 +257,20 @@ where
 fn error_category(error: &crate::discovery::NeighborCoordinatorError) -> &'static str {
     match error {
         crate::discovery::NeighborCoordinatorError::Snapshot(_) => "snapshot",
-        crate::discovery::NeighborCoordinatorError::Discovery(_) => "discovery",
+        crate::discovery::NeighborCoordinatorError::Discovery(error) => match error {
+            crate::discovery::DiscoveryError::Identity(_) => "discovery_identity",
+            crate::discovery::DiscoveryError::Presence(_) => "discovery_presence",
+            crate::discovery::DiscoveryError::Checkpoint(
+                lattice_store::CheckpointError::Capacity(_),
+            ) => "discovery_checkpoint_capacity",
+            crate::discovery::DiscoveryError::Checkpoint(
+                lattice_store::CheckpointError::Conflict(_),
+            ) => "discovery_checkpoint_conflict",
+            crate::discovery::DiscoveryError::Checkpoint(_) => "discovery_checkpoint",
+            crate::discovery::DiscoveryError::InvalidCheckpoint => "discovery_invalid_checkpoint",
+            crate::discovery::DiscoveryError::UnboundLink => "discovery_unbound_link",
+            _ => "discovery",
+        },
     }
 }
 

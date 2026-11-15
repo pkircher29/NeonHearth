@@ -14,6 +14,11 @@ pub const MAX_WALLS_PER_FLOOR: usize = 4096;
 pub const MAX_ROOMS_PER_FLOOR: usize = 1024;
 pub const MIN_CEILING_HEIGHT_M: f64 = 1.8;
 pub const MAX_CEILING_HEIGHT_M: f64 = 6.0;
+/// Thickness assumed for walls in plans written before walls carried one, so
+/// every stored plan keeps loading unchanged (v2 spec, section D).
+pub const DEFAULT_WALL_THICKNESS_M: f64 = 0.1;
+pub const MIN_WALL_THICKNESS_M: f64 = 0.02;
+pub const MAX_WALL_THICKNESS_M: f64 = 1.0;
 /// Floor-local coordinates are bounded to keep geometry sane and match the
 /// storage CHECK constraints.
 pub const MAX_COORDINATE_M: f64 = 1000.0;
@@ -89,8 +94,17 @@ pub struct Wall {
     pub wall_id: WallId,
     pub start: Point,
     pub end: Point,
+    /// Wall thickness in meters. Optional on read — a plan written before
+    /// walls had thickness deserializes to [`DEFAULT_WALL_THICKNESS_M`] — but
+    /// always emitted on write.
+    #[serde(default = "default_wall_thickness_m")]
+    pub thickness_m: f64,
     #[serde(default)]
     pub openings: Vec<Opening>,
+}
+
+fn default_wall_thickness_m() -> f64 {
+    DEFAULT_WALL_THICKNESS_M
 }
 
 impl Wall {
@@ -156,6 +170,10 @@ pub enum PlanValidationError {
     DegenerateWall {
         wall_id: WallId,
     },
+    WallThicknessOutOfRange {
+        wall_id: WallId,
+        thickness_m: f64,
+    },
     PolygonTooSmall {
         room_id: RoomId,
         points: usize,
@@ -207,6 +225,15 @@ impl fmt::Display for PlanValidationError {
             }
             Self::DegenerateWall { wall_id } => {
                 write!(formatter, "wall {wall_id} has zero length")
+            }
+            Self::WallThicknessOutOfRange {
+                wall_id,
+                thickness_m,
+            } => {
+                write!(
+                    formatter,
+                    "wall {wall_id} thickness {thickness_m} outside {MIN_WALL_THICKNESS_M}..={MAX_WALL_THICKNESS_M} m"
+                )
             }
             Self::PolygonTooSmall { room_id, points } => {
                 write!(
@@ -283,6 +310,13 @@ impl Wall {
         if length <= 0.0 {
             return Err(PlanValidationError::DegenerateWall {
                 wall_id: self.wall_id,
+            });
+        }
+        // `contains` is false for NaN, so non-finite thickness is rejected too.
+        if !(MIN_WALL_THICKNESS_M..=MAX_WALL_THICKNESS_M).contains(&self.thickness_m) {
+            return Err(PlanValidationError::WallThicknessOutOfRange {
+                wall_id: self.wall_id,
+                thickness_m: self.thickness_m,
             });
         }
         for opening in &self.openings {
@@ -430,6 +464,7 @@ mod tests {
             wall_id: WallId::new(),
             start,
             end,
+            thickness_m: DEFAULT_WALL_THICKNESS_M,
             openings,
         }
     }
@@ -656,6 +691,7 @@ mod tests {
                     "wall_id": "018f47a0-9b5c-7a22-8a33-112233445568",
                     "start": {"x": 0.0, "y": 0.0},
                     "end": {"x": 4.2, "y": 0.0},
+                    "thickness_m": 0.1,
                     "openings": [{
                         "opening_id": "018f47a0-9b5c-7a22-8a33-112233445569",
                         "kind": "door",
@@ -678,6 +714,72 @@ mod tests {
         assert_eq!(plan.version, 3);
         assert_eq!(plan.floors[0].walls[0].openings[0].kind, OpeningKind::Door);
         assert_eq!(serde_json::to_value(&plan).unwrap(), json);
+    }
+
+    #[test]
+    fn wall_written_before_thickness_existed_loads_with_the_default() {
+        // Byte-for-byte a wall from a plan committed before v2 added
+        // thickness: it must still deserialize, validate, and now carry 0.1.
+        let legacy = serde_json::json!({
+            "wall_id": "018f47a0-9b5c-7a22-8a33-112233445568",
+            "start": {"x": 0.0, "y": 0.0},
+            "end": {"x": 4.2, "y": 0.0},
+            "openings": []
+        });
+        let wall: Wall = serde_json::from_value(legacy).unwrap();
+        assert_eq!(wall.thickness_m, DEFAULT_WALL_THICKNESS_M);
+        assert_eq!(wall.thickness_m, 0.1);
+        assert_eq!(wall.validate(), Ok(()));
+        // Serialization always emits the field, so the next save is explicit.
+        let written = serde_json::to_value(&wall).unwrap();
+        assert_eq!(written["thickness_m"], 0.1);
+    }
+
+    #[test]
+    fn wall_thickness_round_trips_a_custom_value() {
+        let mut plan = sample_plan();
+        plan.floors[0].walls[0].thickness_m = 0.35;
+        assert_eq!(plan.validate(), Ok(()));
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["floors"][0]["walls"][0]["thickness_m"], 0.35);
+        let parsed: HomePlan = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, plan);
+        assert_eq!(parsed.floors[0].walls[0].thickness_m, 0.35);
+    }
+
+    #[test]
+    fn wall_thickness_outside_bounds_is_rejected() {
+        for thickness in [0.0, 0.019, 1.5, f64::NAN, f64::INFINITY] {
+            let mut plan = sample_plan();
+            plan.floors[0].walls[0].thickness_m = thickness;
+            assert!(
+                matches!(
+                    plan.validate(),
+                    Err(PlanValidationError::WallThicknessOutOfRange { .. })
+                ),
+                "thickness {thickness} should be rejected"
+            );
+        }
+        for thickness in [
+            MIN_WALL_THICKNESS_M,
+            DEFAULT_WALL_THICKNESS_M,
+            MAX_WALL_THICKNESS_M,
+        ] {
+            let mut plan = sample_plan();
+            plan.floors[0].walls[0].thickness_m = thickness;
+            assert_eq!(plan.validate(), Ok(()), "thickness {thickness}");
+        }
+    }
+
+    #[test]
+    fn wall_thickness_error_message_names_the_wall_and_the_bounds() {
+        let mut plan = sample_plan();
+        plan.floors[0].walls[0].thickness_m = 1.5;
+        let message = plan.validate().unwrap_err().to_string();
+        assert!(message.contains("thickness"), "{message}");
+        assert!(message.contains("1.5"), "{message}");
+        assert!(message.contains("0.02"), "{message}");
+        assert!(message.contains('1'), "{message}");
     }
 
     #[test]

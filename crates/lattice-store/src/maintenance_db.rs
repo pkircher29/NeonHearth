@@ -140,31 +140,56 @@ impl DbMaintenance {
     /// Writes a complete snapshot of the database to `destination` using
     /// `VACUUM INTO` a temporary file in the destination directory, then an
     /// atomic rename. See the module docs for why this is the chosen strategy.
+    ///
+    /// Durability: the temporary file is created private (0600 on Unix) and
+    /// fsynced before the rename, and the directory is fsynced after it, so a
+    /// power loss cannot publish a truncated file at the final path. The live
+    /// database and its sidecars are refused as destinations.
     pub async fn backup_to(&self, destination: &Path) -> Result<BackupReport, MaintenanceError> {
         let destination_text = utf8_path(destination)?;
-        let mut temp = destination.as_os_str().to_owned();
-        temp.push(".tmp");
-        let temp = PathBuf::from(temp);
+        self.refuse_live_paths(destination)?;
+        let temp = suffixed(destination, ".tmp");
         let temp_text = utf8_path(&temp)?;
         if temp.exists() {
             std::fs::remove_file(&temp)
                 .map_err(|error| io_error("remove stale backup temp file", error))?;
         }
+        // VACUUM INTO accepts an existing *empty* file, which lets the file be
+        // created with private permissions before any data lands in it.
+        create_private_empty(&temp)?;
         // VACUUM INTO takes no bind parameters for its target; escape quotes.
         let sql = format!("VACUUM INTO '{}'", temp_text.replace('\'', "''"));
-        sqlx::query(&sql)
-            .execute(&self.pool)
-            .await
-            .map_err(storage)?;
-        let size_bytes = std::fs::metadata(&temp)
-            .map_err(|error| io_error("stat backup temp file", error))?
-            .len();
+        if let Err(error) = sqlx::query(&sql).execute(&self.pool).await {
+            let _ = std::fs::remove_file(&temp);
+            return Err(storage(error));
+        }
+        let size_bytes = sync_file(&temp)?;
         std::fs::rename(&temp, destination)
             .map_err(|error| io_error("rename backup into place", error))?;
+        sync_parent_dir(destination)?;
         Ok(BackupReport {
             destination: destination_text,
             size_bytes,
         })
+    }
+
+    /// Refuses `candidate` when it resolves to the live database file or one
+    /// of its sidecars (`-wal`, `-shm`, `.migrate.lock`): renaming a backup
+    /// over the open database would corrupt it.
+    fn refuse_live_paths(&self, candidate: &Path) -> Result<(), MaintenanceError> {
+        let live = [
+            self.db_path.clone(),
+            suffixed(&self.db_path, "-wal"),
+            suffixed(&self.db_path, "-shm"),
+            suffixed(&self.db_path, ".migrate.lock"),
+        ];
+        if live.iter().any(|path| same_target(candidate, path)) {
+            return Err(MaintenanceError::InvalidPath(format!(
+                "{} is the live database or one of its sidecar files",
+                candidate.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Opens `path` read-only and proves it is a healthy NeonHearth database:
@@ -205,10 +230,17 @@ impl DbMaintenance {
                 other => other,
             })?;
         let backup_text = utf8_path(backup)?;
+        self.refuse_live_paths(backup)?;
         self.pool.close().await;
 
         let staged = suffixed(&self.db_path, ".restore-tmp");
+        if staged.exists() {
+            std::fs::remove_file(&staged)
+                .map_err(|error| io_error("remove stale restore staging file", error))?;
+        }
+        create_private_empty(&staged)?;
         std::fs::copy(backup, &staged).map_err(|error| io_error("stage restore copy", error))?;
+        sync_file(&staged)?;
         // The incoming snapshot has no journal; stale sidecar files from the
         // old database must not be replayed into it.
         for suffix in ["-wal", "-shm"] {
@@ -233,6 +265,7 @@ impl DbMaintenance {
             }
             return Err(io_error("activate restored database", error));
         }
+        sync_parent_dir(&self.db_path)?;
         Ok(RestoreReport {
             restored_from: backup_text,
             previous_database: previous_kept.then(|| previous.display().to_string()),
@@ -390,4 +423,77 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
+}
+
+/// Creates `path` as a new, empty file readable only by the owner (Unix mode
+/// 0600). Fails if the file already exists.
+fn create_private_empty(path: &Path) -> Result<(), MaintenanceError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map(drop)
+        .map_err(|error| io_error("create private file", error))
+}
+
+/// Flushes `path`'s contents to stable storage and returns its size.
+fn sync_file(path: &Path) -> Result<u64, MaintenanceError> {
+    // FlushFileBuffers requires write access on Windows. Do not truncate or
+    // recreate the verified backup when opening its existing handle for sync.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(cfg!(windows))
+        .open(path)
+        .map_err(|error| io_error("open file for fsync", error))?;
+    file.sync_all()
+        .map_err(|error| io_error("fsync file", error))?;
+    let size = file
+        .metadata()
+        .map_err(|error| io_error("stat file", error))?
+        .len();
+    Ok(size)
+}
+
+/// Flushes the directory entry for `path` so a rename survives power loss.
+/// Directory fsync is a Unix notion; Windows has no equivalent through std.
+fn sync_parent_dir(path: &Path) -> Result<(), MaintenanceError> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let handle = std::fs::File::open(&dir)
+            .map_err(|error| io_error("open directory for fsync", error))?;
+        handle
+            .sync_all()
+            .map_err(|error| io_error("fsync directory", error))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Resolves a path to `canonical(parent)/file_name` so two spellings of the
+/// same file compare equal even when the file itself does not exist yet.
+fn resolve_target(path: &Path) -> PathBuf {
+    let parent = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.canonicalize().ok(),
+        _ => std::env::current_dir().ok(),
+    };
+    match (parent, path.file_name()) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+fn same_target(a: &Path, b: &Path) -> bool {
+    resolve_target(a) == resolve_target(b)
 }

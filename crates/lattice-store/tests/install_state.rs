@@ -29,6 +29,10 @@ async fn concurrent_connects_serialize_first_migration() -> anyhow::Result<()> {
     let (left, right) = tokio::join!(lattice_store::connect(&url), lattice_store::connect(&url));
     let left = left?;
     let right = right?;
+    let expected_count = sqlx::migrate!()
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+        .count() as i64;
     for pool in [&left, &right] {
         let migrations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
             .fetch_one(pool)
@@ -36,7 +40,7 @@ async fn concurrent_connects_serialize_first_migration() -> anyhow::Result<()> {
         let sequences: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_sequence")
             .fetch_one(pool)
             .await?;
-        assert_eq!(migrations.0, 21);
+        assert_eq!(migrations.0, expected_count);
         assert_eq!(sequences.0, 1);
     }
     Ok(())
@@ -64,10 +68,16 @@ async fn initialize_preserves_original_first_run_time_and_install_id() -> anyhow
     let repeated = repository.initialize(later).await?;
 
     assert_eq!(initial.first_run_at, first);
-    assert_eq!(initial.schema_version, 18);
+    assert_eq!(
+        initial.schema_version,
+        lattice_store::latest_migration_version()
+    );
     assert_eq!(initial.install_id, repeated.install_id);
     assert_eq!(initial.first_run_at, repeated.first_run_at);
-    assert_eq!(repeated.schema_version, 18);
+    assert_eq!(
+        repeated.schema_version,
+        lattice_store::latest_migration_version()
+    );
     Ok(())
 }
 
@@ -101,5 +111,25 @@ async fn initialize_is_safe_under_concurrent_first_calls() -> anyhow::Result<()>
         .fetch_one(&pool)
         .await?;
     assert_eq!(count, 1);
+    Ok(())
+}
+
+/// A fresh install's `schema_version` footer must match the newest migration
+/// in this build, not a number frozen when the footer was introduced.
+#[tokio::test]
+async fn fresh_install_records_the_latest_migration_version() -> anyhow::Result<()> {
+    let pool = lattice_store::connect_memory().await?;
+    let state = lattice_store::InstallRepository::new(pool.clone())
+        .initialize(chrono::Utc::now())
+        .await?;
+    let newest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(state.schema_version, newest);
+    assert_eq!(
+        state.schema_version,
+        lattice_store::latest_migration_version()
+    );
+    assert!(state.schema_version >= 23);
     Ok(())
 }

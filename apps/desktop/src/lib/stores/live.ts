@@ -1,4 +1,5 @@
 import type { Coverage, DeviceSnapshot, EnforcementStatus, PolicyEvaluation, RequestedAction, ServerMessage, Snapshot } from '../api/types';
+import { heatTier } from '../twin/heat';
 
 export interface ThroughputPoint { at: string; upload: number; download: number }
 export type CoverageSummary = Coverage | 'unavailable' | 'mixed';
@@ -97,7 +98,7 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
       next.devices[sample.device_id] = { ...current, last_seen_at: event.occurred_at, bandwidth: { available: true, upload: sample.upload_bytes_per_second, download: sample.download_bytes_per_second, coverage: sample.coverage, observed_at: event.payload.data.observed_at } };
     }
     next.aggregate = { upload, download };
-    next.throughput = [...next.throughput, { at: event.occurred_at, upload, download }].slice(-240);
+    next.throughput = event.payload.data.samples.length ? [...next.throughput, { at: event.occurred_at, upload, download }].slice(-240) : [];
     // Rust's BandwidthSample intentionally has no protocol metadata, so this
     // projection remains unavailable rather than inventing a protocol mix.
     next.protocolMix = null;
@@ -128,5 +129,6 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
   return summarize(next);
 }
 
-export function bandwidthTier(totalBps: number): 'blue' | 'cyan' | 'gold' | 'pink' { const megabits = totalBps * 8 / 1_000_000; return megabits < 1 ? 'blue' : megabits <= 10 ? 'cyan' : megabits <= 30 ? 'gold' : 'pink'; }
+/** Tier for a rate in BYTES per second; shares the documented thresholds with the twin's heat ramp. */
+export function bandwidthTier(totalBytesPerSecond: number): 'blue' | 'cyan' | 'gold' | 'pink' { const tier = heatTier(totalBytesPerSecond); return tier === 'unavailable' ? 'blue' : tier; }
 export function topDevices(state: LiveState, limit = 5): DeviceSnapshot[] { return state.deviceOrder.map((id) => state.devices[id]).filter((device): device is DeviceSnapshot => Boolean(device) && device.bandwidth.available).sort((a, b) => (b.bandwidth.upload ?? 0) + (b.bandwidth.download ?? 0) - (a.bandwidth.upload ?? 0) - (a.bandwidth.download ?? 0)).slice(0, limit); }

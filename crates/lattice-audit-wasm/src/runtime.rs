@@ -47,13 +47,39 @@ impl std::fmt::Debug for Sandbox {
     }
 }
 
-pub struct Sandbox {
+/// A compiled module and the engine it was compiled for. Compilation is the
+/// expensive part of admission, so a broker keeps one of these per verified
+/// module digest and builds a [`Sandbox`] around it per request.
+pub(crate) struct CompiledModule {
     engine: Engine,
     module: Module,
-    limits: Limits,
     /// A module runs in a fresh store, but an engine epoch is global. Serialize
     /// admissions so one invocation's deadline cannot interrupt another one.
+    /// The mutex lives with the engine so sharing the compiled module keeps
+    /// that guarantee.
     execution: tokio::sync::Mutex<()>,
+}
+
+impl CompiledModule {
+    fn compile(wasm: &[u8]) -> Result<Self, AuditError> {
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        config.async_support(true);
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).map_err(|_| AuditError::InvalidModule)?;
+        let module = Module::new(&engine, wasm).map_err(|_| AuditError::InvalidModule)?;
+        validate_abi(&module)?;
+        Ok(Self {
+            engine,
+            module,
+            execution: tokio::sync::Mutex::new(()),
+        })
+    }
+}
+
+pub struct Sandbox {
+    compiled: Arc<CompiledModule>,
+    limits: Limits,
 }
 
 #[derive(Clone, Copy)]
@@ -66,8 +92,41 @@ enum ExecutionFailure {
     Host(AuditHostError),
 }
 
-struct StoreState<'a, H: AuditHost> {
-    host: &'a H,
+enum HostCall {
+    Deterministic(tokio::sync::oneshot::Sender<u32>),
+    Exchange(
+        Vec<u8>,
+        usize,
+        tokio::sync::oneshot::Sender<Result<Vec<u8>, AuditHostError>>,
+    ),
+}
+
+/// Wasmtime 36 owns 'static store data. Keep the borrowed, authorized host in
+/// the caller's scoped future and exchange bounded requests through a channel.
+/// No host task or borrow can outlive execute(), including on cancellation.
+#[derive(Clone)]
+struct HostProxy(tokio::sync::mpsc::Sender<HostCall>);
+impl HostProxy {
+    async fn deterministic(&self) -> Result<u32, AuditHostError> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.0
+            .send(HostCall::Deterministic(send))
+            .await
+            .map_err(|_| AuditHostError::Cancelled)?;
+        receive.await.map_err(|_| AuditHostError::Cancelled)
+    }
+    async fn exchange(&self, request: Vec<u8>, cap: usize) -> Result<Vec<u8>, AuditHostError> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.0
+            .send(HostCall::Exchange(request, cap, send))
+            .await
+            .map_err(|_| AuditHostError::Cancelled)?;
+        receive.await.map_err(|_| AuditHostError::Cancelled)?
+    }
+}
+
+struct StoreState {
+    host: HostProxy,
     limiter: LimitsState,
     requests: u32,
     max_requests: u32,
@@ -169,6 +228,15 @@ impl Sandbox {
         verified: VerifiedManifest,
         limits: &Limits,
     ) -> Result<Self, AuditError> {
+        Self::check_limits(&verified, limits)?;
+        let compiled = Self::compile(&verified).await?;
+        Self::with_compiled(&verified, compiled, limits)
+    }
+    /// Rejects effective limits that are invalid or exceed the signed ones.
+    pub(crate) fn check_limits(
+        verified: &VerifiedManifest,
+        limits: &Limits,
+    ) -> Result<(), AuditError> {
         let signed = verified.limits();
         if !valid_limits(limits)
             || limits.max_bytes > signed.max_bytes
@@ -181,20 +249,32 @@ impl Sandbox {
                 "invalid effective limits".into(),
             ));
         }
-        let mut config = Config::new();
-        config.consume_fuel(true);
-        config.async_support(true);
-        config.epoch_interruption(true);
+        Ok(())
+    }
+    /// Compiles a verified module off the async executor. Cranelift compilation
+    /// of a module up to the signed size cap can take hundreds of milliseconds,
+    /// which must not stall other tasks on the runtime.
+    pub(crate) async fn compile(
+        verified: &VerifiedManifest,
+    ) -> Result<Arc<CompiledModule>, AuditError> {
+        let wasm = verified.wasm().to_vec();
+        let compiled = tokio::task::spawn_blocking(move || CompiledModule::compile(&wasm))
+            .await
+            .map_err(|_| AuditError::InvalidModule)??;
+        Ok(Arc::new(compiled))
+    }
+    /// Builds a sandbox around an already compiled module, re-checking the
+    /// per-request limits against the module's static shape.
+    pub(crate) fn with_compiled(
+        verified: &VerifiedManifest,
+        compiled: Arc<CompiledModule>,
+        limits: &Limits,
+    ) -> Result<Self, AuditError> {
+        Self::check_limits(verified, limits)?;
         validate_static_limits(verified.wasm(), limits)?;
-        let engine = Engine::new(&config).map_err(|_| AuditError::InvalidModule)?;
-        let module =
-            Module::new(&engine, verified.wasm()).map_err(|_| AuditError::InvalidModule)?;
-        validate_abi(&module)?;
         Ok(Self {
-            engine,
-            module,
+            compiled,
             limits: limits.clone(),
-            execution: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -208,10 +288,28 @@ impl Sandbox {
         }
         // Tokio's mutex is not poisonable. The guard covers the epoch ticker's
         // entire lifetime, and max_time begins only after this admission.
-        let _execution = self.execution.lock().await;
-        let ticker = EpochTicker::start(self.engine.clone(), self.limits.max_time);
-        let result =
-            tokio::time::timeout(self.limits.max_time, self.execute_inner(input, host)).await;
+        let _execution = self.compiled.execution.lock().await;
+        let ticker = EpochTicker::start(self.compiled.engine.clone(), self.limits.max_time);
+        let (send, mut receive) = tokio::sync::mpsc::channel(1);
+        let forward = async {
+            while let Some(call) = receive.recv().await {
+                match call {
+                    HostCall::Deterministic(reply) => {
+                        let _ = reply.send(host.deterministic().await);
+                    }
+                    HostCall::Exchange(request, cap, reply) => {
+                        let _ = reply.send(host.exchange(request, cap).await);
+                    }
+                }
+            }
+        };
+        let execution = async {
+            tokio::select! {
+                result = self.execute_inner(input, HostProxy(send)) => result,
+                _ = forward => Err(AuditError::InvalidAbi),
+            }
+        };
+        let result = tokio::time::timeout(self.limits.max_time, execution).await;
         drop(ticker);
         match result {
             Ok(result) => result,
@@ -219,14 +317,14 @@ impl Sandbox {
         }
     }
 
-    async fn execute_inner<H: AuditHost>(
+    async fn execute_inner(
         &self,
         input: &[u8],
-        host: &H,
+        host: HostProxy,
     ) -> Result<AuditResult, AuditError> {
         let max_memory = page_bytes(self.limits.max_memory_pages)?;
         let mut store = Store::new(
-            &self.engine,
+            &self.compiled.engine,
             StoreState {
                 host,
                 limiter: LimitsState {
@@ -248,12 +346,12 @@ impl Sandbox {
             .fuel_async_yield_interval(Some(1_000))
             .map_err(|_| AuditError::FuelExhausted)?;
         store.set_epoch_deadline(1);
-        let mut linker = Linker::new(&self.engine);
+        let mut linker = Linker::new(&self.compiled.engine);
         linker
             .func_wrap_async(
                 "audit",
                 "deterministic",
-                |mut caller: wasmtime::Caller<'_, StoreState<'_, H>>, ()| {
+                |mut caller: wasmtime::Caller<'_, StoreState>, ()| {
                     Box::new(async move {
                         let host = {
                             let data = caller.data_mut();
@@ -265,9 +363,15 @@ impl Sandbox {
                                 .requests
                                 .checked_add(1)
                                 .ok_or_else(|| anyhow::anyhow!("request counter overflow"))?;
-                            data.host
+                            data.host.clone()
                         };
-                        Ok(host.deterministic().await as i32)
+                        match host.deterministic().await {
+                            Ok(value) => Ok(value as i32),
+                            Err(error) => {
+                                caller.data_mut().failure = Some(ExecutionFailure::Host(error));
+                                Err(anyhow::anyhow!("host request cancelled"))
+                            }
+                        }
                     })
                 },
             )
@@ -276,7 +380,7 @@ impl Sandbox {
             .func_wrap_async(
                 "audit",
                 "exchange",
-                |mut caller: wasmtime::Caller<'_, StoreState<'_, H>>,
+                |mut caller: wasmtime::Caller<'_, StoreState>,
                  (req_ptr, req_len, out_ptr, out_cap): (i32, i32, i32, i32)| {
                     Box::new(async move {
                         let (req_ptr, req_len, out_ptr, out_cap) = match (
@@ -323,7 +427,7 @@ impl Sandbox {
                             data.bytes += exchange_bytes.expect("validated exchange byte count");
                         }
                         let request = memory.data(&caller)[req_ptr..req_ptr + req_len].to_vec();
-                        let host = caller.data().host;
+                        let host = caller.data().host.clone();
                         let response = match host.exchange(request, out_cap).await {
                             Ok(response) if response.len() <= out_cap => response,
                             Ok(_) | Err(AuditHostError::ExchangeFailed) => {
@@ -348,7 +452,7 @@ impl Sandbox {
             .map_err(|_| AuditError::InvalidAbi)?;
 
         let instance = linker
-            .instantiate_async(&mut store, &self.module)
+            .instantiate_async(&mut store, &self.compiled.module)
             .await
             .map_err(|error| map_error(&store, &error))?;
         let memory = instance
@@ -500,7 +604,7 @@ fn validate_abi(module: &Module) -> Result<(), AuditError> {
     Ok(())
 }
 
-fn map_error<H: AuditHost>(store: &Store<StoreState<'_, H>>, error: &anyhow::Error) -> AuditError {
+fn map_error(store: &Store<StoreState>, error: &anyhow::Error) -> AuditError {
     match store.data().failure.or(store.data().limiter.failure) {
         Some(ExecutionFailure::Memory) => AuditError::MemoryLimitExceeded,
         Some(ExecutionFailure::Table) => AuditError::TableLimitExceeded,

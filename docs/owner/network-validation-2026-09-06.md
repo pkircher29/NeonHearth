@@ -1,0 +1,13 @@
+# Network monitoring validation — September 6, 2026
+
+The Windows package was built, run without administrator elevation, and checked against the owner's Predator Connect W6 and physical LAN. The activated package preserved all 78 existing device records. Its first sweep checked 253 addresses, received 62 responses, and reported zero probe errors. Response counts varied between sweeps, so they are observations rather than a claim that every device always responds.
+
+The W6 collector produced live household WAN upload/download rates, a separately labeled router device count, and persisted rate history. The native browser check displayed 78 inventory rows without duplicates, exercised numeric IP sorting and search, paused/resumed the router graph, and opened the separate host application view. Desktop and 390-pixel phone layouts were visually inspected; no page errors or horizontal overflow were observed.
+
+A private database copy was used before activation. Testing exposed a deferred SQLite transaction racing another writer while saving discovery. Acquiring the write reservation before reading existing sightings fixed the failure. A concurrent-writer regression test covers it. Further testing caught duplicate rows while address enrichment loaded; correlating response observations to the saved interface/MAC identity fixed that, with a UI regression test.
+
+Restart checks preserved discovery settings, first-seen times, history, confirmed names, and the previous web-identification scan. Authenticated MQTT reconnected. An online SQLite backup passed integrity validation before activation; the active database passed integrity validation afterward. The previous package and backup were retained.
+
+Validation included the full existing Rust workspace suite plus the new monitor tests (944 passing before the additional concurrent-writer test, then all five focused monitor tests passing), Clippy with warnings denied, 281 UI tests, Svelte checks with zero errors/warnings, seven Playwright integration tests, and the native browser/API checks above. GitHub CI supplies the Linux and Windows gates for the final commit; the pull request records their outcome.
+
+Scope limits: the W6 feed reports aggregate WAN rates, not per-device byte counts or LAN-to-LAN traffic. Linux discovery was covered by compilation/CI and deterministic boundary tests, not a physical Linux LAN run. Larger subnets and isolated networks remain explicitly outside this bounded sweep. No router settings, firewall rules, or appliance power states were changed by these checks. This is not a claim of complete GlassWire parity or absolute security.

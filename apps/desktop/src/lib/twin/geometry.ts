@@ -26,6 +26,8 @@ export interface PlanWall {
   wall_id: string;
   start: Vec2;
   end: Vec2;
+  /** Optional on read (contract 0.02..=1.0); absent means DEFAULT_WALL_THICKNESS_M. */
+  thickness_m?: number | null;
   openings?: PlanOpening[];
 }
 export interface PlanRoom {
@@ -66,14 +68,26 @@ export interface TwinDevice {
   is_camera?: boolean;
   /** Optional owner-set view direction, degrees CCW from +x in plan space. */
   facing_deg?: number | null;
+  /** Optional evidence tags for the detail card; absent renders as an em-dash. */
+  evidence?: string[] | null;
+  /** Optional RFC3339 last-seen stamp for the detail card. */
+  last_seen_at?: string | null;
 }
+
+import { polygonArea } from '../home/rooms';
 
 // --- Tunable constants (documented so tests and the 2D editor agree) -------
 
 export const DEFAULT_CEILING_M = 2.4;
 export const MIN_CEILING_M = 1.8;
 export const MAX_CEILING_M = 6.0;
-export const WALL_THICKNESS_M = 0.12;
+/** Wall thickness contract: optional on read, 0.02..=1.0, default 0.1 m. */
+export const DEFAULT_WALL_THICKNESS_M = 0.1;
+export const MIN_WALL_THICKNESS_M = 0.02;
+export const MAX_WALL_THICKNESS_M = 1.0;
+export const WALL_THICKNESS_M = DEFAULT_WALL_THICKNESS_M;
+/** Endpoints closer than this (meters) count as one joint when walls meet. */
+export const WALL_JOIN_TOLERANCE_M = 0.05;
 export const SLAB_THICKNESS_M = 0.12;
 /** Visual clearance between a floor's ceiling and the slab above it. */
 export const FLOOR_GAP_M = 0.4;
@@ -88,8 +102,8 @@ export const CAMERA_TILT_HEIGHT_M = 1.4;
 export const CAMERA_TILT_DOWN = 0.25;
 
 export const TWIN_COLORS = {
-  slabExtent: '#0e2430',
-  slabRoom: '#12303c',
+  slabExtent: '#0b1c26',
+  slabRoom: '#14343f',
   wall: '#28505a',
   stair: '#ffcd66'
 } as const;
@@ -122,6 +136,9 @@ export interface SlabDesc {
   name?: string;
   polygon: Vec2[];
   color: string;
+  /** Room slabs only: the owner's room id and its shoelace area in m^2. */
+  room_id?: string;
+  area_m2?: number;
 }
 export interface DevicePin {
   device_id: string;
@@ -146,6 +163,8 @@ export interface FloorGroup {
   elevation_m: number; // world height of this floor's walking surface
   ceiling_m: number;
   slabs: SlabDesc[];
+  /** Subtle ceiling plane; null on the top floor (nothing above it to show). */
+  ceiling: SlabDesc | null;
   walls: WallBox[];
   stairs: StairMarker[];
   pins: DevicePin[];
@@ -188,6 +207,12 @@ export function polygonCentroid(polygon: Vec2[]): Vec2 | null {
   return { x: cx / (6 * area), y: cy / (6 * area) };
 }
 
+/** Clamps a wall's thickness to the contract range; absent/invalid means the default. */
+export function clampWallThickness(value: number | null | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_WALL_THICKNESS_M;
+  return Math.min(MAX_WALL_THICKNESS_M, Math.max(MIN_WALL_THICKNESS_M, value));
+}
+
 export function pointInPolygon(point: Vec2, polygon: Vec2[]): boolean {
   let inside = false;
   for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
@@ -216,7 +241,12 @@ export interface WallExtrusion {
  * - stair: full-height gap plus a flat marker strip on the floor
  * Openings are clamped to the wall, sorted, and overlaps collapse forward.
  */
-export function extrudeWall(wall: PlanWall, ceiling_m: number): WallExtrusion {
+export function extrudeWall(
+  wall: PlanWall,
+  ceiling_m: number,
+  extension: WallExtension = { start: 0, end: 0 }
+): WallExtrusion {
+  const thickness = clampWallThickness(wall.thickness_m);
   const boxes: WallBox[] = [];
   const stairs: StairMarker[] = [];
   const dx = wall.end.x - wall.start.x;
@@ -245,7 +275,7 @@ export function extrudeWall(wall: PlanWall, ceiling_m: number): WallExtrusion {
       segment,
       center: at(from + span / 2),
       length_m: span,
-      thickness_m: WALL_THICKNESS_M,
+      thickness_m: thickness,
       base_m: base,
       height_m: height,
       angle_rad: angle,
@@ -262,7 +292,10 @@ export function extrudeWall(wall: PlanWall, ceiling_m: number): WallExtrusion {
     .filter((opening) => opening.to - opening.from > 1e-9)
     .sort((a, b) => a.from - b.from);
 
-  let cursor = 0;
+  // Joined ends reach past the endpoint so corners meet as solids (no notch).
+  const startExt = Math.max(0, extension.start);
+  const endExt = Math.max(0, extension.end);
+  let cursor = -startExt;
   let index = 0;
   for (const opening of openings) {
     const from = Math.max(opening.from, cursor);
@@ -287,8 +320,63 @@ export function extrudeWall(wall: PlanWall, ceiling_m: number): WallExtrusion {
     cursor = to;
     index += 1;
   }
-  pushBox(cursor, length, 0, ceiling_m, 'solid', `solid-${index}`);
+  pushBox(cursor, length + endExt, 0, ceiling_m, 'solid', `solid-${index}`);
   return { boxes, stairs };
+}
+
+export interface WallExtension {
+  start: number;
+  end: number;
+}
+
+/**
+ * How far each wall end must reach past its endpoint so joined corners are
+ * solid. An end is "joined" when another wall's endpoint coincides with it
+ * (within WALL_JOIN_TOLERANCE_M) and that wall is not a straight continuation;
+ * it then extends by half the thickest joined wall. T-junctions and free ends
+ * need nothing (a butting end already lies inside the other wall's body).
+ */
+export function wallJoinExtensions(walls: PlanWall[]): Map<string, WallExtension> {
+  const result = new Map<string, WallExtension>();
+  const info = walls.map((wall) => {
+    const length = Math.hypot(wall.end.x - wall.start.x, wall.end.y - wall.start.y);
+    return { wall, length, thickness: clampWallThickness(wall.thickness_m) };
+  });
+  const near = (a: Vec2, b: Vec2) => Math.hypot(a.x - b.x, a.y - b.y) <= WALL_JOIN_TOLERANCE_M;
+  // Unit direction leaving the joint along the wall.
+  const away = (entry: (typeof info)[number], fromStart: boolean): Vec2 => {
+    const { wall, length } = entry;
+    const sign = fromStart ? 1 : -1;
+    return {
+      x: (sign * (wall.end.x - wall.start.x)) / length,
+      y: (sign * (wall.end.y - wall.start.y)) / length
+    };
+  };
+  for (const entry of info) {
+    const ext: WallExtension = { start: 0, end: 0 };
+    if (entry.length >= 1e-9) {
+      for (const atStart of [true, false]) {
+        const point = atStart ? entry.wall.start : entry.wall.end;
+        const mine = away(entry, atStart);
+        let reach = 0;
+        for (const other of info) {
+          if (other === entry || other.length < 1e-9) continue;
+          for (const otherAtStart of [true, false]) {
+            const otherPoint = otherAtStart ? other.wall.start : other.wall.end;
+            if (!near(point, otherPoint)) continue;
+            const theirs = away(other, otherAtStart);
+            const cross = Math.abs(mine.x * theirs.y - mine.y * theirs.x);
+            if (cross < 0.05) continue; // straight continuation or doubled-back: no corner
+            reach = Math.max(reach, other.thickness / 2);
+          }
+        }
+        if (atStart) ext.start = reach;
+        else ext.end = reach;
+      }
+    }
+    result.set(entry.wall.wall_id, ext);
+  }
+  return result;
 }
 
 // --- Floor stacking --------------------------------------------------------
@@ -342,11 +430,18 @@ function floorPoints(floor: PlanFloor): Vec2[] {
 export function floorExtent(floor: PlanFloor): { min: Vec2; max: Vec2 } | null {
   const points = floorPoints(floor);
   if (points.length === 0) return null;
-  const xs = points.map((point) => point.x);
-  const ys = points.map((point) => point.y);
+  // Loops, not spread: `Math.min(...xs)` throws a RangeError past the engine's
+  // argument limit (~65k on JavaScriptCore), which a large plan can reach.
+  let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
+  for (const point of points) {
+    if (point.x < minX) minX = point.x;
+    if (point.x > maxX) maxX = point.x;
+    if (point.y < minY) minY = point.y;
+    if (point.y > maxY) maxY = point.y;
+  }
   return {
-    min: { x: Math.min(...xs) - EXTENT_PADDING_M, y: Math.min(...ys) - EXTENT_PADDING_M },
-    max: { x: Math.max(...xs) + EXTENT_PADDING_M, y: Math.max(...ys) + EXTENT_PADDING_M }
+    min: { x: minX - EXTENT_PADDING_M, y: minY - EXTENT_PADDING_M },
+    max: { x: maxX + EXTENT_PADDING_M, y: maxY + EXTENT_PADDING_M }
   };
 }
 
@@ -373,10 +468,126 @@ export function floorSlabs(floor: PlanFloor): SlabDesc[] {
       kind: 'room',
       name: room.name,
       polygon: [...room.polygon],
-      color: TWIN_COLORS.slabRoom
+      color: TWIN_COLORS.slabRoom,
+      room_id: room.room_id,
+      area_m2: polygonArea(room.polygon)
     });
   }
   return slabs;
+}
+
+/** Ceiling plane over a floor's extent (null when the floor has no geometry). */
+export function floorCeiling(floor: PlanFloor): SlabDesc | null {
+  const extent = floorExtent(floor);
+  if (!extent) return null;
+  return {
+    id: `${floor.floor_id}:ceiling`,
+    kind: 'extent',
+    polygon: [
+      { x: extent.min.x, y: extent.min.y },
+      { x: extent.max.x, y: extent.min.y },
+      { x: extent.max.x, y: extent.max.y },
+      { x: extent.min.x, y: extent.max.y }
+    ],
+    color: TWIN_COLORS.slabExtent
+  };
+}
+
+/** The room containing a point on this floor (first match), or null. */
+export function roomAtPoint(floor: PlanFloor, point: Vec2): PlanRoom | null {
+  return (
+    floor.rooms.find((room) => room.polygon.length >= 3 && pointInPolygon(point, room.polygon)) ?? null
+  );
+}
+
+// --- Slab triangulation (ear clipping; handles concave polygons) ----------
+
+function cross2(o: Vec2, a: Vec2, b: Vec2): number {
+  return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+}
+
+/**
+ * Triangulates a simple polygon (convex or concave, either winding, optional
+ * repeated closing point) into index triples into the ORIGINAL array. Every
+ * triangle is wound so that, under the renderer mapping plan (x, y) ->
+ * three.js (x, 0, y), its face normal points +y (up). Degenerate input
+ * (fewer than 3 distinct points, zero area) returns [].
+ */
+export function triangulatePolygon(polygon: Vec2[]): [number, number, number][] {
+  const points = polygon;
+  let count = points.length;
+  if (count > 1) {
+    const first = points[0]!;
+    const last = points[count - 1]!;
+    if (first.x === last.x && first.y === last.y) count -= 1;
+  }
+  if (count < 3) return [];
+  let area2 = 0;
+  for (let i = 0; i < count; i += 1) {
+    const a = points[i]!;
+    const b = points[(i + 1) % count]!;
+    area2 += a.x * b.y - b.x * a.y;
+  }
+  if (Math.abs(area2) < 1e-12) return [];
+  // Work in counter-clockwise order (positive area in plan space).
+  const order = Array.from({ length: count }, (_, i) => i);
+  if (area2 < 0) order.reverse();
+
+  const triangles: [number, number, number][] = [];
+  const inside = (p: Vec2, a: Vec2, b: Vec2, c: Vec2) =>
+    cross2(a, b, p) >= -1e-12 && cross2(b, c, p) >= -1e-12 && cross2(c, a, p) >= -1e-12;
+  const same = (p: Vec2, q: Vec2) => p.x === q.x && p.y === q.y;
+
+  let guard = count * count + 8;
+  while (order.length > 3 && guard-- > 0) {
+    let clipped = false;
+    for (let i = 0; i < order.length; i += 1) {
+      const ia = order[(i + order.length - 1) % order.length]!;
+      const ib = order[i]!;
+      const ic = order[(i + 1) % order.length]!;
+      const a = points[ia]!; const b = points[ib]!; const c = points[ic]!;
+      if (cross2(a, b, c) <= 1e-12) continue; // reflex or collinear: not an ear
+      let blocked = false;
+      for (const other of order) {
+        if (other === ia || other === ib || other === ic) continue;
+        const p = points[other]!;
+        if (same(p, a) || same(p, b) || same(p, c)) continue;
+        if (inside(p, a, b, c)) { blocked = true; break; }
+      }
+      if (blocked) continue;
+      triangles.push([ia, ib, ic]);
+      order.splice(i, 1);
+      clipped = true;
+      break;
+    }
+    if (!clipped) {
+      // Pinched or numerically degenerate: drop a collinear vertex and retry,
+      // otherwise fan what is left so the slab still renders.
+      let dropped = false;
+      for (let i = 0; i < order.length; i += 1) {
+        const a = points[order[(i + order.length - 1) % order.length]!]!;
+        const b = points[order[i]!]!;
+        const c = points[order[(i + 1) % order.length]!]!;
+        if (Math.abs(cross2(a, b, c)) <= 1e-12) { order.splice(i, 1); dropped = true; break; }
+      }
+      if (!dropped) break;
+    }
+  }
+  if (order.length >= 3) {
+    for (let i = 1; i < order.length - 1; i += 1) {
+      const t: [number, number, number] = [order[0]!, order[i]!, order[i + 1]!];
+      if (cross2(points[t[0]]!, points[t[1]]!, points[t[2]]!) > 1e-12) triangles.push(t);
+    }
+  }
+  // CCW in (x, y) means the three.js (x, 0, y) normal is -y; flip to face up.
+  return triangles.map(([a, b, c]) => [a, c, b]);
+}
+
+/** Total area of a triangulation (for tests and sanity checks). */
+export function trianglesArea(polygon: Vec2[], triangles: [number, number, number][]): number {
+  let total = 0;
+  for (const [a, b, c] of triangles) total += Math.abs(cross2(polygon[a]!, polygon[b]!, polygon[c]!)) / 2;
+  return total;
 }
 
 export function deviceLabel(device: TwinDevice | undefined, device_id: string): string {
@@ -462,12 +673,14 @@ export function buildSceneDescription(
   const elevations = new Map(floorElevations(plan.floors).map((entry) => [entry.floor_id, entry]));
   const sortedFloors = [...plan.floors].sort((a, b) => a.level - b.level);
 
+  const topFloor = sortedFloors[sortedFloors.length - 1];
   const floors: FloorGroup[] = sortedFloors.map((floor) => {
     const elevation = elevations.get(floor.floor_id)!;
     const walls: WallBox[] = [];
     const stairs: StairMarker[] = [];
+    const extensions = wallJoinExtensions(floor.walls);
     for (const wall of floor.walls) {
-      const extrusion = extrudeWall(wall, elevation.ceiling_m);
+      const extrusion = extrudeWall(wall, elevation.ceiling_m, extensions.get(wall.wall_id));
       walls.push(...extrusion.boxes);
       stairs.push(...extrusion.stairs);
     }
@@ -484,6 +697,7 @@ export function buildSceneDescription(
       elevation_m: elevation.elevation_m,
       ceiling_m: elevation.ceiling_m,
       slabs: floorSlabs(floor),
+      ceiling: floor === topFloor ? null : floorCeiling(floor),
       walls,
       stairs,
       pins,
@@ -492,28 +706,30 @@ export function buildSceneDescription(
   });
 
   let bounds: SceneBounds | null = null;
-  const xs: number[] = [];
-  const ys: number[] = [];
-  const heights: number[] = [];
+  // Running extremes instead of collected arrays + spread (see floorExtent).
+  let count = 0;
+  let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
+  let minH = Infinity; let maxH = -Infinity;
+  const include = (x: number, y: number, h: number) => {
+    count += 1;
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    if (h < minH) minH = h; if (h > maxH) maxH = h;
+  };
   for (const group of floors) {
     const floor = sortedFloors.find((candidate) => candidate.floor_id === group.floor_id)!;
     const extent = floorExtent(floor);
     if (extent) {
-      xs.push(extent.min.x, extent.max.x);
-      ys.push(extent.min.y, extent.max.y);
-      heights.push(group.elevation_m, group.elevation_m + group.ceiling_m);
+      include(extent.min.x, extent.min.y, group.elevation_m);
+      include(extent.max.x, extent.max.y, group.elevation_m + group.ceiling_m);
     }
-    for (const pin of group.pins) {
-      xs.push(pin.position.x);
-      ys.push(pin.position.y);
-      heights.push(group.elevation_m + pin.height_m);
-    }
+    for (const pin of group.pins) include(pin.position.x, pin.position.y, group.elevation_m + pin.height_m);
   }
-  if (xs.length > 0) {
-    const min = { x: Math.min(...xs), y: Math.min(...ys) };
-    const max = { x: Math.max(...xs), y: Math.max(...ys) };
+  if (count > 0) {
+    const min = { x: minX, y: minY };
+    const max = { x: maxX, y: maxY };
     const horizontal = Math.hypot(max.x - min.x, max.y - min.y) / 2;
-    const vertical = heights.length > 0 ? Math.max(...heights) - Math.min(...heights) : 0;
+    const vertical = maxH - minH;
     bounds = {
       min,
       max,

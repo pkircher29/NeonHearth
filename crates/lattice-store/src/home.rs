@@ -130,7 +130,13 @@ impl HomeRepository {
         if json.len() > MAX_PLAN_BYTES {
             return Err(HomeStoreError::Invalid);
         }
-        let mut transaction = self.pool.begin().await.map_err(map_sqlx)?;
+        // Reserve the writer before reading the version. A deferred read-to-write
+        // upgrade can fail immediately while discovery or automation is writing.
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx)?;
         let actual: Option<i64> =
             sqlx::query_scalar("SELECT version FROM home_plans WHERE singleton = 1")
                 .fetch_optional(&mut *transaction)

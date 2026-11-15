@@ -16,7 +16,7 @@ use lattice_doctor::{
     executor::{FakeRepairTransport, RepairReport},
     probe::{
         DnsFailureReason, FakeProbeTransport, LeaseState, Probe, ProbeError, ProbeRequest,
-        ProbeResponse, ProbeTransport,
+        ProbeResponse, ProbeTransport, RouteEntry,
     },
     repair::{RepairContext, RepairPlan},
 };
@@ -271,6 +271,12 @@ async fn every_doctor_route_rejects_unauthenticated_requests() {
             "POST",
             "/api/v1/doctor/repair",
             Some(serde_json::json!({ "diagnosis_kind": kind })),
+        ),
+        ("GET", "/api/v1/doctor/settings", None),
+        (
+            "PUT",
+            "/api/v1/doctor/settings",
+            Some(serde_json::json!({ "external_probes_confirmed": true })),
         ),
     ] {
         let response = send(&fixture.router, method, uri, body, false).await;
@@ -752,12 +758,14 @@ async fn mint_and_execution_both_append_doctor_action_audit_rows() {
 #[tokio::test]
 async fn openapi_documents_all_doctor_routes_and_schemas() {
     let fixture = mixed_fixture().await;
-    let response = send(&fixture.router, "GET", "/api/v1/openapi.json", None, false).await;
+    let response = send(&fixture.router, "GET", "/api/v1/openapi.json", None, true).await;
     assert_eq!(response.status(), StatusCode::OK);
     let doc = json_body(response).await;
     for (path, method) in [
         ("/api/v1/doctor/run", "post"),
         ("/api/v1/doctor/report", "get"),
+        ("/api/v1/doctor/settings", "get"),
+        ("/api/v1/doctor/settings", "put"),
         ("/api/v1/doctor/approvals", "post"),
         ("/api/v1/doctor/repair", "post"),
     ] {
@@ -803,4 +811,290 @@ async fn openapi_documents_all_doctor_routes_and_schemas() {
             ["schema"]["$ref"],
         "#/components/schemas/DoctorRun"
     );
+}
+
+// ---------------------------------------------------------------------------
+// M-7: owner-visible probe targets, nothing guessed, external probes gated.
+// ---------------------------------------------------------------------------
+
+/// A fully healthy network so every check in the graph actually runs.
+fn healthy_probes() -> FakeProbeTransport {
+    FakeProbeTransport::new(|request| match request {
+        ProbeRequest::CollectorStatus => Ok(ProbeResponse::CollectorStatus {
+            privileged: true,
+            capture_ok: true,
+            worker_running: true,
+        }),
+        ProbeRequest::LinkStatus { .. } => Ok(ProbeResponse::LinkStatus {
+            up: true,
+            speed_mbps: Some(1000),
+        }),
+        ProbeRequest::IpConfig { .. } => Ok(ProbeResponse::IpConfig {
+            address: Some("10.0.0.5".to_owned()),
+            lease: LeaseState::Valid,
+        }),
+        ProbeRequest::ArpProbe { .. } => Ok(ProbeResponse::ArpProbe {
+            responding_macs: vec!["aa:aa:aa:aa:aa:01".to_owned()],
+        }),
+        ProbeRequest::WifiMetrics { .. } => Ok(ProbeResponse::WifiMetrics {
+            wireless: false,
+            rssi_dbm: None,
+            retry_percent: None,
+        }),
+        ProbeRequest::Ping { .. } => Ok(ProbeResponse::PingReply { rtt_ms: 4.0 }),
+        ProbeRequest::DnsQuery { .. } => Ok(ProbeResponse::DnsAnswer {
+            addresses: vec!["93.184.216.34".to_owned()],
+            latency_ms: 12.0,
+        }),
+        ProbeRequest::RouterStatus => Ok(ProbeResponse::RouterStatus {
+            responsive: true,
+            uptime_seconds: Some(3_600),
+        }),
+        ProbeRequest::RouteTable => Ok(ProbeResponse::RouteTable {
+            default_routes: vec![RouteEntry {
+                interface: "eth0".to_owned(),
+                gateway: "10.0.0.1".to_owned(),
+                is_vpn: false,
+                metric: 100,
+            }],
+        }),
+        ProbeRequest::ReachIp { .. } => Ok(ProbeResponse::Reachable { latency_ms: 30.0 }),
+    })
+}
+
+fn check<'a>(run: &'a serde_json::Value, kind: &str) -> &'a serde_json::Value {
+    run["report"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["kind"] == kind)
+        .unwrap_or_else(|| panic!("no {kind} check: {run}"))
+}
+
+#[tokio::test]
+async fn settings_are_owner_editable_validated_audited_and_gate_external_probes() {
+    let fixture = fixture(
+        Arc::new(healthy_probes()),
+        Arc::new(FakeRepairTransport::new()),
+    )
+    .await;
+
+    // `with_parts` mirrors the injected config: owner-provided, confirmed.
+    let response = send(
+        &fixture.router,
+        "GET",
+        "/api/v1/doctor/settings",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let settings = json_body(response).await;
+    assert_eq!(settings["gateway"], "10.0.0.1");
+    assert_eq!(settings["gateway_source"], "owner");
+    assert_eq!(settings["external_probes_confirmed"], true);
+    let mut keys: Vec<_> = settings.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "configured_resolvers",
+            "dns_probe_name",
+            "external_probes_confirmed",
+            "gateway",
+            "gateway_source",
+            "independent_resolver",
+            "interface",
+            "internet_probe_address",
+            "internet_probe_port",
+        ]
+    );
+
+    // Invalid or unknown fields are refused with a reason and change nothing.
+    let response = send(
+        &fixture.router,
+        "PUT",
+        "/api/v1/doctor/settings",
+        Some(serde_json::json!({ "gateway": "router.local" })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json_body(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("gateway")
+    );
+    let response = send(
+        &fixture.router,
+        "PUT",
+        "/api/v1/doctor/settings",
+        Some(serde_json::json!({ "bogus": 1 })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = send(
+        &fixture.router,
+        "GET",
+        "/api/v1/doctor/settings",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(json_body(response).await["gateway"], "10.0.0.1");
+
+    // With everything healthy and confirmed, the by-IP internet check passes.
+    let run = run_doctor(&fixture.router).await;
+    assert_eq!(
+        check(&run, "internet_reachability")["status"]["state"],
+        "passed"
+    );
+
+    // Withdrawing confirmation stops external probes: only 1.1.1.1 is
+    // outside the private network here, so exactly that check turns into a
+    // refused probe instead of a dial.
+    let response = send(
+        &fixture.router,
+        "PUT",
+        "/api/v1/doctor/settings",
+        Some(serde_json::json!({
+            "independent_resolver": "10.0.0.53",
+            "external_probes_confirmed": false
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["external_probes_confirmed"],
+        false
+    );
+    let run = run_doctor(&fixture.router).await;
+    assert_eq!(check(&run, "dns")["status"]["state"], "passed");
+    let internet = check(&run, "internet_reachability");
+    assert_eq!(internet["status"]["state"], "failed");
+    assert_eq!(internet["detail"]["detail"], "probe_failure");
+    assert!(
+        internet["detail"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not confirmed")
+    );
+
+    // Clearing the gateway leaves the check unconfigured rather than guessed.
+    let response = send(
+        &fixture.router,
+        "PUT",
+        "/api/v1/doctor/settings",
+        Some(serde_json::json!({ "gateway": "" })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let settings = json_body(response).await;
+    assert_eq!(settings["gateway"], serde_json::Value::Null);
+    assert_eq!(settings["gateway_source"], "unknown");
+    // The transport answers every ping it is asked, so zero replies means
+    // the placeholder was never dialed.
+    let run = run_doctor(&fixture.router).await;
+    let gateway = check(&run, "gateway");
+    assert_eq!(gateway["status"]["state"], "failed");
+    assert_eq!(gateway["detail"]["detail"], "gateway_ping");
+    assert_eq!(gateway["detail"]["received"], 0);
+
+    // Likewise an empty resolver list is reported as unconfigured, with the
+    // reason on the resolver's own evidence.
+    let response = send(
+        &fixture.router,
+        "PUT",
+        "/api/v1/doctor/settings",
+        Some(serde_json::json!({ "gateway": "10.0.0.1", "configured_resolvers": [] })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let run = run_doctor(&fixture.router).await;
+    let resolvers = check(&run, "dns")["detail"]["resolvers"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let unconfigured = resolvers
+        .iter()
+        .find(|resolver| resolver["resolver"] == "unconfigured")
+        .expect("placeholder resolver is reported");
+    assert_eq!(unconfigured["independent"], false);
+    assert_eq!(unconfigured["outcome"]["outcome"], "unavailable");
+    assert!(
+        unconfigured["outcome"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not configured")
+    );
+
+    // Every accepted change is audited with before and after.
+    let rows: Vec<_> = doctor_audit_rows(&fixture.pool)
+        .await
+        .into_iter()
+        .filter(|row| row.action == "settings_updated")
+        .collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].subject.as_deref(), Some("doctor_settings"));
+    assert_eq!(
+        rows[0].detail["previous"]["external_probes_confirmed"],
+        true
+    );
+    assert_eq!(
+        rows[0].detail["settings"]["external_probes_confirmed"],
+        false
+    );
+    assert_eq!(rows[1].detail["previous"]["gateway"], "10.0.0.1");
+    assert_eq!(
+        rows[1].detail["settings"]["gateway"],
+        serde_json::Value::Null
+    );
+    assert_eq!(rows[2].detail["settings"]["gateway_source"], "owner");
+    assert_eq!(
+        rows[2].detail["settings"]["configured_resolvers"],
+        serde_json::json!([])
+    );
+}
+
+/// M-15: a repair never interleaves with another repair or a diagnostic
+/// run; the loser gets 409 and keeps its (unconsumed) approval.
+#[tokio::test]
+async fn repairs_are_single_flight() {
+    let repairs = FakeRepairTransport::new()
+        .push_measurements(vec![measurement(Metric::RouterResponsive, 0.0)])
+        .push_measurements(vec![measurement(Metric::RouterResponsive, 1.0)]);
+    let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(repairs)).await;
+    let run = run_doctor(&fixture.router).await;
+    let kind = finding_kind(&run, "router_fault");
+    let repair = || {
+        send(
+            &fixture.router,
+            "POST",
+            "/api/v1/doctor/repair",
+            Some(serde_json::json!({ "diagnosis_kind": kind })),
+            true,
+        )
+    };
+    let (first, second) = tokio::join!(repair(), repair());
+    let mut statuses = [first.status(), second.status()];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+
+    // Exactly one execution happened and was audited.
+    let rows = doctor_audit_rows(&fixture.pool).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.action == "repair_executed")
+            .count(),
+        1
+    );
+
+    // The flag is released afterwards: a later repair is admitted again.
+    let response = repair().await;
+    assert_ne!(response.status(), StatusCode::CONFLICT);
 }

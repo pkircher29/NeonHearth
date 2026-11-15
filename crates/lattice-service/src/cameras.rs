@@ -1,5 +1,7 @@
 //! Authenticated camera media sessions and the credential-injecting RTSP loopback.
 
+mod peer;
+
 use async_trait::async_trait;
 use axum::{
     Json,
@@ -11,8 +13,8 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration as ChronoDuration, Utc};
 use lattice_camera::{
-    CameraId, HlsSession, HlsSessionId, LoopbackSourceToken, MediaProcess, MediaProcessFactory,
-    MediaProcessSpec, StreamId,
+    CameraId, HlsSession, HlsSessionId, LoopbackSourceToken, MediaError, MediaProcess,
+    MediaProcessFactory, MediaProcessSpec, StreamId,
 };
 use lattice_sensor::{
     AuthorizedBinding, InterfaceId, TargetGuard, active::pin_socket_to_interface,
@@ -44,6 +46,14 @@ use url::{Host, Url};
 use zeroize::Zeroizing;
 
 use crate::{AppState, auth::Authorized, vault::Vault};
+use peer::verify_loopback_owner;
+
+/// Redacted diagnostic for a camera session stage that failed. Only the opaque
+/// session id, a fixed stage name, and an enum variant are emitted; no host,
+/// path, URI, or header ever reaches the log.
+fn note_session_failure(session: &HlsSessionId, stage: &'static str, error: &dyn fmt::Debug) {
+    tracing::warn!(session = %session, stage, error = ?error, "camera session stage failed");
+}
 
 const CLEANUP_COMPONENT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_RETRY_BASE: Duration = Duration::from_millis(25);
@@ -424,6 +434,7 @@ impl CameraSessionManager {
         {
             Ok(output_dir) => output_dir,
             Err(Some(output_dir)) => {
+                note_session_failure(&session, "output_dir", &CameraSessionError::Unavailable);
                 let _ = self
                     .cleanup_or_retain(
                         session,
@@ -433,7 +444,10 @@ impl CameraSessionManager {
                     .await;
                 return Err(CameraSessionError::Unavailable);
             }
-            Err(None) => return Err(CameraSessionError::Unavailable),
+            Err(None) => {
+                note_session_failure(&session, "output_dir", &CameraSessionError::Unavailable);
+                return Err(CameraSessionError::Unavailable);
+            }
         };
         let proxy_limits = RtspProxyLimits {
             lease_ttl: self.config.total_timeout,
@@ -446,11 +460,13 @@ impl CameraSessionManager {
             binding,
             self.connector.clone(),
             proxy_limits,
+            ProxyConsumer::Pending,
         )
         .await
         {
             Ok(proxy) => proxy,
-            Err(_) => {
+            Err(error) => {
+                note_session_failure(&session, "proxy_start", &error);
                 let _ = self
                     .cleanup_or_retain(
                         session.clone(),
@@ -463,7 +479,8 @@ impl CameraSessionManager {
         };
         let spec = match MediaProcessSpec::hls(proxy.local_addr().port(), &token, &output_dir) {
             Ok(spec) => spec,
-            Err(_) => {
+            Err(error) => {
+                note_session_failure(&session, "media_spec", &error);
                 let _ = self
                     .cleanup_or_retain(
                         session.clone(),
@@ -474,14 +491,24 @@ impl CameraSessionManager {
                 return Err(CameraSessionError::Unavailable);
             }
         };
-        let process = match timeout(
+        let spawned = timeout(
             self.config.process_start_timeout,
             self.process_factory.spawn(spec),
         )
-        .await
-        {
+        .await;
+        let process = match spawned {
             Ok(Ok(process)) => process,
-            Ok(Err(_)) | Err(_) => {
+            failed => {
+                let stage = if failed.is_err() {
+                    "media_spawn_timeout"
+                } else {
+                    "media_spawn"
+                };
+                let error = match failed {
+                    Ok(Err(error)) => error,
+                    _ => MediaError::ProcessUnavailable,
+                };
+                note_session_failure(&session, stage, &error);
                 let _ = self
                     .cleanup_or_retain(
                         session.clone(),
@@ -492,6 +519,19 @@ impl CameraSessionManager {
                 return Err(CameraSessionError::Unavailable);
             }
         };
+        if let Some(pid) = process.pid()
+            && let Err(error) = proxy.authorize_consumer(&session, pid)
+        {
+            note_session_failure(&session, "proxy_consumer", &error);
+            let _ = self
+                .cleanup_or_retain(
+                    session.clone(),
+                    CleanupResources::transient(Some(process), Some(proxy), output_dir, permit),
+                    0,
+                )
+                .await;
+            return Err(CameraSessionError::Unavailable);
+        }
         let now = Instant::now();
         let value = ManagedSession {
             camera,
@@ -513,6 +553,7 @@ impl CameraSessionManager {
             }
         };
         if let Some(value) = value {
+            tracing::debug!(session = %session, "camera session refused: manager shutting down");
             let _ = self
                 .cleanup_or_retain(session.clone(), CleanupResources::from_session(value), 0)
                 .await;
@@ -614,6 +655,7 @@ impl CameraSessionManager {
         let output_dir = match self.create_output_dir("snapshot", &owner.to_string()).await {
             Ok(output_dir) => output_dir,
             Err(Some(output_dir)) => {
+                note_session_failure(&owner, "output_dir", &CameraSessionError::Unavailable);
                 let _ = self
                     .cleanup_or_retain(
                         owner,
@@ -623,7 +665,10 @@ impl CameraSessionManager {
                     .await;
                 return Err(CameraSessionError::Unavailable);
             }
-            Err(None) => return Err(CameraSessionError::Unavailable),
+            Err(None) => {
+                note_session_failure(&owner, "output_dir", &CameraSessionError::Unavailable);
+                return Err(CameraSessionError::Unavailable);
+            }
         };
         let proxy_limits = RtspProxyLimits {
             lease_ttl: self.config.snapshot_timeout,
@@ -636,11 +681,13 @@ impl CameraSessionManager {
             binding,
             self.connector.clone(),
             proxy_limits,
+            ProxyConsumer::Pending,
         )
         .await
         {
             Ok(proxy) => proxy,
-            Err(_) => {
+            Err(error) => {
+                note_session_failure(&owner, "proxy_start", &error);
                 let _ = self
                     .cleanup_or_retain(
                         owner.clone(),
@@ -654,7 +701,8 @@ impl CameraSessionManager {
         let spec = match MediaProcessSpec::snapshot(proxy.local_addr().port(), &token, &output_dir)
         {
             Ok(spec) => spec,
-            Err(_) => {
+            Err(error) => {
+                note_session_failure(&owner, "media_spec", &error);
                 let _ = self
                     .cleanup_or_retain(
                         owner.clone(),
@@ -665,14 +713,24 @@ impl CameraSessionManager {
                 return Err(CameraSessionError::Unavailable);
             }
         };
-        let mut process = match timeout(
+        let spawned = timeout(
             self.config.process_start_timeout,
             self.process_factory.spawn(spec),
         )
-        .await
-        {
+        .await;
+        let mut process = match spawned {
             Ok(Ok(process)) => process,
-            Ok(Err(_)) | Err(_) => {
+            failed => {
+                let stage = if failed.is_err() {
+                    "media_spawn_timeout"
+                } else {
+                    "media_spawn"
+                };
+                let error = match failed {
+                    Ok(Err(error)) => error,
+                    _ => MediaError::ProcessUnavailable,
+                };
+                note_session_failure(&owner, stage, &error);
                 let _ = self
                     .cleanup_or_retain(
                         owner.clone(),
@@ -683,6 +741,19 @@ impl CameraSessionManager {
                 return Err(CameraSessionError::Unavailable);
             }
         };
+        if let Some(pid) = process.pid()
+            && let Err(error) = proxy.authorize_consumer(&owner, pid)
+        {
+            note_session_failure(&owner, "proxy_consumer", &error);
+            let _ = self
+                .cleanup_or_retain(
+                    owner.clone(),
+                    CleanupResources::transient(Some(process), Some(proxy), output_dir, permit),
+                    0,
+                )
+                .await;
+            return Err(CameraSessionError::Unavailable);
+        }
         let result = match timeout(self.config.snapshot_timeout, process.wait()).await {
             Ok(Ok(exit)) if exit.success => {
                 let bytes =
@@ -694,11 +765,32 @@ impl CameraSessionManager {
                     {
                         Ok(bytes)
                     }
-                    Ok(_) => Err(CameraSessionError::Unavailable),
-                    Err(error) => Err(error),
+                    Ok(_) => {
+                        note_session_failure(
+                            &owner,
+                            "snapshot_not_jpeg",
+                            &MediaError::ProcessFailed,
+                        );
+                        Err(CameraSessionError::Unavailable)
+                    }
+                    Err(error) => {
+                        note_session_failure(&owner, "snapshot_read", &error);
+                        Err(error)
+                    }
                 }
             }
-            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => Err(CameraSessionError::Unavailable),
+            Ok(Ok(_)) => {
+                note_session_failure(&owner, "snapshot_exit", &MediaError::ProcessFailed);
+                Err(CameraSessionError::Unavailable)
+            }
+            Ok(Err(error)) => {
+                note_session_failure(&owner, "snapshot_wait", &error);
+                Err(CameraSessionError::Unavailable)
+            }
+            Err(_) => {
+                note_session_failure(&owner, "snapshot_timeout", &MediaError::ProcessFailed);
+                Err(CameraSessionError::Unavailable)
+            }
         };
         if self
             .cleanup_or_retain(
@@ -842,6 +934,7 @@ impl CameraSessionManager {
             (value.output_dir.clone(), crashed)
         };
         if crashed {
+            note_session_failure(session, "media_process_exited", &MediaError::ProcessFailed);
             let crashed = { self.sessions.lock().await.remove(session) };
             if let Some(value) = crashed {
                 let _ = self
@@ -875,6 +968,7 @@ impl CameraSessionManager {
                 .collect::<Vec<_>>()
         };
         for (session, value) in expired {
+            tracing::debug!(session = %session, "camera session reaped (expired or exited)");
             let _ = self
                 .cleanup_or_retain(session, CleanupResources::from_session(value), 0)
                 .await;
@@ -892,6 +986,14 @@ impl CameraSessionManager {
         }
         let attempts = previous_attempts.saturating_add(1);
         let next_retry = Instant::now() + cleanup_retry_delay(attempts);
+        tracing::warn!(
+            session = %owner,
+            attempts,
+            process_pending = resources.process.is_some(),
+            proxy_pending = resources.proxy.is_some(),
+            output_dir_pending = resources.output_dir.is_some(),
+            "camera session cleanup failed; retained for retry"
+        );
         let mut pending = self.pending_cleanup.lock().await;
         debug_assert!(pending.len() < self.config.max_sessions || pending.contains_key(&owner));
         pending.insert(
@@ -1386,7 +1488,13 @@ pub struct RtspProxyLimits {
     pub max_header_bytes: usize,
     pub max_body_bytes: usize,
     pub max_interleaved_frame_bytes: usize,
+    /// Bound on each request/response phase read or write, and on the wait
+    /// for the media process to be authorized as the proxy's consumer.
     pub io_timeout: Duration,
+    /// Bound on silence once the upstream connection exists: a camera that
+    /// sends no interleaved frame for this long (low-motion pause, keyframe
+    /// interval) is treated as stalled. Must be at least `io_timeout`.
+    pub stream_stall_timeout: Duration,
     pub lease_ttl: Duration,
 }
 
@@ -1398,6 +1506,7 @@ impl Default for RtspProxyLimits {
             max_body_bytes: 64 * 1024,
             max_interleaved_frame_bytes: 1024 * 1024,
             io_timeout: Duration::from_secs(5),
+            stream_stall_timeout: Duration::from_secs(30),
             lease_ttl: Duration::from_secs(60),
         }
     }
@@ -1411,6 +1520,8 @@ impl RtspProxyLimits {
             || !(1..=4 * 1024 * 1024).contains(&self.max_interleaved_frame_bytes)
             || self.io_timeout.is_zero()
             || self.io_timeout > Duration::from_secs(30)
+            || self.stream_stall_timeout < self.io_timeout
+            || self.stream_stall_timeout > Duration::from_secs(120)
             || self.lease_ttl.is_zero()
             || self.lease_ttl > Duration::from_secs(10 * 60)
         {
@@ -1439,6 +1550,32 @@ pub enum RtspProxyError {
     Limit,
     #[error("RTSP proxy timed out")]
     Timeout,
+    #[error("RTSP proxy consumer is not the authorized media process")]
+    Consumer,
+}
+
+/// Which process may consume the loopback source.
+///
+/// The source URL (with its token) is an argument of the media process and is
+/// therefore visible to every same-user process on the host, so the token is
+/// not sufficient on its own. The proxy verifies the OS owner of each loopback
+/// peer against this pid before serving it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyConsumer {
+    /// The consumer process is already known (tests, or a pre-spawned helper).
+    Process(u32),
+    /// The consumer will be spawned after the proxy is listening; connections
+    /// wait (bounded by `io_timeout`) for [`LoopbackRtspProxy::authorize_consumer`].
+    Pending,
+}
+
+impl ProxyConsumer {
+    const fn initial(self) -> Option<u32> {
+        match self {
+            Self::Process(pid) => Some(pid),
+            Self::Pending => None,
+        }
+    }
 }
 
 pub trait RtspConnection: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -1501,6 +1638,7 @@ pub struct LoopbackRtspProxy {
     token: LoopbackSourceToken,
     local_addr: SocketAddr,
     shutdown: watch::Sender<bool>,
+    consumer: watch::Sender<Option<u32>>,
     shutdown_timeout: Duration,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1519,6 +1657,7 @@ impl LoopbackRtspProxy {
         approved: ApprovedRtspTarget,
         connector: Arc<dyn AuthorizedRtspConnector>,
         limits: RtspProxyLimits,
+        consumer: ProxyConsumer,
     ) -> Result<Self, RtspProxyError> {
         let limits = limits.validate()?;
         let upstream = Arc::new(Upstream::parse(source)?);
@@ -1535,6 +1674,7 @@ impl LoopbackRtspProxy {
             return Err(RtspProxyError::Unavailable);
         }
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let (consumer, consumer_rx) = watch::channel(consumer.initial());
         let task_token = token.clone();
         let task = tokio::spawn(run_listener(
             listener,
@@ -1544,15 +1684,39 @@ impl LoopbackRtspProxy {
             connector,
             limits,
             shutdown_rx,
+            consumer_rx,
         ));
         Ok(Self {
             owner,
             token,
             local_addr,
             shutdown,
+            consumer,
             shutdown_timeout: limits.io_timeout,
             task: Mutex::new(Some(task)),
         })
+    }
+
+    /// Names the process allowed to consume the source. Connections that
+    /// arrived while the consumer was pending are released to peer
+    /// verification; the pid cannot be changed once set.
+    pub fn authorize_consumer(&self, owner: &HlsSessionId, pid: u32) -> Result<(), RtspProxyError> {
+        if owner != &self.owner {
+            return Err(RtspProxyError::WrongOwner);
+        }
+        let mut result = Ok(());
+        self.consumer.send_if_modified(|current| match *current {
+            None => {
+                *current = Some(pid);
+                true
+            }
+            Some(existing) if existing == pid => false,
+            Some(_) => {
+                result = Err(RtspProxyError::Consumer);
+                false
+            }
+        });
+        result
     }
 
     #[must_use]
@@ -1680,6 +1844,104 @@ impl Upstream {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthScheme {
+    Basic,
+    Digest,
+}
+
+/// Per-connection authentication state. Credentials are only ever sent in
+/// answer to a challenge: the first request goes out bare, Digest is chosen
+/// whenever the camera offers it, and Basic only when nothing stronger is
+/// offered. The chosen scheme is then replayed pre-emptively on later requests
+/// of the same connection so each request costs one round trip.
+#[derive(Default)]
+struct ConnectionAuth {
+    scheme: Option<AuthScheme>,
+    /// The last Digest challenge, replayed pre-emptively; `stale` is ignored on
+    /// replay so the nonce count keeps incrementing.
+    challenge: Option<String>,
+    digest: DigestState,
+}
+
+impl ConnectionAuth {
+    fn preemptive(
+        &mut self,
+        upstream: &Upstream,
+        method: &str,
+        uri: &str,
+    ) -> Result<Option<Zeroizing<String>>, RtspProxyError> {
+        match self.scheme {
+            None => Ok(None),
+            Some(AuthScheme::Basic) => Ok(upstream.basic_header()),
+            Some(AuthScheme::Digest) => {
+                let challenge = self.challenge.as_deref().ok_or(RtspProxyError::Protocol)?;
+                self.digest
+                    .header(
+                        challenge,
+                        method,
+                        uri,
+                        upstream.username.as_deref(),
+                        upstream.password.as_ref(),
+                        false,
+                    )
+                    .map(Some)
+            }
+        }
+    }
+
+    /// Answers a 401. A usable Digest challenge always wins; if the camera
+    /// offers Digest but the challenge is unsupported, the error propagates and
+    /// the connection ends rather than downgrading to Basic. Returns `None`
+    /// when there is nothing new to try (no challenge, no credentials, or
+    /// Basic was already sent).
+    fn answer(
+        &mut self,
+        response: &RtspMessage,
+        upstream: &Upstream,
+        method: &str,
+        uri: &str,
+    ) -> Result<Option<Zeroizing<String>>, RtspProxyError> {
+        let challenges = response
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+            .map(|(_, value)| value.trim_start());
+        let mut digest = None;
+        let mut basic = false;
+        for challenge in challenges {
+            let lower = challenge.to_ascii_lowercase();
+            if lower.starts_with("digest ") && digest.is_none() {
+                digest = Some(challenge);
+            } else if lower.starts_with("basic") {
+                basic = true;
+            }
+        }
+        if let Some(challenge) = digest {
+            let header = self.digest.header(
+                challenge,
+                method,
+                uri,
+                upstream.username.as_deref(),
+                upstream.password.as_ref(),
+                true,
+            )?;
+            self.scheme = Some(AuthScheme::Digest);
+            self.challenge = Some(challenge.to_owned());
+            return Ok(Some(header));
+        }
+        if basic
+            && self.scheme != Some(AuthScheme::Basic)
+            && let Some(header) = upstream.basic_header()
+        {
+            self.scheme = Some(AuthScheme::Basic);
+            return Ok(Some(header));
+        }
+        Ok(None)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_listener(
     listener: TcpListener,
     token: LoopbackSourceToken,
@@ -1688,10 +1950,12 @@ async fn run_listener(
     connector: Arc<dyn AuthorizedRtspConnector>,
     limits: RtspProxyLimits,
     mut shutdown: watch::Receiver<bool>,
+    consumer: watch::Receiver<Option<u32>>,
 ) {
     let expires = Instant::now() + limits.lease_ttl;
     let semaphore = Arc::new(Semaphore::new(limits.max_connections));
     let mut connections = tokio::task::JoinSet::new();
+    let mut accept_failures = 0_u32;
     loop {
         tokio::select! {
             biased;
@@ -1700,26 +1964,90 @@ async fn run_listener(
             }
             _ = tokio::time::sleep_until(expires) => break,
             accepted = listener.accept() => {
-                let Ok((stream, peer)) = accepted else { break };
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => {
+                        accept_failures = 0;
+                        accepted
+                    }
+                    Err(error) => {
+                        // EMFILE/ENFILE/ECONNABORTED are transient; a permanent
+                        // break here used to kill the session silently.
+                        accept_failures = accept_failures.saturating_add(1);
+                        tracing::warn!(
+                            kind = ?error.kind(),
+                            failures = accept_failures,
+                            "rtsp proxy accept failed; backing off"
+                        );
+                        tokio::time::sleep(cleanup_retry_delay(accept_failures)).await;
+                        continue;
+                    }
+                };
                 if peer.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+                    tracing::warn!("rtsp proxy ignored a non-loopback peer");
                     continue;
                 }
                 let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                    tracing::debug!("rtsp proxy at connection limit; rejecting");
                     tokio::spawn(reject_connection(stream, 453, "Not Enough Bandwidth", limits.io_timeout));
                     continue;
                 };
                 let token = token.clone();
                 let upstream = upstream.clone();
                 let connector = connector.clone();
+                let mut consumer = consumer.clone();
                 connections.spawn(async move {
                     let _permit = permit;
-                    let _ = serve_connection(stream, token, upstream, binding, connector, limits, expires).await;
+                    match verify_consumer(&stream, peer, &mut consumer, limits, expires).await {
+                        Ok(()) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                error = ?error,
+                                "rtsp proxy rejected a loopback peer that is not the media process"
+                            );
+                            reject_connection(stream, 403, "Forbidden", limits.io_timeout).await;
+                            return;
+                        }
+                    }
+                    match serve_connection(stream, token, upstream, binding, connector, limits, expires).await {
+                        Ok(()) => tracing::debug!("rtsp proxy connection closed"),
+                        Err(error) => tracing::debug!(error = ?error, "rtsp proxy connection ended"),
+                    }
                 });
             }
         }
     }
     connections.abort_all();
     while connections.join_next().await.is_some() {}
+}
+
+/// Waits (bounded) for the consumer pid, then asks the OS whether that pid owns
+/// the peer socket. Verification reads the kernel connection table, so it runs
+/// on the blocking pool.
+async fn verify_consumer(
+    stream: &TcpStream,
+    peer: SocketAddr,
+    consumer: &mut watch::Receiver<Option<u32>>,
+    limits: RtspProxyLimits,
+    expires: Instant,
+) -> Result<(), RtspProxyError> {
+    let deadline = expires.min(Instant::now() + limits.io_timeout);
+    let pid = {
+        let guard = timeout_at(deadline, consumer.wait_for(|pid| pid.is_some()))
+            .await
+            .map_err(|_| RtspProxyError::Timeout)?
+            .map_err(|_| RtspProxyError::Unavailable)?;
+        (*guard).ok_or(RtspProxyError::Unavailable)?
+    };
+    let local = stream
+        .local_addr()
+        .map_err(|_| RtspProxyError::Unavailable)?;
+    let verified = tokio::task::spawn_blocking(move || verify_loopback_owner(peer, local, pid))
+        .await
+        .map_err(|_| RtspProxyError::Unavailable)?;
+    verified.map_err(|error| {
+        tracing::debug!(reason = ?error, "rtsp proxy peer verification failed");
+        RtspProxyError::Consumer
+    })
 }
 
 async fn reject_connection(mut stream: TcpStream, status: u16, reason: &str, limit: Duration) {
@@ -1744,16 +2072,20 @@ async fn serve_connection(
     let (mut client_read, mut client_write) = split(client);
     let mut upstream_io: Option<tokio::io::ReadHalf<Box<dyn RtspConnection>>> = None;
     let mut upstream_write: Option<tokio::io::WriteHalf<Box<dyn RtspConnection>>> = None;
-    let mut digest_state = DigestState::default();
+    let mut auth = ConnectionAuth::default();
+    let mut control_map = ControlMap::new();
     loop {
         enum Incoming {
             Client(Option<u8>),
             Upstream(Option<u8>),
         }
+        // Once the upstream exists the connection is streaming or idle between
+        // requests; silence there is bounded by the stall timeout, not the
+        // per-message I/O timeout that still governs each read inside a message.
         let incoming = if let Some(reader) = upstream_io.as_mut() {
             tokio::select! {
-                value = read_byte(&mut client_read, limits.io_timeout, expires) => Incoming::Client(value?),
-                value = read_byte(reader, limits.io_timeout, expires) => Incoming::Upstream(value?),
+                value = read_byte(&mut client_read, limits.stream_stall_timeout, expires) => Incoming::Client(value?),
+                value = read_byte(reader, limits.stream_stall_timeout, expires) => Incoming::Upstream(value?),
             }
         } else {
             Incoming::Client(read_byte(&mut client_read, limits.io_timeout, expires).await?)
@@ -1810,31 +2142,26 @@ async fn serve_connection(
             upstream_io = Some(read);
             upstream_write = Some(write);
         }
-        let upstream_uri = upstream_target(upstream.uri.expose_secret(), &validated.suffix)?;
-        let basic = upstream.basic_header();
-        let mut outbound = Zeroizing::new(
-            validated.to_upstream(&upstream_uri, basic.as_ref().map(|value| value.as_str()))?,
-        );
+        let upstream_uri = upstream_target(
+            upstream.uri.expose_secret(),
+            &validated.suffix,
+            &control_map,
+        )?;
+        let authorization = auth.preemptive(&upstream, &validated.method, &upstream_uri)?;
+        let mut outbound = Zeroizing::new(validated.to_upstream(
+            &upstream_uri,
+            authorization.as_ref().map(|value| value.as_str()),
+        )?);
         let writer = upstream_write.as_mut().ok_or(RtspProxyError::Unavailable)?;
         write_all(writer, &outbound, limits.io_timeout, expires).await?;
         let reader = upstream_io.as_mut().ok_or(RtspProxyError::Unavailable)?;
         let mut response =
             read_upstream_response(reader, &mut client_write, limits, expires).await?;
         if response.status_code() == Some(401)
-            && let Some(challenge) = response.header("www-authenticate")
-            && challenge
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("digest ")
+            && let Some(answer) =
+                auth.answer(&response, &upstream, &validated.method, &upstream_uri)?
         {
-            let digest = digest_state.header(
-                challenge,
-                &validated.method,
-                &upstream_uri,
-                upstream.username.as_deref(),
-                upstream.password.as_ref(),
-            )?;
-            outbound = Zeroizing::new(validated.to_upstream(&upstream_uri, Some(&digest))?);
+            outbound = Zeroizing::new(validated.to_upstream(&upstream_uri, Some(&answer))?);
             write_all(writer, &outbound, limits.io_timeout, expires).await?;
             response = read_upstream_response(reader, &mut client_write, limits, expires).await?;
         }
@@ -1843,6 +2170,7 @@ async fn serve_connection(
             upstream.uri.expose_secret(),
             &local_endpoint,
             limits.max_body_bytes,
+            &mut control_map,
         )?;
         write_all(&mut client_write, &sanitized, limits.io_timeout, expires).await?;
 
@@ -1904,6 +2232,7 @@ impl RtspMessage {
         upstream: &str,
         local: &str,
         max_body: usize,
+        control_map: &mut ControlMap,
     ) -> Result<Vec<u8>, RtspProxyError> {
         if self.status_code().is_none() {
             return Err(RtspProxyError::Protocol);
@@ -1914,7 +2243,7 @@ impl RtspMessage {
             .and_then(|value| value.split(';').next())
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/sdp"))
         {
-            body = rewrite_sdp(&body, upstream, local, max_body)?;
+            body = rewrite_sdp(&body, upstream, local, max_body, control_map)?;
         }
         let mut output = Vec::new();
         push_line(&mut output, &self.start)?;
@@ -1938,8 +2267,12 @@ impl RtspMessage {
                 };
                 push_header(&mut output, name, &format!("{local}{suffix}"))?;
             } else if name.eq_ignore_ascii_case("rtp-info") {
-                let rewritten =
+                let mut rewritten =
                     value.replace(upstream.trim_end_matches('/'), local.trim_end_matches('/'));
+                for (suffix, mapped) in control_map.iter() {
+                    rewritten = rewritten
+                        .replace(mapped, &format!("{}{suffix}", local.trim_end_matches('/')));
+                }
                 if !all_rtsp_urls_are_local(&rewritten, local) {
                     return Err(RtspProxyError::Protocol);
                 }
@@ -2379,17 +2712,62 @@ async fn write_status<W: AsyncWrite + Unpin>(
     .await
 }
 
-fn upstream_target(base: &str, suffix: &str) -> Result<String, RtspProxyError> {
+/// Local path suffix -> full upstream control URL, recorded while rewriting an
+/// SDP whose `a=control` lines point at same-host paths outside the base URL.
+/// Bounded so a hostile SDP cannot grow it.
+type ControlMap = Vec<(String, String)>;
+const MAX_CONTROL_MAP: usize = 32;
+
+fn upstream_target(
+    base: &str,
+    suffix: &str,
+    control_map: &ControlMap,
+) -> Result<String, RtspProxyError> {
     if unsafe_path(suffix) {
         return Err(RtspProxyError::Protocol);
     }
     if suffix.is_empty() {
         return Ok(base.to_owned());
     }
+    if let Some((_, mapped)) = control_map.iter().find(|(local, _)| local == suffix) {
+        return Ok(mapped.clone());
+    }
     let mut url = Url::parse(base).map_err(|_| RtspProxyError::Protocol)?;
     let path = format!("{}{suffix}", url.path().trim_end_matches('/'));
     url.set_path(&path);
     Ok(url.to_string())
+}
+
+/// Replaces `host` in `line` only where it stands as a whole address: not
+/// preceded by an address character and not followed by more digits or dots,
+/// so `192.168.1.5` never rewrites the inside of `192.168.1.50` or
+/// `10.192.168.1.5`. A following `:` (port) or `/` (path) is a boundary.
+fn replace_host_delimited(line: &str, host: &str, replacement: &str) -> String {
+    if host.is_empty() {
+        return line.to_owned();
+    }
+    let mut output = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(index) = rest.find(host) {
+        let (before, after) = (&rest[..index], &rest[index + host.len()..]);
+        let previous_is_boundary = before
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '.' || c == ':'));
+        let next_is_boundary = after
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_digit() || c == '.'));
+        output.push_str(before);
+        if previous_is_boundary && next_is_boundary {
+            output.push_str(replacement);
+        } else {
+            output.push_str(host);
+        }
+        rest = after;
+    }
+    output.push_str(rest);
+    output
 }
 
 fn unsafe_path(path: &str) -> bool {
@@ -2406,12 +2784,15 @@ fn rewrite_sdp(
     upstream: &str,
     local: &str,
     limit: usize,
+    control_map: &mut ControlMap,
 ) -> Result<Vec<u8>, RtspProxyError> {
     let text = std::str::from_utf8(body).map_err(|_| RtspProxyError::Protocol)?;
-    let upstream_host = Url::parse(upstream)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
+    let upstream_url = Url::parse(upstream).map_err(|_| RtspProxyError::Protocol)?;
+    let upstream_host = upstream_url
+        .host_str()
+        .map(str::to_owned)
         .ok_or(RtspProxyError::Protocol)?;
+    let upstream_port = upstream_url.port().unwrap_or(554);
     let mut output = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
         let newline = if line.ends_with("\r\n") {
@@ -2421,14 +2802,27 @@ fn rewrite_sdp(
         } else {
             ""
         };
-        let sanitized_bare = line
-            .trim_end_matches(['\r', '\n'])
-            .replace(&upstream_host, "127.0.0.1");
+        let raw_bare = line.trim_end_matches(['\r', '\n']);
+        let sanitized_bare = replace_host_delimited(raw_bare, &upstream_host, "127.0.0.1");
         let bare = sanitized_bare.as_str();
         if let Some(control) = bare.strip_prefix("a=control:") {
+            let raw_control = raw_bare.strip_prefix("a=control:").unwrap_or(control);
             let rewritten = if control == "*" {
                 "*".to_owned()
-            } else if let Some(suffix) = control.strip_prefix(upstream.trim_end_matches('/')) {
+            } else if let Some(suffix) = raw_control.strip_prefix(upstream.trim_end_matches('/')) {
+                format!("{}{suffix}", local.trim_end_matches('/'))
+            } else if let Some(mapped) =
+                same_host_control(raw_control, &upstream_host, upstream_port)?
+            {
+                // Absolute same-host control URL whose path is not under the
+                // base: keep the whole path and remember where it really goes.
+                let suffix = mapped.path().to_owned();
+                if !control_map.iter().any(|(local, _)| local == &suffix) {
+                    if control_map.len() >= MAX_CONTROL_MAP {
+                        return Err(RtspProxyError::Limit);
+                    }
+                    control_map.push((suffix.clone(), mapped.to_string()));
+                }
                 format!("{}{suffix}", local.trim_end_matches('/'))
             } else {
                 let relative = control.rsplit('/').next().unwrap_or(control);
@@ -2449,6 +2843,37 @@ fn rewrite_sdp(
     Ok(output.into_bytes())
 }
 
+/// Parses an `a=control` value as an absolute RTSP URL on the upstream host and
+/// port. Returns the credential-free URL (path may carry a query) or `None`
+/// when the value is relative or points elsewhere.
+fn same_host_control(
+    control: &str,
+    upstream_host: &str,
+    upstream_port: u16,
+) -> Result<Option<Url>, RtspProxyError> {
+    let Ok(mut url) = Url::parse(control) else {
+        return Ok(None);
+    };
+    if url.scheme() != "rtsp"
+        || !url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(upstream_host))
+        || url.port().unwrap_or(554) != upstream_port
+    {
+        return Ok(None);
+    }
+    if url.fragment().is_some() || unsafe_path(url.path()) || url.path().len() > 1024 {
+        return Err(RtspProxyError::Protocol);
+    }
+    if url.path().is_empty() || url.path() == "/" {
+        return Ok(None);
+    }
+    url.set_username("").map_err(|_| RtspProxyError::Protocol)?;
+    url.set_password(None)
+        .map_err(|_| RtspProxyError::Protocol)?;
+    Ok(Some(url))
+}
+
 #[derive(Default)]
 struct DigestState {
     realm: Option<String>,
@@ -2466,6 +2891,7 @@ impl DigestState {
         uri: &str,
         username: Option<&str>,
         password: Option<&SecretString>,
+        honor_stale: bool,
     ) -> Result<Zeroizing<String>, RtspProxyError> {
         let username = username.ok_or(RtspProxyError::Protocol)?;
         let password = password.ok_or(RtspProxyError::Protocol)?.expose_secret();
@@ -2515,6 +2941,7 @@ impl DigestState {
             })
             .transpose()?
             .unwrap_or(false);
+        let stale = stale && honor_stale;
         if stale || self.nonce.as_deref() != Some(nonce) || self.realm.as_deref() != Some(realm) {
             self.realm = Some(realm.to_owned());
             self.nonce = Some(nonce.to_owned());
@@ -2723,6 +3150,7 @@ async fn run_fake_fixture(mut fixture: DuplexStream, state: Arc<FakeConnectorSta
             max_body_bytes: 1024 * 1024,
             max_interleaved_frame_bytes: 1024 * 1024,
             io_timeout: Duration::from_secs(5),
+            stream_stall_timeout: Duration::from_secs(30),
             lease_ttl: Duration::from_secs(60),
         };
         let Ok(request) = read_message(

@@ -1,20 +1,26 @@
 # nfpm configuration producing NeonHearth .deb and .rpm packages.
 #
 # Run from packaging/linux/ on a Linux host AFTER packaging/stage.sh has
-# populated packaging/dist/linux/:
+# populated packaging/dist/linux/ (relative src paths below resolve from the
+# working directory, so run nfpm from this directory):
 #
+#   export NEONHEARTH_VERSION=0.1.0            # or the tag version, no leading v
+#   export NEONHEARTH_ARCH=amd64               # or arm64; must match the staged binary
 #   nfpm package --config nfpm.yaml --packager deb --target ../dist/
 #   nfpm package --config nfpm.yaml --packager rpm --target ../dist/
 #
-# STATUS / HONESTY: authored on the Windows build machine and validated as
-# YAML syntax only (PyYAML load). nfpm itself has not been run here (no nfpm
-# binary on this machine, and downloading one was out of scope), so the
-# contents mapping has not been exercised against a real nfpm version.
+# The version comes from the NEONHEARTH_VERSION environment variable (nfpm
+# expands ${VAR} in this file). Semver prereleases (0.1.0-alpha.1) are fine:
+# nfpm's default semver schema splits the prerelease into the deb version
+# (0.1.0~alpha.1) and the rpm release field automatically.
+#
+# STATUS: exercised with nfpm 2.47.0 (deb + rpm packagers) against a staged
+# tree; produced by .github/workflows/release.yml on tagged releases.
 
 name: neonhearth
-arch: amd64
+arch: ${NEONHEARTH_ARCH}
 platform: linux
-version: 0.1.0
+version: ${NEONHEARTH_VERSION}
 section: net
 priority: optional
 maintainer: NeonHearth Project <pkircher@gmail.com>
@@ -25,6 +31,24 @@ description: |
 vendor: NeonHearth Project
 homepage: https://github.com/pkircher29/NeonHearth
 license: AGPL-3.0-or-later
+
+# ffmpeg is required by the camera media pipeline (crates/lattice-camera
+# media.rs spawns it; audit M-18: it was neither packaged nor declared, so
+# camera media failed on every clean install). Debian/Ubuntu ship the `ffmpeg`
+# package in main. Fedora ships `ffmpeg-free` in the base repos and the full
+# `ffmpeg` via RPM Fusion; both provide /usr/bin/ffmpeg, so the rpm depends
+# on the file rather than either package name.
+overrides:
+  deb:
+    depends:
+      - ffmpeg
+      - avahi-daemon
+      - avahi-utils
+  rpm:
+    depends:
+      - /usr/bin/ffmpeg
+      - avahi
+      - avahi-tools
 
 contents:
   # Service binary (built by packaging/stage.sh).

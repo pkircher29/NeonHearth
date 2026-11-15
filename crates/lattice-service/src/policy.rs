@@ -36,6 +36,16 @@ pub enum ActuationReconciliation {
 
 pub use lattice_domain::EnforcementStatus as EnforcementResult;
 
+/// Typed refusals from owner policy actions. Anything else that comes back
+/// through `anyhow` is a storage or invariant failure, not a client mistake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PolicyActionError {
+    #[error("device is not enrolled in policy")]
+    NotEnrolled,
+    #[error("cannot replace a pending release until its control state is reconciled")]
+    PendingRelease,
+}
+
 #[async_trait]
 pub trait PolicyActuator: Send + Sync {
     async fn enforce(&self, device: DeviceId, action: RequestedAction) -> EnforcementResult;
@@ -733,6 +743,9 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         d: DeviceId,
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
+        if self.repo.load(d).await?.is_none() {
+            return Err(PolicyActionError::NotEnrolled.into());
+        }
         let prior = self.repo.published_decision(d).await?;
         // A router mutation may be durably verified while its policy event is
         // still only in the journal.  Approval must reconcile that exact
@@ -880,7 +893,11 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         owner: OwnerDecision,
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
-        let current = self.repo.load(d).await?.context("unknown policy device")?;
+        let current = self
+            .repo
+            .load(d)
+            .await?
+            .ok_or(PolicyActionError::NotEnrolled)?;
         let mut intended = current.clone();
         intended.owner_decision = owner;
         let evaluation = evaluate_policy(&intended, now);
@@ -907,9 +924,9 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                     }
                     ActuationReconciliation::Indeterminate
                     | ActuationReconciliation::ManualRequired
-                    | ActuationReconciliation::Failed => anyhow::bail!(
-                        "cannot replace a pending release until its control state is reconciled"
-                    ),
+                    | ActuationReconciliation::Failed => {
+                        return Err(PolicyActionError::PendingRelease.into());
+                    }
                 }
             } else {
                 self.repo.clear_release_retry(d).await?;
@@ -925,8 +942,12 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         until: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
+        if self.repo.load(d).await?.is_none() {
+            return Err(PolicyActionError::NotEnrolled.into());
+        }
         self.repo.extend_once(d, until).await?;
-        self.evaluate(self.repo.load(d).await?.unwrap(), now).await
+        let p = self.repo.load(d).await?.context("policy disappeared")?;
+        self.evaluate(p, now).await
     }
     pub async fn needs_recovery(&self, device: DeviceId) -> anyhow::Result<bool> {
         Ok(self.repo.load(device).await?.is_none())

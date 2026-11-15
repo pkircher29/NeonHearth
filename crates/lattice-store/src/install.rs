@@ -10,6 +10,19 @@ pub struct InstallState {
     pub schema_version: i64,
 }
 
+/// The newest migration compiled into this build. A fresh install records it
+/// as its `schema_version` footer; migrations only ever *raise* the footer of
+/// existing rows, so hard-coding a number here would leave new installs
+/// reporting a version behind their own migration history.
+pub fn latest_migration_version() -> i64 {
+    sqlx::migrate!()
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or(0)
+}
+
 #[derive(Clone)]
 pub struct InstallRepository {
     pool: SqlitePool,
@@ -44,10 +57,11 @@ impl InstallRepository {
         }
         let install_id = Uuid::now_v7();
         sqlx::query(
-            "INSERT OR IGNORE INTO install_state (singleton, install_id, first_run_at, schema_version) VALUES (1, ?, ?, 18)",
+            "INSERT OR IGNORE INTO install_state (singleton, install_id, first_run_at, schema_version) VALUES (1, ?, ?, ?)",
         )
         .bind(install_id.to_string())
         .bind(now.to_rfc3339())
+        .bind(latest_migration_version())
         .execute(&self.pool)
         .await?;
 

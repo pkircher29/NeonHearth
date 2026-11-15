@@ -79,3 +79,46 @@ before commit; the M5 gate is proven in a real browser.
 - A draft autosaved before the first committed save is keyed under the
   placeholder home id and is not re-offered after that first commit.
 - Conflict-resolution reload does not re-offer an existing draft.
+
+## Home tools v2 (2026-11-15)
+
+Implements `m5-home-tools-v2-spec.md` sections A–F and replaces the Pulse
+hearth with a Flow Map (the hearth stays available behind a Flow / Hearth
+switch).
+
+Verified on the integration branch `feat/home-tools-v2`:
+
+- `npm run check` — 0 errors, 0 warnings.
+- `npx vitest run --exclude 'e2e/**'` — 48 files, 579 tests passed.
+- `npx playwright test` — 21 passed, 9 skipped (the Flow Map screenshot and
+  live-service scenarios only run with `FLOW_SHOTS=1` / `FLOW_REAL=1`), real
+  WebGL path. Includes pinch zoom and two-finger pan driven by real touch
+  events through the Chrome DevTools Protocol.
+- A release `lattice-service` built from this branch, run isolated with
+  `scripts/run-local.py` on a real home network (89 discovered devices, no
+  router feed, so no device types, names or per-device counters):
+  - Plan editor: rectangle room, a partition landing on two wall bodies
+    (both split), Detect rooms → Add all, save. The service stored version 1
+    with seven walls carrying `thickness_m` and the two half rooms, and it
+    reloaded. The 3D view rendered it with room labels.
+  - Device tray: "Unplaced devices · 89" with maker labels and addresses;
+    the Inspector stays inside its column and in view.
+  - Flow Map: sectors grouped by maker (Home & IoT 41, Unclassified 14,
+    Computers 13, Media 8, Cameras 7, Network 4, Private address 2),
+    presence visible, this computer's live traffic in the core and history
+    ring, application streams. Average frame 16.67 ms, worst 16.8 ms.
+  - The 20 s quiet-socket resync no longer flashes "unavailable" (two
+    resyncs observed, no flip).
+- Flow Map with a 150-device synthetic fixture in headless Chromium:
+  average frame 16.67 ms, worst 16.8 ms over 10 s.
+
+Not verified (recorded, not claimed):
+
+- A physical touchscreen, mobile Safari or Android Chrome (touch was
+  emulated in desktop Chromium).
+- Browsers other than Chromium; the twin detail card on a narrow screen.
+- The Flow Map with real per-device counters (no router feed was
+  connected), or on an integrated GPU.
+- Maker grouping is a hand-made keyword table; 14 of 89 real devices stayed
+  Unclassified.
+- Ctrl+D on a room copies the room outline, not its walls.

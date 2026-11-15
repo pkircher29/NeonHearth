@@ -1,9 +1,11 @@
 use crate::{
     AuditError, AuditHost, AuditHostError, AuthorizedTarget, Capability, Limits, Sandbox,
     TargetAuthorizer, TargetError, VerifiedManifest, manifest::valid_limits,
+    runtime::CompiledModule,
 };
 use async_trait::async_trait;
 use std::{
+    collections::HashMap,
     net::IpAddr,
     sync::{Arc, Mutex},
     time::Instant,
@@ -206,9 +208,15 @@ pub struct BrokerResult {
     pub approval_id: Uuid,
     pub bytes: Vec<u8>,
 }
+/// Compiled modules retained per verified digest. Small on purpose: the set of
+/// signed audit modules an installation runs is tiny, and clearing the whole
+/// cache on overflow keeps the bound trivially correct.
+const MAX_CACHED_MODULES: usize = 16;
+
 pub struct Broker {
     authorizer: Arc<dyn TargetAuthorizer>,
     exchange: Arc<dyn TargetBoundExchange>,
+    compiled: Mutex<HashMap<[u8; 32], Arc<CompiledModule>>>,
     #[cfg(test)]
     before_publication: Option<std::time::Duration>,
 }
@@ -220,9 +228,46 @@ impl Broker {
         Self {
             authorizer,
             exchange,
+            compiled: Mutex::new(HashMap::new()),
             #[cfg(test)]
             before_publication: None,
         }
+    }
+    /// Number of compiled modules currently retained.
+    pub fn cached_modules(&self) -> usize {
+        self.compiled.lock().map(|cache| cache.len()).unwrap_or(0)
+    }
+    /// Returns a sandbox for the request, compiling the module only the first
+    /// time its digest is seen. A verified manifest binds the digest to the
+    /// bytes, so two manifests with the same digest share one compilation.
+    async fn sandbox_for(
+        &self,
+        module: &VerifiedManifest,
+        limits: &Limits,
+    ) -> Result<Sandbox, AuditError> {
+        Sandbox::check_limits(module, limits)?;
+        let digest = module.sha256();
+        let cached = self
+            .compiled
+            .lock()
+            .map_err(|_| AuditError::InvalidModule)?
+            .get(&digest)
+            .cloned();
+        let compiled = match cached {
+            Some(compiled) => compiled,
+            None => {
+                let compiled = Sandbox::compile(module).await?;
+                let mut cache = self
+                    .compiled
+                    .lock()
+                    .map_err(|_| AuditError::InvalidModule)?;
+                if cache.len() >= MAX_CACHED_MODULES {
+                    cache.clear();
+                }
+                Arc::clone(cache.entry(digest).or_insert(compiled))
+            }
+        };
+        Sandbox::with_compiled(module, compiled, limits)
     }
     pub async fn execute(&self, request: BrokerRequest) -> Result<BrokerResult, BrokerError> {
         if request.approval_id.is_nil() {
@@ -267,7 +312,7 @@ impl Broker {
         if Instant::now() >= deadline {
             return Err(BrokerError::DeadlineExceeded);
         }
-        let sandbox = Sandbox::new_with_limits(request.module, &limits).await?;
+        let sandbox = self.sandbox_for(&request.module, &limits).await?;
         if Instant::now() >= deadline {
             return Err(BrokerError::DeadlineExceeded);
         }
@@ -563,5 +608,78 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(BrokerError::DeadlineExceeded)));
+    }
+
+    fn signed_module(name: &str, wasm: &[u8], limits: &Limits) -> VerifiedManifest {
+        let mut manifest = AuditManifest::new(
+            name.into(),
+            1,
+            Sha256::digest(wasm).into(),
+            TargetKind::NumericPrivateDevice,
+            BTreeSet::from([Capability::TcpExchange { port: 80 }]),
+            "test".into(),
+            SideEffectProfile::ReadOnly,
+            RollbackPlan {
+                required: false,
+                description: "none".into(),
+            },
+            EvidenceSchema {
+                fields: BTreeMap::from([("out".into(), EvidenceType::Bytes)]),
+            },
+            limits.clone(),
+        )
+        .unwrap();
+        let key = SigningKey::from_bytes(&[4; 32]);
+        manifest.sign(&key).unwrap();
+        verify_manifest(&manifest, wasm, &key.verifying_key()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn compiled_modules_are_cached_per_digest_and_reused_across_requests() {
+        let wasm = wat::parse_str(r#"(module (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#).unwrap();
+        let limits = Limits {
+            max_bytes: 64,
+            max_requests: 1,
+            max_time: Duration::from_secs(1),
+            max_fuel: 100_000,
+            max_memory_pages: 1,
+        };
+        let broker = Broker::new(Arc::new(Auth), Arc::new(UnusedExchange));
+        assert_eq!(broker.cached_modules(), 0);
+        // Two distinct manifests over the same bytes share one compilation.
+        for name in ["first", "second"] {
+            broker
+                .execute(BrokerRequest {
+                    module: signed_module(name, &wasm, &limits),
+                    input: vec![],
+                    target: "192.168.1.2".parse().unwrap(),
+                    interface: 7,
+                    port: 80,
+                    capability: Capability::TcpExchange { port: 80 },
+                    approval_id: Uuid::new_v4(),
+                    limits: limits.clone(),
+                    cancellation: CancellationToken::new(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(broker.cached_modules(), 1);
+        }
+        // A different module gets its own entry.
+        let other = wat::parse_str(r#"(module (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i64.const 1))"#).unwrap();
+        broker
+            .execute(BrokerRequest {
+                module: signed_module("third", &other, &limits),
+                input: vec![],
+                target: "192.168.1.2".parse().unwrap(),
+                interface: 7,
+                port: 80,
+                capability: Capability::TcpExchange { port: 80 },
+                approval_id: Uuid::new_v4(),
+                limits,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(broker.cached_modules(), 2);
     }
 }

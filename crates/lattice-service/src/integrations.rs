@@ -528,18 +528,22 @@ pub(crate) async fn policy_route(
         Err(response) => return response,
     };
     let policy = PolicyRepository::new(state.state_repository().pool().clone());
-    let mut items = Vec::with_capacity(devices.len());
-    for device in devices {
-        match policy.load(device.device_id).await {
-            Ok(Some(row)) => items.push(IntegrationPolicy {
-                device_id: device.device_id,
-                owner_decision: row.owner_decision,
-                protection: row.protection,
-            }),
-            Ok(None) => {}
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        }
-    }
+    let ids: Vec<DeviceId> = devices.iter().map(|device| device.device_id).collect();
+    let Ok(mut policies) = policy.load_many(&ids).await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let items = devices
+        .into_iter()
+        .filter_map(|device| {
+            policies
+                .remove(&device.device_id)
+                .map(|row| IntegrationPolicy {
+                    device_id: device.device_id,
+                    owner_decision: row.owner_decision,
+                    protection: row.protection,
+                })
+        })
+        .collect();
     Json(IntegrationPolicyList { items }).into_response()
 }
 
@@ -575,16 +579,29 @@ fn scope_allows(scopes: &[IntegrationScope], payload: &EventPayload) -> bool {
     }
 }
 
-#[utoipa::path(get, path = "/api/v1/integrations/v1/events", params(("after_sequence" = u64, Query), ("wait_ms" = Option<u64>, Query, maximum = 25000)), responses((status = 200, body = IntegrationEvents), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/integrations/v1/events", params(("after_sequence" = u64, Query), ("wait_ms" = Option<u64>, Query, maximum = 25000)), responses((status = 200, body = IntegrationEvents), (status = 400), (status = 401), (status = 429, description = "this token already holds its maximum number of open long-polls"), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn events_route(
     principal: IntegrationPrincipal,
     State(state): State<AppState>,
+    axum::Extension(remote): axum::Extension<RemoteAccessState>,
     query: Result<Query<IntegrationEventsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     // Any valid integration token may long-poll; each envelope is filtered
     // to the token's scopes, so an out-of-scope payload is never serialized.
     let Ok(Query(query)) = query else {
         return StatusCode::BAD_REQUEST.into_response();
+    };
+    let wait = std::time::Duration::from_millis(query.wait_ms.unwrap_or(0).min(MAX_EVENT_WAIT_MS));
+    // A waiting poll parks a broadcast receiver for up to 25s; bound how
+    // many one token may hold open so a misbehaving client cannot pile up
+    // receivers. Immediate reads need no permit.
+    let _permit = if wait.is_zero() {
+        None
+    } else {
+        match remote.long_poll_permit(principal.0.token_id) {
+            Some(permit) => Some(permit),
+            None => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+        }
     };
     let scopes = principal.0.scopes.clone();
     let bus = state.events().clone();
@@ -611,7 +628,6 @@ pub(crate) async fn events_route(
             (visible, next_after)
         }
     };
-    let wait = std::time::Duration::from_millis(query.wait_ms.unwrap_or(0).min(MAX_EVENT_WAIT_MS));
     if visible.is_empty() && !wait.is_zero() {
         let deadline = tokio::time::Instant::now() + wait;
         loop {

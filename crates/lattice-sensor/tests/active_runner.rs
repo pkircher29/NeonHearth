@@ -848,3 +848,47 @@ async fn full_denied_queue_is_scanned_once_then_parked_until_eligibility() {
     runner.stop_and_drain().await;
     coordinator.await.unwrap();
 }
+
+#[tokio::test]
+async fn protocol_violations_are_terminal_while_socket_failures_retry() {
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.responses.lock().unwrap().extend([
+        Err(ActiveError::Protocol),
+        Err(ActiveError::Network),
+        Ok(TransportResponse::Refused),
+    ]);
+    let config = SchedulerConfig {
+        base_backoff: Duration::from_secs(1),
+        max_backoff: Duration::from_secs(2),
+        jitter_percent: 0,
+        ..SchedulerConfig::default()
+    };
+    let (runner, mut results, clock) = runner(config, transport.clone());
+    runner
+        .enqueue(request("192.168.50.9", "tcp.http.80"))
+        .unwrap();
+    assert_eq!(runner.dispatch_ready().await, 1);
+    let malformed = results.recv().await.unwrap();
+    assert_eq!(malformed.result, Err(ActiveError::Protocol));
+    assert!(
+        !malformed.will_retry,
+        "a reply that violates the protocol is terminal"
+    );
+    clock.advance(Duration::from_secs(5));
+    assert_eq!(runner.dispatch_ready().await, 0);
+
+    runner
+        .enqueue(request("192.168.50.10", "tcp.http.80"))
+        .unwrap();
+    assert_eq!(runner.dispatch_ready().await, 1);
+    let socket = results.recv().await.unwrap();
+    assert_eq!(socket.result, Err(ActiveError::Network));
+    assert!(socket.will_retry, "a socket-level failure stays transient");
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(runner.dispatch_ready().await, 1);
+    let settled = results.recv().await.unwrap();
+    assert_eq!(settled.attempt, 1);
+    assert!(!settled.will_retry);
+    assert_eq!(transport.sends.lock().unwrap().len(), 3);
+    runner.stop_and_drain().await;
+}

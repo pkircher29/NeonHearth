@@ -3,7 +3,16 @@ import type { CameraDetail } from '../api/types';
 
 export type CameraItem = CameraDetail & { streams?: Array<{ stream_id: string; label?: string }> };
 export interface CameraSession { cameraId: string; streamId: string; sessionId: string; playlistUrl: string }
-export interface CamerasState { loading: boolean; error: string | null; items: CameraItem[]; selected: string | null; session: CameraSession | null; snapshotUrl: string | null }
+export interface CamerasState {
+  loading: boolean;
+  error: string | null;
+  items: CameraItem[];
+  /** Cameras the list named but whose detail could not be read this load (audit M-28). */
+  unreadable: number;
+  selected: string | null;
+  session: CameraSession | null;
+  snapshotUrl: string | null;
+}
 type ObjectUrlApi = Pick<typeof URL, 'createObjectURL' | 'revokeObjectURL'>;
 
 export function cameraError(error: unknown): string {
@@ -15,7 +24,7 @@ export function cameraError(error: unknown): string {
 }
 
 export function createCameraStore(client: ApiClient, urls: ObjectUrlApi = URL) {
-  let state: CamerasState = { loading: false, error: null, items: [], selected: null, session: null, snapshotUrl: null };
+  let state: CamerasState = { loading: false, error: null, items: [], unreadable: 0, selected: null, session: null, snapshotUrl: null };
   const listeners = new Set<(next: CamerasState) => void>(); let request = 0; let disposed = false;
   const publish = () => listeners.forEach((listener) => listener(state));
   const update = (next: Partial<CamerasState>) => { state = { ...state, ...next }; publish(); };
@@ -39,10 +48,18 @@ export function createCameraStore(client: ApiClient, urls: ObjectUrlApi = URL) {
       const token = ++request; update({ loading: true, error: null });
       try {
         const page = await client.cameras();
-        const items = await Promise.all(page.items.map((item) => client.camera(item.camera_id))) as CameraItem[];
+        // One unreadable camera must not empty the list: keep every detail
+        // that resolved and report how many did not.
+        const results = await Promise.allSettled(page.items.map((item) => client.camera(item.camera_id)));
         if (disposed || token !== request) return;
-        update({ items, selected: state.selected && items.some((item) => item.camera_id === state.selected) ? state.selected : items[0]?.camera_id ?? null });
-      } catch (error) { if (!disposed && token === request) update({ items: [], selected: null, error: cameraError(error) }); }
+        const items = results.flatMap((result) => (result.status === 'fulfilled' ? [result.value as CameraItem] : []));
+        const failures = results.filter((result) => result.status === 'rejected');
+        if (items.length === 0 && failures.length > 0) {
+          update({ items: [], unreadable: failures.length, selected: null, error: cameraError(failures[0]!.reason) });
+          return;
+        }
+        update({ items, unreadable: failures.length, selected: state.selected && items.some((item) => item.camera_id === state.selected) ? state.selected : items[0]?.camera_id ?? null });
+      } catch (error) { if (!disposed && token === request) update({ items: [], unreadable: 0, selected: null, error: cameraError(error) }); }
       finally { if (!disposed && token === request) update({ loading: false }); }
     },
     async snapshot(cameraId: string, streamId?: string) {

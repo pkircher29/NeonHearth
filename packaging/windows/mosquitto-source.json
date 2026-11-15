@@ -1,0 +1,7 @@
+{
+  "version": "2.1.2",
+  "url": "https://mosquitto.org/files/binary/win64/mosquitto-2.1.2-install-windows-x64.exe",
+  "sha256": "58008ad7a22ada0b4073afa415801746e027c5f583e4fa52d0f4e9193b98d6aa",
+  "files": ["mosquitto.exe", "mosquitto_passwd.exe", "mosquitto_pub.exe", "mosquitto_sub.exe", "mosquitto_common.dll", "mosquitto.dll", "mosquitto_acl_file.dll", "mosquitto_password_file.dll", "libssl-3-x64.dll", "libcrypto-3-x64.dll", "libmicrohttpd-dll.dll", "cjson.dll", "pthreadVC3.dll"],
+  "notices": ["NOTICE.md", "edl-v10", "epl-v20", "README-windows.txt"]
+}

@@ -1,0 +1,5 @@
+crates/lattice-store/migrations/*.sql -text
+# Keep the generated IEEE data identical to its recorded SHA-256 on Windows.
+crates/lattice-service/data/mac-assignments.tsv text eol=lf
+# Keep verified third-party sources stable across Windows/Linux checkouts.
+vendor/** text eol=lf

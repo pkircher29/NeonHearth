@@ -1,0 +1,36 @@
+{
+  "source": "IEEE Registration Authority public assignment listings",
+  "retrieved_at": "2026-09-06T19:41:33.027283+00:00",
+  "sources": [
+    {
+      "registry": "MA-L",
+      "url": "https://standards-oui.ieee.org/oui/oui.csv",
+      "sha256": "50d13a6977be13fe16b6c61eff043b1097ee0dbeae329d0329ce45e08686d11d",
+      "assignments": 40089
+    },
+    {
+      "registry": "MA-M",
+      "url": "https://standards-oui.ieee.org/oui28/mam.csv",
+      "sha256": "20693e68cb203cb645a91fd125f47207925dc4bc03f2ae97353eec702131d8e8",
+      "assignments": 6579
+    },
+    {
+      "registry": "MA-S",
+      "url": "https://standards-oui.ieee.org/oui36/oui36.csv",
+      "sha256": "146ecae1bcb203f6b4acfd5c78aa5cf05e6cbde004e072b35337696052b954ad",
+      "assignments": 7172
+    },
+    {
+      "registry": "IAB",
+      "url": "https://standards-oui.ieee.org/iab/iab.csv",
+      "sha256": "6e71aa3d47f00f19d09cb3b31ce1038de1834703420f0ce4ce111da586f1a533",
+      "assignments": 4575
+    }
+  ],
+  "assignments": 58412,
+  "ambiguous_assignments": [
+    "0001C8",
+    "080030"
+  ],
+  "data_sha256": "5c25d4bd3f6ddaac453cfc02a8ffcdaff551570b08a0de5f5bea65a82844ab4f"
+}
