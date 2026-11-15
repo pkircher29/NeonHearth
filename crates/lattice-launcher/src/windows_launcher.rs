@@ -1,5 +1,5 @@
 use crate::{
-    mqtt,
+    mqtt, owner_token,
     platform::{self, ProcessStamp},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -540,7 +540,19 @@ pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
         println!("{{\"status\":\"stopped\",\"data_preserved\":true}}");
         return Ok(());
     }
-    let owner = load_owner(&state)?;
+    // The service's rotated `owner-token` file wins over the sealed credential
+    // (the service applies the same precedence to the token it is given), so
+    // a rotation survives a restart. Read at every launch: the launcher is a
+    // one-shot process, so there is no long-lived session to refresh.
+    let (owner, owner_source) =
+        owner_token::resolve_owner_token(&owner_token::portable_token_file(&state), || {
+            load_owner(&state)
+        })?;
+    if owner_source == owner_token::TokenSource::FallbackUnreadable {
+        eprintln!(
+            "The collector's owner-token file exists but cannot be read by this account; using the saved launcher credential. If sign-in fails after a token rotation, check the data folder permissions."
+        );
+    }
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -674,6 +686,32 @@ mod tests {
                 .unwrap()
                 .windows(first.expose_secret().len())
                 .any(|bytes| bytes == first.expose_secret().as_bytes())
+        );
+    }
+    #[test]
+    fn a_rotated_service_token_file_wins_over_the_sealed_credential() {
+        let parent = tempfile::tempdir().unwrap();
+        let state = prepare_state(&parent.path().join("private")).unwrap();
+        let file = owner_token::portable_token_file(&state);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "fake-rotated-token-0123456789-ABCDEFGHIJ\n").unwrap();
+        let (owner, source) =
+            owner_token::resolve_owner_token(&file, || load_owner(&state)).unwrap();
+        assert_eq!(
+            owner.expose_secret(),
+            "fake-rotated-token-0123456789-ABCDEFGHIJ"
+        );
+        assert_eq!(source, owner_token::TokenSource::File);
+        // The sealed credential was not consulted, so it was not created.
+        assert!(!state.join("owner.dpapi").exists());
+        // Deleting the file returns to the sealed credential.
+        fs::remove_file(&file).unwrap();
+        let (fallback, source) =
+            owner_token::resolve_owner_token(&file, || load_owner(&state)).unwrap();
+        assert_eq!(source, owner_token::TokenSource::Fallback);
+        assert_eq!(
+            fallback.expose_secret(),
+            load_owner(&state).unwrap().expose_secret()
         );
     }
     fn sample_package(root: &Path) {

@@ -6,6 +6,14 @@
 # no read access, and it never appears in `systemctl show` environment listings
 # or process command lines.
 #
+# Token precedence (matches the service, crates/lattice-service/src/main.rs):
+# /var/lib/neonhearth/owner-token, written by the service itself (service
+# account, mode 0600) whenever the owner rotates the token, wins over the
+# LATTICE_SERVICE_TOKEN value in the env file below. The env file is therefore
+# only the install-time seed. Upgrades leave both alone, so a rotated token
+# survives; `sudo neonhearth-token` prints whichever is current. Nothing here
+# makes the token readable by an unprivileged user.
+#
 # Packager arguments: dpkg passes "configure <old-version>" (old-version empty
 # on first install); rpm passes "1" on install and "2" on upgrade. Upgrades must
 # not re-enable a unit the administrator disabled, and preremove.sh no longer
@@ -19,6 +27,7 @@ set -eu
 
 ENV_DIR=/etc/neonhearth
 ENV_FILE="$ENV_DIR/service.env"
+STATE_DIR=/var/lib/neonhearth
 fresh_install=0
 case "${1:-}" in
     configure) [ -z "${2:-}" ] && fresh_install=1 ;;
@@ -54,6 +63,10 @@ if [ ! -f "$ENV_FILE" ]; then
     # 64 alphanumeric chars; the service requires >= 32 (constant-time compare).
     token="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 64)"
     printf 'LATTICE_SERVICE_TOKEN=%s\n' "$token" > "$ENV_FILE"
+    # A rotated-token file left by an earlier install would win over this new
+    # seed and lock out the token just generated. rm unlinks the name only (it
+    # never follows a symlink the service account may have planted).
+    rm -f "$STATE_DIR/owner-token"
 fi
 chown root:root "$ENV_FILE"
 chmod 0600 "$ENV_FILE"

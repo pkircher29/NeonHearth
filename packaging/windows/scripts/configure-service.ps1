@@ -11,10 +11,15 @@
 #      (NT SERVICE\NeonHearth) modify, nobody else. ProgramData's inherited
 #      default grants BUILTIN\Users read on everything below it, which would
 #      expose lattice.db, backups and logs to every local account (audit H-2).
-#   2. Generates the LATTICE_SERVICE_TOKEN pairing secret on first install and
-#      stores it in the service-private Environment registry value. The service
-#      binary refuses to start without it (see crates/lattice-service/src/main.rs)
-#      and MSI authoring cannot generate per-machine random secrets.
+#   2. Generates the owner pairing token on first install and stores it in
+#      <state dir>\owner-token (SYSTEM/Administrators/service only), which the
+#      service reads before any LATTICE_SERVICE_TOKEN environment value
+#      (choose_token in crates/lattice-service/src/main.rs) and rewrites when
+#      the owner rotates the token. A token an older installer left in the
+#      service Environment registry value is migrated into that file and the
+#      registry copy is removed, so there is one source of truth and a rotated
+#      token survives upgrades. MSI authoring cannot generate per-machine
+#      random secrets, hence the script.
 #      The service registry key is then given the same explicit ACL as the
 #      state directory (SYSTEM / Administrators / service account only).
 #      Service keys inherit BUILTIN\Users read by default, which would let any
@@ -188,29 +193,109 @@ function Set-EnvEntry {
     if ($idx -ge 0) { $List[$idx] = "$Name=$Value" } else { $List.Add("$Name=$Value") }
 }
 
-$tokenRotated = $false
-$hasToken = [bool]($entries | Where-Object { $_ -like 'LATTICE_SERVICE_TOKEN=*' })
-if ($hasToken -and $generation -lt 2) {
-    $kept = [System.Collections.Generic.List[string]]::new()
-    foreach ($e in $entries) { if ($e -notlike 'LATTICE_SERVICE_TOKEN=*') { $kept.Add($e) } }
-    $entries = $kept
-    $hasToken = $false
-    $tokenRotated = $true
-    Write-Log 'Rotating the pairing token once: it predates the hardened install order.'
+# --- 2b. Owner token: ONE source of truth, the owner-token file -------------
+# The service reads <state dir>\owner-token first and only then the
+# LATTICE_SERVICE_TOKEN environment value (choose_token in
+# crates/lattice-service/src/main.rs), and a token rotation from the app
+# rewrites that file. So the installer writes the token THERE and removes the
+# registry copy, which could only go stale after the first rotation:
+#   - file present and valid       -> keep it (a rotated token survives
+#                                     upgrades and repair installs);
+#   - no file, registry token from a
+#     hardened (generation 2) install -> migrate that exact token into the file
+#                                     (no re-pairing, no restart needed);
+#   - otherwise                    -> generate a new token into the file.
+# The file inherits the protected state-directory ACL and is then given the
+# same explicit descriptor (SYSTEM/Administrators full, service modify); no
+# standard user can read it. Reading it needs administrator rights, exactly as
+# reading the registry value did: open-neonhearth.ps1 already elevates.
+$tokenFile = Join-Path $stateDir 'owner-token'
+
+function Test-OwnerToken {
+    param([string]$Value)
+    # Same rule as validate_token in crates/lattice-service/src/state.rs.
+    if ([string]::IsNullOrEmpty($Value)) { return $false }
+    if ($Value -notmatch '^[A-Za-z0-9._-]{32,}\z') { return $false }
+    $distinct = [System.Collections.Generic.HashSet[char]]::new([char[]]$Value.ToCharArray())
+    return ($distinct.Count -ge 8)
 }
-if (-not $hasToken) {
+function Read-OwnerTokenFile {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try { $text = ([System.IO.File]::ReadAllText($Path)).Trim() } catch { return $null }
+    if (Test-OwnerToken $text) { return $text }
+    return $null
+}
+function Write-OwnerTokenFile {
+    param([string]$Path, [string]$Value)
+    # Temp file in the same (protected) directory, then an atomic replace.
+    # No trailing newline; ASCII only (the alphabet is [A-Za-z0-9._-]).
+    $temp = "$Path.tmp-" + [guid]::NewGuid().ToString('N')
+    [System.IO.File]::WriteAllBytes($temp, [System.Text.Encoding]::ASCII.GetBytes($Value))
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Replace($temp, $Path, $null)
+        } else {
+            [System.IO.File]::Move($temp, $Path)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+    }
+    $fileSec = [System.Security.AccessControl.FileSecurity]::new()
+    $fileSec.SetAccessRuleProtection($true, $false)
+    foreach ($pair in @(@($sidSystem, 'FullControl'), @($sidAdmins, 'FullControl'), @($serviceSid, 'Modify'))) {
+        $fileSec.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $pair[0], $pair[1], $allow))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $fileSec
+    $applied = Get-Acl -LiteralPath $Path
+    $permitted = @($sidSystem.Value, $sidAdmins.Value, $serviceSid.Value)
+    $stray = @($applied.Access | Where-Object {
+        $_.AccessControlType -eq 'Allow' -and
+        ($permitted -notcontains $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value)
+    })
+    if ($stray.Count -gt 0 -or -not $applied.AreAccessRulesProtected) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw 'Owner token file ACL verification failed; the token file was removed.'
+    }
+}
+
+$legacyToken = $null
+foreach ($e in $entries) {
+    if ($e -like 'LATTICE_SERVICE_TOKEN=*') { $legacyToken = $e.Substring('LATTICE_SERVICE_TOKEN='.Length) }
+}
+# A token that predates the hardened install order is never carried forward.
+if ($null -ne $legacyToken -and ($generation -lt 2 -or -not (Test-OwnerToken $legacyToken))) {
+    Write-Log 'Rotating the pairing token once: it predates the hardened install order.'
+    $legacyToken = $null
+}
+$hadRegistryToken = [bool]($entries | Where-Object { $_ -like 'LATTICE_SERVICE_TOKEN=*' })
+
+$tokenRotated = $false
+$fileToken = Read-OwnerTokenFile -Path $tokenFile
+if ($null -ne $fileToken) {
+    Write-Log 'owner-token file already present and valid; preserved (a rotated token is never overwritten).'
+} elseif ($null -ne $legacyToken) {
+    Write-OwnerTokenFile -Path $tokenFile -Value $legacyToken
+    Write-Log 'Migrated the existing pairing token from the service Environment value into the owner-token file.'
+} else {
     # Windows PowerShell 5.1 (.NET Framework) has no static RandomNumberGenerator.Fill().
     $bytes = New-Object byte[] 48
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-    # URL-safe alphabet: AppState::new (state.rs) only accepts [A-Za-z0-9._-].
+    # URL-safe alphabet: validate_token (state.rs) only accepts [A-Za-z0-9._-].
     # 48 bytes -> exactly 64 chars, no '=' padding.
     $token = [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_')
-    $entries.Add("LATTICE_SERVICE_TOKEN=$token")
-    Write-Log 'Generated new LATTICE_SERVICE_TOKEN (stored only in the service Environment registry value).'
-} else {
-    Write-Log 'LATTICE_SERVICE_TOKEN already present; preserved.'
+    Write-OwnerTokenFile -Path $tokenFile -Value $token
+    # A running service still holds a different (older) token in memory.
+    if ($hadRegistryToken) { $tokenRotated = $true }
+    Write-Log 'Generated a new pairing token (stored only in the owner-token file).'
 }
+# The registry copy would go stale after the first rotation and would confuse
+# which value is authoritative; the file now holds the token, so drop it.
+$kept = [System.Collections.Generic.List[string]]::new()
+foreach ($e in $entries) { if ($e -notlike 'LATTICE_SERVICE_TOKEN=*') { $kept.Add($e) } }
+$entries = $kept
 
 # Bundled ffmpeg (opt-in MSI component; flat in the install folder).
 $ffmpegPath = Join-Path $installDir 'ffmpeg.exe'
@@ -257,7 +342,7 @@ if ($Start) {
     if ($tokenRotated -and $svc.Status -ne 'Stopped') {
         # The running service still holds the old token in memory.
         Restart-Service -Name $ServiceName -Force
-        Write-Log 'Service restarted to load the rotated pairing token. Reopen NeonHearth from the Start menu.'
+        Write-Log 'Service restarted to load the new pairing token. Reopen NeonHearth from the Start menu.'
     } elseif ($svc.Status -eq 'Stopped') {
         Start-Service -Name $ServiceName
         Write-Log 'Service started.'
@@ -273,7 +358,9 @@ the SQLite database (lattice.db), backups, and logs.
 
 Uninstalling NeonHearth stops and removes the service and deletes the program
 files, but deliberately leaves this directory in place so your device history,
-baseline cohort, and approvals survive a reinstall.
+baseline cohort, and approvals survive a reinstall. The one exception is the
+owner pairing token (owner-token): a full uninstall deletes it so a later
+install starts with a fresh one. Upgrades keep it.
 
 To remove all NeonHearth data after uninstalling, delete this folder.
 "@

@@ -166,6 +166,7 @@ jobs:
           pip install pyyaml==6.0.2
           python packaging/test_home_hub_package.py
           python packaging/test_linux_scripts.py
+          python packaging/windows/test_owner_token_installers.py
           python -m unittest discover -s scripts/tests -p 'test_*.py'
 
       - name: Type/lint check

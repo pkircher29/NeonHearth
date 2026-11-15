@@ -44,6 +44,40 @@ with constant-time comparison. Without the token the service answers
 one-time tickets issued from the same token, so the token itself never
 appears in a URL.
 
+### Where the token lives, and rotating it
+
+The owner can replace the token at any time (`POST /api/v1/service/token/rotate`,
+owner only; the old token stops working immediately). The service saves the new
+token in a file named `owner-token` in its state directory, and **that file wins
+over the `LATTICE_SERVICE_TOKEN` value at every start**, so a rotation survives
+restarts and upgrades.
+
+| Install | Token file | Who can read it |
+| --- | --- | --- |
+| Windows installer (MSI) | `%ProgramData%\NeonHearth\owner-token` | SYSTEM, Administrators and the `NT SERVICE\NeonHearth` account only. The Start-menu shortcut reads it after one UAC prompt. |
+| Windows portable `NeonHearth.exe` | `<data folder>\data\NeonHearth\owner-token` | You (the data folder is private to your account). The launcher reads it before its own saved credential, on every launch. |
+| Linux deb/rpm | `/var/lib/neonhearth/owner-token` (mode 0600, service account) | The service account and root. Run `sudo neonhearth-token` to print the current token. |
+
+What each installer writes at install time:
+
+- **Windows MSI:** the installer generates the token straight into
+  `owner-token` and removes the older copy in the service's registry
+  `Environment` value (an upgrade from an older build migrates that copy once).
+  Upgrades and repairs never overwrite an existing token file, so a rotated
+  token is kept. A full uninstall deletes the file (collected data stays).
+- **Linux:** `/etc/neonhearth/service.env` (root only) holds the install-time
+  seed. Once the owner rotates, the token file takes over. Upgrades keep both;
+  removing the package deletes the token file, a fresh install replaces any
+  stale one.
+
+If the desktop app or launcher answers `401` after a rotation, it is still
+holding the previous token: relaunch from the Start menu (Windows) or read the
+current token with `sudo neonhearth-token` (Linux). A token file that is empty
+is ignored; one that is malformed (fewer than 32 characters, or characters
+outside `A-Z a-z 0-9 . _ -`) stops the service from starting; delete the file
+to fall back to the install-time value. Never paste a token into chat, tickets
+or logs.
+
 In this build the desktop app does not yet obtain the token automatically.
 Until pairing is wired, views that need protected data show honest
 placeholders such as "Unavailable until paired" and "Pair NeonHearth to

@@ -13,6 +13,9 @@ import unittest
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent / 'linux' / 'scripts'
+# Obviously fake values; never a real token.
+FAKE_SEED = 'fakeSeedToken0123456789abcdefghijklmnopqrstuvwxyzAB'
+FAKE_ROTATED = 'fake-rotated-token-0123456789-ABCDEFGHIJ'
 SH = shutil.which('sh')
 
 
@@ -28,11 +31,14 @@ class MaintainerScriptTests(unittest.TestCase):
         self.systemd = self.root / 'run-systemd'
         self.systemd.mkdir()
         self.etc = self.root / 'etc-neonhearth'
+        self.state = self.root / 'var-lib-neonhearth'
+        self.state.mkdir()
         for name, body in {
             'systemctl': 'echo "systemctl $*" >> "$CALLS"\n[ "$1" = is-enabled ] && exit "${IS_ENABLED:-0}"\nexit 0\n',
             'chown': 'echo "chown $*" >> "$CALLS"\n',
             'getent': 'exit 0\n',
             'systemd-sysusers': 'exit 0\n',
+            'id': 'echo "${FAKE_UID:-0}"\n',
         }.items():
             path = self.bin / name
             path.write_text('#!/bin/sh\n' + body, newline='\n')
@@ -42,10 +48,24 @@ class MaintainerScriptTests(unittest.TestCase):
         text = (SCRIPTS / name).read_text(encoding='utf-8')
         text = text.replace('/run/systemd/system', str(self.systemd).replace('\\', '/'))
         text = text.replace('ENV_DIR=/etc/neonhearth', f'ENV_DIR={str(self.etc).replace(chr(92), "/")}')
+        text = text.replace('STATE_DIR=/var/lib/neonhearth', f'STATE_DIR={str(self.state).replace(chr(92), "/")}')
+        text = text.replace('ENV_FILE=/etc/neonhearth/service.env', f'ENV_FILE={str(self.etc / "service.env").replace(chr(92), "/")}')
         script = self.root / name
         script.write_text(text, newline='\n')
         env = {**os.environ, 'PATH': f'{self.bin}{os.pathsep}{os.environ["PATH"]}', 'CALLS': str(self.log), 'IS_ENABLED': str(enabled)}
         return subprocess.run([SH, str(script), *args], capture_output=True, text=True, env=env)
+
+    def run_helper(self, uid='0'):
+        return self.run_script_path(SCRIPTS.parent / 'neonhearth-token', FAKE_UID=uid)
+
+    def run_script_path(self, source, **extra):
+        text = source.read_text(encoding='utf-8')
+        text = text.replace('STATE_DIR=/var/lib/neonhearth', f'STATE_DIR={str(self.state).replace(chr(92), "/")}')
+        text = text.replace('ENV_FILE=/etc/neonhearth/service.env', f'ENV_FILE={str(self.etc / "service.env").replace(chr(92), "/")}')
+        script = self.root / source.name
+        script.write_text(text, newline='\n')
+        env = {**os.environ, 'PATH': f'{self.bin}{os.pathsep}{os.environ["PATH"]}', 'CALLS': str(self.log), **extra}
+        return subprocess.run([SH, str(script)], capture_output=True, text=True, env=env)
 
     def calls(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
@@ -62,6 +82,54 @@ class MaintainerScriptTests(unittest.TestCase):
             self.log.write_text('')
             self.assertEqual(self.run_script('preremove.sh', *args).returncode, 0)
             self.assertEqual(self.calls(), ['systemctl stop neonhearth.service', 'systemctl disable neonhearth.service'])
+
+    def test_real_removal_deletes_the_rotated_token_but_keeps_other_state(self):
+        for args in (('remove',), ('0',)):
+            (self.state / 'owner-token').write_text(FAKE_ROTATED)
+            (self.state / 'lattice.db').write_text('database')
+            self.assertEqual(self.run_script('preremove.sh', *args).returncode, 0)
+            self.assertFalse((self.state / 'owner-token').exists(), args)
+            self.assertEqual((self.state / 'lattice.db').read_text(), 'database')
+        # Removing when there is no token file is not an error.
+        self.assertEqual(self.run_script('preremove.sh', 'remove').returncode, 0)
+
+    def test_upgrade_keeps_the_rotated_token_file(self):
+        (self.state / 'owner-token').write_text(FAKE_ROTATED)
+        for args in (('upgrade',), ('1',)):
+            self.assertEqual(self.run_script('preremove.sh', *args).returncode, 0)
+        self.run_script('postinstall.sh', 'configure')  # fresh: creates env, drops stale file
+        (self.state / 'owner-token').write_text(FAKE_ROTATED)
+        self.assertEqual(self.run_script('postinstall.sh', 'configure', '1.0.0').returncode, 0)
+        self.assertEqual((self.state / 'owner-token').read_text(), FAKE_ROTATED)
+
+    def test_fresh_install_drops_a_stale_rotated_token_so_the_new_seed_applies(self):
+        (self.state / 'owner-token').write_text(FAKE_ROTATED)
+        self.assertEqual(self.run_script('postinstall.sh', 'configure').returncode, 0)
+        self.assertFalse((self.state / 'owner-token').exists())
+
+    def test_helper_prefers_the_rotated_token_file_and_trims_it(self):
+        self.etc.mkdir()
+        (self.etc / 'service.env').write_text(f'LATTICE_SERVICE_TOKEN={FAKE_SEED}\n')
+        result = self.run_helper()
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, FAKE_SEED), result.stderr)
+        (self.state / 'owner-token').write_text(f'  {FAKE_ROTATED}\r\n')
+        result = self.run_helper()
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, FAKE_ROTATED), result.stderr)
+        # An empty file is ignored, as the service does.
+        (self.state / 'owner-token').write_text('\n')
+        self.assertEqual(self.run_helper().stdout.strip(), FAKE_SEED)
+
+    def test_helper_refuses_non_root_malformed_and_missing(self):
+        self.etc.mkdir()
+        self.assertNotEqual(self.run_helper(uid='1000').returncode, 0)
+        self.assertNotEqual(self.run_helper().returncode, 0)  # no env file, no token file
+        (self.etc / 'service.env').write_text('LATTICE_SERVICE_TOKEN=short\n')
+        self.assertNotEqual(self.run_helper().returncode, 0)
+        (self.state / 'owner-token').write_text('has space inside it ' + 'x' * 30)
+        result = self.run_helper()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+        self.assertNotIn('x' * 30, result.stderr)
 
     def test_fresh_install_creates_token_enables_and_starts(self):
         result = self.run_script('postinstall.sh', 'configure')
@@ -120,7 +188,7 @@ class MaintainerScriptTests(unittest.TestCase):
         self.assertNotIn('README-UNINSTALL', code)
 
     def test_every_script_parses_and_stage_uses_locked(self):
-        for script in SCRIPTS.glob('*.sh'):
+        for script in [*SCRIPTS.glob('*.sh'), SCRIPTS.parent / 'neonhearth-token']:
             self.assertEqual(subprocess.run([SH, '-n', str(script)], capture_output=True).returncode, 0, script.name)
         stage = (SCRIPTS.parents[1] / 'stage.sh').read_text(encoding='utf-8')
         self.assertIn('cargo build --locked --release', stage)
