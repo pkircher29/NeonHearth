@@ -52,3 +52,23 @@ it('keeps a valid measured zero distinct from missing household measurements',()
   expect(view.getByRole('region',{name:'Household internet traffic'}).textContent).toContain('0 kbps');
   expect(view.queryByText(/No fresh router readings/)).toBeNull();
 });
+
+it('shows the Flow Map by default, can switch to the Hearth, and remembers the choice',async()=>{
+  const memory=new Map<string,string>();
+  vi.stubGlobal('localStorage',{getItem:(k:string)=>memory.get(k)??null,setItem:(k:string,v:string)=>{memory.set(k,v);},removeItem:(k:string)=>{memory.delete(k);}});
+  const first=render(PulseView,{state:{...initialLiveState,connected:true}});
+  expect(first.getByRole('img',{name:/Network flow map:/})).toBeTruthy();
+  expect(first.getByRole('complementary',{name:'How to read the flow map'})).toBeTruthy();
+  expect(first.getByText(/The flow map below uses per-device counters/)).toBeTruthy();
+  expect(first.getByRole('button',{name:'Flow'}).getAttribute('aria-pressed')).toBe('true');
+  await fireEvent.click(first.getByRole('button',{name:'Hearth'}));
+  expect(first.getByRole('img',{name:/Network hearth:/})).toBeTruthy();
+  expect(first.getByRole('complementary',{name:'How to read the hearth'})).toBeTruthy();
+  expect(first.getByText(/The hearth below uses per-device counters/)).toBeTruthy();
+  expect(first.queryByRole('img',{name:/Network flow map:/})).toBeNull();
+  first.unmount();
+  const second=render(PulseView,{state:{...initialLiveState,connected:true}});
+  expect(second.getByRole('img',{name:/Network hearth:/})).toBeTruthy();
+  expect(memory.get('neonhearth.pulse.hero')).toBe('hearth');
+  vi.unstubAllGlobals();
+});

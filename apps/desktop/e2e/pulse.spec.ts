@@ -23,7 +23,7 @@ test('owner sees separate household WAN readings and can open the supported Traf
   await expect(page.getByText('Live readings connected',{exact:true})).toBeVisible();
   await expect(page.getByText('No per-device counter source',{exact:true})).toBeVisible();
   await expect(page.getByText('Unavailable until paired',{exact:true})).toHaveCount(0);
-  await expect(page.getByRole('img',{name:/Network hearth:/})).toHaveAttribute('aria-label',/unavailable total/);
+  await expect(page.getByRole('img',{name:/Network flow map:/})).toHaveAttribute('aria-label',/unavailable total/);
   await page.setViewportSize({width:1440,height:1000});
   await page.screenshot({path:info.outputPath('pulse-desktop.png'),fullPage:true});
   for(const width of [320,390,768,1440]){
