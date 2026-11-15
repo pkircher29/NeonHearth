@@ -106,8 +106,16 @@ restart or clock changes.
 The app opens on **Pulse** (live throughput, protocol mix, coverage, and an
 event thread), with **Devices**, **Guard**, and **Cameras** views alongside.
 A collector status card in the side rail tells you plainly whether the local
-service is reachable, checking, or unavailable. Views that are not built yet
-say so on screen instead of pretending.
+service is reachable, checking, or unavailable. The rest of the navigation
+is working views:
+
+- **Home** — draw your home and see devices on a 3D plan; see
+  [Home Twin](home-twin.md).
+- **Doctor** — runs diagnostics; see the Doctor section of the guide.
+- **History** — the audit log of approvals, scans, enforcement and repairs,
+  with a check that the log's hash chain is intact.
+- **Settings** — your sign-in session, appearance, phone pairing and
+  access, integrations, and the targets the Doctor checks.
 
 ## Not yet available
 
@@ -116,7 +124,6 @@ say so on screen instead of pretending.
 - Automatic pairing between the desktop app and the service.
 - Phone access over Tailscale (planned as private Tailscale Serve only; not
   yet implemented — and public exposure will remain prohibited).
-- The Home, Doctor, History, and Settings navigation destinations show a
-  "still being wired" notice in this build.
 - Automated router enforcement (see [Guard and policy](guard-and-policy.md)
-  for what happens instead today).
+  for what happens instead today). Blocking a device is a manual step in
+  your router's own app.

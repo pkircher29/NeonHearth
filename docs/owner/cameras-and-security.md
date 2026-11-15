@@ -56,8 +56,14 @@ store. Two things keep findings honest:
 
 ## Confined audit modules
 
-Deeper security checks run inside a locked-down sandbox with hard rules
-enforced by the service, not by the module:
+**No audit module can be run in this build.** The module host (a WebAssembly
+sandbox) is built and tested as a separate component, but it is not part of
+the service: the service cannot load or run a module, and nothing records
+audit-module activity. The rules below are what the host enforces and what
+the service is meant to enforce once it is connected. They describe the
+design, not something you can use today.
+
+The planned rules:
 
 - **Owner approval is mandatory** — a module without your approval is
   refused before it starts.
@@ -85,8 +91,9 @@ presents information for you to act on yourself.
 - A findings/advisories panel in the app (findings are served by the
   authenticated per-device advisory API; the on-screen surface is pending),
   and scheduled advisory-feed refresh with staleness labeling.
-- Launching confined audit modules from the app (the sandbox and its rules
-  exist in the service; there is no owner-facing trigger yet).
+- Confined audit modules. The sandbox is built and tested as a separate
+  component, not part of the service; no module can be run in this build, from
+  the app or otherwise.
 - Alternative-firmware research (not implemented in this build).
 - Authenticated ONVIF operations beyond the bounded inventory shown, and
   camera recording (live view is not recorded by default and no recorder

@@ -94,6 +94,11 @@ required**: the Guard card shows exactly that, keeps the device's state
 truthful, and the action stays retryable. Nothing is ever displayed as
 blocked without router verification.
 
+No other router brand has a connector. On any other router, including mesh
+systems such as Netgear Orbi, blocking a device is always a manual step in
+the router's own app; the Guard card shows "manual required" and NeonHearth
+never marks the device as blocked itself.
+
 ## Undo
 
 Each Guard card shows whether owner undo is available. Before mutating the
