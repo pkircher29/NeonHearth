@@ -39,9 +39,11 @@ impl ServiceRuntimeStatus {
 
 pub(crate) const EVENT_TICKET_TTL: Duration = Duration::from_secs(30);
 pub(crate) const MAX_OUTSTANDING_EVENT_TICKETS: usize = 64;
-/// One principal may hold this many unredeemed tickets, so a phone session
-/// cannot starve the owner's UI of tickets (the global cap still applies).
-pub(crate) const MAX_TICKETS_PER_PRINCIPAL: usize = 8;
+/// One phone session may hold this many unredeemed tickets.
+pub(crate) const MAX_TICKETS_PER_PHONE: usize = 8;
+/// Slots of the global cap that phone sessions can never occupy, so the
+/// owner UI can always get a ticket.
+pub(crate) const OWNER_RESERVED_TICKETS: usize = 8;
 /// Concurrent event WebSockets the service will serve.
 pub(crate) const MAX_EVENT_SOCKETS: usize = 32;
 
@@ -311,13 +313,27 @@ impl AppState {
     ) -> Result<String, TicketLimitReached> {
         let mut tickets = self.event_tickets.lock().await;
         tickets.retain(|_, record| record.expires_at >= now);
-        if tickets.len() >= MAX_OUTSTANDING_EVENT_TICKETS
-            || tickets
-                .values()
-                .filter(|record| record.principal == principal)
-                .count()
-                >= MAX_TICKETS_PER_PRINCIPAL
-        {
+        let refused = tickets.len() >= MAX_OUTSTANDING_EVENT_TICKETS
+            || match principal {
+                // The owner is bound only by the global cap (the documented
+                // contract: 64 outstanding tickets).
+                Principal::Owner => false,
+                // A phone session holds a few, and phones together never take
+                // the slots reserved for the owner.
+                Principal::Phone(_) => {
+                    let phone_held = tickets
+                        .values()
+                        .filter(|record| record.principal != Principal::Owner)
+                        .count();
+                    let own = tickets
+                        .values()
+                        .filter(|record| record.principal == principal)
+                        .count();
+                    own >= MAX_TICKETS_PER_PHONE
+                        || phone_held >= MAX_OUTSTANDING_EVENT_TICKETS - OWNER_RESERVED_TICKETS
+                }
+            };
+        if refused {
             return Err(TicketLimitReached);
         }
         let ticket = Uuid::new_v4().to_string();
@@ -367,7 +383,7 @@ mod tests {
         // quota, is what ends the run.
         let principals: Vec<_> = (0..MAX_OUTSTANDING_EVENT_TICKETS)
             .map(|index| {
-                if index % MAX_TICKETS_PER_PRINCIPAL == 0 {
+                if index % MAX_TICKETS_PER_PHONE == 0 {
                     Principal::Owner
                 } else {
                     Principal::Phone(Uuid::from_u128(index as u128))
@@ -380,7 +396,7 @@ mod tests {
                 tickets.push(ticket);
             }
         }
-        assert!(tickets.len() > MAX_TICKETS_PER_PRINCIPAL);
+        assert!(tickets.len() > MAX_TICKETS_PER_PHONE);
         let ticket = tickets[0].clone();
         assert_eq!(
             tickets
@@ -416,7 +432,7 @@ mod tests {
         let state = state().await;
         let now = Instant::now();
         let phone = Principal::Phone(Uuid::new_v4());
-        for _ in 0..MAX_TICKETS_PER_PRINCIPAL {
+        for _ in 0..MAX_TICKETS_PER_PHONE {
             state.issue_event_ticket(now, phone).await.unwrap();
         }
         assert!(state.issue_event_ticket(now, phone).await.is_err());
@@ -429,6 +445,35 @@ mod tests {
             state.consume_event_ticket(&owner, now).await,
             Some(Principal::Owner)
         );
+    }
+
+    #[tokio::test]
+    async fn the_owner_may_hold_the_full_global_cap_and_phones_leave_it_room() {
+        let state = state().await;
+        let now = Instant::now();
+        for _ in 0..MAX_OUTSTANDING_EVENT_TICKETS {
+            state
+                .issue_event_ticket(now, Principal::Owner)
+                .await
+                .unwrap();
+        }
+        assert!(
+            state
+                .issue_event_ticket(now, Principal::Owner)
+                .await
+                .is_err()
+        );
+        // Phones fill every slot except the owner's reserve.
+        let state = self::state().await;
+        let mut granted = 0;
+        for index in 0..MAX_OUTSTANDING_EVENT_TICKETS {
+            let phone = Principal::Phone(Uuid::from_u128(index as u128 / 4 + 1));
+            if state.issue_event_ticket(now, phone).await.is_ok() {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, MAX_OUTSTANDING_EVENT_TICKETS - OWNER_RESERVED_TICKETS);
+        assert!(state.issue_event_ticket(now, Principal::Owner).await.is_ok());
     }
 
     #[tokio::test]

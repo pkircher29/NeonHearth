@@ -72,7 +72,7 @@ Every minting/revocation and step-up failure is appended to the audit log
   age; revoked or expired sessions are never touched back to life, and the
   store exposes `purge_dead_phone_sessions` for the maintenance task.
 - **Sockets follow their principal.** An event ticket records the principal it
-  was issued to (quota: 8 outstanding per principal, 64 overall). A phone
+  was issued to (64 outstanding overall; a phone session holds at most 8, and phones together never take the last 8 slots, which stay reserved for the owner). A phone
   socket closes immediately when its session is revoked (broadcast) and
   re-validates against storage every 30 s as a backstop. Sockets are capped
   (32), pinged, closed when idle (60 s), limited in lifetime (1 h, clients
