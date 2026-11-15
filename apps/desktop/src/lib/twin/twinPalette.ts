@@ -4,6 +4,9 @@
 
 export interface TwinPalette {
   stage: string; // canvas background (--bg)
+  ink: string; // brightest neutral (--ink): wall caps, pin stems
+  surface: string; // dark glass (--surface)
+  raised: string; // room slab tint (--surface-raised)
   ground: string; // hemisphere bounce colour (--line)
   ambient: string; // cool ambient (--muted-strong)
   key: string; // warm key light (--gold)
@@ -14,6 +17,9 @@ export interface TwinPalette {
 
 const FALLBACK: TwinPalette = {
   stage: '#061019',
+  ink: '#e9fbfc',
+  surface: '#0b1c26',
+  raised: '#102a35',
   ground: '#17323d',
   ambient: '#9bb7bb',
   key: '#ffcd66',
@@ -36,6 +42,9 @@ export function readTwinPalette(root: Element | null = typeof document !== 'unde
   }
   return {
     stage: token(style, '--bg', FALLBACK.stage),
+    ink: token(style, '--ink', FALLBACK.ink),
+    surface: token(style, '--surface', FALLBACK.surface),
+    raised: token(style, '--surface-raised', FALLBACK.raised),
     ground: token(style, '--line', FALLBACK.ground),
     ambient: token(style, '--muted-strong', FALLBACK.ambient),
     key: token(style, '--gold', FALLBACK.key),

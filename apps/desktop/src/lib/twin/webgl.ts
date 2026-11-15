@@ -1,7 +1,7 @@
 // The only file that touches a real WebGL context. HomeTwin3D.svelte talks to
 // it through the narrow TwinRenderer interface so component tests in jsdom can
 // mock this module and never need a GPU.
-import { WebGLRenderer, type Camera, type Scene } from 'three';
+import { ACESFilmicToneMapping, WebGLRenderer, type Camera, type Scene } from 'three';
 
 export interface TwinRenderer {
   setSize(width: number, height: number): void;
@@ -26,7 +26,10 @@ export function detectWebGL(): boolean {
 /** Creates the real renderer; returns null instead of throwing on failure. */
 export function createTwinRenderer(canvas: HTMLCanvasElement): TwinRenderer | null {
   try {
-    return new WebGLRenderer({ canvas, antialias: true, alpha: true });
+    const renderer = new WebGLRenderer({ canvas, antialias: true, alpha: true });
+    renderer.toneMapping = ACESFilmicToneMapping; // sRGB output is the default; ACES keeps highlights from clipping
+    renderer.toneMappingExposure = 1.1;
+    return renderer;
   } catch {
     return null;
   }

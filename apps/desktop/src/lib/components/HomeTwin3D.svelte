@@ -14,10 +14,14 @@
     type TwinDevice,
     type Vec2
   } from '../twin/geometry';
-  import { heatColor, riskBadge, riskFromPresence } from '../twin/heat';
+  import { HEAT_UNAVAILABLE_COLOR, heatColor, riskBadge, riskFromPresence } from '../twin/heat';
   import {
     boxAround,
     contactShadow,
+    EXPLODE_GAP_M,
+    stubbedBox,
+    WALL_STUB_M,
+    wallIsCut,
     framePose,
     lerpPose,
     PHI_MAX,
@@ -27,7 +31,6 @@
     RADIUS_MIN,
     sceneBox,
     tweenProgress,
-    wallFadeOpacity,
     wallRoughness,
     unitHash,
     type CameraPose,
@@ -75,6 +78,7 @@
   let selected = $state<string | null>(null);
   let selectedRoomId = $state<string | null>(null);
   let hoverRoom = $state<RoomHover | null>(null);
+  let hoverPin = $state<{ id: string; name: string; x: number; y: number } | null>(null);
   let activePreset = $state<CameraPresetName | null>('iso');
   let wallsHidden = $state(false);
   let isolatedFloorId = $state<string | null>(null);
@@ -116,12 +120,14 @@
   let staticRoot: THREE.Group | null = null;
   let shadowTexture: THREE.DataTexture | null = null;
   let floorNodes = new Map<string, { group: THREE.Group; walls: THREE.Group }>();
-  let pinNodes = new Map<string, { pin: THREE.Mesh; ring: THREE.Mesh; hit: THREE.Mesh; floor_id: string }>();
+  let pinNodes = new Map<string, { pin: THREE.Mesh; ring: THREE.Mesh; hit: THREE.Mesh; glow: THREE.Sprite; halo: THREE.Sprite; floor_id: string }>();
   let roomNodes = new Map<string, { mesh: THREE.Mesh; material: THREE.MeshStandardMaterial; floor_id: string; name: string; area_m2: number | undefined; polygon: Vec2[]; elevation: number }>();
-  let wallNodes: { material: THREE.MeshStandardMaterial; center: Vec2; floor_id: string }[] = [];
-  // Slabs/ceilings per floor, so floors above the one being inspected can ghost.
-  let ghostables: { floor_id: string; material: THREE.Material; opacity: number; transparent: boolean; depthWrite: boolean }[] = [];
-  let floorGhost = new Map<string, number>();
+  // Walls grouped per wall so every segment of one wall cuts down together.
+  let wallNodes: { floor_id: string; mid: Vec2; cut: boolean; parts: { mesh: THREE.Mesh; base: number; height: number }[] }[] = [];
+  // Floor materials with their base colour, so floors below the focus dim without alpha.
+  let dimmables: { floor_id: string; material: THREE.Material & { color: THREE.Color }; base: THREE.Color }[] = [];
+  let glowTexture: THREE.DataTexture | null = null;
+  let ringTexture: THREE.DataTexture | null = null;
   const prevPresence = new Map<string, PresenceState>();
   const pulses = new Map<string, number>();
 
@@ -161,19 +167,22 @@
     }
   }
 
-  function updateWallFade() {
-    if (wallNodes.length === 0) return;
+  /** Dollhouse cut: camera-side walls drop to short stubs; far walls stay tall. */
+  function updateWallCut() {
+    if (wallNodes.length === 0 || !sceneDesc.bounds) return;
     const toCamera = { x: Math.cos(theta), y: Math.sin(theta) };
-    const at = { x: target.x, y: target.z };
+    const center = sceneDesc.bounds.center;
     for (const node of wallNodes) {
-      let opacity = wallFadeOpacity(node.center, at, toCamera, phi) * (floorGhost.get(node.floor_id) ?? 1);
-      // Snap near-solid to exactly 1 so the same camera always renders the same pixels
-      // (the canvas is alpha-composited, so a 0.998 wall would differ from a 1.0 wall).
-      if (opacity >= 0.995) opacity = 1;
-      if (node.material.opacity !== opacity) {
-        node.material.opacity = opacity;
-        node.material.transparent = opacity < 1;
-        node.material.depthWrite = opacity > 0.95;
+      const cut = wallIsCut(node.mid, center, toCamera, phi);
+      if (cut === node.cut) continue;
+      node.cut = cut;
+      for (const part of node.parts) {
+        const stub = cut ? stubbedBox(part.base, part.height, WALL_STUB_M) : { base: part.base, height: part.height };
+        part.mesh.visible = stub !== null;
+        if (stub) {
+          part.mesh.scale.y = stub.height / part.height;
+          part.mesh.position.y = stub.base + stub.height / 2;
+        }
       }
     }
   }
@@ -186,7 +195,7 @@
       target.z + radius * Math.sin(phi) * Math.sin(theta)
     );
     camera.lookAt(target);
-    updateWallFade();
+    updateWallCut();
   }
 
   function renderFrame() {
@@ -255,7 +264,7 @@
 
   function goPreset(name: CameraPresetName, instant = false) {
     activePreset = name;
-    moveTo(presetPose(name, sceneDesc, aspect()), instant);
+    moveTo(presetPose(name, sceneDesc, aspect(), undefined, EXPLODE_GAP_M), instant);
   }
 
   function resetView(instant = true) {
@@ -264,8 +273,10 @@
     goPreset('iso', instant);
   }
 
+  /** World height of a floor's walking surface, including the exploded-stack gap. */
   function floorElevation(floor_id: string): number {
-    return sceneDesc.floors.find((floor) => floor.floor_id === floor_id)?.elevation_m ?? 0;
+    const index = sceneDesc.floors.findIndex((floor) => floor.floor_id === floor_id);
+    return index < 0 ? 0 : sceneDesc.floors[index]!.elevation_m + index * EXPLODE_GAP_M;
   }
 
   /** Frames the selected device or room; with nothing selected, the whole home. */
@@ -288,7 +299,7 @@
       moveTo(framePose(box, { theta, phi }, aspect()));
       return;
     }
-    const whole = sceneBox(sceneDesc);
+    const whole = sceneBox(sceneDesc, EXPLODE_GAP_M);
     if (whole) {
       activePreset = null;
       moveTo(framePose(whole, { theta, phi }, aspect(), undefined, 4));
@@ -300,6 +311,7 @@
     selectedRoomId = null;
     onselect?.(device_id);
     const pin = allPins.find((candidate) => candidate.device_id === device_id);
+    if (pin && sceneDesc.floors.length > 1) isolatedFloorId = pin.floor_id; // selecting focuses its floor
     if (pin && mode === '3d') {
       const y = floorElevation(pin.floor_id) + pin.height_m;
       activePreset = null;
@@ -333,6 +345,7 @@
       tween = null;
       activePreset = null;
       if (hoverRoom) hoverRoom = null;
+      if (hoverPin) hoverPin = null;
     }
     if (dragging === 'orbit') {
       theta -= dx * 0.005;
@@ -355,6 +368,7 @@
 
   function onPointerLeave() {
     if (hoverRoom) hoverRoom = null;
+    if (hoverPin) hoverPin = null;
   }
 
   function onWheel(event: WheelEvent) {
@@ -398,8 +412,12 @@
     return true;
   }
 
+  function floorLevel(floor_id: string): number {
+    return sceneDesc.floors.find((floor) => floor.floor_id === floor_id)?.level ?? 0;
+  }
+  /** With a floor focused, floors above it are hidden. */
   function floorVisible(floor_id: string): boolean {
-    return isolatedFloorId === null || isolatedFloorId === floor_id;
+    return isolatedFloorId === null || floorLevel(floor_id) <= floorLevel(isolatedFloorId);
   }
 
   function pickPin(): string | null {
@@ -421,21 +439,25 @@
   }
 
   function hoverAt(event: PointerEvent) {
-    if (roomNodes.size === 0 || !pointerRay(event)) return;
+    if ((roomNodes.size === 0 && pinNodes.size === 0) || !pointerRay(event)) return;
+    const rect = stage?.getBoundingClientRect();
+    const x = event.clientX - (rect?.left ?? 0);
+    const y = event.clientY - (rect?.top ?? 0);
+    const pinId = pickPin();
+    if (pinId) {
+      const label = allPins.find((pin) => pin.device_id === pinId)?.label ?? 'Device';
+      hoverPin = { id: pinId, name: label, x, y };
+      if (hoverRoom) hoverRoom = null;
+      return;
+    }
+    if (hoverPin) hoverPin = null;
     const roomId = pickRoom();
     if (roomId === null) {
       if (hoverRoom) hoverRoom = null;
       return;
     }
     const node = roomNodes.get(roomId)!;
-    const rect = stage?.getBoundingClientRect();
-    hoverRoom = {
-      id: roomId,
-      name: node.name,
-      area: formatArea(node.area_m2),
-      x: event.clientX - (rect?.left ?? 0),
-      y: event.clientY - (rect?.top ?? 0)
-    };
+    hoverRoom = { id: roomId, name: node.name, area: formatArea(node.area_m2), x, y };
   }
 
   function pickAt(event: PointerEvent) {
@@ -448,6 +470,8 @@
     const roomId = pickRoom();
     selected = null;
     selectedRoomId = roomId;
+    const picked = roomId ? roomNodes.get(roomId) : undefined;
+    if (picked && sceneDesc.floors.length > 1) isolatedFloorId = picked.floor_id;
   }
 
   // --- Scene assembly from the pure description ----------------------------
@@ -506,6 +530,22 @@
     return texture;
   }
 
+  /** Radial glow (filled) or thin ring, as raw white pixels tinted by the sprite colour. */
+  function makeSpriteTexture(kind: 'glow' | 'ring'): THREE.DataTexture {
+    const size = 64;
+    const data = new Uint8Array(size * size * 4).fill(255);
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        const d = Math.hypot((x + 0.5) / size - 0.5, (y + 0.5) / size - 0.5) * 2;
+        const alpha = kind === 'glow' ? Math.pow(Math.max(0, 1 - d), 2) : Math.max(0, 1 - Math.abs(d - 0.82) / 0.1);
+        data[(y * size + x) * 4 + 3] = Math.round(Math.min(1, alpha) * 255);
+      }
+    }
+    const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+    texture.needsUpdate = true;
+    return texture;
+  }
+
   function rebuildStatic(desc: SceneDescription) {
     if (!scene) return;
     if (staticRoot) {
@@ -513,27 +553,37 @@
       disposeObject(staticRoot);
     }
     shadowTexture?.dispose();
+    glowTexture?.dispose();
+    ringTexture?.dispose();
     shadowTexture = makeShadowTexture();
+    glowTexture = makeSpriteTexture('glow');
+    ringTexture = makeSpriteTexture('ring');
     floorNodes = new Map();
     pinNodes = new Map();
     roomNodes = new Map();
     wallNodes = [];
-    ghostables = [];
+    dimmables = [];
     hoverRoom = null;
+    hoverPin = null;
     staticRoot = new THREE.Group();
-    for (const floor of desc.floors) {
+    const wallSide = new THREE.Color(palette.ink).lerp(new THREE.Color(palette.ambient), 0.4);
+    const outline = new THREE.Color(palette.ink).lerp(new THREE.Color(palette.raised), 0.45);
+    desc.floors.forEach((floor, floorIndex) => {
+      const tint = (material: THREE.Material & { color: THREE.Color }) => {
+        dimmables.push({ floor_id: floor.floor_id, material, base: material.color.clone() });
+        return material;
+      };
       const group = new THREE.Group();
-      group.position.y = floor.elevation_m;
+      group.position.y = floor.elevation_m + floorIndex * EXPLODE_GAP_M;
       const walls = new THREE.Group();
       for (const slab of floor.slabs) {
         if (slab.kind === 'extent') {
-          // A real slab: a thin box whose top face is the walking surface.
+          // A real slab: dark glass, a thin box whose top face is the walking surface.
           const { minX, minY, maxX, maxY } = slabBounds(slab);
           const mesh = new THREE.Mesh(
             new THREE.BoxGeometry(maxX - minX, SLAB_THICKNESS_M, maxY - minY),
-            new THREE.MeshStandardMaterial({ color: slab.color, roughness: 0.92, metalness: 0 })
+            tint(new THREE.MeshStandardMaterial({ color: new THREE.Color(palette.raised), roughness: 0.6, metalness: 0 }))
           );
-          ghostables.push({ floor_id: floor.floor_id, material: mesh.material as THREE.Material, opacity: 1, transparent: false, depthWrite: true });
           mesh.position.set((minX + maxX) / 2, -SLAB_THICKNESS_M / 2, (minY + maxY) / 2);
           group.add(mesh);
           continue;
@@ -541,16 +591,22 @@
         const geometry = polygonGeometry(slab.polygon);
         if (!geometry) continue;
         const material = new THREE.MeshStandardMaterial({
-          color: slab.color,
-          roughness: 0.78,
+          color: new THREE.Color(palette.raised).lerp(new THREE.Color(palette.ink), 0.1),
+          roughness: 0.7,
           metalness: 0,
           emissive: palette.highlight,
           emissiveIntensity: 0,
           side: THREE.DoubleSide
         });
+        tint(material);
         const mesh = new THREE.Mesh(geometry, material);
-        ghostables.push({ floor_id: floor.floor_id, material, opacity: 1, transparent: false, depthWrite: true });
         mesh.position.y = 0.012;
+        // A thin light outline keeps every room individually readable from above.
+        const edge = new THREE.LineLoop(
+          new THREE.BufferGeometry().setFromPoints(slab.polygon.map((point) => new THREE.Vector3(point.x, 0.03, point.y))),
+          tint(new THREE.LineBasicMaterial({ color: outline }))
+        );
+        group.add(edge);
         if (slab.room_id) {
           mesh.userData.room_id = slab.room_id;
           roomNodes.set(slab.room_id, {
@@ -560,7 +616,7 @@
             name: slab.name?.trim() ? slab.name : 'Unnamed room',
             area_m2: slab.area_m2,
             polygon: slab.polygon,
-            elevation: floor.elevation_m
+            elevation: floor.elevation_m + floorIndex * EXPLODE_GAP_M
           });
         }
         group.add(mesh);
@@ -569,35 +625,38 @@
         const { minX, minY, maxX, maxY } = slabBounds(floor.ceiling);
         const plane = new THREE.Mesh(
           new THREE.PlaneGeometry(maxX - minX, maxY - minY),
-          new THREE.MeshBasicMaterial({
-            color: palette.fill,
-            transparent: true,
-            opacity: 0.07,
-            side: THREE.DoubleSide,
-            depthWrite: false
-          })
+          new THREE.MeshBasicMaterial({ color: palette.fill, transparent: true, opacity: 0.04, side: THREE.DoubleSide, depthWrite: false })
         );
-        ghostables.push({ floor_id: floor.floor_id, material: plane.material as THREE.Material, opacity: 0.07, transparent: true, depthWrite: false });
         plane.rotation.x = Math.PI / 2;
         plane.position.set((minX + maxX) / 2, floor.ceiling_m, (minY + maxY) / 2);
         walls.add(plane); // hidden with the walls
       }
+      const byWall = new Map<string, (typeof wallNodes)[number]>();
+      const sums = new Map<string, { x: number; y: number; n: number }>();
       for (const box of floor.walls) {
-        const tone = new THREE.Color(box.color);
-        tone.offsetHSL(0, 0, 0.03 + (unitHash(box.wall_id) - 0.5) * 0.07);
-        const material = new THREE.MeshStandardMaterial({
-          color: tone,
-          roughness: wallRoughness(box.wall_id),
-          metalness: 0.02
-        });
-        const mesh = new THREE.Mesh(
-          new THREE.BoxGeometry(box.length_m, box.height_m, box.thickness_m),
-          material
-        );
+        const tone = wallSide.clone();
+        tone.offsetHSL(0, 0, (unitHash(box.wall_id) - 0.5) * 0.06);
+        const side = tint(new THREE.MeshStandardMaterial({ color: tone, roughness: wallRoughness(box.wall_id), metalness: 0 }));
+        // The cap is unlit and brighter than the sides, so the plan reads from above.
+        const cap = tint(new THREE.MeshBasicMaterial({ color: palette.ink, toneMapped: false }));
+        const mesh = new THREE.Mesh(new THREE.BoxGeometry(box.length_m, box.height_m, box.thickness_m), [side, side, cap, side, side, side]);
         mesh.position.set(box.center.x, box.base_m + box.height_m / 2, box.center.y);
         mesh.rotation.y = -box.angle_rad;
         walls.add(mesh);
-        wallNodes.push({ material, center: box.center, floor_id: floor.floor_id });
+        let node = byWall.get(box.wall_id);
+        if (!node) {
+          node = { floor_id: floor.floor_id, mid: { x: 0, y: 0 }, cut: false, parts: [] };
+          byWall.set(box.wall_id, node);
+          sums.set(box.wall_id, { x: 0, y: 0, n: 0 });
+          wallNodes.push(node);
+        }
+        node.parts.push({ mesh, base: box.base_m, height: box.height_m });
+        const sum = sums.get(box.wall_id)!;
+        sum.x += box.center.x; sum.y += box.center.y; sum.n += 1;
+      }
+      for (const [id, node] of byWall) {
+        const sum = sums.get(id)!;
+        node.mid = { x: sum.x / sum.n, y: sum.y / sum.n };
       }
       for (const stair of floor.stairs) {
         const mesh = new THREE.Mesh(
@@ -612,30 +671,40 @@
         const blob = contactShadow(pin.height_m);
         const shadow = new THREE.Mesh(
           new THREE.PlaneGeometry(blob.radius * 2, blob.radius * 2),
-          new THREE.MeshBasicMaterial({
-            color: '#000000',
-            map: shadowTexture,
-            transparent: true,
-            opacity: blob.opacity,
-            depthWrite: false
-          })
+          new THREE.MeshBasicMaterial({ color: '#000000', map: shadowTexture, transparent: true, opacity: blob.opacity, depthWrite: false })
         );
         shadow.rotation.x = -Math.PI / 2;
         shadow.position.set(pin.position.x, 0.024, pin.position.y);
         shadow.renderOrder = 1;
         group.add(shadow);
+        // A thin stem ties the pin to the floor so its height reads.
+        const stem = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.012, 0.012, Math.max(pin.height_m, 0.02), 6),
+          new THREE.MeshBasicMaterial({ color: palette.ink, toneMapped: false })
+        );
+        stem.position.set(pin.position.x, Math.max(pin.height_m, 0.02) / 2, pin.position.y);
+        group.add(stem);
         const mesh = new THREE.Mesh(
-          new THREE.SphereGeometry(0.14, 16, 12),
-          // Neutral at build time; the live-state effect applies heat colors.
-          new THREE.MeshBasicMaterial({ color: heatColor(null) })
+          new THREE.SphereGeometry(0.13, 20, 14),
+          // Neutral at build time; the live-state effect applies heat colors. Unlit and
+          // untone-mapped so the heat tier colour is exactly what shows.
+          new THREE.MeshBasicMaterial({ color: heatColor(null), toneMapped: false })
         );
         mesh.position.set(pin.position.x, pin.height_m, pin.position.y);
         mesh.userData.device_id = pin.device_id;
-        // A generous invisible target keeps small pins easy to click.
-        const hit = new THREE.Mesh(
-          new THREE.SphereGeometry(0.32, 8, 6),
-          new THREE.MeshBasicMaterial({ visible: false })
+        const glow = new THREE.Sprite(
+          new THREE.SpriteMaterial({ map: glowTexture, color: heatColor(null), transparent: true, opacity: 0.7, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false })
         );
+        glow.scale.setScalar(0.85);
+        glow.position.copy(mesh.position);
+        const halo = new THREE.Sprite(
+          new THREE.SpriteMaterial({ map: ringTexture, color: palette.highlight, transparent: true, opacity: 1, depthWrite: false, toneMapped: false })
+        );
+        halo.scale.setScalar(0.62);
+        halo.position.copy(mesh.position);
+        halo.visible = false;
+        // A generous invisible target keeps small pins easy to click.
+        const hit = new THREE.Mesh(new THREE.SphereGeometry(0.32, 8, 6), new THREE.MeshBasicMaterial({ visible: false }));
         hit.position.copy(mesh.position);
         hit.userData.device_id = pin.device_id;
         const ring = new THREE.Mesh(
@@ -645,8 +714,8 @@
         ring.geometry.rotateX(-Math.PI / 2);
         ring.position.set(pin.position.x, pin.height_m - 0.05, pin.position.y);
         ring.visible = false;
-        group.add(mesh, ring, hit);
-        pinNodes.set(pin.device_id, { pin: mesh, ring, hit, floor_id: floor.floor_id });
+        group.add(glow, mesh, halo, ring, hit);
+        pinNodes.set(pin.device_id, { pin: mesh, ring, hit, glow, halo, floor_id: floor.floor_id });
       }
       for (const cone of floor.cones) {
         const coneRadius = Math.tan(cone.half_angle_rad) * cone.length_m;
@@ -663,43 +732,31 @@
         group.add(mesh);
       }
       group.add(walls);
-      staticRoot.add(group);
+      staticRoot!.add(group);
       floorNodes.set(floor.floor_id, { group, walls });
-    }
+    });
     scene.add(staticRoot);
     applyVisibility();
+    applyDim();
     applyRoomHighlight();
-    applyGhost();
     rebuildCount += 1;
   }
 
+  /** Focus a floor: floors above it are hidden (floorVisible), floors below dim. */
   function applyVisibility() {
     for (const [floor_id, node] of floorNodes) {
-      node.group.visible = isolatedFloorId === null || isolatedFloorId === floor_id;
+      node.group.visible = floorVisible(floor_id);
       node.walls.visible = !wallsHidden;
     }
   }
 
-  /** Floors above the one holding the selection ghost out so they never hide it. */
-  function applyGhost() {
-    floorGhost = new Map();
-    const focusId = selected
-      ? allPins.find((pin) => pin.device_id === selected)?.floor_id
-      : selectedRoomId
-        ? roomNodes.get(selectedRoomId)?.floor_id
-        : undefined;
-    const focusLevel = sceneDesc.floors.find((floor) => floor.floor_id === focusId)?.level;
-    if (focusLevel !== undefined) {
-      for (const floor of sceneDesc.floors) if (floor.level > focusLevel) floorGhost.set(floor.floor_id, 0.1);
+  /** Dimming multiplies base colours, so it stays opaque and pixel-deterministic. */
+  function applyDim() {
+    const focusLevel = isolatedFloorId === null ? null : floorLevel(isolatedFloorId);
+    for (const entry of dimmables) {
+      const factor = focusLevel !== null && floorLevel(entry.floor_id) < focusLevel ? 0.32 : 1;
+      entry.material.color.copy(entry.base).multiplyScalar(factor);
     }
-    for (const entry of ghostables) {
-      const factor = floorGhost.get(entry.floor_id) ?? 1;
-      entry.material.opacity = entry.opacity * factor;
-      entry.material.transparent = entry.transparent || factor < 1;
-      entry.material.depthWrite = factor < 1 ? false : entry.depthWrite;
-      entry.material.needsUpdate = true;
-    }
-    updateWallFade();
   }
 
   function applyRoomHighlight() {
@@ -716,14 +773,24 @@
       if (previous !== undefined && previous !== state && !reduced) { pulses.set(pin.device_id, now); dirty = true; }
       prevPresence.set(pin.device_id, state);
       if (!node) continue;
-      const material = node.pin.material as THREE.MeshBasicMaterial;
-      material.color.set(heatColor(bandwidth[pin.device_id] ?? null));
-      material.opacity = state === 'offline' || state === 'unknown' ? 0.55 : 1;
-      material.transparent = material.opacity < 1;
+      const tier = heatColor(bandwidth[pin.device_id] ?? null);
+      // The "unavailable" tier renders as a bright neutral with a ring, never dull grey.
+      const unavailable = tier === HEAT_UNAVAILABLE_COLOR;
+      const color = unavailable ? palette.ink : tier;
+      (node.pin.material as THREE.MeshBasicMaterial).color.set(color);
+      const quiet = state === 'offline' || state === 'unknown';
+      const glow = node.glow.material as THREE.SpriteMaterial;
+      glow.color.set(color);
+      glow.opacity = quiet ? 0.35 : 0.75;
+      const isSelected = selected === pin.device_id;
+      node.halo.visible = isSelected || unavailable;
+      const haloMaterial = node.halo.material as THREE.SpriteMaterial;
+      haloMaterial.color.set(isSelected ? palette.highlight : palette.ink);
+      node.halo.scale.setScalar(isSelected ? 0.78 : 0.56);
       const badge = riskBadge(riskFromPresence(state));
       node.ring.visible = badge.ring;
       (node.ring.material as THREE.MeshBasicMaterial).color.set(badge.outline);
-      if (!pulses.has(pin.device_id)) node.pin.scale.setScalar(selected === pin.device_id ? 1.35 : 1);
+      if (!pulses.has(pin.device_id)) node.pin.scale.setScalar(isSelected ? 1.3 : 1);
     }
   }
 
@@ -758,12 +825,12 @@
     scene = new THREE.Scene();
     // Cool ambient from below-left, warm key from the camera's right: faces
     // the default view sees get the warm side, shaded faces stay cool.
-    scene.add(new THREE.HemisphereLight(palette.ambient, palette.ground, 1.5));
-    const key = new THREE.DirectionalLight(new THREE.Color(palette.key).lerp(new THREE.Color('#ffffff'), 0.3), 4.2);
-    key.position.set(9, 14, -5);
+    scene.add(new THREE.HemisphereLight(palette.ambient, palette.ground, 1.1));
+    const key = new THREE.DirectionalLight(new THREE.Color(palette.key).lerp(new THREE.Color('#ffffff'), 0.45), 5.4);
+    key.position.set(12, 4.5, -2);
     scene.add(key);
-    const fill = new THREE.DirectionalLight(palette.fill, 0.8);
-    fill.position.set(-8, 6, 10);
+    const fill = new THREE.DirectionalLight(palette.fill, 0.55);
+    fill.position.set(-6, 5, -10);
     scene.add(fill);
     camera = new THREE.PerspectiveCamera(50, 4 / 3, 0.1, 500);
     mode = '3d';
@@ -783,6 +850,10 @@
       if (staticRoot) disposeObject(staticRoot);
       shadowTexture?.dispose();
       shadowTexture = null;
+      glowTexture?.dispose();
+      ringTexture?.dispose();
+      glowTexture = null;
+      ringTexture = null;
       renderer?.dispose();
       renderer?.forceContextLoss?.();
       renderer = null;
@@ -814,6 +885,7 @@
     void wallsHidden;
     void isolatedFloorId;
     applyVisibility();
+    applyDim();
     requestRender();
   });
 
@@ -821,7 +893,7 @@
     if (mode !== '3d') return;
     void hoverRoom?.id;
     void selectedRoomId;
-    applyGhost();
+    applyDim();
     applyRoomHighlight();
     requestRender();
   });
@@ -831,7 +903,7 @@
     void presence;
     void bandwidth;
     void selected;
-    applyGhost();
+    applyDim();
     updatePins(typeof performance !== 'undefined' ? performance.now() : 0);
     requestRender();
   });
@@ -858,6 +930,7 @@
   data-selected={selected ?? ''}
   data-selected-room={selectedRoomId ?? ''}
   data-hover-room={hoverRoom?.id ?? ''}
+  data-hover-pin={hoverPin?.id ?? ''}
   data-camera-preset={activePreset ?? ''}
   data-rebuild-count={rebuildCount}
   data-reset-count={resetCount}
@@ -920,6 +993,16 @@
       >
         <strong>{hoverRoom.name}</strong>
         <span>{hoverRoom.area}</span>
+      </div>
+    {/if}
+    {#if mode === '3d' && hoverPin}
+      <div
+        class="twin-room-tip twin-pin-tip"
+        role="status"
+        style:left="{Math.min(hoverPin.x + 14, (stage?.clientWidth ?? 600) - 170)}px"
+        style:top="{Math.max(hoverPin.y - 40, 6)}px"
+      >
+        <strong>{hoverPin.name}</strong>
       </div>
     {/if}
     {#if mode === '3d' && card}

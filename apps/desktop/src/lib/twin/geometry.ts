@@ -102,8 +102,8 @@ export const CAMERA_TILT_HEIGHT_M = 1.4;
 export const CAMERA_TILT_DOWN = 0.25;
 
 export const TWIN_COLORS = {
-  slabExtent: '#17323d',
-  slabRoom: '#20424b',
+  slabExtent: '#0b1c26',
+  slabRoom: '#14343f',
   wall: '#28505a',
   stair: '#ffcd66'
 } as const;

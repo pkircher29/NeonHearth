@@ -28,6 +28,10 @@ export const RADIUS_MIN = 1.5;
 export const RADIUS_MAX = 200;
 export const TRANSITION_MS = 450;
 export const FRAME_MARGIN = 1.12;
+/** Extra vertical air between storeys so a lower floor's interior stays visible (exploded stack). */
+export const EXPLODE_GAP_M = 1.2;
+/** Height of a cut-away wall stub (the dollhouse cut). */
+export const WALL_STUB_M = 0.25;
 
 export interface SceneBox {
   min: Vec3;
@@ -35,14 +39,15 @@ export interface SceneBox {
 }
 
 /** World-space box of the whole model (all floors stacked), or null when empty. */
-export function sceneBox(scene: SceneDescription): SceneBox | null {
+export function sceneBox(scene: SceneDescription, explode = 0): SceneBox | null {
   if (!scene.bounds || scene.floors.length === 0) return null;
   let low = Infinity;
   let high = -Infinity;
-  for (const floor of scene.floors) {
-    if (floor.elevation_m < low) low = floor.elevation_m;
-    if (floor.elevation_m + floor.ceiling_m > high) high = floor.elevation_m + floor.ceiling_m;
-  }
+  scene.floors.forEach((floor, index) => {
+    const lift = index * explode;
+    if (floor.elevation_m + lift < low) low = floor.elevation_m + lift;
+    if (floor.elevation_m + floor.ceiling_m + lift > high) high = floor.elevation_m + floor.ceiling_m + lift;
+  });
   return {
     min: { x: scene.bounds.min.x, y: low, z: scene.bounds.min.y },
     max: { x: scene.bounds.max.x, y: high, z: scene.bounds.max.y }
@@ -80,16 +85,17 @@ export function presetPose(
   name: CameraPresetName,
   scene: SceneDescription,
   aspect = 4 / 3,
-  fovDeg = CAMERA_FOV_DEG
+  fovDeg = CAMERA_FOV_DEG,
+  explode = 0
 ): CameraPose {
-  const box = sceneBox(scene);
+  const box = sceneBox(scene, explode);
   if (!box || !scene.bounds) return { ...DEFAULT_POSE, target: { ...DEFAULT_POSE.target } };
   const target = centerOf(box);
   const width = box.max.x - box.min.x;
   const depth = box.max.z - box.min.z;
   const height = box.max.y - box.min.y;
   if (name === 'iso') {
-    return { theta: -Math.PI / 4, phi: 1.05, radius: scene.bounds.radius_m * 2.4, target };
+    return { theta: -Math.PI / 4, phi: 1.05, radius: Math.max(scene.bounds.radius_m, height) * 2.4, target };
   }
   if (name === 'top') {
     return {
@@ -179,29 +185,28 @@ export function tweenProgress(start: number, now: number, duration = TRANSITION_
 }
 
 /**
- * Cut-away opacity for a wall. Walls on the camera's side of the model hide
- * the rooms behind them, so they fade toward `minOpacity`; far walls stay
- * solid. `wallCenter` and `target` are plan-plane points; `toCamera` is the
- * horizontal direction from the target toward the camera (any length). The
- * effect fades out as the camera goes overhead (`phi` -> 0), where walls hide
- * nothing.
+ * Dollhouse cut: true when a wall sits on the camera's side of the model, so it
+ * should render as a short stub and let the eye see in over it. Boolean on
+ * purpose (same camera, same pixels). Never cuts from near-overhead views,
+ * where walls hide nothing.
  */
-export function wallFadeOpacity(
-  wallCenter: Vec2,
-  target: Vec2,
+export function wallIsCut(
+  wallMid: Vec2,
+  modelCenter: Vec2,
   toCamera: Vec2,
   phi: number,
-  minOpacity = 0.16,
-  spread = 1.5
-): number {
+  margin = 0.4
+): boolean {
   const norm = Math.hypot(toCamera.x, toCamera.y);
-  if (norm < 1e-9) return 1;
-  const along = ((wallCenter.x - target.x) * toCamera.x + (wallCenter.y - target.y) * toCamera.y) / norm;
-  // Smooth step from solid (behind the target) to faded (in front by `spread`).
-  const s = Math.min(1, Math.max(0, along / spread / 2 + 0.5));
-  const smooth = s * s * (3 - 2 * s);
-  const elevation = Math.min(1, Math.max(0, Math.sin(phi) * 1.6 - 0.2));
-  return 1 - (1 - minOpacity) * smooth * elevation;
+  if (norm < 1e-9 || Math.sin(phi) < 0.45) return false;
+  const along = ((wallMid.x - modelCenter.x) * toCamera.x + (wallMid.y - modelCenter.y) * toCamera.y) / norm;
+  return along > margin;
+}
+
+/** Stub geometry for a wall box: new base-relative height, or null when the box hides entirely. */
+export function stubbedBox(base_m: number, height_m: number, stub = WALL_STUB_M): { base: number; height: number } | null {
+  if (base_m >= stub) return null;
+  return { base: base_m, height: Math.min(base_m + height_m, stub) - base_m };
 }
 
 /** Contact-shadow blob under a pin: higher pins cast a wider, fainter shadow. */

@@ -29,7 +29,10 @@ import {
   sceneBox,
   tweenProgress,
   unitHash,
-  wallFadeOpacity,
+  wallIsCut,
+  stubbedBox,
+  WALL_STUB_M,
+  EXPLODE_GAP_M,
   wallRoughness
 } from './twinCamera';
 import { buildPinCard, formatArea, formatLastSeen, MISSING, presenceLabel } from './twinCard';
@@ -287,19 +290,27 @@ describe('camera tween helpers', () => {
   });
 });
 
-describe('wall fade (cut-away)', () => {
+describe('wall cut-away (dollhouse)', () => {
   const origin = { x: 0, y: 0 };
-  it('fades walls on the camera side and keeps far walls solid', () => {
-    const near = wallFadeOpacity({ x: 5, y: 0 }, origin, { x: 1, y: 0 }, 1.05);
-    const far = wallFadeOpacity({ x: -5, y: 0 }, origin, { x: 1, y: 0 }, 1.05);
-    expect(near).toBeLessThan(0.3);
-    expect(far).toBe(1);
+  it('cuts walls on the camera side and keeps far walls tall', () => {
+    expect(wallIsCut({ x: 5, y: 0 }, origin, { x: 1, y: 0 }, 1.05)).toBe(true);
+    expect(wallIsCut({ x: -5, y: 0 }, origin, { x: 1, y: 0 }, 1.05)).toBe(false);
+    expect(wallIsCut({ x: 0.1, y: 4 }, origin, { x: 1, y: 0 }, 1.05)).toBe(false);
   });
-  it('does not fade from straight overhead', () => {
-    expect(wallFadeOpacity({ x: 5, y: 0 }, origin, { x: 1, y: 0 }, 0.02)).toBeGreaterThan(0.95);
+  it('never cuts from straight overhead or without a horizontal camera direction', () => {
+    expect(wallIsCut({ x: 5, y: 0 }, origin, { x: 1, y: 0 }, 0.02)).toBe(false);
+    expect(wallIsCut({ x: 5, y: 0 }, origin, { x: 0, y: 0 }, 1)).toBe(false);
   });
-  it('is solid without a horizontal camera direction', () => {
-    expect(wallFadeOpacity({ x: 5, y: 0 }, origin, { x: 0, y: 0 }, 1)).toBe(1);
+  it('stubs low boxes and hides boxes that start above the stub', () => {
+    expect(stubbedBox(0, 2.4)).toEqual({ base: 0, height: WALL_STUB_M });
+    expect(stubbedBox(0, 0.1)).toEqual({ base: 0, height: 0.1 });
+    expect(stubbedBox(2, 0.4)).toBeNull();
+  });
+  it('exploded stacks add the gap to the scene box and framing', () => {
+    const plan: HomePlan = { home_id: 'h', version: 1, name: 'H', floors: [floorOf({ floor_id: 'g', walls: [wall('a', 0, 0, 8, 0)] }), floorOf({ floor_id: 'u', level: 1, walls: [wall('b', 0, 0, 8, 0)] })] };
+    const scene = buildSceneDescription(plan);
+    expect(sceneBox(scene, EXPLODE_GAP_M)!.max.y - sceneBox(scene)!.max.y).toBeCloseTo(EXPLODE_GAP_M);
+    expect(presetPose('iso', scene, 4 / 3, 50, EXPLODE_GAP_M).target.y).toBeGreaterThan(presetPose('iso', scene).target.y);
   });
 });
 
