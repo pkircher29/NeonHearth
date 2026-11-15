@@ -26,6 +26,8 @@ export interface PlanWall {
   wall_id: string;
   start: Vec2;
   end: Vec2;
+  /** Optional on read (contract 0.02..=1.0); absent means DEFAULT_WALL_THICKNESS_M. */
+  thickness_m?: number | null;
   openings?: PlanOpening[];
 }
 export interface PlanRoom {
@@ -66,6 +68,10 @@ export interface TwinDevice {
   is_camera?: boolean;
   /** Optional owner-set view direction, degrees CCW from +x in plan space. */
   facing_deg?: number | null;
+  /** Optional evidence tags for the detail card; absent renders as an em-dash. */
+  evidence?: string[] | null;
+  /** Optional RFC3339 last-seen stamp for the detail card. */
+  last_seen_at?: string | null;
 }
 
 // --- Tunable constants (documented so tests and the 2D editor agree) -------
