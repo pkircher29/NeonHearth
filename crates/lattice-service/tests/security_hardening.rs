@@ -109,10 +109,7 @@ async fn the_tailnet_name_is_served_once_known_and_never_before() {
     );
     let router = app_with_remote_access(state, remote.clone());
     let host = [("host", "neonhearth.tailnet.ts.net")];
-    assert_eq!(
-        status(&router, health(&host)).await,
-        StatusCode::FORBIDDEN
-    );
+    assert_eq!(status(&router, health(&host)).await, StatusCode::FORBIDDEN);
     remote.prime_host_policy().await;
     assert_eq!(status(&router, health(&host)).await, StatusCode::OK);
     assert_eq!(
@@ -166,11 +163,13 @@ async fn serve(router: Router) -> String {
     format!("ws://{address}/api/v1/events")
 }
 
-type Client = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Client =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect(router: &Router, base: &str) -> Result<Client, tokio_tungstenite::tungstenite::Error> {
+async fn connect(
+    router: &Router,
+    base: &str,
+) -> Result<Client, tokio_tungstenite::tungstenite::Error> {
     let ticket = ticket(router).await;
     tokio_tungstenite::connect_async(format!("{base}?ticket={ticket}&after_sequence=0"))
         .await
@@ -255,7 +254,9 @@ async fn an_oversized_client_message_closes_the_socket() {
     let router = app(state().await);
     let base = serve(router.clone()).await;
     let mut socket = connect(&router, &base).await.unwrap();
-    let _ = socket.send(Message::Binary(vec![0u8; 64 * 1024].into())).await;
+    let _ = socket
+        .send(Message::Binary(vec![0u8; 64 * 1024].into()))
+        .await;
     assert!(closes_within(&mut socket, 5).await);
 }
 
@@ -385,7 +386,10 @@ fn expected(method: &str, path: &str) -> Verdict {
         return HighImpact;
     }
     match (method, path) {
-        ("GET", "/api/v1/health" | "/api/v1/state" | "/api/v1/cameras" | "/api/v1/openapi.json")
+        (
+            "GET",
+            "/api/v1/health" | "/api/v1/state" | "/api/v1/cameras" | "/api/v1/openapi.json",
+        )
         | ("GET", "/api/v1/cameras/{id}")
         | ("GET", "/api/v1/cameras/{id}/health" | "/api/v1/cameras/{id}/inventory")
         | ("GET", "/api/v1/devices/{device_id}/advisories")
@@ -454,10 +458,9 @@ async fn every_scanned_route_has_an_explicit_phone_verdict() {
         .await
         .unwrap();
     assert_eq!(pair.status(), StatusCode::OK);
-    let pair: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(pair.into_body(), 4096).await.unwrap(),
-    )
-    .unwrap();
+    let pair: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(pair.into_body(), 4096).await.unwrap())
+            .unwrap();
     let credential = format!(
         "PhoneSession {}:{}",
         pair["session_id"].as_str().unwrap(),

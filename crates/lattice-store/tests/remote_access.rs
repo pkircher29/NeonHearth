@@ -202,7 +202,9 @@ async fn a_spent_budget_locks_and_a_correct_pin_cannot_unlock_it() {
     // After the window lapses a new budget opens.
     let later = now + window + Duration::seconds(1);
     assert!(matches!(
-        repo.reserve_pin_attempt(id, later, window, 5).await.unwrap(),
+        repo.reserve_pin_attempt(id, later, window, 5)
+            .await
+            .unwrap(),
         PinReservation::Reserved { attempt: 1 }
     ));
 }
@@ -215,8 +217,17 @@ async fn touch_never_resurrects_revoked_or_expired_sessions_and_purge_removes_th
     let revoked = session(&repo, now).await;
     repo.revoke_phone_session(revoked).await.unwrap();
     let new_expiry = now + Duration::days(30);
-    assert!(repo.touch_phone_session(live, now, new_expiry).await.unwrap());
-    assert!(!repo.touch_phone_session(revoked, now, new_expiry).await.unwrap());
+    assert!(
+        repo.touch_phone_session(live, now, new_expiry)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repo
+            .touch_phone_session(revoked, now, new_expiry)
+            .await
+            .unwrap()
+    );
     let far = now + Duration::days(31);
     assert!(!repo.touch_phone_session(live, far, far).await.unwrap());
     let removed = repo
@@ -235,7 +246,9 @@ async fn command_claims_are_durable_exclusive_and_bodies_trimmed() {
     let command = Uuid::new_v4();
     let fingerprint = "b".repeat(64);
     assert_eq!(
-        repo.claim_command(id, command, &fingerprint, now).await.unwrap(),
+        repo.claim_command(id, command, &fingerprint, now)
+            .await
+            .unwrap(),
         None
     );
     // In flight: a second claim sees an incomplete record.
@@ -256,7 +269,9 @@ async fn command_claims_are_durable_exclusive_and_bodies_trimmed() {
     assert!(seen.completed && seen.status == 200 && seen.body == b"{}");
     for _ in 0..4 {
         let other = Uuid::new_v4();
-        repo.claim_command(id, other, &fingerprint, now).await.unwrap();
+        repo.claim_command(id, other, &fingerprint, now)
+            .await
+            .unwrap();
         repo.complete_command(id, other, 204, None, Some(b""), 2)
             .await
             .unwrap();

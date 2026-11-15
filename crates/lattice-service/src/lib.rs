@@ -21,6 +21,7 @@ mod state;
 pub mod tailscale;
 pub mod vault;
 pub mod ws;
+pub use auth::Principal;
 use axum::{
     Router,
     extract::{Query, State, WebSocketUpgrade, rejection::QueryRejection},
@@ -29,9 +30,8 @@ use axum::{
     routing::{delete, get, post, put},
 };
 pub use platform::{Platform, PlatformPaths, platform_paths};
-use serde::Deserialize;
-pub use auth::Principal;
 pub use security::HostPolicy;
+use serde::Deserialize;
 pub use state::{AppState, InvalidServiceToken, ServiceRuntimeStatus, SocketLimits};
 use tower_http::timeout::TimeoutLayer;
 #[cfg(any(test, feature = "test-support"))]
@@ -149,7 +149,10 @@ pub fn app_with_parts(
             delete(cameras::close_session_route),
         )
         .route("/api/v1/openapi.json", get(api::openapi))
-        .route("/api/v1/service/token/rotate", post(api::rotate_owner_token))
+        .route(
+            "/api/v1/service/token/rotate",
+            post(api::rotate_owner_token),
+        )
         .route("/api/v1/remote/serve", post(tailscale::serve_route))
         .route("/api/v1/remote/status", get(tailscale::status_route))
         .route("/api/v1/remote/pair", post(tailscale::pair_route))

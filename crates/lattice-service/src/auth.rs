@@ -40,15 +40,9 @@ impl FromRequestParts<AppState> for Authorized {
             .extensions
             .get::<crate::tailscale::PhoneAuthorized>()
             .is_some();
-        let valid = phone
-            || bearer_token(&parts.headers).is_some_and(|token| state.token_matches(token));
-        async move {
-            if valid {
-                Ok(Self)
-            } else {
-                Err(unauthorized())
-            }
-        }
+        let valid =
+            phone || bearer_token(&parts.headers).is_some_and(|token| state.token_matches(token));
+        async move { if valid { Ok(Self) } else { Err(unauthorized()) } }
     }
 }
 
@@ -137,7 +131,10 @@ mod tests {
         assert_eq!(bearer_token(&headers(&["bearer abc"])), None);
         assert_eq!(bearer_token(&headers(&["Basic abc"])), None);
         assert_eq!(bearer_token(&headers(&["Bearer abc", "Bearer abc"])), None);
-        assert_eq!(bearer_token(&headers(&["Bearer abc", "PhoneSession x:y"])), None);
+        assert_eq!(
+            bearer_token(&headers(&["Bearer abc", "PhoneSession x:y"])),
+            None
+        );
     }
 
     #[test]

@@ -1388,11 +1388,9 @@ async fn sixty_concurrent_pin_guesses_verify_at_most_the_budget() {
         5,
         "only the 5-attempt budget may ever be verified"
     );
-    assert!(
-        statuses
-            .iter()
-            .all(|status| { *status == StatusCode::FORBIDDEN || *status == StatusCode::TOO_MANY_REQUESTS })
-    );
+    assert!(statuses.iter().all(|status| {
+        *status == StatusCode::FORBIDDEN || *status == StatusCode::TOO_MANY_REQUESTS
+    }));
     assert!(!statuses.contains(&StatusCode::OK), "no guess may succeed");
 }
 
@@ -1562,7 +1560,14 @@ async fn a_phone_session_cannot_exhaust_the_owners_event_tickets() {
     let phone = Auth::Phone(id, secret);
     let mut refused = false;
     for _ in 0..20 {
-        let response = send(&fixture.router, "POST", "/api/v1/events/ticket", None, &phone).await;
+        let response = send(
+            &fixture.router,
+            "POST",
+            "/api/v1/events/ticket",
+            None,
+            &phone,
+        )
+        .await;
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             refused = true;
             break;
@@ -1588,8 +1593,17 @@ async fn revoking_a_phone_session_closes_its_live_event_socket() {
     let fixture = fixture_at(Utc::now()).await;
     let (id, secret) = pair(&fixture, "pixel", "123456").await;
     let phone = Auth::Phone(id.clone(), secret);
-    let ticket = json_body(send(&fixture.router, "POST", "/api/v1/events/ticket", None, &phone).await)
-        .await["ticket"]
+    let ticket = json_body(
+        send(
+            &fixture.router,
+            "POST",
+            "/api/v1/events/ticket",
+            None,
+            &phone,
+        )
+        .await,
+    )
+    .await["ticket"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1632,10 +1646,13 @@ async fn revoking_a_phone_session_closes_its_live_event_socket() {
 async fn a_socket_rechecks_its_session_when_no_revocation_was_announced() {
     use tokio_tungstenite::tungstenite::Message;
     let fixture = fixture_at(Utc::now()).await;
-    let state = fixture.state.clone().with_socket_limits(lattice_service::SocketLimits {
-        session_recheck: std::time::Duration::from_millis(100),
-        ..Default::default()
-    });
+    let state = fixture
+        .state
+        .clone()
+        .with_socket_limits(lattice_service::SocketLimits {
+            session_recheck: std::time::Duration::from_millis(100),
+            ..Default::default()
+        });
     let remote = RemoteAccessState::with_parts(
         &state,
         Arc::clone(&fixture.tailscale) as Arc<dyn TailscaleControl>,
@@ -1781,9 +1798,7 @@ async fn concurrent_commands_and_restart_never_repeat_execution() {
     // the retry is answered from it (never re-executed). The original main
     // behaviour was a bare 409; replaying the settled answer is stricter
     // about side effects and kinder to the client.
-    assert!(
-        response.status() == StatusCode::OK || response.status() == StatusCode::CONFLICT
-    );
+    assert!(response.status() == StatusCode::OK || response.status() == StatusCode::CONFLICT);
     assert_eq!(
         response.status() == StatusCode::OK,
         response.headers().get("x-command-replayed").is_some(),

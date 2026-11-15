@@ -91,9 +91,13 @@ type ReplayRow = (String, i64, i64, Option<String>, Option<Vec<u8>>, i64);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PinReservation {
     /// The attempt was admitted; the caller may now verify the PIN.
-    Reserved { attempt: u32 },
+    Reserved {
+        attempt: u32,
+    },
     /// The budget is spent or the session is locked; do not verify.
-    Locked { until: DateTime<Utc> },
+    Locked {
+        until: DateTime<Utc>,
+    },
     NoSession,
 }
 
@@ -490,16 +494,15 @@ impl RemoteAccessRepository {
         if inserted.rows_affected() > 0 {
             return Ok(None);
         }
-        let row: Option<ReplayRow> =
-            sqlx::query_as(
-                "SELECT request_fingerprint, completed, status, content_type, body, body_omitted \
+        let row: Option<ReplayRow> = sqlx::query_as(
+            "SELECT request_fingerprint, completed, status, content_type, body, body_omitted \
                  FROM phone_command_replays WHERE session_id = ? AND command_id = ?",
-            )
-            .bind(session_id.to_string())
-            .bind(command_id.to_string())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage)?;
+        )
+        .bind(session_id.to_string())
+        .bind(command_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage)?;
         let Some((fingerprint, completed, status, content_type, body, omitted)) = row else {
             return Err(RemoteAccessStoreError::Storage(
                 "command record vanished during claim".into(),

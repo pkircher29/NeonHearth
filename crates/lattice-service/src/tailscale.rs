@@ -512,7 +512,10 @@ impl RemoteAccessState {
         &self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
-        let permit = Arc::clone(&self.shared.pin_gate).acquire_owned().await.ok()?;
+        let permit = Arc::clone(&self.shared.pin_gate)
+            .acquire_owned()
+            .await
+            .ok()?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             work()
@@ -741,10 +744,10 @@ async fn run_command(
     let Ok(request_body) = axum::body::to_bytes(body, MAX_COMMAND_REQUEST_BODY).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
-    let target = parts
-        .uri
-        .path_and_query()
-        .map_or_else(|| parts.uri.path().to_owned(), |value| value.as_str().to_owned());
+    let target = parts.uri.path_and_query().map_or_else(
+        || parts.uri.path().to_owned(),
+        |value| value.as_str().to_owned(),
+    );
     let fingerprint = request_fingerprint(&parts.method, &target, &request_body);
     let request = Request::from_parts(parts, Body::from(request_body));
 
@@ -1735,10 +1738,22 @@ mod tests {
     #[test]
     fn request_fingerprint_binds_method_target_and_body() {
         let base = request_fingerprint(&Method::POST, "/api/v1/policy/action", b"{}");
-        assert_eq!(base, request_fingerprint(&Method::POST, "/api/v1/policy/action", b"{}"));
-        assert_ne!(base, request_fingerprint(&Method::PUT, "/api/v1/policy/action", b"{}"));
-        assert_ne!(base, request_fingerprint(&Method::POST, "/api/v1/home/plan", b"{}"));
-        assert_ne!(base, request_fingerprint(&Method::POST, "/api/v1/policy/action", b"{ }"));
+        assert_eq!(
+            base,
+            request_fingerprint(&Method::POST, "/api/v1/policy/action", b"{}")
+        );
+        assert_ne!(
+            base,
+            request_fingerprint(&Method::PUT, "/api/v1/policy/action", b"{}")
+        );
+        assert_ne!(
+            base,
+            request_fingerprint(&Method::POST, "/api/v1/home/plan", b"{}")
+        );
+        assert_ne!(
+            base,
+            request_fingerprint(&Method::POST, "/api/v1/policy/action", b"{ }")
+        );
     }
 
     // -- Replay layer and PIN gate, driven through the real layer ---------

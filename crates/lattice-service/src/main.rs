@@ -257,7 +257,10 @@ pub(crate) async fn serve(
     // status, not vanish: each task is watched by `supervise_background`.
     supervise_background(
         "host_monitor",
-        state.host_monitor().start(shutdown_rx.clone()).into_handle(),
+        state
+            .host_monitor()
+            .start(shutdown_rx.clone())
+            .into_handle(),
         &state,
         shutdown_rx.clone(),
     );
@@ -283,7 +286,8 @@ pub(crate) async fn serve(
         lattice_service::runtime::build(state.clone(), M2StateRepository::new(pool.clone())).await;
     let bind_var = std::env::var("LATTICE_BIND").ok();
     let bind = parse_bind(bind_var.as_deref()).map_err(|message| anyhow::anyhow!(message))?;
-    let listener = bind_exclusive(bind).with_context(|| format!("bind loopback listener {bind}"))?;
+    let listener =
+        bind_exclusive(bind).with_context(|| format!("bind loopback listener {bind}"))?;
     // The Serve mapping, funnel checks and Host allowlist follow the port the
     // listener really holds (it may differ from the default via LATTICE_BIND,
     // or be ephemeral).

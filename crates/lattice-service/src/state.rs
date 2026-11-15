@@ -383,7 +383,10 @@ mod tests {
         assert!(tickets.len() > MAX_TICKETS_PER_PRINCIPAL);
         let ticket = tickets[0].clone();
         assert_eq!(
-            tickets.iter().collect::<std::collections::HashSet<_>>().len(),
+            tickets
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
             tickets.len()
         );
 
@@ -418,7 +421,10 @@ mod tests {
         }
         assert!(state.issue_event_ticket(now, phone).await.is_err());
         // The owner is unaffected, and a ticket stays bound to its principal.
-        let owner = state.issue_event_ticket(now, Principal::Owner).await.unwrap();
+        let owner = state
+            .issue_event_ticket(now, Principal::Owner)
+            .await
+            .unwrap();
         assert_eq!(
             state.consume_event_ticket(&owner, now).await,
             Some(Principal::Owner)
@@ -427,11 +433,13 @@ mod tests {
 
     #[tokio::test]
     async fn token_validation_and_rotation() {
-        assert!(AppState::new(
-            "a".repeat(40),
-            M2StateRepository::new(connect_memory().await.unwrap())
-        )
-        .is_err());
+        assert!(
+            AppState::new(
+                "a".repeat(40),
+                M2StateRepository::new(connect_memory().await.unwrap())
+            )
+            .is_err()
+        );
         let state = state().await;
         assert!(state.token_matches(TOKEN));
         let new = "rotated-token-9876543210zyxwvutsrq";
