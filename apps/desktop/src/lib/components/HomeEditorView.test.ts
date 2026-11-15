@@ -578,21 +578,31 @@ describe('HomeEditorView', () => {
     }
     const touch = (pointerId: number, x: number, y: number) => ({ pointerType: 'touch', pointerId, clientX: x, clientY: y, isPrimary: pointerId === 11 });
 
-    it('keeps the controls compact: zoom cluster inside the canvas frame, Detect rooms beside the room tools, Copy footprint on the floor row', async () => {
+    it('lays out as a drafting table: tool rail, canvas with its view controls, status bar, floors beside it', async () => {
       const { view } = await openEditor();
       const frame = view.container.querySelector('.canvas-frame')!;
       expect(frame.querySelector('[role="toolbar"][aria-label="Plan view"]')).toBeTruthy();
+      // The tools are a vertical toolbar of named buttons; the shortcut letter is not part of the name.
       const tools = screen.getByRole('toolbar', { name: 'Editor tools' });
-      expect(tools.querySelector('button.detect')).toBeNull(); // not inside the tools toolbar (name collisions), but its sibling
-      expect(tools.nextElementSibling!.textContent).toBe('Detect rooms');
-      expect(tools.lastElementChild!.textContent).toBe('Rectangle');
-      const row = view.container.querySelector('.floor-row')!;
-      expect(row.contains(screen.getByRole('combobox', { name: 'Footprint destination' }))).toBe(true);
-      expect(row.contains(screen.getByRole('button', { name: 'Copy footprint' }))).toBe(true);
-      // Undo / Redo / Save share the toolbar row with the tools.
-      const toolbar = view.container.querySelector('.editor-toolbar')!;
-      expect(toolbar.contains(screen.getByRole('button', { name: 'Undo' }))).toBe(true);
-      expect(toolbar.contains(screen.getByRole('button', { name: 'Save plan' }))).toBe(true);
+      expect(tools.getAttribute('aria-orientation')).toBe('vertical');
+      expect([...tools.querySelectorAll('button.tool')].map((button) => button.querySelector('.tool-name')!.textContent))
+        .toEqual(['Select', 'Pan', 'Wall', 'Rectangle', 'Room', 'Opening', 'Place device']);
+      expect(screen.getByRole('button', { name: 'Wall' }).getAttribute('aria-keyshortcuts')).toBe('W');
+      // Detect rooms stays outside the tools toolbar (its name would collide with the Room tool).
+      expect(tools.querySelector('button.detect')).toBeNull();
+      const status = view.container.querySelector('.status-bar')!;
+      expect(status.contains(screen.getByRole('button', { name: 'Detect rooms' }))).toBe(true);
+      expect(status.contains(screen.getByRole('combobox', { name: 'Measurement units' }))).toBe(true);
+      expect(status.querySelector('.tool-hint')).toBeTruthy();
+      // Floors, with Copy footprint, sit in the side column above the tray.
+      const floors = view.container.querySelector('.floors-panel')!;
+      expect(floors.contains(screen.getByRole('navigation', { name: 'Floors' }))).toBe(true);
+      expect(floors.contains(screen.getByRole('combobox', { name: 'Footprint destination' }))).toBe(true);
+      expect(floors.contains(screen.getByRole('button', { name: 'Copy footprint' }))).toBe(true);
+      // Undo / Redo / Save live in the title bar.
+      const top = view.container.querySelector('.editor-top')!;
+      expect(top.contains(screen.getByRole('button', { name: 'Undo' }))).toBe(true);
+      expect(top.contains(screen.getByRole('button', { name: 'Save plan' }))).toBe(true);
     });
 
     it('two-finger pinch zooms about the finger midpoint and two-finger drag pans, without drawing', async () => {

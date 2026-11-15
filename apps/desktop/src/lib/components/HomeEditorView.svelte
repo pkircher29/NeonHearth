@@ -970,23 +970,32 @@
     }
   });
 
-  const tools: Array<{ id: Tool; label: string; key: string }> = [
-    { id: 'select', label: 'Select', key: 'V' }, { id: 'pan', label: 'Pan', key: 'H' }, { id: 'wall', label: 'Wall', key: 'W' },
-    { id: 'opening', label: 'Opening', key: 'O' }, { id: 'place', label: 'Place device', key: 'P' },
-    { id: 'room', label: 'Room', key: 'R' }, { id: 'rect', label: 'Rectangle', key: 'B' }
+  // Grouped the way the work goes: move around, draw the shell, then furnish it with devices.
+  const tools: Array<{ id: Tool; label: string; key: string; group: 'move' | 'draw' | 'place' }> = [
+    { id: 'select', label: 'Select', key: 'V', group: 'move' }, { id: 'pan', label: 'Pan', key: 'H', group: 'move' },
+    { id: 'wall', label: 'Wall', key: 'W', group: 'draw' }, { id: 'rect', label: 'Rectangle', key: 'B', group: 'draw' },
+    { id: 'room', label: 'Room', key: 'R', group: 'draw' }, { id: 'opening', label: 'Opening', key: 'O', group: 'draw' },
+    { id: 'place', label: 'Place device', key: 'P', group: 'place' }
   ];
 </script>
 
 <svelte:window onkeydown={onWindowKeydown} onkeyup={onWindowKeyup} onbeforeunload={onBeforeUnload} onblur={() => { spaceHeld = false; }} />
 
 <section class="home-editor" aria-labelledby="home-heading">
-  <div class="view-heading">
-    <div>
-      <p class="kicker">HOME / PLAN EDITOR</p>
+  <header class="editor-top">
+    <div class="editor-title">
       <h1 id="home-heading">Draw the home you protect.</h1>
       <p class="muted">Owner-confirmed placement is the truth. Estimates stay advisory until you place them.</p>
     </div>
-  </div>
+    {#if !loading && !loadError}
+      <div class="history-actions">
+        <span class="autosave" role="status">{autosaveLabel}</span>
+        <button type="button" disabled={!canUndo} onclick={() => dispatch({ type: 'undo' })} aria-keyshortcuts="Control+Z">Undo</button>
+        <button type="button" disabled={!canRedo} onclick={() => dispatch({ type: 'redo' })} aria-keyshortcuts="Control+Shift+Z">Redo</button>
+        <button type="button" class="save" disabled={committing} onclick={() => void saveCommitted()}>Save plan</button>
+      </div>
+    {/if}
+  </header>
 
   {#if loading}
     <div class="editor-state" role="status">Reading home plan…</div>
@@ -1020,58 +1029,6 @@
       </div>
     {/if}
 
-    <div class="editor-toolbar">
-      <div class="tool-row">
-      <div class="tool-palette" role="toolbar" aria-label="Editor tools">
-        <label class="opening-kind">Units
-          <select aria-label="Measurement units" value={units} onchange={event => { units = event.currentTarget.value as HomeUnits; saveHomeUnits(units); cancelPending(); }}>
-            <option value="metric">Metric (meters)</option><option value="imperial">Imperial (feet / inches)</option>
-          </select>
-        </label>
-        {#each tools as entry (entry.id)}
-          <button type="button" class:active={tool === entry.id} aria-pressed={tool === entry.id} aria-keyshortcuts={entry.key} title={`${entry.label} (${entry.key})`} onclick={() => setTool(entry.id)}>{entry.label}</button>
-        {/each}
-        {#if tool === 'opening'}
-          <label class="opening-kind">Kind
-            <select value={openingKind} onchange={(event) => (openingKind = (event.currentTarget as HTMLSelectElement).value as OpeningKind)}>
-              <option value="door">Door</option><option value="window">Window</option><option value="stair">Stair</option>
-            </select>
-          </label>
-        {/if}
-        {#if tool === 'room' && pendingRoom.length > 0}
-          <button type="button" class="finish" disabled={pendingRoom.length < 3} onclick={finishRoom}>Finish room ({pendingRoom.length})</button>
-          <button type="button" class="quiet" onclick={cancelPending}>Cancel</button>
-        {/if}
-        {#if placingDevice}
-          <span class="placing-hint" role="status">Placing {deviceName(placingDevice)} — click the plan.</span>
-        {/if}
-      </div>
-        <button type="button" class="detect" title="Find closed loops of walls that are not rooms yet" onclick={() => offerRooms(true)}>Detect rooms</button>
-      </div>
-      <div class="history-actions">
-        <button type="button" disabled={!canUndo} onclick={() => dispatch({ type: 'undo' })} aria-keyshortcuts="Control+Z">Undo</button>
-        <button type="button" disabled={!canRedo} onclick={() => dispatch({ type: 'redo' })} aria-keyshortcuts="Control+Shift+Z">Redo</button>
-        <span class="autosave" role="status">{autosaveLabel}</span>
-        <button type="button" class="save" disabled={committing} onclick={() => void saveCommitted()}>Save plan</button>
-      </div>
-    </div>
-    <p class="tool-hint" aria-live="polite">{hint}</p>
-
-    <div class="floor-row">
-    <HomeEditorFloorBar {units} floors={plan.floors} active={activeFloor?.floor_id ?? null} onselect={(floorId) => { activeFloorId = floorId; selection = { kind: 'floor' }; cancelPending(); roomOfferOpen = false; }} onadd={addFloor} onduplicate={duplicateFloor} />
-      {#if activeFloor}
-        <div class="footprint-controls tool-palette" title="Copies walls (with thickness), openings, and rooms. Devices keep their locations.">
-          <label class="opening-kind">Copy footprint to
-            <select aria-label="Footprint destination" bind:value={copyTarget}>
-              <option value="new">New floor above</option>
-              {#each copyTargets as floor (floor.floor_id)}<option value={floor.floor_id}>{floor.name}</option>{/each}
-            </select>
-          </label>
-          <button type="button" disabled={!activeFloor.walls.length && !activeFloor.rooms.length} onclick={copyFootprint}>Copy footprint</button>
-        </div>
-      {/if}
-    </div>
-
     {#if roomOfferOpen && candidates.length > 0}
       <div class="banner offer" role="region" aria-label="Detected rooms">
         <strong>{candidates.length === 1 ? 'A closed room was found.' : `${candidates.length} closed rooms were found.`}</strong>
@@ -1091,7 +1048,39 @@
       </div>
     {/if}
 
-    <div class="editor-body">
+    {#snippet glyph(id: Tool)}
+      <!-- Drawn in the plan's own language: wall bands, endpoint squares, door swings. -->
+      <svg class="tool-glyph" viewBox="0 0 24 24" aria-hidden="true">
+        {#if id === 'select'}<path class="solid" d="M6 3 V18 L10 14.4 L12.8 20.4 L15 19.4 L12.3 13.5 L17.6 13.1 Z" />
+        {:else if id === 'pan'}<path d="M12 3 V21 M3 12 H21 M9 6 L12 3 L15 6 M9 18 L12 21 L15 18 M6 9 L3 12 L6 15 M18 9 L21 12 L18 15" />
+        {:else if id === 'wall'}<path class="band" d="M5.5 16.5 L18.5 7.5" /><rect class="solid" x="3" y="14" width="5" height="5" /><rect class="solid" x="16" y="5" width="5" height="5" />
+        {:else if id === 'rect'}<rect class="tint" x="4" y="6" width="16" height="12" /><rect class="solid" x="2" y="4" width="4" height="4" /><rect class="solid" x="18" y="16" width="4" height="4" />
+        {:else if id === 'room'}<path class="tint" d="M4 5 H14 V10 H20 V19 H4 Z" />
+        {:else if id === 'opening'}<path class="band" d="M2 18 H8 M17 18 H22" /><path d="M8 18 V9" /><path class="swing" d="M8 9 A9 9 0 0 1 17 18" />
+        {:else}<circle class="swing" cx="12" cy="12" r="8.5" /><circle class="solid" cx="12" cy="12" r="3.4" />{/if}
+      </svg>
+    {/snippet}
+
+    <div class="workspace">
+      <div class="tool-rail" role="toolbar" aria-label="Editor tools" aria-orientation="vertical">
+        {#each tools as entry, index (entry.id)}
+          {#if index > 0 && tools[index - 1].group !== entry.group}<span class="rail-gap" aria-hidden="true"></span>{/if}
+          <button type="button" class="tool" class:active={tool === entry.id} aria-pressed={tool === entry.id} aria-keyshortcuts={entry.key} title={`${entry.label} (${entry.key})`} onclick={() => setTool(entry.id)}>{@render glyph(entry.id)}<span class="tool-name">{entry.label}</span><kbd aria-hidden="true">{entry.key}</kbd></button>
+        {/each}
+        {#if tool === 'opening'}
+          <label class="rail-option">Kind
+            <select value={openingKind} onchange={(event) => (openingKind = (event.currentTarget as HTMLSelectElement).value as OpeningKind)}>
+              <option value="door">Door</option><option value="window">Window</option><option value="stair">Stair</option>
+            </select>
+          </label>
+        {/if}
+        {#if tool === 'room' && pendingRoom.length > 0}
+          <button type="button" class="finish" disabled={pendingRoom.length < 3} onclick={finishRoom}>Finish room ({pendingRoom.length})</button>
+          <button type="button" class="quiet" onclick={cancelPending}>Cancel</button>
+        {/if}
+      </div>
+
+      <div class="stage">
       <div class="canvas-frame">
         {#if activeFloor}
           <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
@@ -1196,7 +1185,36 @@
           </div>
         {/if}
       </div>
+        <footer class="status-bar">
+          <p class="tool-hint" aria-live="polite">{hint}</p>
+          {#if placingDevice}
+            <span class="placing-hint" role="status">Placing {deviceName(placingDevice)} — click the plan.</span>
+          {/if}
+          <button type="button" class="detect" title="Find closed loops of walls that are not rooms yet" onclick={() => offerRooms(true)}>Detect rooms</button>
+          <label class="units">Units
+            <select aria-label="Measurement units" value={units} onchange={event => { units = event.currentTarget.value as HomeUnits; saveHomeUnits(units); cancelPending(); }}>
+              <option value="metric">Metric (meters)</option><option value="imperial">Imperial (feet / inches)</option>
+            </select>
+          </label>
+        </footer>
+      </div>
+
       <div class="side-panel">
+        <div class="floors-panel">
+          <h2>Floors</h2>
+          <HomeEditorFloorBar {units} floors={plan.floors} active={activeFloor?.floor_id ?? null} onselect={(floorId) => { activeFloorId = floorId; selection = { kind: 'floor' }; cancelPending(); roomOfferOpen = false; }} onadd={addFloor} onduplicate={duplicateFloor} />
+          {#if activeFloor}
+            <div class="footprint-controls" title="Copies walls (with thickness), openings, and rooms. Devices keep their locations.">
+              <label>Copy footprint to
+                <select aria-label="Footprint destination" bind:value={copyTarget}>
+                  <option value="new">New floor above</option>
+                  {#each copyTargets as floor (floor.floor_id)}<option value={floor.floor_id}>{floor.name}</option>{/each}
+                </select>
+              </label>
+              <button type="button" disabled={!activeFloor.walls.length && !activeFloor.rooms.length} onclick={copyFootprint}>Copy footprint</button>
+            </div>
+          {/if}
+        </div>
         {#if target}
           <HomeEditorInspector {target} {units} onaction={apply} onclose={() => (selection = null)} />
         {/if}
@@ -1207,17 +1225,24 @@
 </section>
 
 <style>
-  .view-heading h1{font-size:clamp(26px,2.6vw,36px);line-height:1.1;margin:2px 0 4px}
-  .view-heading .muted{margin:0}
-  .footprint-controls{gap:8px;margin-left:auto}
-  .footprint-controls button{min-height:38px!important;padding:6px 12px!important}
-  .floor-row{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:10px 0}
-  .editor-state{margin-top:28px;padding:18px;border:1px dashed var(--line-strong);color:var(--muted-strong);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  /* Layout: a quiet title bar, then a drafting table — tools on the left edge, the
+     plan in the middle taking all the height it can, floors and details on the right. */
+  .home-editor{display:grid;gap:12px}
+  .editor-top{display:flex;flex-wrap:wrap;gap:10px 24px;align-items:end;justify-content:space-between}
+  .editor-title h1{margin:0;font:700 22px/1.2 var(--font-display);letter-spacing:-.01em}
+  .editor-title .muted{margin:2px 0 0;font-size:13px}
+  .history-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .history-actions button{min-height:38px;padding:6px 14px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:transparent;color:var(--ink);font:600 13px var(--font-display);cursor:pointer}
+  .history-actions button:disabled{opacity:.4;cursor:not-allowed}
+  .history-actions button.save{border-color:var(--accent);background:var(--accent);color:var(--accent-ink)}
+  .autosave{margin-right:4px;color:var(--muted-strong);font:13px var(--font-display)}
+
+  .editor-state{padding:18px;border:1px dashed var(--line-strong);color:var(--muted-strong);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   .editor-state.error{border-color:var(--pink);color:#ffb4cc}
-  .editor-state button{min-height:40px;padding:8px 14px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
-  .banner{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:16px 0 0;padding:12px 14px;border-radius:8px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);font-size:12px}
+  .editor-state button{min-height:40px;padding:8px 14px;border:1px solid var(--accent);border-radius:var(--radius-sm);background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
+  .banner{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:8px 12px;border-radius:var(--radius);border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);font-size:13px}
   .banner strong{color:var(--ink)}
-  .banner button{min-height:38px;padding:7px 12px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
+  .banner button{min-height:34px;padding:5px 12px;border:1px solid var(--accent);border-radius:var(--radius-sm);background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
   .banner button.quiet{border-color:var(--line-strong);color:var(--muted-strong)}
   .banner.conflict{border-color:var(--pink)}
   .banner.conflict strong{color:var(--pink)}
@@ -1227,37 +1252,59 @@
   .banner.uncertain{border-color:var(--gold);border-style:dashed}
   .banner.uncertain strong{color:var(--gold)}
   .banner.uncertain button{border-color:var(--gold);color:var(--gold)}
-  .banner.offer{border-color:var(--accent);margin:0 0 12px}
+  .banner.offer{border-color:var(--accent)}
   .banner.offer strong{color:var(--accent)}
   .offer-list{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:8px}
-  .offer-list li{display:flex;gap:8px;align-items:center;padding:4px 6px;border:1px solid var(--line-strong);border-radius:6px}
+  .offer-list li{display:flex;gap:8px;align-items:center;padding:4px 6px;border:1px solid var(--line-strong);border-radius:var(--radius-sm)}
   .offer-index{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:var(--accent);color:var(--accent-ink);font:700 11px var(--font-mono)}
-  .offer-list input{min-height:34px;width:130px;padding:4px 8px;border:1px solid var(--line-strong);border-radius:5px;background:#0e2430;color:var(--ink);font:13px var(--font-display)}
+  .offer-list input{min-height:34px;width:130px;padding:4px 8px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:var(--surface-raised);color:var(--ink);font:13px var(--font-display)}
   .offer-area{color:var(--muted-strong);font:11px var(--font-mono)}
-  .editor-toolbar{display:flex;flex-wrap:wrap;gap:8px 14px;justify-content:space-between;align-items:center;margin:14px 0 0}
-  .tool-row{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
-  .tool-row .detect{min-height:40px;padding:7px 12px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
-  .tool-hint{margin:8px 0 0;padding:8px 12px;border-left:2px solid var(--accent);background:var(--surface);color:var(--muted-strong);font:12px/1.5 var(--font-display)}
-  .tool-palette{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
-  .tool-palette button{min-height:40px;padding:7px 12px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
-  .tool-palette button.active{border-color:var(--accent);color:var(--accent);box-shadow:inset 0 0 14px color-mix(in srgb, var(--accent) 8%, transparent)}
-  .tool-palette button.finish{border-color:var(--accent);color:var(--accent-ink);background:var(--accent)}
-  .tool-palette button.quiet{border-color:var(--line-strong);color:var(--muted-strong)}
-  .tool-palette button:disabled{opacity:.4;cursor:not-allowed}
-  .opening-kind{display:flex;gap:7px;align-items:center;color:var(--muted-strong);font:10px var(--font-mono);text-transform:uppercase}
-  .opening-kind select{min-height:38px;padding:6px 8px;border:1px solid var(--line-strong);border-radius:5px;background:#0e2430;color:var(--ink);font:12px var(--font-display)}
-  .placing-hint{color:var(--accent);font:11px var(--font-mono)}
-  .history-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-  .history-actions button{min-height:40px;padding:7px 12px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
-  .history-actions button:disabled{opacity:.4;cursor:not-allowed}
-  .history-actions button.save{border-color:var(--accent);background:var(--accent);color:var(--accent-ink)}
-  .autosave{color:var(--muted-strong);font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.07em}
-  .view-controls{position:absolute;top:10px;right:10px;z-index:2;display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:6px;border:1px solid var(--line-strong);border-radius:10px;background:rgba(8,23,34,.72);backdrop-filter:blur(10px) saturate(1.2);box-shadow:0 6px 24px rgba(0,0,0,.35)}
-  .view-controls button{min-height:34px;padding:4px 10px;border:1px solid var(--line-strong);border-radius:6px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
+
+  .workspace{display:grid;grid-template-columns:76px minmax(0,1fr) 272px;gap:12px;align-items:start}
+
+  /* The tool rail is the one loud element: each glyph is a small piece of floor plan. */
+  .tool-rail{display:flex;flex-direction:column;gap:4px;padding:6px;border:1px solid var(--line-mid);border-radius:var(--radius-lg);background:var(--surface)}
+  .tool-rail .tool{position:relative;display:grid;justify-items:center;gap:3px;width:100%;min-height:58px;padding:7px 2px 6px;border:1px solid transparent;border-radius:var(--radius);background:transparent;color:var(--muted-strong);font:600 11px/1.15 var(--font-display);text-align:center;cursor:pointer}
+  .tool-rail .tool:hover{color:var(--ink);background:var(--surface-raised)}
+  .tool-rail .tool.active{color:var(--accent);border-color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,transparent)}
+  .tool-rail .tool:focus-visible,.tool-rail .finish:focus-visible,.tool-rail .quiet:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .tool-rail kbd{position:absolute;top:4px;right:6px;color:var(--faint);font:500 9px var(--font-mono)}
+  .tool-rail .tool.active kbd{color:var(--accent)}
+  .tool-glyph{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;overflow:visible}
+  .tool-glyph .band{stroke-width:3.4;stroke-linecap:butt}
+  .tool-glyph .solid{fill:currentColor;stroke:none}
+  .tool-glyph .tint{fill:currentColor;fill-opacity:.18}
+  .tool-glyph .swing{stroke-dasharray:2.4 2.4;stroke-width:1.2}
+  .rail-gap{height:1px;margin:4px 8px;background:var(--line-mid)}
+  .rail-option{display:grid;gap:4px;margin-top:6px;padding-top:8px;border-top:1px solid var(--line-mid);color:var(--muted-strong);font:11px var(--font-display);text-align:center}
+  .rail-option select{width:100%;min-height:34px;padding:4px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:var(--surface-raised);color:var(--ink);font:12px var(--font-display)}
+  .tool-rail .finish,.tool-rail .quiet{width:100%;min-height:36px;padding:5px 4px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:transparent;color:var(--muted-strong);font:600 11px/1.2 var(--font-display);cursor:pointer}
+  .tool-rail .finish{margin-top:6px;border-color:var(--accent);background:var(--accent);color:var(--accent-ink)}
+  .tool-rail .finish:disabled{opacity:.4;cursor:not-allowed}
+
+  .stage{display:grid;gap:8px;min-width:0}
+  .status-bar{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;min-height:40px}
+  .status-bar > :not(.tool-hint){flex:none}
+  .tool-hint{flex:1 1 100%;min-width:0;margin:0;color:var(--muted-strong);font:13px/1.45 var(--font-display)}
+  .placing-hint{color:var(--accent);font:600 13px var(--font-display)}
+  .units{display:flex;gap:8px;align-items:center;color:var(--muted-strong);font:13px var(--font-display)}
+  .units select{min-height:32px;padding:3px 8px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:var(--surface-raised);color:var(--ink);font:12px var(--font-display)}
+
+  .floors-panel{display:grid;gap:10px;padding:12px 14px;border:1px solid var(--line-mid);border-radius:var(--radius);background:var(--surface)}
+  .floors-panel h2{margin:0;font:600 14px var(--font-display);color:var(--ink)}
+  .footprint-controls{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end;padding-top:10px;border-top:1px solid var(--line-mid)}
+  .footprint-controls label{display:grid;gap:4px;min-width:0;color:var(--muted-strong);font:12px var(--font-display)}
+  .footprint-controls select{min-width:0;min-height:34px;padding:4px 6px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:var(--surface-raised);color:var(--ink);font:12px var(--font-display)}
+  .footprint-controls button{min-height:34px;padding:5px 10px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer;white-space:nowrap}
+  .footprint-controls button:disabled{opacity:.4;cursor:not-allowed}
+
+  .detect{min-height:32px;padding:4px 12px;border:1px solid var(--accent);border-radius:var(--radius-sm);background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
+  .detect:hover{background:var(--accent);color:var(--accent-ink)}
+  .view-controls{position:absolute;top:10px;right:10px;z-index:2;display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:6px;border:1px solid var(--line-strong);border-radius:var(--radius);background:rgba(8,23,34,.72);backdrop-filter:blur(10px) saturate(1.2);box-shadow:0 6px 24px rgba(0,0,0,.35)}
+  .view-controls button{min-height:34px;padding:4px 10px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
   .view-controls button:hover{border-color:var(--accent);color:var(--accent)}
   .zoom-readout{min-width:64px;text-align:center;color:var(--muted-strong);font:11px var(--font-mono)}
-  .editor-body{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:16px;align-items:start;margin-top:4px}
-  .canvas-frame{position:relative;overflow:hidden;height:max(560px,min(72vh,720px));border:1px solid var(--line-mid);border-radius:10px;background:var(--bg)}
+  .canvas-frame{position:relative;overflow:hidden;height:clamp(440px,calc(100svh - 290px),880px);border:1px solid var(--line-mid);border-radius:var(--radius);background:var(--bg)}
   .canvas-frame .editor-state{margin:0;height:100%}
   .plan-canvas{--plan-bg:#081722;display:block;width:100%;height:100%;background:var(--plan-bg);outline:none;touch-action:none;user-select:none}
   .plan-canvas:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
@@ -1284,12 +1331,30 @@
   .snap-marker{fill:none;stroke:var(--gold);stroke-width:2;pointer-events:none}
   .snap-marker.snap-endpoint{stroke:var(--accent)}
   .snap-marker.snap-grid{stroke:var(--muted-strong);stroke-width:1.5}
-  .snap-label{fill:var(--ink);stroke:var(--plan-bg);stroke-width:3px;paint-order:stroke;font:600 10px var(--font-mono);text-transform:uppercase;letter-spacing:.05em}
+  .snap-label{fill:var(--ink);stroke:var(--plan-bg);stroke-width:3px;paint-order:stroke;font:600 11px var(--font-mono)}
   .readout{fill:var(--ink);font:700 12px var(--font-mono);paint-order:stroke;stroke:var(--plan-bg);stroke-width:4px;pointer-events:none}
   .readout-angle{fill:var(--gold)}
   .scale-bar{pointer-events:none}
   .scale-bar path{fill:none;stroke:var(--muted-strong);stroke-width:1.5}
   .scale-bar text{fill:var(--muted-strong);font:10px var(--font-mono)}
   .side-panel{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;align-content:start;min-width:0}
-  @media(max-width:1000px){.editor-body{grid-template-columns:1fr}.side-panel{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}}
+  /* Narrow screens: the rail turns into a strip above the plan and the side column drops below. */
+  @media(max-width:1000px){
+    .workspace{grid-template-columns:minmax(0,1fr)}
+    .tool-rail{flex-direction:row;flex-wrap:wrap}
+    .tool-rail .tool{width:72px}
+    .rail-gap{width:1px;height:auto;margin:8px 4px}
+    .rail-option{margin:0;padding:0 0 0 8px;border-top:0;border-left:1px solid var(--line-mid)}
+    .tool-rail .finish,.tool-rail .quiet{width:auto;margin-top:0;padding:5px 12px}
+    .canvas-frame{height:clamp(420px,70svh,720px)}
+    .status-bar{flex-wrap:wrap}
+    .side-panel{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+  }
+  @media(max-width:520px){
+    .autosave{flex:1 0 100%;margin:0}
+    .history-actions button{flex:1 1 0}
+    .view-controls{top:6px;right:6px;left:6px;gap:4px;padding:4px}
+    .view-controls button{flex:1 1 0;min-height:36px;padding:4px 6px}
+    .zoom-readout{display:none}
+  }
 </style>
