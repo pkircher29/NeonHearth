@@ -1071,9 +1071,12 @@ impl CameraSessionManager {
         name: &str,
         limit: usize,
     ) -> Result<Vec<u8>, CameraSessionError> {
-        // Expiry only detaches cleanup tasks; a media request never waits for
-        // (or can be cancelled out of) another session's teardown.
-        drop(self.expire_sessions(false, false).await);
+        // Cleanup runs in spawned tasks, so cancelling this request cannot
+        // abandon it; on the normal path the request waits for them, so an
+        // expired session is gone from disk before it is reported missing.
+        for handle in self.expire_sessions(false, false).await {
+            let _ = handle.await;
+        }
         let (output, crashed) = {
             let mut sessions = self.sessions.lock().await;
             let value = sessions
@@ -1092,7 +1095,9 @@ impl CameraSessionManager {
             note_session_failure(session, "media_process_exited", &MediaError::ProcessFailed);
             let crashed = { self.sessions.lock().await.remove(session) };
             if let Some(value) = crashed {
-                drop(self.spawn_cleanup(session.clone(), CleanupResources::from_session(value), 0));
+                let _ = self
+                    .cleanup_or_retain(session.clone(), CleanupResources::from_session(value), 0)
+                    .await;
             }
             return Err(CameraSessionError::Unavailable);
         }
