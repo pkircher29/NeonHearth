@@ -205,9 +205,14 @@ describe('HomeTwin3D 3D path (stub renderer)', () => {
     expect(root.getAttribute('data-rebuild-count')).toBe('3');
     expect(root.getAttribute('data-reset-count')).toBe('1');
 
-    // A different plan object is a new home: the camera reframes it.
+    // An edit snapshot of the SAME home (a new plan object, even a new version) rebuilds but keeps the camera.
     await view.rerender({ plan: { ...plan, version: 2 } });
     expect(root.getAttribute('data-rebuild-count')).toBe('4');
+    expect(root.getAttribute('data-reset-count')).toBe('1');
+
+    // A different home reframes the camera.
+    await view.rerender({ plan: { ...plan, home_id: 'home-2' } });
+    expect(root.getAttribute('data-rebuild-count')).toBe('5');
     expect(root.getAttribute('data-reset-count')).toBe('2');
   });
 

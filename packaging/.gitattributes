@@ -1,0 +1,4 @@
+# Shell scripts run on Linux package hosts: never CRLF.
+*.sh text eol=lf
+linux/scripts/* text eol=lf
+linux/*.service text eol=lf

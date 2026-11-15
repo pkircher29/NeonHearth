@@ -39,7 +39,8 @@
 
   const animate = $derived(!paused && !prefersReduced && !pageHidden);
   const layout = $derived(layoutFlow(devices, size, connected, { meta, apps: coreLabel ? hostApps : [] }));
-  const total = $derived(connected && (upload !== null || download !== null) ? (upload ?? 0) + (download ?? 0) : null);
+  // A total exists only when both directions were reported; a one-sided reading is shown as one-sided, never summed with a fake zero.
+  const total = $derived(connected && upload !== null && download !== null ? upload + download : null);
   const description = $derived(describeFlow({ connected, upload, download, nodes: layout.nodes, apps: layout.apps, coreLabel, format: formatThroughput }));
   const stateCopy = $derived(flowStateCopy(layout.state, coreLabel !== null));
   const hovered = $derived(hoveredId ? layout.all.find((node) => node.deviceId === hoveredId) ?? null : null);
@@ -49,8 +50,17 @@
   let history: readonly HistorySample[] = [];
   let scene: { layout: FlowLayout; coreLabel: string | null; connected: boolean; total: number | null; upload: number | null; download: number | null; labels: PlacedLabel[]; labelText: Map<string, { name: string; rate: string; w: number }>; groupRects: Rect[]; hoverId: string | null } | null = null;
   const current = new Map<string, { x: number; y: number }>();
+  const coreRows: Array<[number | null, string, number]> = [[null, '', 1], [null, '', -1]];
   let drawn: Array<{ deviceId: string; x: number; y: number; radius: number }> = [];
   let snap = true;
+  // Frame loop state: paint only when something can change, at a capped rate, while on screen.
+  let dirty = true;
+  let settleUntil = 0;
+  let onScreen = true;
+  const FRAME_MS = 1000 / 30;
+  const SIDES = ['down', 'up'] as const;
+  const LANES = [0, 1] as const;
+  const gradients = new Map<string, CanvasGradient>();
   let lastGeoKey = '';
   let down = buildRamp(DOWN_RAMP.from, DOWN_RAMP.to, LUT);
   let up = buildRamp(UP_RAMP.from, UP_RAMP.to, LUT);
@@ -102,7 +112,7 @@
       labelText.set(node.deviceId, { name, rate, w: Math.max(measure(name, nameFont), measure(rate, rateFont)) + 12 });
     }
     const groupFont = `500 ${Math.max(9.5, 10 * u)}px ${FONT_MONO}`;
-    const groupRects = l.groups.map((group) => groupLabelRect(group, measure(`${(l.geo.compact ? group.short : group.label).toUpperCase()} ${group.count}`, groupFont) + 4));
+    const groupRects = l.groups.map((group) => groupLabelRect(group, measure(`${(l.geo.compact ? group.short : group.label).toUpperCase()} ${group.count} ~`, groupFont) + 4));
     // Keep always-on labels off the ring's NOW / 60 s captions.
     groupRects.push({ x: l.geo.cx - 36, y: l.geo.cy - l.geo.histBase - l.geo.histOut - 24 * u, w: 72, h: 18 });
     const widths = new Map<string, number>([...labelText].map(([id, value]) => [id, value.w]));
@@ -112,7 +122,9 @@
     const known = new Set(l.all.map((node) => node.deviceId));
     for (const id of [...current.keys()]) if (!known.has(id)) current.delete(id);
     const geoKey = `${l.geo.width}x${l.geo.height}`;
-    if (geoKey !== lastGeoKey) { snap = true; lastGeoKey = geoKey; }
+    if (geoKey !== lastGeoKey) { snap = true; lastGeoKey = geoKey; gradients.clear(); }
+    dirty = true;
+    settleUntil = (typeof performance !== 'undefined' ? performance.now() : 0) + 1500; // ease positions toward the new layout
   }
 
   function paint(now: number, dt: number, moving: boolean) {
@@ -134,10 +146,16 @@
     c.globalCompositeOperation = 'source-over';
 
     // Backdrop: a warm bloom that follows total activity, plus faint guide rings.
-    const bloom = c.createRadialGradient(g.cx, g.cy, g.coreR * 0.5, g.cx, g.cy, g.nodeMax + 30);
-    bloom.addColorStop(0, rgba(down[emberIndex]!, live ? 0.07 + 0.13 * totalFraction : 0.04));
-    bloom.addColorStop(0.55, rgba(FIRE.violet, live ? 0.035 : 0.015));
-    bloom.addColorStop(1, 'rgba(0,0,0,0)');
+    const bloomKey = `bloom:${emberIndex}:${live}:${totalFraction.toFixed(2)}`;
+    let bloom = gradients.get(bloomKey);
+    if (!bloom) {
+      bloom = c.createRadialGradient(g.cx, g.cy, g.coreR * 0.5, g.cx, g.cy, g.nodeMax + 30);
+      bloom.addColorStop(0, rgba(down[emberIndex]!, live ? 0.07 + 0.13 * totalFraction : 0.04));
+      bloom.addColorStop(0.55, rgba(FIRE.violet, live ? 0.035 : 0.015));
+      bloom.addColorStop(1, 'rgba(0,0,0,0)');
+      if (gradients.size > 64) gradients.clear();
+      gradients.set(bloomKey, bloom);
+    }
     c.fillStyle = bloom;
     c.fillRect(0, 0, g.width, g.height);
     c.lineWidth = 1;
@@ -157,9 +175,13 @@
       c.lineCap = 'round';
       c.lineWidth = 2.2 * u + 0.8;
       c.strokeStyle = f > 0 && live ? rgba(down[Math.round(f * (LUT - 1))]!, 0.75) : 'rgba(233,251,252,0.16)';
+      // A sector placed entirely by MAC maker is a guess: dashed rail and a trailing mark, never drawn like a confirmed type.
+      const guessed = group.count > 0 && group.inferred === group.count;
+      if (guessed) c.setLineDash([4, 5]);
       c.arc(g.cx, g.cy, g.rimR, group.start + 0.012, group.end - 0.012);
       c.stroke();
-      const caption = `${(g.compact ? group.short : group.label).toUpperCase()} ${group.count}`;
+      if (guessed) c.setLineDash([]);
+      const caption = `${(g.compact ? group.short : group.label).toUpperCase()} ${group.count}${guessed ? ' ~' : ''}`;
       c.globalAlpha = live ? 1 : 0.6;
       c.textAlign = group.align;
       if (g.compact) { const w = c.measureText(caption).width + 10; c.fillStyle = 'rgba(10,12,20,0.88)'; c.fillRect(group.labelX - w / 2, group.labelY - 8, w, 16); }
@@ -178,7 +200,7 @@
     c.beginPath(); c.arc(g.cx, g.cy, g.histBase + g.histOut, 0, TAU); c.stroke();
     c.beginPath(); c.arc(g.cx, g.cy, g.histBase - g.histIn, 0, TAU); c.stroke();
     if (live && history.length) {
-      for (const side of ['down', 'up'] as const) {
+      for (const side of SIDES) {
         const lut = side === 'down' ? down : up;
         let segStart = -1;
         for (let i = 0; i <= history.length; i += 1) {
@@ -275,7 +297,7 @@
         const both = node.downLane > 0 && node.upLane > 0;
         const offD = both ? node.downLane / 2 + 0.6 : 0;
         const offU = both ? -(node.upLane / 2 + 0.6) : 0;
-        for (const lane of [0, 1] as const) {
+        for (const lane of LANES) {
           const width = lane === 0 ? node.downLane : node.upLane;
           if (width <= 0) continue;
           const off = lane === 0 ? offD : offU;
@@ -324,7 +346,7 @@
         }
         if (moving) {
           c.globalCompositeOperation = 'lighter';
-          for (const lane of [0, 1] as const) {
+          for (const lane of LANES) {
             const count = lane === 0 ? node.downParticles : node.upParticles;
             const width = lane === 0 ? node.downLane : node.upLane;
             if (count <= 0 || width <= 0) continue;
@@ -408,16 +430,26 @@
     c.fillText('60 s', g.cx + 4, tickTop - 7);
 
     // Gateway core, drawn over the stream roots.
-    const pulse = !live || L.state === 'empty' ? (moving ? 0.5 + 0.5 * Math.sin(seconds * 1.1) : 0.5) : 0;
+    const pulse = !live || L.state === 'empty' ? 0.5 : 0; // idle and offline cores hold still: nothing is moving, so nothing animates
     const glowR = g.coreR * (1.7 + totalFraction * 0.9);
-    const glow = c.createRadialGradient(g.cx, g.cy, g.coreR * 0.6, g.cx, g.cy, glowR);
-    glow.addColorStop(0, rgba(down[emberIndex]!, live ? 0.28 + 0.22 * totalFraction : 0.1 + 0.07 * pulse));
-    glow.addColorStop(1, rgba(down[emberIndex]!, 0));
+    const glowKey = `glow:${emberIndex}:${live}:${totalFraction.toFixed(2)}:${pulse.toFixed(2)}`;
+    let glow = gradients.get(glowKey);
+    if (!glow) {
+      glow = c.createRadialGradient(g.cx, g.cy, g.coreR * 0.6, g.cx, g.cy, glowR);
+      glow.addColorStop(0, rgba(down[emberIndex]!, live ? 0.28 + 0.22 * totalFraction : 0.1 + 0.07 * pulse));
+      glow.addColorStop(1, rgba(down[emberIndex]!, 0));
+      if (gradients.size > 64) gradients.clear();
+      gradients.set(glowKey, glow);
+    }
     c.fillStyle = glow;
     c.beginPath(); c.arc(g.cx, g.cy, glowR, 0, TAU); c.fill();
-    const disk = c.createRadialGradient(g.cx - g.coreR * 0.3, g.cy - g.coreR * 0.4, 2, g.cx, g.cy, g.coreR);
-    disk.addColorStop(0, 'rgba(34,28,46,0.97)');
-    disk.addColorStop(1, 'rgba(9,11,19,0.98)');
+    let disk = gradients.get('disk');
+    if (!disk) {
+      disk = c.createRadialGradient(g.cx - g.coreR * 0.3, g.cy - g.coreR * 0.4, 2, g.cx, g.cy, g.coreR);
+      disk.addColorStop(0, 'rgba(34,28,46,0.97)');
+      disk.addColorStop(1, 'rgba(9,11,19,0.98)');
+      gradients.set('disk', disk);
+    }
     c.fillStyle = disk;
     c.beginPath(); c.arc(g.cx, g.cy, g.coreR, 0, TAU); c.fill();
     c.lineWidth = 2;
@@ -428,7 +460,7 @@
 
     c.textAlign = 'center';
     c.textBaseline = 'middle';
-    if (live && s.total !== null) {
+    if (live && (s.total !== null || s.download !== null || s.upload !== null)) {
       const lh = Math.max(11, 12.5 * u);
       const textY = s.coreLabel ? -0.85 : -0.62;
       const rowY = s.coreLabel ? 0.7 : 0.62;
@@ -439,10 +471,10 @@
       }
       c.font = `700 ${Math.max(13, 19 * u)}px ${FONT_UI}`;
       c.fillStyle = ink;
-      c.fillText(formatThroughput(s.total), g.cx, g.cy + lh * textY);
+      c.fillText(s.total === null ? '—' : formatThroughput(s.total), g.cx, g.cy + lh * textY);
       c.font = `500 ${Math.max(9, 10.5 * u)}px ${FONT_MONO}`;
-      const rows: Array<[number | null, string, number]> = [[s.download, down[LUT - 1]!, 1], [s.upload, up[LUT - 1]!, -1]];
-      rows.forEach(([value, color, dir], index) => {
+      coreRows[0]![0] = s.download; coreRows[0]![1] = down[LUT - 1]!; coreRows[1]![0] = s.upload; coreRows[1]![1] = up[LUT - 1]!;
+      coreRows.forEach(([value, color, dir], index) => {
         const text = formatThroughput(value);
         const w = c.measureText(text).width;
         const y = g.cy + lh * (rowY + index);
@@ -497,9 +529,10 @@
   $effect(() => {
     const u = upload; const d = download; const ok = connected;
     untrack(() => {
-      if (!ok || (u === null && d === null)) return;
-      const next = pushHistory(history, { at: Date.now(), down: d ?? 0, up: u ?? 0 });
-      if (next !== history) { history = next; repaintStatic(); }
+      // Only a complete reading enters the ring: a missing direction would otherwise be recorded as a measured zero.
+      if (!ok || u === null || d === null) return;
+      const next = pushHistory(history, { at: Date.now(), down: d, up: u });
+      if (next !== history) { history = next; dirty = true; repaintStatic(); }
     });
   });
 
@@ -519,11 +552,20 @@
     context.setTransform(dpr, 0, 0, dpr, 0, 0);
     let raf = 0;
     let last = 0;
+    gradients.clear();
+    dirty = true;
+    const hasParticles = () => (scene?.layout.all.some((node) => node.hasStream && (node.downParticles > 0 || node.upParticles > 0)) ?? false) && Boolean(scene?.connected);
     const frame = (now: number) => {
+      raf = requestAnimationFrame(frame);
+      // Off-screen or too soon: skip. 30 fps is plenty for particles and keeps the GPU/CPU cost halved.
+      if (!onScreen || (last && now - last < FRAME_MS - 1)) return;
+      const animating = hasParticles() || now < settleUntil;
+      // Nothing moving and nothing changed: the last frame is still right, so paint nothing.
+      if (!animating && !dirty) { last = now; return; }
       const dt = last ? Math.min(0.1, (now - last) / 1000) : 0;
       last = now;
-      paint(now, dt, true);
-      raf = requestAnimationFrame(frame);
+      paint(now, dt, animating);
+      dirty = false;
     };
     untrack(() => {
       if (moving && typeof requestAnimationFrame === 'function') raf = requestAnimationFrame(frame);
@@ -562,6 +604,11 @@
     window.addEventListener('neonhearth:motion', onMedia);
     const onVisibility = () => { pageHidden = document.hidden; };
     document.addEventListener('visibilitychange', onVisibility);
+    let visibility: IntersectionObserver | null = null;
+    if (wrap && typeof IntersectionObserver === 'function') {
+      visibility = new IntersectionObserver((entries) => { const seen = entries[entries.length - 1]?.isIntersecting ?? true; if (seen && !onScreen) dirty = true; onScreen = seen; });
+      visibility.observe(wrap);
+    }
     let observer: ResizeObserver | null = null;
     const apply = (width: number) => { if (width > 0) { const next = flowCanvasSize(width); if (next.width !== size.width || next.height !== size.height) size = next; } };
     if (wrap) apply(wrap.getBoundingClientRect().width);
@@ -571,7 +618,7 @@
     }
     // Canvas text needs the bundled faces; repaint once they are ready.
     try { void document.fonts?.ready.then(() => { fontTick += 1; }); } catch { /* fonts API unavailable */ }
-    return () => { media?.removeEventListener?.('change', onMedia); window.removeEventListener('storage', onStorage); window.removeEventListener('neonhearth:motion', onMedia); document.removeEventListener('visibilitychange', onVisibility); observer?.disconnect(); };
+    return () => { media?.removeEventListener?.('change', onMedia); window.removeEventListener('storage', onStorage); window.removeEventListener('neonhearth:motion', onMedia); document.removeEventListener('visibilitychange', onVisibility); observer?.disconnect(); visibility?.disconnect(); };
   });
 </script>
 
@@ -598,10 +645,12 @@
       {#if hovered.kind === 'app'}
         <span>Application on this computer</span>
       {:else}
-        <span>{groupLabel(hovered.group)} · {hovered.presence}</span>
+        <span>{groupLabel(hovered.group)} · {hovered.stale ? `last known ${hovered.presence}` : hovered.presence}</span>
         {#if hovered.groupSource === 'vendor' && hovered.vendor}<span class="vendor">Vendor: {hovered.vendor} — grouped by maker</span>{:else if hovered.vendor}<span class="vendor">Vendor: {hovered.vendor}</span>{/if}
       {/if}
-      {#if hovered.rate === null}
+      {#if hovered.stale}
+        <span class="stale">Collector offline · last known state, not live</span>
+      {:else if hovered.rate === null}
         <span>counters unavailable</span>
       {:else}
         <span class="rates"><b class="d">↓ {formatThroughput(hovered.down)}</b><b class="u">↑ {formatThroughput(hovered.up)}</b></span>
@@ -612,7 +661,7 @@
   {#if onselect && layout.nodes.length}
     <ul class="sr-only">
       {#each layout.nodes as node (node.deviceId)}
-        <li><button type="button" onclick={() => onselect?.(node.deviceId)} onfocus={() => (hoveredId = node.deviceId)} onblur={() => { if (hoveredId === node.deviceId) hoveredId = null; }}>{node.label}, {groupLabel(node.group)}, {node.presence}{node.rate === null ? ', counters unavailable' : `, ${formatThroughput(node.rate)}`}</button></li>
+        <li><button type="button" onclick={() => onselect?.(node.deviceId)} onfocus={() => (hoveredId = node.deviceId)} onblur={() => { if (hoveredId === node.deviceId) hoveredId = null; }}>{node.label}, {groupLabel(node.group)}, {node.stale ? `last known ${node.presence}, collector offline` : node.presence}{node.stale ? '' : node.rate === null ? ', counters unavailable' : `, ${formatThroughput(node.rate)}`}</button></li>
       {/each}
     </ul>
   {/if}

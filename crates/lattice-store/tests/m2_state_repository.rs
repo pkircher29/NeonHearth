@@ -689,3 +689,108 @@ async fn legacy_json_checkpoint_checksum_still_loads_and_tampering_still_fails()
     );
     Ok(())
 }
+
+/// Finding 7: re-sending an already-applied commit after later commits landed
+/// is a no-op, not a Conflict.
+#[tokio::test]
+async fn replaying_an_applied_commit_after_later_commits_is_a_noop() -> anyhow::Result<()> {
+    let directory = tempdir()?;
+    let pool = connect_path(directory.path().join("replay.db")).await?;
+    let repository = M2StateRepository::new(pool.clone());
+    repository.commit(input(1, [1; 32])).await?;
+    repository.commit(input(2, [2; 32])).await?;
+    repository.commit(input(1, [1; 32])).await?;
+    let sequence: i64 = sqlx::query_scalar("SELECT commit_sequence FROM state_checkpoints")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(sequence, 2);
+    // A different payload under the same hash is still a conflict.
+    let mut changed = input(1, [1; 32]);
+    changed.devices[0].owner_name = Some("Someone else".into());
+    assert!(matches!(
+        repository.commit(changed).await,
+        Err(CheckpointError::Conflict(_))
+    ));
+    Ok(())
+}
+
+/// Finding 5: a late rollup for an already-compacted parent must not abort the
+/// whole transaction it travels in.
+#[tokio::test]
+async fn late_flow_row_for_a_sealed_parent_does_not_poison_the_commit() -> anyhow::Result<()> {
+    let directory = tempdir()?;
+    let pool = connect_path(directory.path().join("late.db")).await?;
+    let repository = M2StateRepository::new(pool.clone());
+    let flow = repository.flow_repository(16)?;
+    let rollup = |second: i64| Rollup {
+        key: RollupKey {
+            resolution: Resolution::Second,
+            bucket: time(second),
+            device_id: device(),
+            protocol: Protocol::Tcp,
+            destination: DestinationCategory::Internet,
+            interface: 1,
+            metadata: None,
+        },
+        bytes: ByteCount {
+            upload: 5,
+            download: 7,
+        },
+        coverage: Coverage::Complete,
+        metadata: None,
+    };
+    let base = 1_700_000_040; // minute-aligned
+    repository.commit(input(1, [1; 32])).await?;
+    flow.apply(&[RollupChange::Upsert(rollup(base + 1))], time(base + 2))
+        .await?;
+    let policy = lattice_store::CompactionPolicy::default();
+    let now = time(base + 3 * 24 * 3600);
+    assert_eq!(flow.compact(now, &policy).await?, 1);
+    // Late correction for the compacted minute rides in a discovery commit.
+    repository
+        .commit_with_flow(
+            input(2, [2; 32]),
+            &[RollupChange::Correction(rollup(base + 1))],
+            now,
+            &flow,
+        )
+        .await?;
+    let seconds: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM flow_rollups WHERE resolution='second'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(seconds, 0);
+    Ok(())
+}
+
+/// Finding 10: a corrupt device no longer fails the whole snapshot page.
+#[tokio::test]
+async fn snapshot_page_degrades_per_device() -> anyhow::Result<()> {
+    let pool = lattice_store::connect_memory().await?;
+    let repository = M2StateRepository::new(pool.clone());
+    let good = device();
+    let bad = DeviceId::parse("018f47a0-9b5c-7a22-8a33-112233445500")?;
+    for id in [good, bad] {
+        sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at) VALUES(?,?,?)")
+            .bind(id.to_string())
+            .bind("2026-01-01T00:00:00Z")
+            .bind("2026-01-01T00:00:01Z")
+            .execute(&pool)
+            .await?;
+    }
+    sqlx::query("UPDATE devices SET first_seen_at='garbage' WHERE device_id=?")
+        .bind(bad.to_string())
+        .execute(&pool)
+        .await?;
+    let (snapshots, skipped) = repository.list_device_snapshots_report(10, None).await?;
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].device_id, good);
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].device_id, bad.to_string());
+    // The strict API keeps its contract.
+    assert!(matches!(
+        repository.list_device_snapshots(10, None).await,
+        Err(CheckpointError::Corrupt(_))
+    ));
+    Ok(())
+}

@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { isolateApi } from './fixtures/isolation';
 
 const id = '11111111-1111-4111-8111-111111111111';
 const at = '2026-01-01T00:00:00Z';
@@ -9,6 +10,7 @@ const device = { device_id: id, first_seen_at: at, last_seen_at: at, owner_name:
 const update = { device_id: id, policy_version: 2, evaluation: { policy_version: 2, reason: 'owner_rejected', requested_action: 'permanent_ban', warning: null, deadline: null }, requested_action: 'permanent_ban', evidence_summary: 'typed test policy update', enforcement_result: 'verified', undo_available: false };
 
 async function installFixture(page: Page) {
+  await isolateApi(page);
   await page.route('**/api/v1/health', route => route.fulfill({ json: { status: 'ok', api_version: 'fixture' } }));
   await page.route('**/api/v1/state**', route => route.fulfill({ json: { sequence: 1, devices: [device], next_after: null, service_status: 'ready' } }));
   await page.route('**/api/v1/events/ticket', route => route.fulfill({ json: { ticket: 'fixture-ticket', expires_in_seconds: 30 } }));

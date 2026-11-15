@@ -17,7 +17,7 @@ describe('createLiveConnection', () => {
     const states: string[] = [];
     const connection = createLiveConnection({ client, onState: (state) => states.push(`${state.sequence}:${state.connected}`) });
     await connection.start();
-    expect(client.openEvents).toHaveBeenCalledWith(4, expect.any(Function), expect.any(Function));
+    expect(client.openEvents).toHaveBeenCalledWith(4, expect.any(Function), expect.any(Function), expect.any(AbortSignal));
     connection.stop();
     expect(connection.getState().connected).toBe(false);
     expect(states).toContain('4:false');
@@ -276,4 +276,41 @@ describe('createLiveConnection', () => {
     // An aborted hydration is not a failure worth retrying.
     expect(timers.setTimeout).not.toHaveBeenCalled();
   });
+
+  it('cancels an in-flight ticket request on stop, so a late 401 cannot reach a new credential', async () => {
+    let seen: AbortSignal | undefined;
+    const client = clientStub({ openEvents: vi.fn((_sequence, _onMessage, _callback, signal?: AbortSignal) => { seen = signal; return new Promise<WebSocket>(() => {}); }) });
+    const connection = createLiveConnection({ client });
+    void connection.start();
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    expect(seen!.aborted).toBe(false);
+    connection.stop();
+    expect(seen!.aborted).toBe(true);
+  });
+
+  it('reset forgets the devices learned under the previous credential', async () => {
+    const device = { device_id: 'a', bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null }, presence: { state: 'online' }, policy: null } as never;
+    const client = clientStub({ snapshotAll: vi.fn(async () => ({ sequence: 4, devices: [device], next_after: null, service_status: 'ready' })) });
+    const connection = createLiveConnection({ client });
+    await connection.start();
+    expect(connection.getState().deviceOrder).toEqual(['a']);
+    connection.stop();
+    connection.reset();
+    expect(connection.getState().deviceOrder).toEqual([]);
+  });
+});
+
+it('backs off repeated socket handshake failures', async () => {
+ let fail: () => void = () => {};
+ let retry: () => void = () => {};
+ const delays: number[] = [];
+ const timers = { setTimeout: (callback: () => void, delay: number) => { retry = callback; delays.push(delay); return 1; }, clearTimeout: () => {} };
+ const client = clientStub({ openEvents: vi.fn(async (_seq, _msg, onState) => {
+   fail = () => onState('error'); return { close: vi.fn() } as unknown as WebSocket;
+ }) });
+ const connection = createLiveConnection({ client, timers, random: () => 0.5, openTimeoutMs: 0, staleAfterMs: 0 });
+ await connection.start();
+ for (let i = 0; i < 3; i++) { fail(); retry(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); }
+ expect(delays).toEqual([250, 500, 1000]);
+ connection.stop();
 });

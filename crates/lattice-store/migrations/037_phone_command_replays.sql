@@ -26,4 +26,4 @@ CREATE TABLE phone_command_replays (
 
 CREATE INDEX phone_command_replays_order_idx ON phone_command_replays(session_id, seq);
 
-UPDATE install_state SET schema_version = 32 WHERE singleton = 1 AND schema_version < 32;
+UPDATE install_state SET schema_version = 37 WHERE singleton = 1 AND schema_version < 37;

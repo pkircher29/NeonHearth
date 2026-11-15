@@ -12,6 +12,18 @@ pub const BASELINE_WINDOW: Duration = Duration::hours(48);
 pub const UNKNOWN_DEADLINE: Duration = Duration::hours(UNKNOWN_POLICY_DEADLINE_HOURS);
 pub const AUTOMATIC_DEADLINE: Duration = Duration::hours(AUTOMATIC_POLICY_DEADLINE_HOURS);
 pub const DANGER_THRESHOLD_BPS: u16 = 9_000;
+/// Basis points are 0..=10_000; larger values are malformed.
+pub const MAX_BASIS_POINTS: u16 = 10_000;
+
+fn device_danger_bps(risk: &RiskSignal) -> u16 {
+    match risk {
+        RiskSignal::HighConfidenceDanger {
+            confidence_basis_points,
+            ..
+        } => *confidence_basis_points,
+        RiskSignal::None => 0,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PolicyEngine {
@@ -40,6 +52,29 @@ impl PolicyEngine {
             })
     }
 
+    /// [`Self::evaluate`] with a clock-trust gate. When the system clock is
+    /// not trusted (see the store's clock heartbeat), a deadline expiry is not
+    /// evidence of anything, so quarantine/ban driven purely by a deadline is
+    /// downgraded to owner attention. Owner decisions and danger signals are
+    /// unaffected.
+    pub fn evaluate_guarded(
+        self,
+        device: &DevicePolicy,
+        now: DateTime<Utc>,
+        clock_trusted: bool,
+    ) -> Evaluation {
+        let evaluation = self.evaluate(device, now);
+        if !clock_trusted
+            && matches!(
+                evaluation.reason,
+                PolicyReason::UnknownDeadlineExpired | PolicyReason::AutomaticDeadlineExpired
+            )
+        {
+            return Evaluation::owner_attention();
+        }
+        evaluation
+    }
+
     pub fn evaluate(self, device: &DevicePolicy, now: DateTime<Utc>) -> Evaluation {
         match device.owner_decision {
             OwnerDecision::Rejected => {
@@ -51,6 +86,17 @@ impl PolicyEngine {
             OwnerDecision::Pending | OwnerDecision::Approved => {}
         }
 
+        // A danger signal that crosses the threshold but is malformed (no
+        // evidence, or basis points above 100%) must not read as "no danger":
+        // fail toward the owner instead of silently allowing the device.
+        if let RiskSignal::HighConfidenceDanger {
+            confidence_basis_points: DANGER_THRESHOLD_BPS..,
+            evidence,
+        } = &device.risk
+            && (evidence.trim().is_empty() || device_danger_bps(&device.risk) > MAX_BASIS_POINTS)
+        {
+            return Evaluation::owner_attention();
+        }
         let dangerous = matches!(
             &device.risk,
             RiskSignal::HighConfidenceDanger {

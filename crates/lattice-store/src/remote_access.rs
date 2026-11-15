@@ -84,6 +84,9 @@ pub struct PinFailureOutcome {
     pub locked_until: Option<DateTime<Utc>>,
 }
 
+/// (fingerprint, completed, status, content_type, body, body_omitted).
+type ReplayRow = (String, i64, i64, Option<String>, Option<Vec<u8>>, i64);
+
 /// Outcome of [`RemoteAccessRepository::reserve_pin_attempt`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PinReservation {
@@ -487,7 +490,7 @@ impl RemoteAccessRepository {
         if inserted.rows_affected() > 0 {
             return Ok(None);
         }
-        let row: Option<(String, i64, i64, Option<String>, Option<Vec<u8>>, i64)> =
+        let row: Option<ReplayRow> =
             sqlx::query_as(
                 "SELECT request_fingerprint, completed, status, content_type, body, body_omitted \
                  FROM phone_command_replays WHERE session_id = ? AND command_id = ?",
@@ -512,8 +515,9 @@ impl RemoteAccessRepository {
         }))
     }
 
-    /// Completes a claimed command with its response, then trims the session's
-    /// settled records to the newest `keep`.
+    /// Completes a claimed command with its response, then drops the stored bodies of
+    /// all but the newest `keep` settled records. The ids stay reserved for the
+    /// session's lifetime, so an old id can still never run twice.
     pub async fn complete_command(
         &self,
         session_id: Uuid,
@@ -537,8 +541,7 @@ impl RemoteAccessRepository {
         .await
         .map_err(storage)?;
         sqlx::query(
-            "DELETE FROM phone_command_replays WHERE session_id = ?1 AND completed = 1 AND seq <= \
-             (SELECT MAX(seq) FROM phone_command_replays WHERE session_id = ?1) - ?2",
+            "UPDATE phone_command_replays SET body = NULL, body_omitted = 1 WHERE session_id = ?1 AND completed = 1 AND body_omitted = 0 AND seq <= (SELECT MAX(seq) FROM phone_command_replays WHERE session_id = ?1) - ?2",
         )
         .bind(session_id.to_string())
         .bind(i64::from(keep))

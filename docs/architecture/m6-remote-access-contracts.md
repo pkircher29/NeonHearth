@@ -23,8 +23,15 @@ Locked 2026-08-24 for the Tailscale (T1–T4) and integrations (I1–I2) lanes.
   limited and audited.
 - **No replay (T4)**: command-carrying requests over a phone session include
   a client-generated `command_id` (uuid); the service keeps a bounded
-  per-session dedup window and returns the original result for a replayed
-  id instead of re-executing. WebSocket reconnects resume the event stream
+  durable per-session record (SQLite, `phone_command_replays`) and returns the
+  original result for a replayed id instead of re-executing. The record is
+  claimed before the handler runs, bound to the method, URI and body, and
+  survives restart. Concurrent in-flight duplicates wait for the original
+  result. A changed payload, or a claim whose handler never finished
+  (crash, timeout, disconnect), returns 409; clients must refresh state before
+  deciding whether to issue a new command. Reservations remain for the session
+  lifetime: only the stored response bodies of the oldest settled commands are
+  evicted, never the id. WebSocket reconnects resume the event stream
   by sequence (existing snapshot/resume protocol) and never re-deliver
   commands.
 

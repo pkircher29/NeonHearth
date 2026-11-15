@@ -5,7 +5,7 @@ import {
   buildRamp, capParticles, curvePoint, curveTangent, describeFlow, easeToward, flowCanvasSize, flowGeometry, flowStateCopy, groupOf,
   historyAngle, historyPoints, historyRadius, laneWidth, layoutFlow, mixHex, nodeAt, particlePhase, particleSpec, placeLabels, planRings,
   pushHistory, rateFraction, statusOf, streamCurve, topTalkers, type FlowNode,
-  deviceLabel, deviceMetaFrom, firstIpv4, groupOfWithSource, hostAppRates, hostFlowFrom, layoutApps, vendorGroup, vendorName, type DeviceMeta, type HostSample
+  deviceRates, deviceLabel, deviceMetaFrom, firstIpv4, groupOfWithSource, hostAppRates, hostFlowFrom, layoutApps, vendorGroup, vendorName, type DeviceMeta, type HostSample
 } from './flowMap';
 import { formatThroughput } from './networkFormat';
 
@@ -331,7 +331,7 @@ describe('history ring', () => {
 });
 
 function node(id: string, x: number, y: number, rate: number, extra: Partial<FlowNode> = {}): FlowNode {
-  return { deviceId: id, kind: 'device', vendor: null, groupSource: 'none', label: id, group: 'computers', presence: 'online', status: 'active', rate, down: rate, up: 0, share: 0, rank: 0, x, y, angle: Math.atan2(y - 280, x - 380), radius: 6, hasStream: true, downLane: 1, upLane: 0, downParticles: 1, upParticles: 0, downSpeed: 0.2, upSpeed: 0, seed: 0, ...extra };
+  return { deviceId: id, kind: 'device', vendor: null, groupSource: 'none', label: id, group: 'computers', presence: 'online', status: 'active', rate, down: rate, up: 0, stale: false, share: 0, rank: 0, x, y, angle: Math.atan2(y - 280, x - 380), radius: 6, hasStream: true, downLane: 1, upLane: 0, downParticles: 1, upParticles: 0, downSpeed: 0.2, upSpeed: 0, seed: 0, ...extra };
 }
 
 describe('top talkers and labels', () => {
@@ -415,11 +415,17 @@ describe('vendor grouping (inferred from the MAC maker)', () => {
   it.each([
     ['Espressif Inc.', 'iot'], ['Tuya Smart Inc.', 'iot'], ['WiZ', 'iot'], ['Lumi United Technology Co., Ltd', 'iot'], ['GD Midea Air-Conditioning Equipment Co.,Ltd.', 'iot'], ['Sichuan AI-Link Technology Co., Ltd.', 'iot'],
     ['FLIR Systems', 'cameras'], ['Wyze Labs Inc', 'cameras'], ['Blink by Amazon', 'cameras'], ['Hangzhou Hikvision Digital Technology Co.,Ltd.', 'cameras'],
-    ['Amazon Technologies Inc.', 'media'], ['Google, Inc.', 'media'], ['Sony Home Entertainment&Sound Products Inc', 'media'],
+    ['Amazon Technologies Inc.', 'media'], ['Sony Home Entertainment&Sound Products Inc', 'media'],
     ['Proxmox Server Solutions GmbH', 'computers'], ['Raspberry Pi (Trading) Ltd', 'computers'], ['NVIDIA', 'computers'], ['GIGA-BYTE TECHNOLOGY CO.,LTD.', 'computers'], ['Hewlett Packard', 'computers'], ['Dell Inc.', 'computers'],
-    ['TP-Link Systems Inc.', 'network'], ['Ubiquiti Inc', 'network'], ['Acer Inc.', 'network'],
+    ['TP-Link Systems Inc.', 'network'], ['Ubiquiti Inc', 'network'], ['Acer Inc.', 'computers'],
     ['Apple, Inc.', 'phones']
   ])('%s -> %s', (org, group) => { expect(vendorGroup(org, 'assigned')).toBe(group); });
+  it('does not guess a class for makers that sell phones, TVs and speakers alike, nor match the word ring inside a longer name', () => {
+    expect(vendorGroup('Google, Inc.', 'assigned')).toBeNull();
+    expect(vendorGroup('Samsung Electronics Co.,Ltd', 'assigned')).toBeNull();
+    expect(vendorGroup('Ring LLC', 'assigned')).toBe('cameras');
+    expect(vendorGroup('Steering Systems Ltd', 'assigned')).toBeNull();
+  });
   it('puts a randomised (locally administered) address in its own honest sector', () => {
     expect(vendorGroup(null, 'locally_administered')).toBe('private');
     expect(vendorGroup('Apple, Inc.', 'locally_administered')).toBe('private');
@@ -557,5 +563,41 @@ describe('host traffic fallback', () => {
     const text = describeFlow({ connected: true, upload: 1000, download: 2000, nodes: [], apps, coreLabel: 'This computer', format: formatThroughput });
     expect(text).toContain('showing this computer only');
     expect(text).toContain('Top applications: chrome.exe');
+  });
+});
+
+describe('honesty: freshness, one-sided readings and word-boundary types', () => {
+  it('keeps an unreported direction null instead of a zero', () => {
+    const one = device('a', { bandwidth: { available: true, upload: null, download: 500, coverage: 'complete', observed_at: null } });
+    expect(deviceRates(one)).toEqual({ down: 500, up: null, total: 500, complete: false });
+    const none = device('b', { bandwidth: { available: true, upload: null, download: null, coverage: 'complete', observed_at: null } });
+    expect(deviceRates(none)).toBeNull();
+    const node = layoutFlow([one], SIZE, true).nodes[0]!;
+    expect(node.up).toBeNull();
+    expect(node.down).toBe(500);
+  });
+
+  it('shows every node as last-known with no rate or stream while the collector is offline', () => {
+    const layout = layoutFlow([device('a', { rate: [5_000_000, 1_000_000] })], SIZE, false);
+    expect(layout.state).toBe('offline');
+    const node = layout.nodes[0]!;
+    expect(node).toMatchObject({ rate: null, down: null, up: null, stale: true, hasStream: false });
+    expect(layout.measuredTotal).toBe(0);
+    expect(layoutFlow([device('a')], SIZE, true).nodes[0]!.stale).toBe(false);
+  });
+
+  it('describes a one-sided reading without inventing a total', () => {
+    const text = describeFlow({ connected: true, upload: 1000, download: null, nodes: [], format: formatThroughput });
+    expect(text).toContain('unavailable total');
+    expect(text).toContain('unavailable down');
+  });
+
+  it('matches type words, not substrings', () => {
+    expect(groupOf(device('a', { type: 'Smartphone' }))).toBe('phones');
+    expect(groupOf(device('b', { type: 'Smack machine' }))).toBe('other');
+    expect(groupOf(device('c', { type: 'Wall clock' }))).toBe('other');
+    expect(groupOf(device('d', { type: 'MacBook Pro' }))).toBe('computers');
+    expect(groupOf(device('e', { type: 'Smart lock' }))).toBe('iot');
+    expect(groupOf(device('f', { type: 'Smart TV' }))).toBe('media');
   });
 });

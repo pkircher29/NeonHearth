@@ -44,4 +44,4 @@ BEGIN
     SELECT RAISE(ABORT, 'audit_log is append-only');
 END;
 
-UPDATE install_state SET schema_version = 33 WHERE singleton = 1 AND schema_version < 33;
+UPDATE install_state SET schema_version = 38 WHERE singleton = 1 AND schema_version < 38;

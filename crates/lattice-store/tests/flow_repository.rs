@@ -135,11 +135,17 @@ fn retention_defaults_and_validation_are_exact() {
     let mut bad = p;
     bad.seconds = Duration::zero();
     assert!(bad.validate().is_err());
-    let unsupported = CompactionPolicy {
+    // Hour retention is supported but may not be shorter than minute retention.
+    let shorter = CompactionPolicy {
+        hours: Some(Duration::days(30)),
+        ..CompactionPolicy::default()
+    };
+    assert!(shorter.validate().is_err());
+    let supported = CompactionPolicy {
         hours: Some(Duration::days(365)),
         ..CompactionPolicy::default()
     };
-    assert!(unsupported.validate().is_err());
+    assert!(supported.validate().is_ok());
 }
 #[tokio::test]
 async fn compaction_conserves_seconds_to_minutes_to_hours_and_is_repeatable() {
@@ -182,18 +188,25 @@ async fn compaction_conserves_seconds_to_minutes_to_hours_and_is_repeatable() {
         (h.len(), h[0].bytes.upload, h[0].coverage),
         (1, 5, Coverage::Estimated)
     );
+    // A correction for an already-compacted parent is dropped (it used to be an
+    // error that rolled back the whole commit carrying it); the compacted
+    // totals below must stay untouched and no second-resolution row appears.
+    repo.apply(
+        &[RollupChange::Correction(roll(
+            Resolution::Second,
+            0,
+            99,
+            Coverage::Complete,
+        ))],
+        t(4001),
+    )
+    .await
+    .unwrap();
     assert!(
-        repo.apply(
-            &[RollupChange::Correction(roll(
-                Resolution::Second,
-                0,
-                99,
-                Coverage::Complete
-            ))],
-            t(4001)
-        )
-        .await
-        .is_err()
+        repo.range(Resolution::Second, t(-1), t(5000), 100)
+            .await
+            .unwrap()
+            .is_empty()
     );
     assert_eq!(
         repo.range(Resolution::Hour, t(-1), t(5000), 100)
@@ -303,10 +316,9 @@ async fn schema_constraints_and_query_index_are_enforced() {
     let bad=sqlx::query("INSERT INTO flow_rollups(resolution,bucket,device_id,protocol,destination,interface,upload,download,coverage,updated_at) VALUES('second','1970-01-01T00:00:00Z','missing','tcp','internet',1,1,1,'bogus','1970-01-01T00:00:00Z')").execute(&pool).await;
     assert!(bad.is_err());
     let plan:Vec<(i64,i64,i64,String)>=sqlx::query_as("EXPLAIN QUERY PLAN SELECT * FROM flow_rollups WHERE resolution='second' AND bucket>='1970-01-01T00:00:00Z' AND device_id='x'").fetch_all(&pool).await.unwrap();
-    assert!(
-        plan.iter()
-            .any(|x| x.3.contains("flow_rollups_range_idx") || x.3.contains("sqlite_autoindex"))
-    );
+    assert!(plan.iter().any(|x| x.3.contains("flow_rollups_range_idx")
+        || x.3.contains("flow_rollups_device_latest_idx")
+        || x.3.contains("sqlite_autoindex")));
 }
 
 #[tokio::test]

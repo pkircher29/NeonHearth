@@ -139,15 +139,18 @@ export function easeToward(current: number, target: number, dtSeconds: number, t
 
 export type GroupId = 'computers' | 'phones' | 'media' | 'cameras' | 'iot' | 'network' | 'guests' | 'private' | 'other' | 'unclassified';
 
+/** Whole-word, optionally plural matcher: "mac" must not fire inside "smack" nor "lock" inside "clock". */
+const words = (list: string): RegExp => new RegExp(`\\b(?:${list})s?\\b`);
+
 /** Fixed order: sectors always appear in this order, clockwise from 12 o'clock. */
 export const GROUPS: ReadonlyArray<{ id: GroupId; label: string; patterns: RegExp }> = [
-  { id: 'computers', label: 'Computers', patterns: /laptop|desktop|computer|\bpc\b|mac|workstation|server|\bnas\b/ },
-  { id: 'phones', label: 'Phones', patterns: /phone|mobile|tablet|ipad|watch|handset/ },
-  { id: 'media', label: 'Media', patterns: /\btv\b|television|speaker|audio|stream|console|game|media|cast|soundbar|projector/ },
-  { id: 'cameras', label: 'Cameras', patterns: /camera|doorbell|\bcam\b/ },
-  { id: 'iot', label: 'Home & IoT', patterns: /iot|sensor|light|bulb|plug|thermostat|lock|hub|appliance|printer|vacuum|switchbot|smart/ },
-  { id: 'network', label: 'Network', patterns: /router|gateway|switch|access.?point|\bap\b|mesh|modem|extender/ },
-  { id: 'guests', label: 'Guests', patterns: /guest|visitor/ },
+  { id: 'computers', label: 'Computers', patterns: words('laptop|desktop|computer|pc|mac|macbook|imac|mac ?mini|workstation|server|nas') },
+  { id: 'phones', label: 'Phones', patterns: words('phone|smartphone|mobile|tablet|ipad|iphone|watch|handset') },
+  { id: 'media', label: 'Media', patterns: words('tv|television|speaker|audio|streamer|streaming|stream|console|game|media|cast|chromecast|soundbar|projector') },
+  { id: 'cameras', label: 'Cameras', patterns: words('camera|doorbell|cam') },
+  { id: 'iot', label: 'Home & IoT', patterns: words('iot|sensor|light|bulb|plug|thermostat|lock|hub|appliance|printer|vacuum|switchbot|smart') },
+  { id: 'network', label: 'Network', patterns: words('router|gateway|switch|access.?point|ap|mesh|modem|extender') },
+  { id: 'guests', label: 'Guests', patterns: words('guest|visitor') },
   { id: 'private', label: 'Private address', patterns: /$^/ },
   { id: 'other', label: 'Other', patterns: /$^/ },
   { id: 'unclassified', label: 'Unclassified', patterns: /$^/ }
@@ -167,7 +170,7 @@ export const VENDOR_RULES: ReadonlyArray<{ group: GroupId; name: string; pattern
   { group: 'cameras', name: 'Hikvision', pattern: /hikvision/ },
   { group: 'cameras', name: 'Dahua', pattern: /dahua/ },
   { group: 'cameras', name: 'Reolink', pattern: /reolink/ },
-  { group: 'cameras', name: 'Ring', pattern: /\bring\b/ },
+  { group: 'cameras', name: 'Ring', pattern: /^ring\b/ },
   { group: 'cameras', name: 'Arlo', pattern: /\barlo\b/ },
   { group: 'cameras', name: 'Amcrest', pattern: /amcrest/ },
   { group: 'iot', name: 'Espressif', pattern: /espressif/ },
@@ -184,17 +187,14 @@ export const VENDOR_RULES: ReadonlyArray<{ group: GroupId; name: string; pattern
   { group: 'network', name: 'TP-Link', pattern: /tp-link|tplink/ },
   { group: 'network', name: 'Netgear', pattern: /netgear/ },
   { group: 'network', name: 'Ubiquiti', pattern: /ubiquiti/ },
-  { group: 'network', name: 'Acer', pattern: /\bacer\b/ },
   { group: 'network', name: 'Cisco', pattern: /cisco/ },
   { group: 'network', name: 'MikroTik', pattern: /mikrotik|routerboard/ },
   { group: 'network', name: 'Zyxel', pattern: /zyxel/ },
   { group: 'network', name: 'D-Link', pattern: /d-link/ },
   { group: 'network', name: 'Linksys', pattern: /linksys/ },
   { group: 'media', name: 'Amazon', pattern: /amazon/ },
-  { group: 'media', name: 'Google', pattern: /google/ },
   { group: 'media', name: 'Sony', pattern: /\bsony\b/ },
   { group: 'media', name: 'Roku', pattern: /\broku\b/ },
-  { group: 'media', name: 'Samsung', pattern: /samsung/ },
   { group: 'media', name: 'LG', pattern: /\blg\b|lg elec/ },
   { group: 'media', name: 'Sonos', pattern: /sonos/ },
   { group: 'media', name: 'Vizio', pattern: /vizio/ },
@@ -206,6 +206,7 @@ export const VENDOR_RULES: ReadonlyArray<{ group: GroupId; name: string; pattern
   { group: 'computers', name: 'HP', pattern: /hewlett|\bhp\b/ },
   { group: 'computers', name: 'Dell', pattern: /\bdell\b/ },
   { group: 'computers', name: 'Intel', pattern: /\bintel\b/ },
+  { group: 'computers', name: 'Acer', pattern: /\bacer\b/ },
   { group: 'computers', name: 'ASUS', pattern: /asus/ },
   { group: 'computers', name: 'MSI', pattern: /micro-?star|\bmsi\b/ },
   { group: 'computers', name: 'Lenovo', pattern: /lenovo/ },
@@ -300,14 +301,20 @@ export function deviceLabel(device: DeviceSnapshot, meta?: DeviceMeta | null): s
   return `Device ${device.device_id.slice(0, 6)}`;
 }
 
-/** Directional rates, or null when counters are unavailable (never a fake zero). */
-export function deviceRates(device: DeviceSnapshot): { down: number; up: number; total: number } | null {
+/**
+ * Directional rates, or null when counters are unavailable (never a fake zero).
+ * A direction the service did not report stays null; `total` is the sum of what
+ * is known and `complete` says whether both directions were reported.
+ */
+export function deviceRates(device: DeviceSnapshot): { down: number | null; up: number | null; total: number; complete: boolean } | null {
   const b = device.bandwidth;
   if (!b.available) return null;
-  const down = b.download ?? 0;
-  const up = b.upload ?? 0;
-  if (!Number.isFinite(down) || !Number.isFinite(up) || down < 0 || up < 0) return null;
-  return { down, up, total: down + up };
+  const valid = (value: number | null) => (value === null ? null : Number.isFinite(value) && value >= 0 ? value : NaN);
+  const down = valid(b.download);
+  const up = valid(b.upload);
+  if (Number.isNaN(down) || Number.isNaN(up)) return null;
+  if (down === null && up === null) return null;
+  return { down, up, total: (down ?? 0) + (up ?? 0), complete: down !== null && up !== null };
 }
 
 export function statusOf(device: DeviceSnapshot): NodeStatus {
@@ -383,10 +390,12 @@ export interface FlowNode {
   group: GroupId;
   presence: PresenceState;
   status: NodeStatus;
-  /** Combined rate, or null when counters are unavailable. */
+  /** Combined rate of the reported directions, or null when counters are unavailable. */
   rate: number | null;
-  down: number;
-  up: number;
+  down: number | null;
+  up: number | null;
+  /** True when the collector connection is lost: presence and rates are last-known, not live. */
+  stale: boolean;
   /** Share of total measured device traffic, 0..1. */
   share: number;
   rank: number;
@@ -495,9 +504,14 @@ export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, c
   const geo = flowGeometry(size);
   if (!connected) {
     const base = layoutFlow(devices, size, true, { meta: options.meta });
-    // Offline: keep the ghosts of known devices, but never any stream.
-    for (const node of base.nodes) { node.hasStream = false; node.downParticles = 0; node.upParticles = 0; }
-    return { ...base, state: 'offline' };
+    // Offline: keep the ghosts of known devices for orientation, but never a stream, a rate or a
+    // live-looking presence: everything a tooltip or screen reader can read is marked last-known.
+    for (const node of base.nodes) {
+      node.hasStream = false; node.downParticles = 0; node.upParticles = 0; node.upLane = 0; node.downLane = 0;
+      node.rate = null; node.down = null; node.up = null; node.share = 0; node.stale = true;
+    }
+    for (const group of base.groups) group.rate = 0;
+    return { ...base, state: 'offline', measuredTotal: 0 };
   }
   if (devices.length === 0) return emptyFlowLayout(size, 'empty');
 
@@ -553,8 +567,8 @@ export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, c
         const r = Math.min(geo.nodeMax, plan.radii[ringIndex]! + (1 - activity) * 0.95 * offsetMax);
         const share = total !== null && measuredTotal > 0 ? total / measuredTotal : 0;
         const streaming = (row.status === 'active' || row.status === 'quiet') && total !== null && total >= STREAM_FLOOR_BPS;
-        const down = row.rates?.down ?? 0;
-        const up = row.rates?.up ?? 0;
+        const down = row.rates?.down ?? null;
+        const up = row.rates?.up ?? null;
         const dSpec = streaming ? particleSpec(down) : { count: 0, speed: 0 };
         const uSpec = streaming ? particleSpec(up) : { count: 0, speed: 0 };
         nodes.push({
@@ -567,15 +581,15 @@ export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, c
           presence: row.device.presence.state,
           status: row.status,
           rate: total,
-          down, up, share,
+          down, up, share, stale: false,
           rank,
           x: geo.cx + Math.cos(angle) * r,
           y: geo.cy + Math.sin(angle) * r,
           angle,
           radius: geo.unit * density * (4.2 + 6.2 * (streaming ? rateFraction(total) : 0)),
           hasStream: streaming,
-          downLane: streaming && down >= STREAM_FLOOR_BPS ? laneWidth(down / Math.max(measuredTotal, 1), geo.unit) : 0,
-          upLane: streaming && up >= STREAM_FLOOR_BPS ? laneWidth(up / Math.max(measuredTotal, 1), geo.unit) : 0,
+          downLane: streaming && down !== null && down >= STREAM_FLOOR_BPS ? laneWidth(down / Math.max(measuredTotal, 1), geo.unit) : 0,
+          upLane: streaming && up !== null && up >= STREAM_FLOOR_BPS ? laneWidth(up / Math.max(measuredTotal, 1), geo.unit) : 0,
           downParticles: dSpec.count, upParticles: uSpec.count, downSpeed: dSpec.speed, upSpeed: uSpec.speed,
           seed: (hashId(row.device.device_id) & 0xffff) / 0x10000
         });
@@ -629,7 +643,7 @@ export function layoutApps(apps: readonly AppRate[], geo: FlowGeometry): FlowNod
     return {
       deviceId: `app:${app.appId}`, kind: 'app' as const, label: app.name, vendor: null, groupSource: 'none' as const, group: 'other' as const,
       presence: 'online' as const, status: 'active' as const, rate, down: app.down, up: app.up, share: rate / total,
-      rank: usable.indexOf(app), x: geo.cx + Math.cos(angle) * r, y: geo.cy + Math.sin(angle) * r, angle,
+      stale: false, rank: usable.indexOf(app), x: geo.cx + Math.cos(angle) * r, y: geo.cy + Math.sin(angle) * r, angle,
       radius: geo.unit * (3.6 + 4 * rateFraction(rate)), hasStream: true,
       downLane: app.down >= STREAM_FLOOR_BPS ? laneWidth(app.down / total, geo.unit) * 0.85 : 0,
       upLane: app.up >= STREAM_FLOOR_BPS ? laneWidth(app.up / total, geo.unit) * 0.85 : 0,
@@ -859,7 +873,7 @@ export function describeFlow(input: { connected: boolean; upload: number | null;
   if (!input.connected) return 'Network flow map: collector connection unavailable; reconnect or sign in if requested.';
   const online = input.nodes.filter((node) => node.presence === 'online').length;
   const blocked = input.nodes.filter((node) => node.presence === 'blocked').length;
-  const total = input.upload === null && input.download === null ? null : (input.upload ?? 0) + (input.download ?? 0);
+  const total = input.upload === null || input.download === null ? null : input.upload + input.download;
   const parts = [
     input.coreLabel ? `Network flow map, showing ${input.coreLabel.toLowerCase()} only: ${input.format(total)} total` : `Network flow map: ${input.format(total)} total`,
     `${input.format(input.download)} down`,

@@ -228,7 +228,7 @@ async fn touch_never_resurrects_revoked_or_expired_sessions_and_purge_removes_th
 }
 
 #[tokio::test]
-async fn command_claims_are_durable_exclusive_and_trimmed() {
+async fn command_claims_are_durable_exclusive_and_bodies_trimmed() {
     let repo = RemoteAccessRepository::new(connect_memory().await.unwrap());
     let now = Utc.with_ymd_and_hms(2026, 8, 24, 12, 0, 0).unwrap();
     let id = session(&repo, now).await;
