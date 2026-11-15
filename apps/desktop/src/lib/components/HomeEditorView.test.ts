@@ -667,4 +667,46 @@ describe('HomeEditorView', () => {
       expect(view.container.querySelectorAll('.wall')).toHaveLength(2); // drawn, not split
     });
   });
+
+  describe('Duplicate floor', () => {
+    it('copies the active floor to a new floor above in one undo step and saves it', async () => {
+      const api = apiStub();
+      const view = render(HomeEditorView, { api, devices });
+      await screen.findByRole('button', { name: /Ground/ });
+      await fireEvent.click(screen.getByRole('button', { name: 'Duplicate floor' }));
+
+      expect(screen.getByRole('application').getAttribute('aria-label')).toContain('Copy of Ground');
+      expect(screen.getByRole('button', { name: /Copy of Ground/ }).getAttribute('aria-pressed')).toBe('true');
+      const walls = view.container.querySelectorAll('.wall');
+      expect(walls).toHaveLength(1);
+      expect(walls[0].getAttribute('data-wall-id')).not.toBe(wallId); // a copy with its own ids
+      expect(screen.getByText('Kitchen', { selector: '.room-label' })).toBeTruthy();
+      expect(screen.getByText(/Duplicated Ground as Copy of Ground \(level 2\)/)).toBeTruthy();
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Save plan' }));
+      const saved = vi.mocked(api.savePlan).mock.calls[0][0];
+      expect(saved.floors.map((floor) => [floor.name, floor.level])).toEqual([['Ground', 0], ['Upstairs', 1], ['Copy of Ground', 2]]);
+      expect(saved.floors[2].ceiling_height_m).toBe(2.4);
+      expect(saved.floors[2].rooms[0].room_id).not.toBe(roomId);
+      expect(saved.floors[0].walls[0].wall_id).toBe(wallId); // the original is untouched
+      expect(api.putPlacement).not.toHaveBeenCalled(); // devices stay where they are
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(screen.queryByRole('button', { name: /Copy of Ground/ })).toBeNull();
+    });
+
+    it('numbers a second copy and duplicates an empty floor as an empty floor', async () => {
+      const view = render(HomeEditorView, { api: apiStub(), devices });
+      await screen.findByRole('button', { name: /^Ground/ });
+      await fireEvent.click(screen.getByRole('button', { name: 'Duplicate floor' }));
+      await fireEvent.click(screen.getByRole('button', { name: /^Ground/ }));
+      await fireEvent.click(screen.getByRole('button', { name: 'Duplicate floor' }));
+      expect(screen.getByRole('button', { name: /^Copy of Ground 2/ }).getAttribute('aria-pressed')).toBe('true');
+
+      await fireEvent.click(screen.getByRole('button', { name: /^Upstairs/ }));
+      await fireEvent.click(screen.getByRole('button', { name: 'Duplicate floor' }));
+      expect(screen.getByRole('button', { name: /^Copy of Upstairs/ }).getAttribute('aria-pressed')).toBe('true');
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(0);
+    });
+  });
 });

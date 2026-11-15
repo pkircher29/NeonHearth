@@ -3,7 +3,8 @@
   import { formatArea, formatLength, type HomeUnits } from '../homeUnits';
   import { floorArea } from '../home/rooms';
 
-  let { floors, active, onselect, onadd, units = 'metric' }: { floors: Floor[]; active: string | null; onselect: (floorId: string) => void; onadd: () => void; units?: HomeUnits } = $props();
+  let { floors, active, onselect, onadd, onduplicate, units = 'metric' }: { floors: Floor[]; active: string | null; onselect: (floorId: string) => void; onadd: () => void; onduplicate?: () => void; units?: HomeUnits } = $props();
+  const activeFloor = $derived(floors.find((floor) => floor.floor_id === active) ?? null);
 </script>
 
 <nav class="floor-bar" aria-label="Floors">
@@ -13,6 +14,10 @@
     </button>
   {/each}
   <button type="button" class="floor-add" onclick={onadd}>+ Add floor</button>
+  {#if onduplicate}
+    <button type="button" class="floor-add" disabled={!activeFloor} onclick={onduplicate}
+      title={activeFloor ? `Copies ${activeFloor.name} — walls, openings and rooms — to a new floor above. Devices stay where they are.` : 'Select a floor to duplicate'}>Duplicate floor</button>
+  {/if}
 </nav>
 
 <style>
@@ -23,5 +28,6 @@
   .floor-tab small{color:var(--muted);font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.06em}
   .floor-area{text-transform:none;color:var(--accent)}
   .floor-add{min-height:40px;padding:5px 12px;border:1px dashed var(--line-strong);border-radius:6px;background:transparent;color:var(--muted-strong);font:600 12px var(--font-display);cursor:pointer}
-  .floor-add:hover{border-color:var(--accent);color:var(--accent)}
+  .floor-add:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+  .floor-add:disabled{opacity:.4;cursor:not-allowed}
 </style>
