@@ -415,7 +415,7 @@ fn nbns(probe: &UdpProbe, b: &[u8]) -> Result<Vec<(String, String)>, ActiveError
         p = skip_name(b, p)?
             .checked_add(4)
             .filter(|end| *end <= b.len())
-            .ok_or(ActiveError::Network)?;
+            .ok_or(ActiveError::Protocol)?;
     }
     p = skip_name(b, p)?;
     if p + 10 > b.len() {
@@ -657,8 +657,5 @@ fn safe(v: &[u8]) -> String {
     bounded(&String::from_utf8_lossy(v))
 }
 fn bounded(v: &str) -> String {
-    v.chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_FACT_VALUE_BYTES)
-        .collect()
+    crate::sanitize::display_text(v, MAX_FACT_VALUE_BYTES)
 }

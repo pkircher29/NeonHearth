@@ -601,18 +601,19 @@ fn invalid_utf8_and_oversized_metadata_are_rejected() {
 fn invalid_tcp_data_offset_and_udp_declared_length_are_rejected() {
     let mut tcp = fs::read(fixtures().join("tcp-flow.pcap")).unwrap();
     tcp[40 + 14 + 20 + 12] = 0xf0;
-    assert!(
-        OfflinePassiveAdapter
-            .ingest_pcap("x", &tcp, &PassiveOptions::default())
-            .is_err()
-    );
+    // Malformed frames are skipped (and counted), not fatal for the whole capture.
+    let report = OfflinePassiveAdapter
+        .ingest_pcap_report("x", &tcp, &PassiveOptions::default())
+        .unwrap();
+    assert!(report.observations.is_empty());
+    assert_eq!(report.skipped_frames, 1);
     let mut udp = fs::read(fixtures().join("udp-flow.pcap")).unwrap();
     udp[40 + 14 + 20 + 4..40 + 14 + 20 + 6].copy_from_slice(&0xffffu16.to_be_bytes());
-    assert!(
-        OfflinePassiveAdapter
-            .ingest_pcap("x", &udp, &PassiveOptions::default())
-            .is_err()
-    );
+    let report = OfflinePassiveAdapter
+        .ingest_pcap_report("x", &udp, &PassiveOptions::default())
+        .unwrap();
+    assert!(report.observations.is_empty());
+    assert_eq!(report.skipped_frames, 1);
 }
 
 #[test]
@@ -965,11 +966,12 @@ fn pcap_input_and_record_aggregation_are_bounded() {
     for _ in 0..4097 {
         many.extend(record);
     }
-    assert!(
-        OfflinePassiveAdapter
-            .ingest_pcap("x", &many, &PassiveOptions::default())
-            .is_err()
-    );
+    // A long capture is examined up to the record cap and flagged, not rejected.
+    let report = OfflinePassiveAdapter
+        .ingest_pcap_report("x", &many, &PassiveOptions::default())
+        .unwrap();
+    assert!(report.truncated);
+    assert!(report.observations.len() <= 4096);
 }
 
 #[test]

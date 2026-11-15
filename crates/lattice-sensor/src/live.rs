@@ -1,4 +1,5 @@
 //! Deterministic live-bandwidth coalescing. Durable rollups remain the source of truth.
+//! No production caller feeds it traffic as of this change (see `flow.rs`).
 use crate::flow::{Resolution, Rollup, RollupChange, RollupKey};
 use chrono::{DateTime, Utc};
 use lattice_domain::{

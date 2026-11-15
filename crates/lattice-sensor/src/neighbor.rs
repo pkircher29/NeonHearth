@@ -22,6 +22,10 @@ impl TryFrom<[u8; 6]> for LinkAddress {
     }
 }
 impl LinkAddress {
+    /// True for locally administered (typically randomized or virtual) addresses.
+    pub fn is_locally_administered(self) -> bool {
+        self.0[0] & 2 != 0
+    }
     fn valid(self) -> bool {
         self.0 != [0; 6] && self.0 != [0xff; 6] && self.0[0] & 1 == 0
     }
@@ -172,6 +176,9 @@ pub struct NeighborSnapshotConfig {
     max_rows: usize,
     allowed_interfaces: BTreeSet<InterfaceId>,
     max_raw_messages: usize,
+    /// Attached IPv4 networks per interface; rows naming their network or broadcast address
+    /// are dropped. Empty means "unknown", which disables the check.
+    networks: Vec<(InterfaceId, crate::Address)>,
 }
 impl NeighborSnapshotConfig {
     /// The source accepts at most four raw messages per requested output row.
@@ -197,7 +204,22 @@ impl NeighborSnapshotConfig {
             max_rows,
             allowed_interfaces,
             max_raw_messages,
+            networks: Vec::new(),
         })
+    }
+
+    /// Supplies the attached networks so subnet network/broadcast addresses are not
+    /// reported as neighbors (a spoofed ARP entry for them would otherwise become a target).
+    #[must_use]
+    pub fn with_networks(mut self, networks: Vec<(InterfaceId, crate::Address)>) -> Self {
+        self.networks = networks;
+        self
+    }
+
+    fn is_network_or_broadcast(&self, interface: InterfaceId, ip: IpAddr) -> bool {
+        self.networks
+            .iter()
+            .any(|(id, network)| *id == interface && crate::is_network_or_broadcast(network, ip))
     }
 
     pub fn max_raw_messages(&self) -> usize {
@@ -282,9 +304,11 @@ fn normalize_raw_rows(
     let mut rows = Vec::new();
     let mut count = 0usize;
     for r in raw {
-        count = count.checked_add(1).ok_or(NeighborError::Capacity)?;
+        count = count.saturating_add(1);
         if count > config.max_raw_messages() {
-            return Err(NeighborError::Capacity);
+            // A flooded neighbor table must degrade, not blind discovery: keep the rows that
+            // fit the raw budget and drop the rest.
+            break;
         }
         if r.ifindex == 0
             || !config
@@ -303,7 +327,7 @@ fn normalize_raw_rows(
             ADDRESS_FAMILY_INET6 => IpAddr::V6(Ipv6Addr::from(r.address)),
             _ => return Err(NeighborError::Malformed),
         };
-        if !valid_ip(ip) {
+        if !valid_ip(ip) || config.is_network_or_broadcast(InterfaceId::new(r.ifindex), ip) {
             continue;
         }
         if r.mac.len() != 6 {
@@ -332,9 +356,8 @@ fn normalize_raw_rows(
             .then(reachability_rank(a.reachability).cmp(&reachability_rank(b.reachability)))
     });
     rows.dedup();
-    if rows.len() > config.max_rows() {
-        return Err(NeighborError::Capacity);
-    }
+    // Deterministic: rows are sorted by interface, link address, then IP.
+    rows.truncate(config.max_rows());
     Ok(rows)
 }
 
@@ -419,11 +442,10 @@ fn windows_snapshot(config: &NeighborSnapshotConfig) -> Result<Vec<NeighborRow>,
     let _guard = Guard(table);
     // SAFETY: `table` is a successful non-null MIB_IPNET_TABLE2 allocation owned by `_guard`.
     let count = unsafe { (*table).NumEntries as usize };
-    if count > config.max_raw_messages()
-        || count > isize::MAX as usize / size_of::<MIB_IPNET_ROW2>()
-    {
-        return Err(NeighborError::Capacity);
-    }
+    // Clamp rather than fail: an oversized table keeps its first rows.
+    let count = count
+        .min(config.max_raw_messages())
+        .min(isize::MAX as usize / size_of::<MIB_IPNET_ROW2>());
     // SAFETY: `table` is a successful non-null MIB_IPNET_TABLE2 allocation owned by `_guard`.
     let first = unsafe { (*table).Table.as_ptr() };
     let mut raw_rows = Vec::new();
@@ -557,9 +579,9 @@ where
     let mut raw_count = 0usize;
     let mut raw_rows = Vec::new();
     for message in messages {
-        raw_count = raw_count.checked_add(1).ok_or(NeighborError::Capacity)?;
+        raw_count = raw_count.saturating_add(1);
         if raw_count > config.max_raw_messages() {
-            return Err(NeighborError::Capacity);
+            break;
         }
         if let Some(row) = decode_linux_message_raw(config, message)? {
             raw_rows.push(row);
@@ -592,7 +614,9 @@ impl NeighborSnapshotSource for SystemNeighborSnapshotSource {
                 .map_err(|_| NeighborError::Transport)?
             {
                 if messages.len() >= self.config.max_raw_messages() {
-                    return Err(NeighborError::Capacity);
+                    // Keep draining the dump (the netlink socket must be read to its end)
+                    // but retain only what the budget allows.
+                    continue;
                 }
                 messages.push(message);
             }
@@ -681,6 +705,17 @@ impl fmt::Debug for NeighborEvent {
 struct State {
     device: NeighborDevice,
     missed: usize,
+    /// Consecutive snapshots in which every row for this device was only `Stale`.
+    stale_streak: usize,
+}
+
+/// A device kept "present" only by `Stale` cache entries is treated as missed after this many
+/// consecutive snapshots. Stale entries survive for minutes after a device leaves (Windows)
+/// and are never refreshed without traffic, so they cannot prove presence indefinitely.
+const MAX_STALE_SNAPSHOTS: usize = 60;
+
+fn fresh(reachability: NeighborReachability) -> bool {
+    reachability.present() && reachability != NeighborReachability::Stale
 }
 #[derive(Clone)]
 pub struct NeighborTracker {
@@ -709,10 +744,11 @@ impl NeighborTracker {
         if self.last_observed_at.is_some_and(|last| observed_at < last) {
             return Err(NeighborError::ClockRollback);
         }
-        if rows.len() > self.cfg.max_rows {
-            return Err(NeighborError::Capacity);
-        }
-        let mut grouped: BTreeMap<(InterfaceId, LinkAddress), Vec<IpAddr>> = BTreeMap::new();
+        let mut rows = rows;
+        // Overflow keeps the first rows in snapshot order instead of failing the cycle.
+        rows.truncate(self.cfg.max_rows);
+        let mut grouped: BTreeMap<(InterfaceId, LinkAddress), (Vec<IpAddr>, bool)> =
+            BTreeMap::new();
         let mut ips: BTreeMap<(InterfaceId, IpAddr), LinkAddress> = BTreeMap::new();
         for r in rows {
             if !valid_ip(r.ip) {
@@ -729,27 +765,45 @@ impl NeighborTracker {
             if !r.reachability.present() {
                 continue;
             }
-            grouped
+            let entry = grouped
                 .entry((r.interface, r.link_address))
-                .or_default()
-                .push(r.ip);
+                .or_insert_with(|| (Vec::new(), false));
+            entry.0.push(r.ip);
+            entry.1 |= fresh(r.reachability);
         }
-        if grouped.len() > self.cfg.max_devices {
-            return Err(NeighborError::Capacity);
+        // Devices held present only by Stale entries for too long are treated as absent.
+        let expired: Vec<_> = grouped
+            .iter()
+            .filter(|(key, (_, is_fresh))| {
+                !*is_fresh
+                    && self
+                        .states
+                        .get(key)
+                        .is_some_and(|s| s.stale_streak >= MAX_STALE_SNAPSHOTS)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in expired {
+            grouped.remove(&key);
         }
-        let present: std::collections::BTreeSet<_> = grouped.keys().copied().collect();
+        // Capacity: known devices always stay; new ones are admitted in key order while there
+        // is room. A flood of spoofed neighbors cannot evict or blind real ones.
         let mut next = self.states.clone();
-        let new_count = grouped.keys().filter(|key| !next.contains_key(key)).count();
-        if next
-            .len()
-            .checked_add(new_count)
-            .is_none_or(|n| n > self.cfg.max_devices)
-        {
-            return Err(NeighborError::Capacity);
-        }
+        let mut room = self.cfg.max_devices.saturating_sub(next.len());
+        grouped.retain(|key, _| {
+            if next.contains_key(key) {
+                true
+            } else if room > 0 {
+                room -= 1;
+                true
+            } else {
+                false
+            }
+        });
+        let present: std::collections::BTreeSet<_> = grouped.keys().copied().collect();
         // Events are stable: present devices are key-sorted first, then absent devices key-sorted.
         let mut events = Vec::new();
-        for (key, mut addrs) in grouped {
+        for (key, (mut addrs, is_fresh)) in grouped {
             addrs.sort();
             addrs.dedup();
             let device = NeighborDevice {
@@ -761,6 +815,7 @@ impl NeighborTracker {
                 Some(s) => {
                     s.device = device.clone();
                     s.missed = 0;
+                    s.stale_streak = if is_fresh { 0 } else { s.stale_streak + 1 };
                     events.push(NeighborEvent::Confirmed {
                         device,
                         observed_at,
@@ -772,6 +827,7 @@ impl NeighborTracker {
                         State {
                             device: device.clone(),
                             missed: 0,
+                            stale_streak: usize::from(!is_fresh),
                         },
                     );
                     events.push(NeighborEvent::Appeared {
@@ -852,9 +908,12 @@ mod tests {
             Err(NeighborError::Malformed)
         );
         assert!(!format!("{:?}", NeighborError::Malformed).contains("192.168"));
+        // Overflow degrades to a bounded result instead of failing the whole snapshot.
         assert_eq!(
-            normalize_raw_rows(&c, std::iter::repeat_n(r, c.max_raw_messages() + 1)),
-            Err(NeighborError::Capacity)
+            normalize_raw_rows(&c, std::iter::repeat_n(r, c.max_raw_messages() + 1))
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -988,16 +1047,21 @@ mod tests {
         }
 
         let third = raw(2, ADDRESS_FAMILY_INET, v4(4), vec![2, 0, 0, 0, 0, 4], 5);
+        // Over max_rows the deterministic prefix is kept (this fixture previously errored).
         assert_eq!(
-            normalize_raw_rows(&config, [first.clone(), second.clone(), third]),
-            Err(NeighborError::Capacity)
+            normalize_raw_rows(&config, [first.clone(), second.clone(), third])
+                .unwrap()
+                .len(),
+            2
         );
         assert_eq!(
             normalize_raw_rows(
                 &config,
                 std::iter::repeat_n(first, config.max_raw_messages() + 1),
-            ),
-            Err(NeighborError::Capacity)
+            )
+            .unwrap()
+            .len(),
+            1
         );
         assert!(!format!("{:?}", rows[0]).contains("fd00"));
         assert_eq!(
@@ -1321,12 +1385,12 @@ mod tests {
                 .unwrap(),
             ]
         );
-        assert_eq!(
+        assert!(
             normalize_linux_messages(
                 &config,
                 std::iter::repeat_n(first, config.max_raw_messages() + 1)
-            ),
-            Err(NeighborError::Capacity)
+            )
+            .is_ok()
         );
     }
 
@@ -1340,6 +1404,102 @@ mod tests {
         assert!(matches!(
             NeighborSnapshotConfig::new(usize::MAX, [InterfaceId::new(2)]),
             Err(NeighborError::InvalidConfig)
+        ));
+    }
+
+    #[test]
+    fn rows_naming_attached_network_or_broadcast_addresses_are_dropped() {
+        let config = NeighborSnapshotConfig::new(8, [InterfaceId::new(2)])
+            .unwrap()
+            .with_networks(vec![(
+                InterfaceId::new(2),
+                crate::Address {
+                    ip: "192.168.1.10".parse().unwrap(),
+                    prefix: 24,
+                },
+            )]);
+        let v4 = |last| {
+            let mut address = [0; 16];
+            address[..4].copy_from_slice(&[192, 168, 1, last]);
+            address
+        };
+        for last in [0u8, 255] {
+            assert!(
+                normalize_raw_rows(
+                    &config,
+                    [raw(
+                        2,
+                        ADDRESS_FAMILY_INET,
+                        v4(last),
+                        vec![2, 0, 0, 0, 0, 7],
+                        5
+                    )]
+                )
+                .unwrap()
+                .is_empty(),
+                "{last}"
+            );
+        }
+        assert_eq!(
+            normalize_raw_rows(
+                &config,
+                [raw(
+                    2,
+                    ADDRESS_FAMILY_INET,
+                    v4(77),
+                    vec![2, 0, 0, 0, 0, 7],
+                    5
+                )]
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_only_devices_stop_counting_as_present_after_the_cap() {
+        let mut tracker = NeighborTracker::new(NeighborTrackerConfig::default()).unwrap();
+        let row = |state| {
+            NeighborRow::new(
+                InterfaceId::new(2),
+                "192.168.1.2".parse().unwrap(),
+                LinkAddress::try_from([0x02, 0, 0, 0, 0, 1]).unwrap(),
+                state,
+            )
+            .unwrap()
+        };
+        let mut second = 0;
+        let mut at = || {
+            second += 1;
+            Utc.timestamp_opt(second, 0).unwrap()
+        };
+        tracker
+            .observe(vec![row(NeighborReachability::Reachable)], at())
+            .unwrap();
+        let mut confirmed = 0;
+        let mut missed = false;
+        for _ in 0..(MAX_STALE_SNAPSHOTS + 3) {
+            for event in tracker
+                .observe(vec![row(NeighborReachability::Stale)], at())
+                .unwrap()
+            {
+                match event {
+                    NeighborEvent::Confirmed { .. } => confirmed += 1,
+                    NeighborEvent::Missed { .. } => missed = true,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(confirmed, MAX_STALE_SNAPSHOTS);
+        assert!(missed, "Stale-only presence must lapse");
+        // A fresh row restores it immediately.
+        assert!(matches!(
+            tracker
+                .observe(vec![row(NeighborReachability::Reachable)], at())
+                .unwrap()
+                .as_slice(),
+            [NeighborEvent::Confirmed { .. }]
         ));
     }
 }

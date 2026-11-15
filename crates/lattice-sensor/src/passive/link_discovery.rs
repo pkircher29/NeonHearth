@@ -67,10 +67,10 @@ fn text(b: &[u8]) -> Result<String, PassiveParseError> {
     if b.len() > 512 {
         return Err(PassiveParseError::Metadata);
     }
-    Ok(String::from_utf8_lossy(b)
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect())
+    Ok(crate::sanitize::display_text(
+        &String::from_utf8_lossy(b),
+        usize::MAX,
+    ))
 }
 fn identifier(b: &[u8]) -> Result<String, PassiveParseError> {
     if b.len() < 2 || b.len() > 256 || !(1..=7).contains(&b[0]) {
