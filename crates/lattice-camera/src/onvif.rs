@@ -466,15 +466,17 @@ pub struct BoundedMetadata(String);
 
 /// True for `password=x`, `passwd: x`, `token = x` style text.
 fn looks_like_credential_assignment(normalized: &str) -> bool {
-    ["password", "passwd", "pwd", "token", "secret", "apikey", "api_key"]
-        .iter()
-        .any(|word| {
-            normalized.match_indices(word).any(|(at, _)| {
-                normalized[at + word.len()..]
-                    .trim_start()
-                    .starts_with([':', '='])
-            })
+    [
+        "password", "passwd", "pwd", "token", "secret", "apikey", "api_key",
+    ]
+    .iter()
+    .any(|word| {
+        normalized.match_indices(word).any(|(at, _)| {
+            normalized[at + word.len()..]
+                .trim_start()
+                .starts_with([':', '='])
         })
+    })
 }
 
 impl BoundedMetadata {

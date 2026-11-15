@@ -1,10 +1,11 @@
 use crate::SourceTrust;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::header::{ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+#[cfg(any(test, feature = "test-support"))]
+use std::{collections::VecDeque, sync::Mutex};
 use std::{
-    collections::VecDeque,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration as StdDuration,
 };
 use url::Url;
