@@ -351,9 +351,13 @@ impl CleanupResources {
     }
 
     /// Converts a fully launched set of resources into a managed session.
-    fn into_session(mut self, camera: CameraId, stream: StreamId) -> Result<ManagedSession, Self> {
+    fn into_session(
+        mut self,
+        camera: CameraId,
+        stream: StreamId,
+    ) -> Result<ManagedSession, Box<Self>> {
         if self.process.is_none() || self.proxy.is_none() || self.output_dir.is_none() {
-            return Err(self);
+            return Err(Box::new(self));
         }
         let now = Instant::now();
         match (
@@ -372,12 +376,12 @@ impl CleanupResources {
                 proxy,
                 _permit: permit,
             }),
-            (process, proxy, output_dir, permit) => Err(Self {
+            (process, proxy, output_dir, permit) => Err(Box::new(Self {
                 process,
                 proxy,
                 output_dir,
                 permit,
-            }),
+            })),
         }
     }
 
@@ -663,7 +667,7 @@ impl CameraSessionManager {
             }
             Err(resources) => {
                 drop(sessions);
-                let _ = self.cleanup_or_retain(session, resources, 0).await;
+                let _ = self.cleanup_or_retain(session, *resources, 0).await;
                 Err(CameraSessionError::Unavailable)
             }
         }
