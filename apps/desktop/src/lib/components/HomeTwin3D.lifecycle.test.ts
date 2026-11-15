@@ -89,7 +89,7 @@ describe('HomeTwin3D context loss', () => {
 });
 
 describe('HomeTwin3D pointer robustness', () => {
-  const orbit = async (view: ReturnType<typeof render>, move: () => Promise<unknown>) => {
+  const orbit = async (view: { container: HTMLElement }, move: () => Promise<unknown>) => {
     await fireEvent.pointerDown(stage(view.container), { clientX: 100, clientY: 100, button: 0, buttons: 1, pointerId: 1 });
     await move();
   };

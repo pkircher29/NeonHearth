@@ -10,6 +10,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { settled } from './fixtures/isolation';
 
 const OUT = resolve(process.cwd(), '../../output/flow-map');
 const CONNECTION = process.env.NH_LIVE_CONNECTION ?? '';
@@ -71,7 +72,7 @@ test.describe('flow map against the live service', () => {
     await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
     const flow = page.getByRole('img', { name: /Network flow map/ });
     await expect(flow).toHaveAttribute('aria-label', /showing this computer only/, { timeout: 45000 });
-    await page.waitForTimeout(20000);
+    await settled(page);
     const label = (await flow.getAttribute('aria-label')) ?? '';
     console.log('REAL_ARIA', label.slice(0, 400));
     console.log('REAL_GROUPS', await page.evaluate(() => document.querySelector('canvas') ? 'canvas-ok' : 'no-canvas'));
@@ -93,7 +94,7 @@ test.describe('flow map against the live service', () => {
     }));
     console.log('REAL_FRAME_STATS', JSON.stringify(stats));
     await page.getByRole('button', { name: /Pause decorative animation/ }).click();
-    await page.waitForTimeout(800);
+    await settled(page);
     await shoot(page, '10-real-paused');
     expect(errors).toEqual([]);
     await context.close();
@@ -103,7 +104,7 @@ test.describe('flow map against the live service', () => {
     await installLive(mobile);
     await mobile.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
     await expect(mobile.getByRole('img', { name: /Network flow map/ })).toHaveAttribute('aria-label', /showing this computer only/, { timeout: 45000 });
-    await mobile.waitForTimeout(12000);
+    await settled(mobile);
     await shoot(mobile, '11-real-mobile');
     expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await phone.close();
