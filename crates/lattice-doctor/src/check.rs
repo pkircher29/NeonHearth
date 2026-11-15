@@ -9,6 +9,7 @@
 
 use crate::DoctorError;
 use crate::probe::{DnsFailureReason, LeaseState, MAX_PROBE_TIMEOUT_MS, RouteEntry};
+use crate::types::{IpVersion, MacAddr};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -205,7 +206,7 @@ pub enum CheckDetail {
     },
     DuplicateIp {
         address: String,
-        macs: Vec<String>,
+        macs: Vec<MacAddr>,
     },
     Wifi {
         wireless: bool,
@@ -224,8 +225,10 @@ pub enum CheckDetail {
         median_rtt_ms: Option<f64>,
     },
     Mtu {
-        largest_passing_bytes: Option<u16>,
-        smallest_failing_bytes: Option<u16>,
+        /// ICMP payload sizes (not link MTUs); see [`IpVersion::icmp_overhead`].
+        largest_passing_payload_bytes: Option<u16>,
+        smallest_failing_payload_bytes: Option<u16>,
+        ip_version: IpVersion,
     },
     Dns {
         resolvers: Vec<ResolverEvidence>,

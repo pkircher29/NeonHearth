@@ -53,7 +53,12 @@ impl TargetAddress {
                     )
             })
             && !path.split('/').any(|part| matches!(part, "." | ".."));
-        if port == 0 || !valid_path {
+        // A camera is a LAN host: never this machine, "any", or a group address.
+        let routable = !(address.is_loopback()
+            || address.is_unspecified()
+            || address.is_multicast()
+            || matches!(address, IpAddr::V4(ip) if ip.is_broadcast()));
+        if port == 0 || !valid_path || !routable {
             return Err(OnvifError::InvalidTarget);
         }
         Ok(Self {
@@ -459,6 +464,21 @@ impl<'de> Deserialize<'de> for StreamSourceRef {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BoundedMetadata(String);
 
+/// True for `password=x`, `passwd: x`, `token = x` style text.
+fn looks_like_credential_assignment(normalized: &str) -> bool {
+    [
+        "password", "passwd", "pwd", "token", "secret", "apikey", "api_key",
+    ]
+    .iter()
+    .any(|word| {
+        normalized.match_indices(word).any(|(at, _)| {
+            normalized[at + word.len()..]
+                .trim_start()
+                .starts_with([':', '='])
+        })
+    })
+}
+
 impl BoundedMetadata {
     pub fn new(value: impl AsRef<str>) -> Result<Self, OnvifError> {
         let value = value.as_ref().trim();
@@ -466,10 +486,15 @@ impl BoundedMetadata {
         if value.is_empty()
             || value.len() > MAX_PUBLIC_TEXT_BYTES
             || value.chars().any(char::is_control)
-            || value.contains('@')
-            || ["://", "authorization", "password", "bearer"]
-                .iter()
-                .any(|marker| normalized.contains(marker))
+            // Reject only secret-shaped text: URLs (embedded user:password@host),
+            // auth header shapes, and credential assignments. Product names
+            // may legitimately contain "password" or "@" on their own.
+            || normalized.contains("://")
+            || normalized.contains("authorization")
+            || normalized.contains("bearer ")
+            || normalized.starts_with("basic ")
+            || (value.contains('@') && value.contains(':'))
+            || looks_like_credential_assignment(&normalized)
         {
             return Err(OnvifError::InvalidMetadata);
         }
@@ -580,10 +605,10 @@ impl Default for InventoryLimits {
     fn default() -> Self {
         Self {
             max_request_bytes: 16 * 1024,
-            max_response_bytes: 64 * 1024,
+            max_response_bytes: 256 * 1024,
             max_xml_depth: 32,
             max_facts: 16,
-            max_events: 2_048,
+            max_events: 8_192,
             max_profiles: 16,
             max_capabilities: 16,
             max_field_bytes: MAX_PUBLIC_TEXT_BYTES,
@@ -825,7 +850,12 @@ fn parse_envelope(
     let body = &root.children[1];
     require_name(header, SOAP, "Header")?;
     require_name(body, SOAP, "Body")?;
-    if !header.attributes.is_empty() || !header.text.trim().is_empty() || header.children.len() != 2
+    // Real devices add MessageID, To, security and vendor header blocks; only
+    // the correlated Action and RelatesTo are required, each exactly once.
+    if !header.attributes.is_empty()
+        || !header.text.trim().is_empty()
+        || header.children.len() < 2
+        || header.children.len() > limits.max_facts
     {
         return Err(OnvifError::InvalidResponse);
     }
@@ -858,6 +888,8 @@ fn parse_xml(bytes: &[u8], limits: &InventoryLimits) -> Result<XmlNode, OnvifErr
     reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = true;
     let mut stack: Vec<XmlNode> = Vec::new();
+    // Raw (escaped) text bytes seen per open element, bounded like decoded text.
+    let mut wire: Vec<usize> = Vec::new();
     let mut root = None;
     let mut declaration_seen = false;
     let mut events = 0usize;
@@ -879,6 +911,7 @@ fn parse_xml(bytes: &[u8], limits: &InventoryLimits) -> Result<XmlNode, OnvifErr
                 }
                 let node = node_from_start(&reader, start, event_namespace, max_retained)?;
                 stack.push(node);
+                wire.push(0);
             }
             Event::Empty(start) => {
                 if stack.len() >= limits.max_xml_depth {
@@ -897,7 +930,11 @@ fn parse_xml(bytes: &[u8], limits: &InventoryLimits) -> Result<XmlNode, OnvifErr
                     return Err(OnvifError::InvalidResponse);
                 }
                 if let Some(node) = stack.last_mut() {
-                    if node.text.len().saturating_add(decoded.len()) > max_retained {
+                    let raw = wire.last_mut().ok_or(OnvifError::InvalidResponse)?;
+                    *raw = raw.saturating_add(text.as_ref().len());
+                    if *raw > max_retained
+                        || node.text.len().saturating_add(decoded.len()) > max_retained
+                    {
                         return Err(OnvifError::InvalidResponse);
                     }
                     node.text.push_str(&decoded);
@@ -905,12 +942,44 @@ fn parse_xml(bytes: &[u8], limits: &InventoryLimits) -> Result<XmlNode, OnvifErr
                     return Err(OnvifError::InvalidResponse);
                 }
             }
+            Event::GeneralRef(reference) => {
+                // The five predefined entities and numeric character
+                // references only. A document type declaration is rejected, so
+                // no other entity can be defined or expanded.
+                let character = match reference
+                    .resolve_char_ref()
+                    .map_err(|_| OnvifError::InvalidResponse)?
+                {
+                    Some(character) => character,
+                    None => match &*reference {
+                        b"lt" => '<',
+                        b"gt" => '>',
+                        b"amp" => '&',
+                        b"apos" => '\'',
+                        b"quot" => '"',
+                        _ => return Err(OnvifError::InvalidResponse),
+                    },
+                };
+                if character.is_control() && !matches!(character, '\t' | '\n' | '\r') {
+                    return Err(OnvifError::InvalidResponse);
+                }
+                let node = stack.last_mut().ok_or(OnvifError::InvalidResponse)?;
+                let raw = wire.last_mut().ok_or(OnvifError::InvalidResponse)?;
+                *raw = raw.saturating_add(reference.len() + 2);
+                if *raw > max_retained
+                    || node.text.len().saturating_add(character.len_utf8()) > max_retained
+                {
+                    return Err(OnvifError::InvalidResponse);
+                }
+                node.text.push(character);
+            }
             Event::End(end) => {
                 let closing = XmlName {
                     namespace: event_namespace,
                     local: bounded_utf8(end.local_name().as_ref(), MAX_XML_NAME_BYTES)?,
                 };
                 let node = stack.pop().ok_or(OnvifError::InvalidResponse)?;
+                wire.pop();
                 if node.name != closing {
                     return Err(OnvifError::InvalidResponse);
                 }
@@ -944,7 +1013,6 @@ fn parse_xml(bytes: &[u8], limits: &InventoryLimits) -> Result<XmlNode, OnvifErr
             | Event::PI(_)
             | Event::DocType(_)
             | Event::CData(_)
-            | Event::GeneralRef(_)
             | Event::Decl(_) => {
                 return Err(OnvifError::InvalidResponse);
             }
@@ -1097,10 +1165,13 @@ fn parse_device_information(
     ];
     let mut seen = BTreeSet::new();
     for child in &response.children {
+        // Vendor extensions are ignored; known facts may appear once each.
         if child.name.namespace.as_deref() != Some(DEVICE)
             || !allowed.contains(&child.name.local.as_str())
-            || !seen.insert(child.name.local.as_str())
         {
+            continue;
+        }
+        if !seen.insert(child.name.local.as_str()) {
             return Err(OnvifError::InvalidResponse);
         }
         let _ = leaf_text(child, limits.max_field_bytes)?;
@@ -1109,7 +1180,9 @@ fn parse_device_information(
         response
             .children
             .iter()
-            .find(|child| child.name.local == name)
+            .find(|child| {
+                child.name.namespace.as_deref() == Some(DEVICE) && child.name.local == name
+            })
             .map(|child| BoundedMetadata::new(leaf_text(child, limits.max_field_bytes)?))
             .transpose()
             .map_err(|_| OnvifError::InvalidResponse)
@@ -1117,7 +1190,9 @@ fn parse_device_information(
     let serial = response
         .children
         .iter()
-        .find(|child| child.name.local == "SerialNumber")
+        .find(|child| {
+            child.name.namespace.as_deref() == Some(DEVICE) && child.name.local == "SerialNumber"
+        })
         .map(|child| BoundedSerial::new(leaf_text(child, limits.max_field_bytes)?))
         .transpose()
         .map_err(|_| OnvifError::InvalidResponse)?;
@@ -1151,13 +1226,16 @@ fn parse_capabilities(
     let mut seen = BTreeSet::new();
     let mut output = Vec::with_capacity(capabilities.children.len());
     for capability in &capabilities.children {
+        // Extension blocks and unknown capability groups are ignored.
         if capability.name.namespace.as_deref() != Some(SCHEMA)
             || !matches!(
                 capability.name.local.as_str(),
                 "Analytics" | "Device" | "Events" | "Imaging" | "Media" | "PTZ"
             )
-            || !seen.insert(capability.name.local.as_str())
         {
+            continue;
+        }
+        if !seen.insert(capability.name.local.as_str()) {
             return Err(OnvifError::InvalidResponse);
         }
         output.push(
@@ -1250,8 +1328,10 @@ fn parse_health(
                 child.name.local.as_str(),
                 "DateTimeType" | "DaylightSavings" | "TimeZone" | "UTCDateTime" | "LocalDateTime"
             )
-            || !seen.insert(child.name.local.as_str())
         {
+            continue;
+        }
+        if !seen.insert(child.name.local.as_str()) {
             return Err(OnvifError::InvalidResponse);
         }
     }

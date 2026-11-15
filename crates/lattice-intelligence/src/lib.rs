@@ -632,32 +632,49 @@ impl IdentityEngine {
     pub fn resolve(&self, id: DeviceId) -> Result<DeviceId, IdentityError> {
         Ok(canon(&self.component(id)?))
     }
+    /// Union-find over the active merge edges: near-linear in devices + edges,
+    /// so the usable size is `max_devices` rather than a V*E work budget.
+    fn roots(&self) -> HashMap<DeviceId, DeviceId> {
+        fn find(parent: &mut HashMap<DeviceId, DeviceId>, mut x: DeviceId) -> DeviceId {
+            while let Some(&p) = parent.get(&x) {
+                if p == x {
+                    break;
+                }
+                let grand = parent.get(&p).copied().unwrap_or(p);
+                parent.insert(x, grand);
+                x = grand;
+            }
+            x
+        }
+        let mut parent: HashMap<DeviceId, DeviceId> =
+            self.facts.keys().map(|id| (*id, *id)).collect();
+        for e in self.edges.values().filter(|e| e.active) {
+            if parent.contains_key(&e.a) && parent.contains_key(&e.b) {
+                let (ra, rb) = (find(&mut parent, e.a), find(&mut parent, e.b));
+                if ra != rb {
+                    parent.insert(ra, rb);
+                }
+            }
+        }
+        let ids: Vec<DeviceId> = parent.keys().copied().collect();
+        let mut out = HashMap::with_capacity(ids.len());
+        for id in ids {
+            let root = find(&mut parent, id);
+            out.insert(id, root);
+        }
+        out
+    }
     fn component(&self, id: DeviceId) -> Result<Vec<DeviceId>, IdentityError> {
         if !self.facts.contains_key(&id) {
             return Err(IdentityError::DeviceNotFound);
         }
-        if self.facts.len().saturating_mul(self.edges.len().max(1)) > self.cfg.max_candidate_work {
-            return Err(IdentityError::Capacity("graph work"));
-        }
-        let mut seen = HashSet::from([id]);
-        let mut q = VecDeque::from([id]);
-        while let Some(x) = q.pop_front() {
-            for e in self.edges.values().filter(|e| e.active) {
-                let y = if e.a == x {
-                    Some(e.b)
-                } else if e.b == x {
-                    Some(e.a)
-                } else {
-                    None
-                };
-                if let Some(y) = y
-                    && seen.insert(y)
-                {
-                    q.push_back(y)
-                }
-            }
-        }
-        let mut v: Vec<_> = seen.into_iter().collect();
+        let roots = self.roots();
+        let root = roots[&id];
+        let mut v: Vec<_> = roots
+            .iter()
+            .filter(|(_, r)| **r == root)
+            .map(|(d, _)| *d)
+            .collect();
         v.sort_by_key(ToString::to_string);
         Ok(v)
     }
@@ -665,16 +682,17 @@ impl IdentityEngine {
         if self.edges.len() > self.cfg.max_merge_edges {
             return Err(IdentityError::Capacity("graph"));
         }
+        let roots = self.roots();
         let mut ids: Vec<_> = self.facts.keys().copied().collect();
         ids.sort_by_key(ToString::to_string);
-        let mut seen: HashSet<DeviceId> = HashSet::new();
-        let mut out = vec![];
+        let mut index: HashMap<DeviceId, usize> = HashMap::new();
+        let mut out: Vec<Vec<DeviceId>> = vec![];
         for id in ids {
-            if !seen.contains(&id) {
-                let c = self.component(id)?;
-                seen.extend(c.iter().copied());
-                out.push(c)
-            }
+            let slot = *index.entry(roots[&id]).or_insert_with(|| {
+                out.push(vec![]);
+                out.len() - 1
+            });
+            out[slot].push(id);
         }
         Ok(out)
     }
@@ -714,11 +732,23 @@ impl IdentityEngine {
     ) -> Result<Option<Identification>, IdentityError> {
         let c = self.component(id)?;
         let refs = self.refs(&c)?;
-        let active: Vec<_> = refs
+        let live: Vec<_> = refs
             .into_iter()
             .filter(|f| {
                 f.expires_at.is_none_or(|x| x > now) && f.family != EvidenceFamily::RouterHint
             })
+            .collect();
+        // Recency: a family's newer observation of a key supersedes its older
+        // ones, so a changed attribute is not held hostage by stale evidence.
+        let newest: HashMap<(EvidenceFamily, &str), DateTime<Utc>> =
+            live.iter().fold(HashMap::new(), |mut m, f| {
+                let slot = m.entry((f.family, f.key.as_str())).or_insert(f.observed_at);
+                *slot = (*slot).max(f.observed_at);
+                m
+            });
+        let active: Vec<_> = live
+            .into_iter()
+            .filter(|f| newest[&(f.family, f.key.as_str())] == f.observed_at)
             .collect();
         let own = |k: &str| {
             self.owners
@@ -734,6 +764,7 @@ impl IdentityEngine {
                 .max_by(|a, b| {
                     a.confidence
                         .total_cmp(&b.confidence)
+                        .then(a.observed_at.cmp(&b.observed_at))
                         .then(a.value.cmp(&b.value))
                 })
         };
@@ -770,18 +801,29 @@ impl IdentityEngine {
                 return Ok(None);
             }
         }
-        let mut fam: Vec<_> = active
-            .iter()
-            .filter(|f| {
-                ((f.key == "vendor" && f.value == vendor) || (f.key == "class" && f.value == class))
-                    && f.confidence >= self.cfg.auto_identification_threshold
-            })
-            .map(|x| x.family)
-            .collect();
-        sortfam(&mut fam);
-        if (ov.is_none() || oc.is_none()) && fam.len() < 2 {
+        // Each machine-derived key needs two independent families agreeing on
+        // the chosen value; one family corroborating two keys is not enough.
+        let supporting = |k: &str, val: &str| {
+            let mut fam: Vec<_> = active
+                .iter()
+                .filter(|f| {
+                    f.key == k
+                        && f.value == val
+                        && f.confidence >= self.cfg.auto_identification_threshold
+                })
+                .map(|x| x.family)
+                .collect();
+            sortfam(&mut fam);
+            fam
+        };
+        let vendor_families = supporting("vendor", vendor);
+        let class_families = supporting("class", class);
+        if (ov.is_none() && vendor_families.len() < 2) || (oc.is_none() && class_families.len() < 2)
+        {
             return Ok(None);
         }
+        let mut fam: Vec<_> = vendor_families.into_iter().chain(class_families).collect();
+        sortfam(&mut fam);
         Ok(Some(Identification {
             vendor: vendor.into(),
             device_class: class.into(),
@@ -865,8 +907,14 @@ impl IdentityEngine {
         families: Vec<EvidenceFamily>,
         reasons: Vec<String>,
     ) -> Result<u64, IdentityError> {
+        // A device merged with itself is meaningless and makes a checkpoint
+        // that cannot be restored. Pairs already in one component are allowed:
+        // redundant edges are what keep an undo from splitting a diamond.
         self.resolve(a)?;
         self.resolve(b)?;
+        if a == b {
+            return Err(IdentityError::InvalidInput("merge target"));
+        }
         validprop(score, &families, &reasons)?;
         self.preprops(1)?;
         Ok(self.insert_prop(a, b, score, families, reasons))

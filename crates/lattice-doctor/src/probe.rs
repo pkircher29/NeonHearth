@@ -6,6 +6,7 @@
 //! implementation, and tests supply [`FakeProbeTransport`].
 
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 use utoipa::ToSchema;
 
@@ -154,44 +155,51 @@ pub trait ProbeTransport: Send + Sync {
     ) -> impl std::future::Future<Output = Result<ProbeResponse, ProbeError>> + Send;
 }
 
-/// In-memory transport for tests: answers from a handler and logs every probe.
-pub struct FakeProbeTransport {
-    #[allow(clippy::type_complexity)]
-    handler: Box<dyn Fn(&ProbeRequest) -> Result<ProbeResponse, ProbeError> + Send + Sync>,
-    log: Mutex<Vec<Probe>>,
-}
+#[cfg(any(test, feature = "test-support"))]
+mod fake {
+    use super::*;
 
-impl std::fmt::Debug for FakeProbeTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FakeProbeTransport").finish_non_exhaustive()
+    /// In-memory transport for tests: answers from a handler and logs every probe.
+    pub struct FakeProbeTransport {
+        #[allow(clippy::type_complexity)]
+        handler: Box<dyn Fn(&ProbeRequest) -> Result<ProbeResponse, ProbeError> + Send + Sync>,
+        log: Mutex<Vec<Probe>>,
     }
-}
 
-impl FakeProbeTransport {
-    pub fn new(
-        handler: impl Fn(&ProbeRequest) -> Result<ProbeResponse, ProbeError> + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            handler: Box::new(handler),
-            log: Mutex::new(Vec::new()),
+    impl std::fmt::Debug for FakeProbeTransport {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FakeProbeTransport").finish_non_exhaustive()
         }
     }
 
-    /// Every probe issued so far, in order.
-    pub fn probes(&self) -> Vec<Probe> {
-        self.log.lock().expect("fake probe log lock").clone()
-    }
-}
+    impl FakeProbeTransport {
+        pub fn new(
+            handler: impl Fn(&ProbeRequest) -> Result<ProbeResponse, ProbeError> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                handler: Box::new(handler),
+                log: Mutex::new(Vec::new()),
+            }
+        }
 
-impl ProbeTransport for FakeProbeTransport {
-    async fn probe(&self, probe: Probe) -> Result<ProbeResponse, ProbeError> {
-        self.log
-            .lock()
-            .expect("fake probe log lock")
-            .push(probe.clone());
-        (self.handler)(&probe.request)
+        /// Every probe issued so far, in order.
+        pub fn probes(&self) -> Vec<Probe> {
+            self.log.lock().expect("fake probe log lock").clone()
+        }
+    }
+
+    impl ProbeTransport for FakeProbeTransport {
+        async fn probe(&self, probe: Probe) -> Result<ProbeResponse, ProbeError> {
+            self.log
+                .lock()
+                .expect("fake probe log lock")
+                .push(probe.clone());
+            (self.handler)(&probe.request)
+        }
     }
 }
+#[cfg(any(test, feature = "test-support"))]
+pub use fake::FakeProbeTransport;
 
 #[cfg(test)]
 mod tests {

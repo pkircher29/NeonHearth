@@ -24,6 +24,7 @@ pub mod engine;
 pub mod executor;
 pub mod probe;
 pub mod repair;
+pub mod types;
 
 use chrono::{DateTime, Utc};
 
@@ -40,6 +41,8 @@ pub enum DoctorError {
     InvalidSymptom(&'static str),
     #[error("approval token is invalid")]
     InvalidApproval,
+    #[error("invalid value: {0}")]
+    InvalidValue(&'static str),
 }
 
 /// Injectable time source so engines and executors stay deterministic in tests.

@@ -13,7 +13,7 @@ use lattice_doctor::{
     check::{DiagnosticBudget, DiagnosticReport, Measurement, Metric, Unit},
     diagnosis::Diagnosis,
     engine::{DoctorConfig, Thresholds},
-    executor::{FakeRepairTransport, RepairReport},
+    executor::{FakeRepairTransport, RepairReport, SettlePolicy},
     probe::{
         DnsFailureReason, FakeProbeTransport, LeaseState, Probe, ProbeError, ProbeRequest,
         ProbeResponse, ProbeTransport, RouteEntry,
@@ -162,7 +162,8 @@ async fn fixture(
         probes,
         repairs,
     )
-    .unwrap();
+    .unwrap()
+    .with_settle_policy(SettlePolicy::Immediate);
     Fixture {
         router: app_with_doctor(state, doctor),
         pool,
@@ -531,11 +532,11 @@ async fn safe_automatic_repair_executes_without_approval_and_is_audited() {
 #[tokio::test]
 async fn approval_required_repair_needs_a_live_unused_matching_approval() {
     let repairs = FakeRepairTransport::new()
-        .push_measurements(vec![measurement(Metric::ConflictingMacCount, 2.0)])
-        .push_measurements(vec![measurement(Metric::ConflictingMacCount, 1.0)]);
+        .push_measurements(vec![measurement(Metric::PassingMtuBytes, 1200.0)])
+        .push_measurements(vec![measurement(Metric::PassingMtuBytes, 1400.0)]);
     let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(repairs)).await;
     let run = run_doctor(&fixture.router).await;
-    let kind = finding_kind(&run, "duplicate_ip");
+    let kind = finding_kind(&run, "mtu_blackhole");
 
     // Without an approval id: 403.
     let response = send(
@@ -713,11 +714,11 @@ async fn repair_404s_without_a_matching_latest_run_plan() {
 #[tokio::test]
 async fn mint_and_execution_both_append_doctor_action_audit_rows() {
     let repairs = FakeRepairTransport::new()
-        .push_measurements(vec![measurement(Metric::ConflictingMacCount, 2.0)])
-        .push_measurements(vec![measurement(Metric::ConflictingMacCount, 1.0)]);
+        .push_measurements(vec![measurement(Metric::PassingMtuBytes, 1200.0)])
+        .push_measurements(vec![measurement(Metric::PassingMtuBytes, 1400.0)]);
     let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(repairs)).await;
     let run = run_doctor(&fixture.router).await;
-    let kind = finding_kind(&run, "duplicate_ip");
+    let kind = finding_kind(&run, "mtu_blackhole");
     let approval = json_body(
         send(
             &fixture.router,
@@ -750,11 +751,45 @@ async fn mint_and_execution_both_append_doctor_action_audit_rows() {
     );
     for row in &rows {
         assert_eq!(row.category, AuditCategory::DoctorAction);
-        assert_eq!(row.subject.as_deref(), Some("duplicate_ip"));
+        assert_eq!(row.subject.as_deref(), Some("mtu_blackhole"));
     }
     assert_eq!(rows[1].detail["approval_id"], approval["approval_id"]);
     assert_eq!(rows[2].detail["approval_id"], approval["approval_id"]);
     assert!(rows[2].detail["rollback"].is_object());
+}
+
+#[tokio::test]
+async fn a_duplicate_ip_repair_is_refused_until_the_owner_has_chosen_a_device() {
+    // The plan never picks a claimant (ARP answers are spoofable), so an
+    // approved reservation with no owner choice must not reach the transport.
+    let fixture = mixed_fixture().await;
+    let run = run_doctor(&fixture.router).await;
+    let kind = finding_kind(&run, "duplicate_ip");
+    let approval = json_body(
+        send(
+            &fixture.router,
+            "POST",
+            "/api/v1/doctor/approvals",
+            Some(serde_json::json!({ "diagnosis_kind": kind })),
+            true,
+        )
+        .await,
+    )
+    .await;
+    let response = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/repair",
+        Some(serde_json::json!({
+            "diagnosis_kind": kind,
+            "approval_id": approval["approval_id"],
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["repair"]["outcome"]["outcome"], "apply_failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,13 +1037,18 @@ async fn settings_are_owner_editable_validated_audited_and_gate_external_probes(
     let settings = json_body(response).await;
     assert_eq!(settings["gateway"], serde_json::Value::Null);
     assert_eq!(settings["gateway_source"], "unknown");
-    // The transport answers every ping it is asked, so zero replies means
-    // the placeholder was never dialed.
+    // The placeholder is refused before dialing. A refused probe is a probe
+    // failure, not packet loss: it must not read as a dead gateway.
     let run = run_doctor(&fixture.router).await;
     let gateway = check(&run, "gateway");
     assert_eq!(gateway["status"]["state"], "failed");
-    assert_eq!(gateway["detail"]["detail"], "gateway_ping");
-    assert_eq!(gateway["detail"]["received"], 0);
+    assert_eq!(gateway["detail"]["detail"], "probe_failure");
+    assert!(
+        gateway["detail"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not configured")
+    );
 
     // Likewise an empty resolver list is reported as unconfigured, with the
     // reason on the resolver's own evidence.

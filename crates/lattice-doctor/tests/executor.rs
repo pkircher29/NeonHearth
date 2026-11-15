@@ -7,8 +7,8 @@ use lattice_doctor::FixedClock;
 use lattice_doctor::check::{CheckKind, Measurement, Metric, Unit};
 use lattice_doctor::executor::{
     FakeRepairTransport, MetricDirection, RepairEventKind, RepairExecutor, RepairOutcome,
-    RepairTransportError, RollbackOutcome, RollbackSkipReason, StateEntry, Symptom, TransportCall,
-    Verdict,
+    RepairTransportError, RollbackOutcome, RollbackSkipReason, SettlePolicy, StateEntry, Symptom,
+    TransportCall, Verdict,
 };
 use lattice_doctor::repair::{
     ApprovalAction, ApprovalId, ApprovedRepair, ExecutableRepair, SafeAction, StateKey,
@@ -18,6 +18,7 @@ fn executor() -> RepairExecutor {
     RepairExecutor::with_clock(FixedClock(
         Utc.with_ymd_and_hms(2026, 8, 24, 12, 0, 0).unwrap(),
     ))
+    .with_settle_policy(SettlePolicy::Immediate)
 }
 
 fn meas(metric: Metric, value: f64) -> Measurement {
@@ -42,7 +43,7 @@ fn loss_symptom() -> Symptom {
 fn dns_repair() -> ExecutableRepair {
     ExecutableRepair::Approved(ApprovedRepair::new(
         ApprovalAction::ChangeDnsServers {
-            servers: vec!["9.9.9.9".into()],
+            servers: vec!["9.9.9.9".parse().unwrap()],
         },
         ApprovalId::try_new("approval-1").unwrap(),
     ))

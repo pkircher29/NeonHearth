@@ -1,4 +1,4 @@
-use crate::transport::{KEV_URL, MAX_RESPONSE_BYTES};
+use crate::transport::{FeedResponse, KEV_URL, MAX_RESPONSE_BYTES};
 use crate::{
     AdvisoryError, AdvisoryInput, AdvisorySource, Confidence, Exploitability, Exposure, Freshness,
     MAX_FIELD, MAX_PARSER_OUTPUTS, NormalizedAdvisory, Remediation, Severity, SourceTrust,
@@ -15,10 +15,42 @@ pub enum KevParseError {
     #[error("KEV advisory is invalid")]
     Advisory(#[from] AdvisoryError),
 }
+/// Parses a bare body of unknown origin; never `OfficialApi`. Use
+/// [`parse_kev_response`] for a body that arrived through a feed transport.
 pub fn parse_kev(
     body: &str,
     retrieved_at: DateTime<Utc>,
     cache_expires_at: DateTime<Utc>,
+) -> Result<Vec<NormalizedAdvisory>, KevParseError> {
+    parse_kev_with_trust(
+        body,
+        retrieved_at,
+        cache_expires_at,
+        SourceTrust::RegisteredHttps,
+    )
+}
+
+/// Parses a transport response; trust and timestamps come from the response.
+pub fn parse_kev_response(
+    response: &FeedResponse,
+    cache_expires_at: DateTime<Utc>,
+) -> Result<Vec<NormalizedAdvisory>, KevParseError> {
+    if response.source_url != KEV_URL {
+        return Err(KevParseError::Malformed);
+    }
+    parse_kev_with_trust(
+        &response.body,
+        response.retrieved_at,
+        cache_expires_at,
+        response.trust,
+    )
+}
+
+fn parse_kev_with_trust(
+    body: &str,
+    retrieved_at: DateTime<Utc>,
+    cache_expires_at: DateTime<Utc>,
+    trust: SourceTrust,
 ) -> Result<Vec<NormalizedAdvisory>, KevParseError> {
     if body.len() > MAX_RESPONSE_BYTES {
         return Err(KevParseError::Oversized);
@@ -67,7 +99,7 @@ pub fn parse_kev(
                 retrieved_at,
                 cache_expires_at,
                 freshness: Freshness::Fresh,
-                source_trust: SourceTrust::OfficialApi,
+                source_trust: trust,
                 severity: Severity::Unknown,
                 exploitability: Exploitability::ActiveKnownExploitation,
                 exposure: Exposure::Unknown,

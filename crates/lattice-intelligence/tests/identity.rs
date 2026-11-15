@@ -219,6 +219,14 @@ fn identification_threshold_router_cap_and_independent_families_are_exact() {
         vec![fact(EvidenceFamily::Service, "class", "camera", 0.85)],
     )
     .unwrap();
+    // Vendor still has a single family: one family corroborating two keys is
+    // not independent evidence for either of them.
+    assert_eq!(e.identification(one).unwrap(), None);
+    e.add_facts(
+        one,
+        vec![fact(EvidenceFamily::Service, "vendor", "Acme", 0.85)],
+    )
+    .unwrap();
     assert_eq!(e.identification(one).unwrap().unwrap().vendor, "Acme");
     let r = e
         .observe(
@@ -245,6 +253,7 @@ fn owner_values_override_until_explicit_clear() {
         d,
         vec![
             fact(EvidenceFamily::Naming, "vendor", "Auto", 1.0),
+            fact(EvidenceFamily::Service, "vendor", "Auto", 1.0),
             fact(EvidenceFamily::Service, "class", "camera", 1.0),
             fact(EvidenceFamily::Naming, "class", "camera", 1.0),
         ],
@@ -558,4 +567,104 @@ fn stale_components_are_evicted_but_annotated_or_pending_ones_are_kept() {
         )
         .unwrap();
     assert_eq!(fresh, id(5));
+}
+
+#[test]
+fn propose_merge_rejects_self_merges_and_every_state_survives_a_checkpoint() {
+    let mut e = engine();
+    let a = e.observe(None, vec![]).unwrap();
+    let b = e.observe(None, vec![]).unwrap();
+    assert!(matches!(
+        e.propose_merge(a, a, 0.5, vec![EvidenceFamily::Naming], vec!["r".into()]),
+        Err(IdentityError::InvalidInput(_))
+    ));
+    let p = e
+        .propose_merge(a, b, 0.9, vec![EvidenceFamily::Naming], vec!["r".into()])
+        .unwrap();
+    e.decide(p, Decision::Accept).unwrap();
+    // A redundant edge inside one component stays allowed (diamond undo safety).
+    assert!(
+        e.propose_merge(a, b, 0.9, vec![EvidenceFamily::Naming], vec!["r".into()])
+            .is_ok()
+    );
+    // Every state the public API can build must survive a checkpoint round trip.
+    IdentityEngine::from_checkpoint(IdentityConfig::default(), e.checkpoint()).unwrap();
+}
+
+#[test]
+fn newer_observation_from_a_family_supersedes_its_older_one() {
+    let t0 = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+    let mut e = engine();
+    let mut old_name = fact(EvidenceFamily::Naming, "vendor", "OldCo", 0.95);
+    old_name.observed_at = t0;
+    let mut old_svc = fact(EvidenceFamily::Service, "vendor", "OldCo", 0.95);
+    old_svc.observed_at = t0;
+    let d = e
+        .observe_at(
+            None,
+            vec![
+                old_name,
+                old_svc,
+                fact(EvidenceFamily::Naming, "class", "camera", 0.95),
+                fact(EvidenceFamily::Service, "class", "camera", 0.95),
+            ],
+            t0,
+        )
+        .unwrap();
+    assert_eq!(e.identification_at(d, t0).unwrap().unwrap().vendor, "OldCo");
+    let t1 = t0 + Duration::hours(1);
+    let mut new_name = fact(EvidenceFamily::Naming, "vendor", "NewCo", 0.95);
+    new_name.observed_at = t1;
+    let mut new_svc = fact(EvidenceFamily::Service, "vendor", "NewCo", 0.95);
+    new_svc.observed_at = t1;
+    e.add_facts_at(d, vec![new_name, new_svc], t1).unwrap();
+    // Without recency the stale high-confidence OldCo facts conflict and
+    // identification is stuck at None until they expire.
+    assert_eq!(e.identification_at(d, t1).unwrap().unwrap().vendor, "NewCo");
+}
+
+#[test]
+fn component_work_scales_to_the_configured_device_count() {
+    let mut e = IdentityEngine::new(
+        IdentityConfig::default(),
+        (0..2000u32)
+            .map(|n| DeviceId::parse(&format!("018f47a0-9b5c-7a22-8a33-{n:012x}")).unwrap()),
+    )
+    .unwrap();
+    let mut ids = vec![];
+    for n in 0..1500 {
+        ids.push(
+            e.observe(
+                None,
+                vec![fact(
+                    EvidenceFamily::Addressing,
+                    "ip",
+                    &format!("10.0.{}.{}", n / 250, n % 250),
+                    0.5,
+                )],
+            )
+            .unwrap(),
+        );
+    }
+    for pair in ids.chunks(2).take(1200 / 2) {
+        let p = e
+            .propose_merge(
+                pair[0],
+                pair[1],
+                0.9,
+                vec![EvidenceFamily::Naming],
+                vec!["r".into()],
+            )
+            .unwrap();
+        e.decide(p, Decision::Accept).unwrap();
+    }
+    // 1500 devices x 600 edges exceeded the old 1,000,000 V*E guard.
+    assert!(e.identification(ids[0]).is_ok());
+    assert!(
+        e.observe(
+            None,
+            vec![fact(EvidenceFamily::Addressing, "ip", "9.9.9.9", 0.5)]
+        )
+        .is_ok()
+    );
 }

@@ -1,3 +1,4 @@
+use crate::version::{Applies, exact_applies, less_than_applies, range_applies};
 use crate::{
     AdvisorySource, Confidence, Exploitability, Exposure, Freshness, MAX_FIELD, NormalizedAdvisory,
     Remediation, Severity, SourceTrust, VersionConstraint,
@@ -195,9 +196,29 @@ impl DeviceInput for Option<&DeviceIdentity> {
     }
 }
 
+/// Matches using the freshness recorded when the advisory was ingested.
+/// Prefer [`match_advisory_at`], which also expires cached advisories.
 pub fn match_advisory<D: DeviceInput>(
     device: D,
     advisory: &NormalizedAdvisory,
+) -> Result<AdvisoryMatch, MatchError> {
+    match_advisory_inner(device, advisory, None)
+}
+
+/// Matches at `now`: an advisory whose cache window has passed is treated as
+/// stale and can never produce an `Exact` label.
+pub fn match_advisory_at<D: DeviceInput>(
+    device: D,
+    advisory: &NormalizedAdvisory,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<AdvisoryMatch, MatchError> {
+    match_advisory_inner(device, advisory, Some(now))
+}
+
+fn match_advisory_inner<D: DeviceInput>(
+    device: D,
+    advisory: &NormalizedAdvisory,
+    now: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<AdvisoryMatch, MatchError> {
     let input = advisory.input();
     let selectors = !input.vendor.eq_ignore_ascii_case("unknown")
@@ -227,28 +248,28 @@ pub fn match_advisory<D: DeviceInput>(
             Confidence::Low,
         ));
     };
+    let fresh =
+        input.freshness == Freshness::Fresh && now.is_none_or(|now| now <= input.cache_expires_at);
     let vendor_match = input.vendor.eq_ignore_ascii_case("unknown")
         || input.vendor.eq_ignore_ascii_case(device.vendor());
     let model_match = input
         .model
         .as_ref()
         .is_none_or(|m| device.model().is_some_and(|d| m.eq_ignore_ascii_case(d)));
-    let firmware_match = match &input.firmware {
-        VersionConstraint::Exact(v) => device
-            .firmware()
-            .is_some_and(|d| v.as_bytes() == d.as_bytes()),
-        VersionConstraint::Any
-        | VersionConstraint::LessThan(_)
-        | VersionConstraint::Range { .. } => true,
+    let firmware = match (&input.firmware, device.firmware()) {
+        (VersionConstraint::Any, _) | (_, None) => Applies::Unknown,
+        (VersionConstraint::Exact(v), Some(d)) => exact_applies(v, d),
+        (VersionConstraint::LessThan(max), Some(d)) => less_than_applies(max, d),
+        (VersionConstraint::Range { min, max }, Some(d)) => range_applies(min, max, d),
     };
+    let firmware_constrained = !matches!(input.firmware, VersionConstraint::Any);
+    let firmware_contradicts = firmware == Applies::No;
     let contradiction = !vendor_match
         || input
             .model
             .as_ref()
             .is_some_and(|_| device.model().is_some() && !model_match)
-        || matches!(input.firmware, VersionConstraint::Exact(_))
-            && device.firmware().is_some()
-            && !firmware_match;
+        || firmware_contradicts;
     if device.has_contradictory_high_confidence() {
         return Ok(result(
             MatchLabel::Contradicted,
@@ -258,10 +279,22 @@ pub fn match_advisory<D: DeviceInput>(
         ));
     }
     if contradiction {
+        let mut fields = Vec::new();
+        if vendor_match && !input.vendor.eq_ignore_ascii_case("unknown") {
+            fields.push(MatchedField::Vendor);
+        }
+        if model_match && input.model.is_some() && device.model().is_some() {
+            fields.push(MatchedField::Model);
+        }
+        let explanation = if firmware_contradicts && vendor_match && model_match {
+            "device firmware is outside the affected versions"
+        } else {
+            "identity evidence contradicts the advisory"
+        };
         return Ok(result(
             MatchLabel::Contradicted,
-            matched(input, vendor_match, model_match, firmware_match),
-            "identity evidence contradicts the advisory",
+            fields,
+            explanation,
             Confidence::High,
         ));
     }
@@ -272,22 +305,19 @@ pub fn match_advisory<D: DeviceInput>(
     if input.model.is_some() && device.model().is_some() && model_match {
         fields.push(MatchedField::Model);
     }
-    if matches!(input.firmware, VersionConstraint::Exact(_))
-        && device.firmware().is_some()
-        && firmware_match
-    {
+    if firmware_constrained && firmware == Applies::Yes {
         fields.push(MatchedField::Firmware);
     }
     let exact_allowed = !input.vendor.eq_ignore_ascii_case("unknown")
-        && input.freshness == Freshness::Fresh
+        && fresh
         && matches!(
             input.source_trust,
             SourceTrust::OfficialApi | SourceTrust::VerifiedSignature
         )
         && input.model.is_some()
         && device.model().is_some()
-        && matches!(input.firmware, VersionConstraint::Exact(_))
-        && device.firmware().is_some()
+        && firmware_constrained
+        && firmware == Applies::Yes
         && !device.has_contradictory_high_confidence();
     if exact_allowed {
         Ok(result(
@@ -306,24 +336,6 @@ pub fn match_advisory<D: DeviceInput>(
     }
 }
 
-fn matched(
-    input: &crate::AdvisoryInput,
-    vendor: bool,
-    model: bool,
-    firmware: bool,
-) -> Vec<MatchedField> {
-    let mut out = Vec::new();
-    if vendor && !input.vendor.eq_ignore_ascii_case("unknown") {
-        out.push(MatchedField::Vendor);
-    }
-    if model && input.model.is_some() {
-        out.push(MatchedField::Model);
-    }
-    if firmware && matches!(input.firmware, VersionConstraint::Exact(_)) {
-        out.push(MatchedField::Firmware);
-    }
-    out
-}
 fn result(
     label: MatchLabel,
     matched_fields: Vec<MatchedField>,

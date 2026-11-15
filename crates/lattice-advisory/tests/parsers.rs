@@ -284,7 +284,8 @@ fn vendor_registry_rejects_duplicate_source_urls_and_oversized_signature_inputs(
 fn vendor_signature_covers_exact_body_and_invalid_signatures_are_low_trust() {
     let body = r#"{"schema_id":"neonhearth.vendor-advisory.v1","advisories":[{"id":"ACME-2","title":"Camera update","vendor":"Acme","version":"1.2","published_at":"1970-01-01T00:00:00Z","modified_at":"1970-01-01T00:00:00Z","severity":"high","remediation":"upgrade"}]}"#;
     let signing_key = SigningKey::from_bytes(&[7; 32]);
-    let mut signed = b"NeonHearth vendor advisory v1\0".to_vec();
+    let mut signed = b"NeonHearth vendor advisory v2\0".to_vec();
+    signed.extend_from_slice(b"https://advisories.acme.test/feed\0");
     signed.extend_from_slice(body.as_bytes());
     let signature = VendorSignature::new(
         "acme-2026",
@@ -369,4 +370,144 @@ fn kev_ransomware_maps_active_exploitation_without_severity() {
         Exploitability::ActiveKnownExploitation
     );
     assert_eq!(result[0].input().severity, Severity::Unknown);
+}
+
+fn nvd_with(cpe_extra: &str, stamps: (&str, &str)) -> String {
+    format!(
+        r#"{{"vulnerabilities":[{{"cve":{{"id":"CVE-2026-0009","published":"{}","lastModified":"{}","descriptions":[{{"lang":"en","value":"d"}}],"configurations":[{{"nodes":[{{"cpeMatch":[{{"criteria":"cpe:2.3:a:acme:camera:*:*:*:*:*:*:*:*"{cpe_extra}}}]}}]}}]}}}}]}}"#,
+        stamps.0, stamps.1
+    )
+}
+
+#[test]
+fn nvd_accepts_offsetless_timestamps_as_documented_by_nvd_and_offset_forms() {
+    // NVD 2.0 documents timestamps such as 2021-12-10T10:15:09.143 (no offset,
+    // UTC). Verified against the documented format only, not a live response.
+    for stamp in [
+        "2021-12-10T10:15:09.143",
+        "2021-12-10T10:15:09",
+        "2021-12-10T10:15:09.143Z",
+        "2021-12-10T10:15:09.143+00:00",
+    ] {
+        let body = nvd_with("", (stamp, stamp));
+        let result = parse_nvd(&body, at(4_000_000_000), at(4_000_000_001)).unwrap();
+        assert_eq!(result.len(), 1, "{stamp}");
+    }
+    assert!(parse_nvd(&nvd_with("", ("garbage", "garbage")), at(1), at(2)).is_err());
+    assert_eq!(
+        lattice_advisory::nvd::parse_nvd_time("2021-12-10T10:15:09.143").unwrap(),
+        lattice_advisory::nvd::parse_nvd_time("2021-12-10T10:15:09.143Z").unwrap()
+    );
+}
+
+#[test]
+fn nvd_bounds_keep_inclusivity_and_start_only_ranges() {
+    let stamp = ("2021-12-10T10:15:09.143", "2021-12-10T10:15:09.143");
+    let firmware = |extra: &str| {
+        parse_nvd(
+            &nvd_with(extra, stamp),
+            at(4_000_000_000),
+            at(4_000_000_001),
+        )
+        .unwrap()[0]
+            .input()
+            .firmware
+            .clone()
+    };
+    // Regression: a start-only bound used to become Any ("every version").
+    assert_eq!(
+        firmware(r#","versionStartIncluding":"2.0""#),
+        VersionConstraint::Range {
+            min: "2.0".into(),
+            max: "*".into()
+        }
+    );
+    assert_eq!(
+        firmware(r#","versionStartExcluding":"2.0""#),
+        VersionConstraint::Range {
+            min: ">2.0".into(),
+            max: "*".into()
+        }
+    );
+    assert_eq!(
+        firmware(r#","versionEndExcluding":"3.0""#),
+        VersionConstraint::LessThan("3.0".into())
+    );
+    assert_eq!(
+        firmware(r#","versionEndIncluding":"3.0""#),
+        VersionConstraint::LessThan("<=3.0".into())
+    );
+    assert_eq!(
+        firmware(r#","versionStartIncluding":"1.0","versionEndExcluding":"3.0""#),
+        VersionConstraint::Range {
+            min: "1.0".into(),
+            max: "<3.0".into()
+        }
+    );
+}
+
+#[test]
+fn bare_bodies_are_never_official_but_transport_responses_carry_their_trust() {
+    use lattice_advisory::{
+        nvd::parse_nvd_response,
+        transport::{FeedResponse, NVD_URL},
+    };
+    let body = nvd_with("", ("2021-12-10T10:15:09.143", "2021-12-10T10:15:09.143"));
+    let bare = parse_nvd(&body, at(4_000_000_000), at(4_000_000_001)).unwrap();
+    assert_eq!(bare[0].input().source_trust, SourceTrust::RegisteredHttps);
+    let response = |trust, url: &str| FeedResponse {
+        trust,
+        status: 200,
+        body: body.clone(),
+        retrieved_at: at(4_000_000_000),
+        etag: None,
+        last_modified: None,
+        source_url: url.into(),
+    };
+    let official = parse_nvd_response(
+        &response(SourceTrust::OfficialApi, NVD_URL),
+        at(4_000_000_001),
+    )
+    .unwrap();
+    assert_eq!(official[0].input().source_trust, SourceTrust::OfficialApi);
+    assert!(
+        parse_nvd_response(
+            &response(SourceTrust::OfficialApi, "https://evil.test/x"),
+            at(4_000_000_001)
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_vendor_source_with_a_key_rejects_an_unsigned_body_and_a_signature_for_another_url() {
+    let body = r#"{"schema_id":"neonhearth.vendor-advisory.v1","advisories":[{"id":"ACME-9","title":"Camera update","vendor":"Acme","version":"1.2","published_at":"1970-01-01T00:00:00Z","modified_at":"1970-01-01T00:00:00Z","severity":"high","remediation":"upgrade"}]}"#;
+    let key = SigningKey::from_bytes(&[9; 32]);
+    let feed_a = "https://advisories.acme.test/feed";
+    let feed_b = "https://advisories.acme.test/other";
+    let registry = VendorRegistry::new([
+        VendorSource::signed(feed_a, "k", key.verifying_key().to_bytes()),
+        VendorSource::signed(feed_b, "k", key.verifying_key().to_bytes()),
+    ]);
+    // Stripping the detached signature must fail, not downgrade to Low trust.
+    assert!(parse_vendor(body, feed_a, None, at(1), at(2), &registry).is_err());
+    let mut message = b"NeonHearth vendor advisory v2\0".to_vec();
+    message.extend_from_slice(feed_a.as_bytes());
+    message.push(0);
+    message.extend_from_slice(body.as_bytes());
+    let signature =
+        VendorSignature::new("k", URL_SAFE_NO_PAD.encode(key.sign(&message).to_bytes()));
+    assert_eq!(
+        parse_vendor(body, feed_a, Some(&signature), at(1), at(2), &registry).unwrap()[0]
+            .input()
+            .source_trust,
+        SourceTrust::VerifiedSignature
+    );
+    // The same signature presented for another URL no longer verifies.
+    assert_eq!(
+        parse_vendor(body, feed_b, Some(&signature), at(1), at(2), &registry).unwrap()[0]
+            .input()
+            .source_trust,
+        SourceTrust::Invalid
+    );
 }

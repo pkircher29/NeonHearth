@@ -8,7 +8,14 @@ license.workspace = true
 chrono.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 utoipa.workspace = true
 
+[features]
+# Test doubles (FakeProbeTransport, FakeRepairTransport) for dependent crates.
+test-support = []
+
 [dev-dependencies]
+serde_json.workspace = true
+lattice-doctor = { path = ".", features = ["test-support"] }
 tokio.workspace = true

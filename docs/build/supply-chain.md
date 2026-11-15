@@ -101,7 +101,7 @@ passes with an empty `[advisories].ignore` list. Resolved versions:
 
 | Dependency | Version | Relevant remediation |
 |---|---|---|
-| Wasmtime | 36.0.14 | Maintained LTS patches, including RUSTSEC-2026-0269; the audit host now uses a bounded scoped request channel for the updated owned Store API |
+| Wasmtime | 36.0.20 | Maintained LTS patches, including RUSTSEC-2026-0269; the audit host now uses a bounded scoped request channel for the updated owned Store API |
 | hickory-proto | 0.26.2 | DNS encoding fix and removal of the affected DNSSEC handle from this crate |
 | quick-xml | 0.41.0 | Bounded namespace declarations and linear duplicate-attribute checks |
 | chacha20 | 0.10.2 | Replaces yanked 0.10.1 pulled by the new DNS dependency |

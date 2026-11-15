@@ -10,10 +10,16 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
 url.workspace = true
 reqwest.workspace = true
 base64 = "0.22"
 ed25519-dalek = { version = "3.0.0", default-features = false }
 
+[features]
+# Fixture transports for tests in this and dependent crates.
+test-support = []
+
 [dev-dependencies]
 tokio.workspace = true
+lattice-advisory = { path = ".", features = ["test-support"] }

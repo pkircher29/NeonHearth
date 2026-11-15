@@ -17,6 +17,11 @@ uuid.workspace = true
 wasmtime.workspace = true
 wasmparser.workspace = true
 
+[features]
+# Test-only constructors (AuthorizerWitness::for_tests) for integration tests.
+test-support = []
+
 [dev-dependencies]
+lattice-audit-wasm = { path = ".", features = ["test-support"] }
 serde_json.workspace = true
 wat.workspace = true

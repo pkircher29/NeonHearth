@@ -1,9 +1,11 @@
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use crate::SourceTrust;
+use chrono::{DateTime, Duration, Utc};
 use reqwest::header::{ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+#[cfg(any(test, feature = "test-support"))]
+use std::{collections::VecDeque, sync::Mutex};
 use std::{
-    collections::VecDeque,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
-    sync::{Arc, Mutex},
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::Duration as StdDuration,
 };
 use url::Url;
@@ -73,8 +75,8 @@ impl FeedRequest {
             return Err(TransportError::InvalidWindow);
         }
         let results_per_page = results_per_page.min(MAX_RESULTS_PER_PAGE);
-        let start = modified_start.to_rfc3339_opts(SecondsFormat::Millis, true);
-        let end = modified_end.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let start = nvd_date(modified_start);
+        let end = nvd_date(modified_end);
         let mut url = Url::parse(NVD_URL).expect("constant NVD URL is valid");
         url.query_pairs_mut()
             .append_pair("lastModStartDate", &start)
@@ -144,14 +146,8 @@ impl FeedRequest {
             let mut canonical = Url::parse(NVD_URL).expect("constant NVD URL is valid");
             canonical
                 .query_pairs_mut()
-                .append_pair(
-                    "lastModStartDate",
-                    &start.to_rfc3339_opts(SecondsFormat::Millis, true),
-                )
-                .append_pair(
-                    "lastModEndDate",
-                    &end.to_rfc3339_opts(SecondsFormat::Millis, true),
-                )
+                .append_pair("lastModStartDate", &nvd_date(start))
+                .append_pair("lastModEndDate", &nvd_date(end))
                 .append_pair("startIndex", &self.start_index.to_string())
                 .append_pair("resultsPerPage", &self.results_per_page.to_string());
             if canonical.as_str() != self.url {
@@ -162,8 +158,17 @@ impl FeedRequest {
     }
 }
 
+/// NVD documents `lastModStartDate=2021-08-04T13:00:00.000` plus an optional
+/// `+HH:MM` offset. UTC is always sent with an explicit offset.
+fn nvd_date(value: DateTime<Utc>) -> String {
+    value.format("%Y-%m-%dT%H:%M:%S%.3f+00:00").to_string()
+}
+
 #[derive(Clone, Debug)]
 pub struct FeedResponse {
+    /// Assigned by the transport from how the body was obtained. Parsers take
+    /// their `SourceTrust` from here and never promote a bare string.
+    pub trust: SourceTrust,
     pub status: u16,
     pub body: String,
     pub retrieved_at: DateTime<Utc>,
@@ -173,7 +178,6 @@ pub struct FeedResponse {
 }
 
 pub struct ProductionTransport {
-    client: reqwest::Client,
     clock: Arc<dyn Clock>,
 }
 impl ProductionTransport {
@@ -181,31 +185,41 @@ impl ProductionTransport {
         Self::with_clock(SystemClock)
     }
     pub fn with_clock(clock: impl Clock + 'static) -> Result<Self, TransportError> {
-        let nvd = resolve_public_host("services.nvd.nist.gov")?;
-        let cisa = resolve_public_host("www.cisa.gov")?;
-        let client = reqwest::Client::builder()
+        Ok(Self {
+            clock: Arc::new(clock),
+        })
+    }
+
+    /// Resolves the official host asynchronously for this request, rejects any
+    /// non-public answer, and pins the validated addresses for the connection.
+    /// Re-resolving per request keeps CDN rotation working while the address
+    /// check still prevents a poisoned answer from redirecting to a private
+    /// host.
+    async fn client_for(&self, host: &str) -> Result<reqwest::Client, TransportError> {
+        let addresses = resolve_public_host(host).await?;
+        reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .connect_timeout(StdDuration::from_secs(10))
             .timeout(StdDuration::from_secs(30))
-            .pool_max_idle_per_host(2)
+            .pool_max_idle_per_host(0)
             .no_gzip()
             .no_brotli()
             .no_deflate()
-            .resolve_to_addrs("services.nvd.nist.gov", &nvd)
-            .resolve_to_addrs("www.cisa.gov", &cisa)
+            .resolve_to_addrs(host, &addresses)
             .build()
-            .map_err(|_| TransportError::Unavailable)?;
-        Ok(Self {
-            client,
-            clock: Arc::new(clock),
-        })
+            .map_err(|_| TransportError::Unavailable)
     }
 }
 impl FeedTransport for ProductionTransport {
     async fn get(&self, request: FeedRequest) -> Result<FeedResponse, TransportError> {
         request.validate()?;
-        let mut builder = self.client.get(&request.url);
+        let host = url::Url::parse(&request.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .ok_or(TransportError::UnsafeUrl)?;
+        let client = self.client_for(&host).await?;
+        let mut builder = client.get(&request.url);
         if let Some(etag) = &request.etag {
             builder = builder.header(IF_NONE_MATCH, etag);
         }
@@ -222,6 +236,7 @@ impl FeedTransport for ProductionTransport {
         let last_modified = header(headers, LAST_MODIFIED)?;
         if status == 304 {
             return Ok(FeedResponse {
+                trust: SourceTrust::OfficialApi,
                 status,
                 body: String::new(),
                 retrieved_at: self.clock.now(),
@@ -271,6 +286,7 @@ impl FeedTransport for ProductionTransport {
         }
         let body = String::from_utf8(bytes).map_err(|_| TransportError::InvalidContentType)?;
         Ok(FeedResponse {
+            trust: SourceTrust::OfficialApi,
             status,
             body,
             retrieved_at: self.clock.now(),
@@ -288,6 +304,7 @@ pub trait FeedTransport: Send + Sync {
     ) -> impl std::future::Future<Output = Result<FeedResponse, TransportError>> + Send;
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
 pub struct FixtureReply {
     pub status: u16,
@@ -295,6 +312,7 @@ pub struct FixtureReply {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
 }
+#[cfg(any(test, feature = "test-support"))]
 impl FixtureReply {
     pub fn json(body: impl Into<String>) -> Self {
         Self {
@@ -318,11 +336,13 @@ impl FixtureReply {
         self
     }
 }
+#[cfg(any(test, feature = "test-support"))]
 pub struct FixtureTransport {
     replies: Arc<Mutex<VecDeque<Result<FixtureReply, TransportError>>>>,
     requests: Arc<Mutex<Vec<FeedRequest>>>,
     clock: Arc<dyn Clock>,
 }
+#[cfg(any(test, feature = "test-support"))]
 impl Clone for FixtureTransport {
     fn clone(&self) -> Self {
         Self {
@@ -332,11 +352,13 @@ impl Clone for FixtureTransport {
         }
     }
 }
+#[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Debug for FixtureTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FixtureTransport").finish_non_exhaustive()
     }
 }
+#[cfg(any(test, feature = "test-support"))]
 impl FixtureTransport {
     pub fn queued(replies: impl IntoIterator<Item = Result<FixtureReply, TransportError>>) -> Self {
         Self::with_clock(replies, SystemClock)
@@ -358,6 +380,7 @@ impl FixtureTransport {
         self.requests.lock().expect("fixture lock").clone()
     }
 }
+#[cfg(any(test, feature = "test-support"))]
 impl FeedTransport for FixtureTransport {
     async fn get(&self, request: FeedRequest) -> Result<FeedResponse, TransportError> {
         request.validate()?;
@@ -375,6 +398,7 @@ impl FeedTransport for FixtureTransport {
             return Err(TransportError::Oversized);
         }
         Ok(FeedResponse {
+            trust: SourceTrust::RegisteredHttps,
             status: reply.status,
             body: reply.body,
             retrieved_at: self.clock.now(),
@@ -436,9 +460,9 @@ fn validate_exact_url(raw: &str) -> Result<(), TransportError> {
     }
 }
 
-fn resolve_public_host(host: &str) -> Result<Vec<SocketAddr>, TransportError> {
-    let addresses: Vec<_> = (host, 443)
-        .to_socket_addrs()
+async fn resolve_public_host(host: &str) -> Result<Vec<SocketAddr>, TransportError> {
+    let addresses: Vec<_> = tokio::net::lookup_host((host, 443))
+        .await
         .map_err(|_| TransportError::Unavailable)?
         .collect();
     if addresses.is_empty()

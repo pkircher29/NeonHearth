@@ -10,11 +10,17 @@
 //! [`RepairEvent`] sequence suitable for persistence.
 
 use crate::check::{CheckKind, Measurement, Metric};
-use crate::repair::{ExecutableRepair, RepairClass, StateKey};
+use crate::repair::{ApprovalAction, ExecutableRepair, RepairClass, SafeAction, StateKey};
 use crate::{Clock, DoctorError, SystemClock};
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
+use std::time::Duration;
+use tokio::time::Instant;
 use utoipa::ToSchema;
 
 /// Transport-level failure while snapshotting, applying, restoring, or
@@ -74,11 +80,33 @@ pub enum MetricDirection {
 /// The measured symptom a repair is judged against: the ORIGINAL check and
 /// metric that motivated the repair.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(try_from = "SymptomWire")]
 pub struct Symptom {
     check: CheckKind,
     metric: Metric,
     direction: MetricDirection,
     min_meaningful_delta: f64,
+}
+
+/// Unvalidated wire form; deserialising a [`Symptom`] re-runs [`Symptom::new`].
+#[derive(Deserialize)]
+struct SymptomWire {
+    check: CheckKind,
+    metric: Metric,
+    direction: MetricDirection,
+    min_meaningful_delta: f64,
+}
+
+impl TryFrom<SymptomWire> for Symptom {
+    type Error = DoctorError;
+    fn try_from(wire: SymptomWire) -> Result<Self, DoctorError> {
+        Self::new(
+            wire.check,
+            wire.metric,
+            wire.direction,
+            wire.min_meaningful_delta,
+        )
+    }
 }
 
 impl Symptom {
@@ -206,10 +234,91 @@ pub struct RepairReport {
     pub events: Vec<RepairEvent>,
 }
 
+/// Upper bounds on each transport call so a hung transport cannot stall a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepairTimeouts {
+    pub snapshot: Duration,
+    pub apply: Duration,
+    pub restore: Duration,
+    pub measure: Duration,
+}
+
+impl Default for RepairTimeouts {
+    fn default() -> Self {
+        Self {
+            snapshot: Duration::from_secs(10),
+            apply: Duration::from_secs(60),
+            restore: Duration::from_secs(60),
+            measure: Duration::from_secs(20),
+        }
+    }
+}
+
+/// How long a repair is given to take effect before it is judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettleProfile {
+    /// Wait after `apply` before the first measurement.
+    pub settle: Duration,
+    /// While the verdict is `Regressed`, keep re-measuring this long.
+    pub verify_window: Duration,
+    pub poll_interval: Duration,
+}
+
+impl SettleProfile {
+    pub const IMMEDIATE: Self = Self {
+        settle: Duration::ZERO,
+        verify_window: Duration::ZERO,
+        poll_interval: Duration::ZERO,
+    };
+
+    const fn secs(settle: u64, window: u64, poll: u64) -> Self {
+        Self {
+            settle: Duration::from_secs(settle),
+            verify_window: Duration::from_secs(window),
+            poll_interval: Duration::from_secs(poll),
+        }
+    }
+
+    /// Per-action table: a router reboot needs minutes, a cache refresh none.
+    pub fn for_repair(repair: &ExecutableRepair) -> Self {
+        match repair {
+            ExecutableRepair::Safe { action } => match action {
+                SafeAction::RefreshAppCaches => Self::IMMEDIATE,
+                SafeAction::RestartCollectorWorker | SafeAction::RepairTailscaleServe => {
+                    Self::secs(2, 10, 2)
+                }
+                SafeAction::RenewCollectorLease => Self::secs(3, 15, 3),
+                SafeAction::RetryRouterSession => Self::secs(1, 5, 1),
+            },
+            ExecutableRepair::Approved(approved) => match approved.action() {
+                ApprovalAction::RebootRouter => Self::secs(60, 240, 5),
+                ApprovalAction::ResetAdapter { .. } => Self::secs(5, 30, 2),
+                ApprovalAction::RenewDhcpLease { .. } => Self::secs(3, 20, 2),
+                ApprovalAction::ChangeDnsServers { .. }
+                | ApprovalAction::SetDhcpReservation { .. }
+                | ApprovalAction::BlockDevice { .. }
+                | ApprovalAction::UnblockDevice { .. }
+                | ApprovalAction::SetInterfaceMtu { .. } => Self::secs(1, 10, 1),
+            },
+        }
+    }
+}
+
+/// Whether verification uses the per-action settle table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettlePolicy {
+    PerAction,
+    /// Measure once, right after apply. For deterministic tests.
+    Immediate,
+}
+
 /// Executes exactly one repair through a [`RepairTransport`].
 #[derive(Clone, Debug)]
 pub struct RepairExecutor {
     clock: Arc<dyn Clock>,
+    timeouts: RepairTimeouts,
+    settle: SettlePolicy,
+    rollback_unchanged: bool,
 }
 
 impl Default for RepairExecutor {
@@ -226,7 +335,30 @@ impl RepairExecutor {
     pub fn with_clock(clock: impl Clock + 'static) -> Self {
         Self {
             clock: Arc::new(clock),
+            timeouts: RepairTimeouts::default(),
+            settle: SettlePolicy::PerAction,
+            rollback_unchanged: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: RepairTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    #[must_use]
+    pub fn with_settle_policy(mut self, settle: SettlePolicy) -> Self {
+        self.settle = settle;
+        self
+    }
+
+    /// Roll a reversible repair back when it changed nothing measurable.
+    /// Off by default: the change is kept and reported as `Unchanged`.
+    #[must_use]
+    pub fn rollback_unchanged(mut self, enabled: bool) -> Self {
+        self.rollback_unchanged = enabled;
+        self
     }
 
     /// Run the snapshot -> apply -> verify -> rollback lifecycle.
@@ -246,9 +378,36 @@ impl RepairExecutor {
             class,
             description: description.clone(),
         });
+        if !repair.is_decided() {
+            let error = "the owner has not chosen which device keeps the address".to_owned();
+            events.push(RepairEventKind::ApplyFailed {
+                error: error.clone(),
+            });
+            return finish(
+                class,
+                description,
+                RepairOutcome::ApplyFailed { error },
+                None,
+                RollbackOutcome::NotAttempted {
+                    reason: RollbackSkipReason::NotNeeded,
+                },
+                events,
+            );
+        }
+        let limits = self.timeouts;
+        let profile = match self.settle {
+            SettlePolicy::PerAction => SettleProfile::for_repair(repair),
+            SettlePolicy::Immediate => SettleProfile::IMMEDIATE,
+        };
 
         let keys = repair.state_keys();
-        let snapshot = match transport.snapshot(&keys).await {
+        let snapshot = match bounded(
+            limits.snapshot,
+            transport.snapshot(&keys),
+            RepairTransportError::Snapshot,
+        )
+        .await
+        {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return finish(
@@ -266,7 +425,10 @@ impl RepairExecutor {
             }
         };
 
-        let baseline = match measure_symptom(transport, symptom).await.and_then(finite) {
+        let baseline = match measure_symptom(transport, symptom, limits.measure)
+            .await
+            .and_then(finite)
+        {
             Ok(measurement) => measurement,
             Err(error) => {
                 return finish(
@@ -286,7 +448,13 @@ impl RepairExecutor {
             baseline: baseline.clone(),
         });
 
-        if let Err(error) = transport.apply(repair).await {
+        if let Err(error) = bounded(
+            limits.apply,
+            transport.apply(repair),
+            RepairTransportError::Apply,
+        )
+        .await
+        {
             events.push(RepairEventKind::ApplyFailed {
                 error: error.to_string(),
             });
@@ -297,6 +465,7 @@ impl RepairExecutor {
                 &snapshot,
                 symptom,
                 &baseline,
+                &limits,
                 &mut events,
             )
             .await;
@@ -313,9 +482,11 @@ impl RepairExecutor {
         }
         events.push(RepairEventKind::Applied);
 
-        // A non-finite re-measurement (NaN from a divide-by-zero, an infinite
-        // latency) is not "unchanged": it is unverifiable, so treat it as such.
-        let after = match measure_symptom(transport, symptom).await.and_then(finite) {
+        // Give the change time to take effect, then keep re-measuring while
+        // the symptom still looks worse: a reboot or adapter bounce is
+        // transiently worse than the baseline and is not a regression.
+        let after = match settle_and_measure(transport, symptom, &baseline, &limits, profile).await
+        {
             Ok(measurement) => measurement,
             Err(error) => {
                 events.push(RepairEventKind::VerificationFailed {
@@ -329,6 +500,7 @@ impl RepairExecutor {
                     &snapshot,
                     symptom,
                     &baseline,
+                    &limits,
                     &mut events,
                 )
                 .await;
@@ -349,13 +521,16 @@ impl RepairExecutor {
             before: baseline.clone(),
             after: after.clone(),
         });
-        let rollback = if verdict == Verdict::Regressed {
+        let rollback = if verdict == Verdict::Regressed
+            || (verdict == Verdict::Unchanged && self.rollback_unchanged)
+        {
             roll_back(
                 transport,
                 repair,
                 &snapshot,
                 symptom,
                 &baseline,
+                &limits,
                 &mut events,
             )
             .await
@@ -380,14 +555,33 @@ impl RepairExecutor {
     }
 }
 
+/// Bounds one transport call; a timeout becomes the call own error variant.
+async fn bounded<R>(
+    limit: Duration,
+    call: impl Future<Output = Result<R, RepairTransportError>>,
+    on_timeout: fn(String) -> RepairTransportError,
+) -> Result<R, RepairTransportError> {
+    match tokio::time::timeout(limit, call).await {
+        Ok(result) => result,
+        Err(_) => Err(on_timeout(format!(
+            "timed out after {} ms",
+            limit.as_millis()
+        ))),
+    }
+}
+
 async fn measure_symptom<T: RepairTransport>(
     transport: &T,
     symptom: &Symptom,
+    limit: Duration,
 ) -> Result<Measurement, String> {
-    let measurements = transport
-        .measure(symptom.check())
-        .await
-        .map_err(|error| error.to_string())?;
+    let measurements = bounded(
+        limit,
+        transport.measure(symptom.check()),
+        RepairTransportError::Measure,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     measurements
         .iter()
         .find(|measurement| measurement.metric == symptom.metric())
@@ -398,6 +592,44 @@ async fn measure_symptom<T: RepairTransport>(
                 symptom.metric()
             )
         })
+}
+
+/// Waits `settle`, then measures; while the verdict is `Regressed`, polls
+/// until `verify_window` elapses. Returns the last usable measurement.
+async fn settle_and_measure<T: RepairTransport>(
+    transport: &T,
+    symptom: &Symptom,
+    baseline: &Measurement,
+    limits: &RepairTimeouts,
+    profile: SettleProfile,
+) -> Result<Measurement, String> {
+    if !profile.settle.is_zero() {
+        tokio::time::sleep(profile.settle).await;
+    }
+    let deadline = Instant::now() + profile.verify_window;
+    let mut last_ok: Option<Measurement> = None;
+    let mut last_error = String::new();
+    loop {
+        match measure_symptom(transport, symptom, limits.measure)
+            .await
+            .and_then(finite)
+        {
+            Ok(measurement) => {
+                let regressed =
+                    compare(symptom, baseline.value, measurement.value) == Verdict::Regressed;
+                last_ok = Some(measurement);
+                if !regressed {
+                    break;
+                }
+            }
+            Err(error) => last_error = error,
+        }
+        if Instant::now() + profile.poll_interval >= deadline {
+            break;
+        }
+        tokio::time::sleep(profile.poll_interval).await;
+    }
+    last_ok.ok_or(last_error)
 }
 
 /// Rejects a measurement whose value cannot be compared.
@@ -421,11 +653,21 @@ async fn roll_back<T: RepairTransport>(
     snapshot: &[StateEntry],
     symptom: &Symptom,
     baseline: &Measurement,
+    limits: &RepairTimeouts,
     events: &mut EventLog,
 ) -> RollbackOutcome {
     let outcome = if repair.reversible() {
-        match transport.restore(snapshot).await {
-            Ok(()) => match measure_symptom(transport, symptom).await.and_then(finite) {
+        match bounded(
+            limits.restore,
+            transport.restore(snapshot),
+            RepairTransportError::Restore,
+        )
+        .await
+        {
+            Ok(()) => match measure_symptom(transport, symptom, limits.measure)
+                .await
+                .and_then(finite)
+            {
                 Ok(restored) => match compare(symptom, baseline.value, restored.value) {
                     Verdict::Regressed => RollbackOutcome::Failed {
                         error: format!(
@@ -514,114 +756,127 @@ impl EventLog {
     }
 }
 
-/// Which transport operation was invoked, in order — for test assertions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportCall {
-    Snapshot,
-    Apply,
-    Restore,
-    Measure,
-}
+#[cfg(any(test, feature = "test-support"))]
+mod fake {
+    use super::*;
 
-/// Scripted in-memory transport for tests.
-#[derive(Debug)]
-pub struct FakeRepairTransport {
-    snapshot_result: Mutex<Result<Vec<StateEntry>, RepairTransportError>>,
-    apply_result: Mutex<Result<(), RepairTransportError>>,
-    restore_result: Mutex<Result<(), RepairTransportError>>,
-    measurements: Mutex<VecDeque<Result<Vec<Measurement>, RepairTransportError>>>,
-    calls: Mutex<Vec<TransportCall>>,
-}
-
-impl Default for FakeRepairTransport {
-    fn default() -> Self {
-        Self::new()
+    /// Which transport operation was invoked, in order — for test assertions.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TransportCall {
+        Snapshot,
+        Apply,
+        Restore,
+        Measure,
     }
-}
 
-impl FakeRepairTransport {
-    pub fn new() -> Self {
-        Self {
-            snapshot_result: Mutex::new(Ok(Vec::new())),
-            apply_result: Mutex::new(Ok(())),
-            restore_result: Mutex::new(Ok(())),
-            measurements: Mutex::new(VecDeque::new()),
-            calls: Mutex::new(Vec::new()),
+    /// Scripted in-memory transport for tests.
+    #[derive(Debug)]
+    pub struct FakeRepairTransport {
+        snapshot_result: Mutex<Result<Vec<StateEntry>, RepairTransportError>>,
+        apply_result: Mutex<Result<(), RepairTransportError>>,
+        restore_result: Mutex<Result<(), RepairTransportError>>,
+        measurements: Mutex<VecDeque<Result<Vec<Measurement>, RepairTransportError>>>,
+        calls: Mutex<Vec<TransportCall>>,
+    }
+
+    impl Default for FakeRepairTransport {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
-    pub fn with_snapshot(self, entries: Vec<StateEntry>) -> Self {
-        *self.snapshot_result.lock().expect("fake lock") = Ok(entries);
-        self
+    impl FakeRepairTransport {
+        pub fn new() -> Self {
+            Self {
+                snapshot_result: Mutex::new(Ok(Vec::new())),
+                apply_result: Mutex::new(Ok(())),
+                restore_result: Mutex::new(Ok(())),
+                measurements: Mutex::new(VecDeque::new()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn with_snapshot(self, entries: Vec<StateEntry>) -> Self {
+            *self.snapshot_result.lock().expect("fake lock") = Ok(entries);
+            self
+        }
+
+        pub fn with_snapshot_error(self, error: RepairTransportError) -> Self {
+            *self.snapshot_result.lock().expect("fake lock") = Err(error);
+            self
+        }
+
+        pub fn with_apply_error(self, error: RepairTransportError) -> Self {
+            *self.apply_result.lock().expect("fake lock") = Err(error);
+            self
+        }
+
+        pub fn with_restore_error(self, error: RepairTransportError) -> Self {
+            *self.restore_result.lock().expect("fake lock") = Err(error);
+            self
+        }
+
+        /// Queue one `measure` reply (first queued serves the baseline).
+        pub fn push_measurements(self, measurements: Vec<Measurement>) -> Self {
+            self.measurements
+                .lock()
+                .expect("fake lock")
+                .push_back(Ok(measurements));
+            self
+        }
+
+        pub fn push_measure_error(self, error: RepairTransportError) -> Self {
+            self.measurements
+                .lock()
+                .expect("fake lock")
+                .push_back(Err(error));
+            self
+        }
+
+        pub fn calls(&self) -> Vec<TransportCall> {
+            self.calls.lock().expect("fake lock").clone()
+        }
+
+        fn record(&self, call: TransportCall) {
+            self.calls.lock().expect("fake lock").push(call);
+        }
     }
 
-    pub fn with_snapshot_error(self, error: RepairTransportError) -> Self {
-        *self.snapshot_result.lock().expect("fake lock") = Err(error);
-        self
-    }
+    impl RepairTransport for FakeRepairTransport {
+        async fn snapshot(
+            &self,
+            _keys: &[StateKey],
+        ) -> Result<Vec<StateEntry>, RepairTransportError> {
+            self.record(TransportCall::Snapshot);
+            self.snapshot_result.lock().expect("fake lock").clone()
+        }
 
-    pub fn with_apply_error(self, error: RepairTransportError) -> Self {
-        *self.apply_result.lock().expect("fake lock") = Err(error);
-        self
-    }
+        async fn apply(&self, _repair: &ExecutableRepair) -> Result<(), RepairTransportError> {
+            self.record(TransportCall::Apply);
+            self.apply_result.lock().expect("fake lock").clone()
+        }
 
-    pub fn with_restore_error(self, error: RepairTransportError) -> Self {
-        *self.restore_result.lock().expect("fake lock") = Err(error);
-        self
-    }
+        async fn restore(&self, _entries: &[StateEntry]) -> Result<(), RepairTransportError> {
+            self.record(TransportCall::Restore);
+            self.restore_result.lock().expect("fake lock").clone()
+        }
 
-    /// Queue one `measure` reply (first queued serves the baseline).
-    pub fn push_measurements(self, measurements: Vec<Measurement>) -> Self {
-        self.measurements
-            .lock()
-            .expect("fake lock")
-            .push_back(Ok(measurements));
-        self
-    }
-
-    pub fn push_measure_error(self, error: RepairTransportError) -> Self {
-        self.measurements
-            .lock()
-            .expect("fake lock")
-            .push_back(Err(error));
-        self
-    }
-
-    pub fn calls(&self) -> Vec<TransportCall> {
-        self.calls.lock().expect("fake lock").clone()
-    }
-
-    fn record(&self, call: TransportCall) {
-        self.calls.lock().expect("fake lock").push(call);
+        async fn measure(
+            &self,
+            _check: CheckKind,
+        ) -> Result<Vec<Measurement>, RepairTransportError> {
+            self.record(TransportCall::Measure);
+            self.measurements
+                .lock()
+                .expect("fake lock")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(RepairTransportError::Measure(
+                        "no scripted measurement".into(),
+                    ))
+                })
+        }
     }
 }
-
-impl RepairTransport for FakeRepairTransport {
-    async fn snapshot(&self, _keys: &[StateKey]) -> Result<Vec<StateEntry>, RepairTransportError> {
-        self.record(TransportCall::Snapshot);
-        self.snapshot_result.lock().expect("fake lock").clone()
-    }
-
-    async fn apply(&self, _repair: &ExecutableRepair) -> Result<(), RepairTransportError> {
-        self.record(TransportCall::Apply);
-        self.apply_result.lock().expect("fake lock").clone()
-    }
-
-    async fn restore(&self, _entries: &[StateEntry]) -> Result<(), RepairTransportError> {
-        self.record(TransportCall::Restore);
-        self.restore_result.lock().expect("fake lock").clone()
-    }
-
-    async fn measure(&self, _check: CheckKind) -> Result<Vec<Measurement>, RepairTransportError> {
-        self.record(TransportCall::Measure);
-        self.measurements
-            .lock()
-            .expect("fake lock")
-            .pop_front()
-            .unwrap_or_else(|| {
-                Err(RepairTransportError::Measure(
-                    "no scripted measurement".into(),
-                ))
-            })
-    }
-}
+#[cfg(any(test, feature = "test-support"))]
+pub use fake::{FakeRepairTransport, TransportCall};
