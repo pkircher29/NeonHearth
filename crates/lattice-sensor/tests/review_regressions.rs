@@ -140,11 +140,14 @@ fn non_utf8_http_header_bytes_do_not_discard_the_response() {
 #[test]
 fn pcap_with_a_truncated_frame_is_skipped_and_the_rest_ingested() {
     use lattice_sensor::{OfflinePassiveAdapter, PassiveOptions};
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pcap/arp.pcap");
+    let path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pcap/arp.pcap");
     let original = std::fs::read(path).unwrap();
     let adapter = OfflinePassiveAdapter;
     let options = PassiveOptions::default();
-    let baseline = adapter.ingest_pcap_report("fixture0", &original, &options).unwrap();
+    let baseline = adapter
+        .ingest_pcap_report("fixture0", &original, &options)
+        .unwrap();
     assert!(!baseline.observations.is_empty());
 
     // Append one record whose frame is 3 bytes: too short for an Ethernet header.
@@ -163,7 +166,9 @@ fn pcap_with_a_truncated_frame_is_skipped_and_the_rest_ingested() {
     damaged.extend_from_slice(&word(3));
     damaged.extend_from_slice(&[0xde, 0xad, 0xbe]);
 
-    let result = adapter.ingest_pcap_report("fixture0", &damaged, &options).unwrap();
+    let result = adapter
+        .ingest_pcap_report("fixture0", &damaged, &options)
+        .unwrap();
     assert_eq!(result.observations, baseline.observations);
     assert!(result.skipped_frames <= 1);
     let link_only = adapter.ingest_pcap_link_discovery("fixture0", &damaged);

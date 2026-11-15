@@ -295,7 +295,8 @@ impl ScanHub {
         Ok(current.status.clone())
     }
     async fn targets(&self, requested: &[String]) -> Result<(Vec<Target>, usize), StatusCode> {
-        let stale_before = (Utc::now() - chrono::Duration::days(LOCAL_MAC_MAX_AGE_DAYS)).to_rfc3339();
+        let stale_before =
+            (Utc::now() - chrono::Duration::days(LOCAL_MAC_MAX_AGE_DAYS)).to_rfc3339();
         let evidence = scan_candidate_evidence(&self.pool, &stale_before).await?;
         let mut identities: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         let mut known = BTreeSet::new();
@@ -934,10 +935,10 @@ mod tests {
         let recent = now.to_rfc3339();
         // (mac, observed_at, owner_confirmed)
         let rows = [
-            ("02:00:00:00:00:01", &old, 0),    // randomized, stale, unconfirmed: dropped
+            ("02:00:00:00:00:01", &old, 0), // randomized, stale, unconfirmed: dropped
             ("02:00:00:00:00:02", &recent, 0), // randomized but recent: kept
-            ("02:00:00:00:00:03", &old, 1),    // randomized, stale, owner confirmed: kept
-            ("00:11:22:33:44:55", &old, 0),    // universally administered: kept
+            ("02:00:00:00:00:03", &old, 1), // randomized, stale, owner confirmed: kept
+            ("00:11:22:33:44:55", &old, 0), // universally administered: kept
         ];
         for (mac, at, confirmed) in rows {
             let id = uuid::Uuid::new_v4().to_string();
