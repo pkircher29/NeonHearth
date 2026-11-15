@@ -6,8 +6,10 @@ use chacha20poly1305::{
 use lattice_camera::{CameraId, StreamId, StreamSourceRef};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::HashSet;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     io::Write as _,
     path::{Path, PathBuf},
