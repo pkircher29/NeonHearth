@@ -1,0 +1,21 @@
+name: Install WiX (checksum-pinned)
+description: >
+  Installs WiX 5.0.2 from SHA-256 verified NuGet packages and exposes the
+  extension DLL paths. Never use it in a job that holds a signing identity.
+outputs:
+  tool_dir:
+    description: Folder containing wix.exe
+    value: ${{ steps.install.outputs.tool_dir }}
+  util_ext:
+    description: Path to WixToolset.Util.wixext.dll
+    value: ${{ steps.install.outputs.util_ext }}
+  bal_ext:
+    description: Path to WixToolset.BootstrapperApplications.wixext.dll
+    value: ${{ steps.install.outputs.bal_ext }}
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: pwsh
+      run: ./install-wix.ps1 -WorkDir "$env:RUNNER_TEMP/wix"
+      working-directory: ${{ github.action_path }}

@@ -152,6 +152,18 @@ In place:
 - Every GitHub Action in CI is pinned to a commit SHA, and `cargo-cyclonedx`
   to an exact version.
 - Node major version is pinned to 22 in CI, matching the recorded baseline.
+- Release builds use `cargo build --locked` on every platform (Linux staging
+  previously did not).
+- The release pipeline separates unprivileged build jobs from the signing job
+  (`.github/workflows/sign.yml`), passes artifacts between jobs with a
+  SHA-256 list whose hash travels as a job output, and installs WiX from
+  SHA-256 pinned NuGet packages. The Azure signing client, nfpm and the
+  Mosquitto installer are hash-pinned as before.
+- `vendor/sqlx-sqlite` is checked in CI (`scripts/check-vendor-sqlx.py`)
+  against the upstream crate: checksum plus a file-by-file diff that allows
+  only the documented `libsqlite3-sys` pin and the patch note.
+- `deny.toml` flags unmaintained crates across the whole dependency graph
+  (`unmaintained = "all"`).
 
 NOT yet in place — do not claim reproducibility beyond this:
 
@@ -161,9 +173,12 @@ NOT yet in place — do not claim reproducibility beyond this:
   or normalized-environment work has been done.
 - Vite/npm build output has not been checked for determinism (hashing,
   timestamps).
-- SBOMs are generated per build but are not yet signed, and no attestation
-  (SLSA provenance) is produced. Artifact signing is tracked separately as
-  RLS7.
+- SBOMs are generated per build and attached to the release as one archive,
+  but are not signed, and no attestation (SLSA provenance) is produced yet
+  (TODO in release.yml: an attestation action must be pinned by a verified
+  full commit SHA). Windows artifact signing is implemented in CI and
+  needs the repository variables and `release-signing` environment described
+  in windows-delivery.md; the Linux packages are not signed.
 
 ## Historical verification evidence (2026-08-24, Windows 11 dev box)
 

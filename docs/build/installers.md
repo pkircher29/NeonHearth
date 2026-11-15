@@ -46,7 +46,7 @@ packaging/
   windows/
     NeonHearth.wxs                WiX installer definition (MSI, x64, perMachine) - requires WiX v5
     Bundle.wxs                    Burn bundle: NeonHearth-Setup-<ver>-x64.exe chaining the MSI
-    scripts/configure-service.ps1 Post-install: token, ACL, Npcap detect/limited mode, recovery
+    scripts/configure-service.ps1 Post-install: state dir + key ACLs, token, recovery (no Npcap)
   linux/
     neonhearth.service            Hardened systemd unit
     neonhearth.sysusers.conf      sysusers.d fragment (dedicated `neonhearth` user)
@@ -309,6 +309,9 @@ Windows (this repo, elevated not required for staging; WiX v5 CLI via
 pwsh -File packaging\stage.ps1              # build + stage into packaging\dist\windows
 wix extension add -g WixToolset.Util.wixext/5.0.2
 wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
+# CI does NOT do the two lines above: it installs the same three packages from
+# SHA-256 pinned .nupkg files (.github/actions/install-wix) and passes the
+# extension DLLs to `wix build -ext <path>`.
 # bindpaths MUST be absolute (see WIX8601 note above); -wx enforces it
 wix build packaging\windows\NeonHearth.wxs `
     -ext WixToolset.Util.wixext `
@@ -342,18 +345,43 @@ with `sc.exe failure` in the configure script), then runs
 `configure-service.ps1` which generates the pairing token into the
 service-private `Environment` registry value, sets explicit non-inherited
 ACLs on both the state directory and the service registry key, points the
-service at a bundled ffmpeg when present, detects Npcap (adding a service-local `PATH` entry when Npcap lacks
-WinPcap-compat DLLs in System32), and starts the service — or engages
-limited mode when Npcap is absent. Uninstall stops/deletes the service and
+service at a bundled ffmpeg when present, and starts the service (native
+discovery; Npcap is not used). Uninstall stops/deletes the service and
 removes program files; the state directory survives with a note.
 
 Linux: deb/rpm install the binary to `/usr/libexec/neonhearth/`, the
 hardened unit, the sysusers fragment, and UI assets;
 `postinstall.sh` creates the user, generates
-`/etc/neonhearth/service.env` (root:neonhearth 0640) on first install,
+`/etc/neonhearth/service.env` (root:root 0600) on first install,
 and enables/starts the unit. `StateDirectory=neonhearth` owns
 `/var/lib/neonhearth`; package removal never deletes it (note file written
 at install).
+
+## Delivery review fixes, 2026-11 (authored; install scripts untested on a real machine)
+
+- **State directory pre-creation (configure-service.ps1).** A standard user can
+  create `C:\ProgramData\NeonHearth` before the installer runs. The script,
+  which runs as SYSTEM, now refuses a reparse point, moves aside a directory not
+  owned by SYSTEM/Administrators (never reused), creates the directory with its
+  final protected DACL and sets the owner to Administrators, and verifies it.
+- **Token write order.** The service key ACL is set and verified first; the
+  token is written only afterwards, and any failure removes the `Environment`
+  value (fail closed; re-running generates a new token).
+- **Token rotation.** A token that predates this order is rotated once
+  (marker `HKLM\SOFTWARE\NeonHearth\TokenGeneration` = 2) and the running
+  service is restarted so it loads the new value. The Start-menu shortcut always
+  reads the current token, so only an already-open dashboard tab must be
+  reopened. Later upgrades preserve the token.
+- **Linux upgrade.** `preremove.sh` acts only on real removal (deb `remove`,
+  rpm `0`); before this fix every upgrade left the unit stopped and disabled.
+  `postinstall.sh` no longer writes into the service-owned state directory (a
+  planted symlink could redirect a root write); the retention note ships as
+  `/usr/share/doc/neonhearth/README-DATA.txt`. `service.env` is `root:root 0600`.
+  `stage.sh` builds with `cargo --locked`. The unit gains `PrivateDevices`,
+  `ProtectKernelLogs`, `ProcSubset=pid`; `MemoryDenyWriteExecute` stays on
+  because ffmpeg only remuxes (`-c:v copy`).
+- **Release pipeline.** See `windows-delivery.md` and the header of
+  `.github/workflows/release.yml`.
 
 ## Audit remediation, 2026-09-03 (authored; not yet exercised on a real install)
 

@@ -31,6 +31,30 @@ def protected(path):
         path.chmod(0o700)
 
 
+def listener_owner(port):
+    """PID of the single process listening on 127.0.0.1:port; None if nobody; raises if unknowable."""
+    try:
+        import psutil
+    except ImportError as error:
+        raise RuntimeError("psutil is required to verify who owns the dashboard port (pip install psutil)") from error
+    owners = {c.pid for c in psutil.net_connections(kind="tcp")
+              if c.status == "LISTEN" and c.laddr.port == port and c.laddr.ip in ("127.0.0.1", "0.0.0.0", "::", "::1")}
+    if len(owners) > 1:
+        raise RuntimeError(f"More than one process claims port {port}")
+    return next(iter(owners), None)
+
+
+def owns_listener(port, pid, binary):
+    """True only if `pid` is the saved collector and is the one listening on `port`."""
+    import psutil
+    if not isinstance(pid, int) or listener_owner(port) != pid:
+        return False
+    try:
+        return Path(psutil.Process(pid).exe()).resolve() == Path(binary).resolve()
+    except (psutil.Error, OSError):
+        return False
+
+
 def authenticated(url, token):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     request = urllib.request.Request(url + "/api/v1/automation", headers={"Authorization": "Bearer " + token})
@@ -65,7 +89,8 @@ def main():
     url = f"http://127.0.0.1:{args.port}"
     if connection.exists():
         previous = json.loads(connection.read_text(encoding="utf-8"))
-        if previous.get("url") == url and authenticated(url, previous["token"]):
+        if (previous.get("url") == url and owns_listener(args.port, previous.get("pid"), previous.get("binary", ""))
+                and authenticated(url, previous["token"])):
             if not args.no_browser:
                 webbrowser.open(url + "/#token=" + previous["token"])
             print(f"NeonHearth is running at {url}")
@@ -92,7 +117,7 @@ def main():
     for _ in range(80):
         if process.poll() is not None:
             raise RuntimeError(f"Service exited. See {state / 'service.log'}")
-        if authenticated(url, token):
+        if listener_owner(args.port) == process.pid and authenticated(url, token):
             connection.write_text(json.dumps({"url": url, "token": token, "pid": process.pid,
                                               "binary": str(binary)}), encoding="utf-8")
             if os.name != "nt":

@@ -15,7 +15,7 @@ export interface LiveConnectionOptions {
   /** No server message for this long on an open socket triggers a resync (0 disables). */
   staleAfterMs?: number;
 }
-export interface LiveConnection { start(): Promise<void>; stop(): void; getState(): LiveState }
+export interface LiveConnection { start(): Promise<void>; stop(): void; /** Forget everything learned under the previous credential. */ reset(): void; getState(): LiveState }
 
 const defaultTimers: SessionTimers = { setTimeout: (callback, delay) => globalThis.setTimeout(callback, delay), clearTimeout: (timer) => globalThis.clearTimeout(timer as ReturnType<typeof setTimeout>) };
 
@@ -71,7 +71,7 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
       if (softGeneration === token) state = { ...state, connected: true };
       publish();
       const epoch = ++socketEpoch;
-      const opened = await client.openEvents(state.sequence, handleMessage, (socketState) => handleSocketState(token, epoch, socketState));
+      const opened = await client.openEvents(state.sequence, handleMessage, (socketState) => handleSocketState(token, epoch, socketState), abort.signal);
       if (!isCurrent(token) || epoch !== socketEpoch) { opened.close(); return; }
       socket = opened;
       cancelRetry();
@@ -138,6 +138,7 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
       hydrationAbort?.abort(new Error('Connection stopped')); hydrationAbort = undefined;
       state = { ...state, connected: false }; publish();
     },
+    reset() { state = initialLiveState; publish(); },
     getState() { return state; }
   };
 }
