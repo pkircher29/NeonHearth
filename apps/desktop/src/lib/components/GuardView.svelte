@@ -14,7 +14,8 @@
 
   // The prop keeps its public name `state`; the local alias avoids shadowing
   // the `$state` rune used for the owner-action UI state below.
-  let { state: live, client = null, network = null, scan = null, labelsApi = null, onsaved }: { state: LiveState; client?: PolicyActionClient | null; network?: NetworkDetails | null; scan?: ScanStatus | null; labelsApi?: DeviceLabelsApi | null; onsaved?: (label: DeviceLabel) => void } = $props();
+  // `owner` is false for a paired phone: only the owner may confirm the clock, so a phone sees the explanation without the button.
+  let { state: live, client = null, network = null, scan = null, labelsApi = null, onsaved, owner = true }: { state: LiveState; client?: PolicyActionClient | null; network?: NetworkDetails | null; scan?: ScanStatus | null; labelsApi?: DeviceLabelsApi | null; onsaved?: (label: DeviceLabel) => void; owner?: boolean } = $props();
   const networkByDevice = $derived(new Map(network?.devices.map(d => [d.device_id,d]) ?? []));
   const findings = $derived(findingsByDevice(scan?.findings ?? []));
   // One freshness signal: while the collector is unreachable every card is last-known, and owner decisions are not sent into the void.
@@ -141,7 +142,8 @@
     <div class="offline-banner clock-notice" role="alert">
       <strong>This computer's clock changed unexpectedly, so automatic quarantine deadlines are paused.</strong>
       <p class="muted">Until you confirm the clock is right, a passed deadline will only ask for your attention instead of quarantining a device. Your own decisions still apply.{#if clock.detail} Detected: {clock.detail}.{/if}</p>
-      {#if client?.acknowledgeClock}<button type="button" class="act" disabled={clockBusy || offline} onclick={() => void acknowledgeClock()}>Confirm the clock is correct</button>{/if}
+      {#if !owner}<p class="muted">The owner can confirm the clock is correct from the home computer.</p>
+      {:else if client?.acknowledgeClock}<button type="button" class="act" disabled={clockBusy || offline} onclick={() => void acknowledgeClock()}>Confirm the clock is correct</button>{/if}
       {#if clockError}<p class="action-error" role="alert">{clockError}</p>{/if}
     </div>
   {/if}

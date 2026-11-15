@@ -38,6 +38,16 @@ describe('GuardView clock notice', () => {
     expect(screen.getByText(/clock changed unexpectedly/)).toBeTruthy();
   });
 
+  it('tells a paired phone the owner confirms the clock, with no button', () => {
+    const acknowledgeClock = vi.fn();
+    render(GuardView, { state: suspect, client: { policyAction: unused, acknowledgeClock }, owner: false });
+
+    expect(screen.getByText(/clock changed unexpectedly, so automatic quarantine deadlines are paused/)).toBeTruthy();
+    expect(screen.getByText('The owner can confirm the clock is correct from the home computer.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Confirm the clock is correct' })).toBeNull();
+    expect(acknowledgeClock).not.toHaveBeenCalled();
+  });
+
   it('shows the notice without a button when no client can acknowledge', () => {
     render(GuardView, { state: suspect });
     expect(screen.getByText(/clock changed unexpectedly/)).toBeTruthy();
