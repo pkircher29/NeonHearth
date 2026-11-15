@@ -689,3 +689,38 @@ test.describe('touch gestures on the plan canvas', () => {
     await expect(planCanvas(page).locator('line.wall')).toHaveCount(5); // the seeded plan has 4
   });
 });
+
+test('Duplicate floor copies the active floor to a new floor above, and the copy is saved and survives a reload', async ({ page }) => {
+  const server = await installHomeFixture(page, { plan: seededTwinPlan() });
+  await page.goto('/');
+  await openHome(page);
+  await expect(floorBar(page).getByRole('button', { name: /^Ground/ })).toHaveAttribute('aria-pressed', 'true');
+  const wallsBefore = await planCanvas(page).locator('line.wall').count();
+  const floorsBefore = await floorBar(page).locator('button.floor-tab').count();
+  expect(wallsBefore).toBeGreaterThan(0);
+
+  await floorBar(page).getByRole('button', { name: 'Duplicate floor' }).click();
+  const copy = floorBar(page).getByRole('button', { name: /^Copy of Ground/ });
+  await expect(copy).toHaveAttribute('aria-pressed', 'true');
+  await expect(floorBar(page).locator('button.floor-tab')).toHaveCount(floorsBefore + 1);
+  await expect(planCanvas(page).locator('line.wall')).toHaveCount(wallsBefore);
+  await expect(page.getByText(/Duplicated Ground as Copy of Ground/)).toBeVisible();
+
+  await page.getByRole('button', { name: 'Save plan' }).click();
+  await expect(page.getByText(/Plan saved as version/)).toBeVisible();
+  const saved = server.planPuts.at(-1)!.plan;
+  const source = saved.floors.find((floor) => floor.name === 'Ground')!;
+  const duplicate = saved.floors.find((floor) => floor.name === 'Copy of Ground')!;
+  expect(duplicate.level).toBe(Math.max(...saved.floors.map((floor) => floor.level)));
+  expect(duplicate.walls).toHaveLength(source.walls.length);
+  expect(duplicate.rooms).toHaveLength(source.rooms.length);
+  const sourceIds = new Set(source.walls.map((entry) => entry.wall_id));
+  expect(duplicate.walls.some((entry) => sourceIds.has(entry.wall_id))).toBe(false);
+  expect(duplicate.walls.map((entry) => [entry.start, entry.end])).toEqual(source.walls.map((entry) => [entry.start, entry.end]));
+
+  await page.reload();
+  await openHome(page);
+  await floorBar(page).getByRole('button', { name: /^Copy of Ground/ }).click();
+  await expect(planCanvas(page).locator('line.wall')).toHaveCount(wallsBefore);
+  await page.screenshot({ path: process.env.DUP_SHOT ?? 'test-results/duplicate-floor.png' });
+});

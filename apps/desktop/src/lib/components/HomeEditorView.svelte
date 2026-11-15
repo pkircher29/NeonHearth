@@ -835,6 +835,28 @@
     if (dispatch({ type: 'add_floor', floor_id, level, name: `Floor ${level}`, ceiling_height_m: 2.4 })) activeFloorId = floor_id;
   }
 
+  /** One click: the active floor's walls, openings and rooms on a new floor above, as one undo step. */
+  function duplicateFloor() {
+    if (!activeFloor) return;
+    const source = activeFloor;
+    const level = Math.max(...plan.floors.map((floor) => floor.level)) + 1;
+    const taken = new Set(plan.floors.map((floor) => floor.name));
+    const base = `Copy of ${source.name}`;
+    let name = base.slice(0, 64);
+    for (let n = 2; taken.has(name); n += 1) name = `${base.slice(0, 64 - ` ${n}`.length)} ${n}`;
+    const blank = { floor_id: newId(), level, name, ceiling_height_m: source.ceiling_height_m, walls: [], rooms: [] };
+    // An empty floor has no footprint to copy, so it duplicates as a new empty floor of the same height.
+    const done = source.walls.length || source.rooms.length
+      ? dispatch({ type: 'copy_footprint', floor: copyFloorFootprint(source, blank, newId) })
+      : dispatch({ type: 'add_floor', floor_id: blank.floor_id, level, name, ceiling_height_m: blank.ceiling_height_m });
+    if (!done) { notice = 'The floor could not be duplicated. A plan holds up to 64 floors.'; return; }
+    activeFloorId = blank.floor_id;
+    selection = { kind: 'floor' };
+    cancelPending();
+    roomOfferOpen = false;
+    notice = `Duplicated ${source.name} as ${name} (level ${level}). Devices stay on their own floor; Undo removes the copy.`;
+  }
+
   function copyFootprint() {
     if (!activeFloor) return;
     const level = Math.max(...plan.floors.map(floor => floor.level)) + 1;
@@ -992,7 +1014,7 @@
     <p class="tool-hint" aria-live="polite">{hint}</p>
 
     <div class="floor-row">
-    <HomeEditorFloorBar {units} floors={plan.floors} active={activeFloor?.floor_id ?? null} onselect={(floorId) => { activeFloorId = floorId; selection = { kind: 'floor' }; cancelPending(); roomOfferOpen = false; }} onadd={addFloor} />
+    <HomeEditorFloorBar {units} floors={plan.floors} active={activeFloor?.floor_id ?? null} onselect={(floorId) => { activeFloorId = floorId; selection = { kind: 'floor' }; cancelPending(); roomOfferOpen = false; }} onadd={addFloor} onduplicate={duplicateFloor} />
       {#if activeFloor}
         <div class="footprint-controls tool-palette" title="Copies walls (with thickness), openings, and rooms. Devices keep their locations.">
           <label class="opening-kind">Copy footprint to
