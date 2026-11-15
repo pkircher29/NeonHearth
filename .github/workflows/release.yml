@@ -35,6 +35,11 @@ jobs:
     name: Windows native Home Hub (recommended ZIP)
     runs-on: windows-latest
     needs: quality
+    # Holds the trust link that lets this job sign with Azure Artifact Signing.
+    environment: release-signing
+    permissions:
+      contents: read
+      id-token: write
     env:
       # Rust EXEs must load before the launcher can explain the broker's separate prerequisite.
       CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
@@ -73,6 +78,35 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Staging target tests failed' }
       - name: Build locked native launcher and collector
         run: cargo build --locked --release --target x86_64-pc-windows-msvc -p lattice-service -p lattice-launcher
+      # Code signing with Azure Artifact Signing. The job signs in with GitHub's
+      # OIDC identity (no stored secret). Without the AZURE_CLIENT_ID repository
+      # variable every signing step is skipped and the output stays unsigned.
+      # The signing token lasts about an hour and cannot be renewed in the job,
+      # so the sign-in comes after the long compile.
+      - name: Sign in to Azure for code signing
+        if: vars.AZURE_CLIENT_ID != ''
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Prepare code signing
+        if: vars.AZURE_CLIENT_ID != ''
+        shell: pwsh
+        run: ./scripts/windows-signing/setup.ps1 -Endpoint "${{ vars.ARTIFACT_SIGNING_ENDPOINT }}" -Account "${{ vars.ARTIFACT_SIGNING_ACCOUNT }}" -CertificateProfile "${{ vars.ARTIFACT_SIGNING_PROFILE }}"
+      # Signed before packaging so PACKAGE-MANIFEST.json and the ZIP hash
+      # describe the signed programs.
+      - name: Sign and check the launcher and collector
+        if: vars.AZURE_CLIENT_ID != ''
+        shell: pwsh
+        run: |
+          $release = 'target/x86_64-pc-windows-msvc/release'
+          foreach ($name in 'NeonHearth.exe', 'lattice-service.exe') {
+            ./scripts/windows-signing/sign.ps1 "$release/$name"
+            if ($LASTEXITCODE -ne 0) { throw "Signing $name failed" }
+          }
+          ./scripts/windows-signing/verify.ps1 -Publisher "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}" "$release/NeonHearth.exe" "$release/lattice-service.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Signature check failed' }
       - name: Build dashboard
         shell: pwsh
         run: |
@@ -85,8 +119,17 @@ jobs:
       - name: Assemble native Home Hub ZIP
         shell: pwsh
         run: |
-          python scripts/package-home-hub.py --target target/x86_64-pc-windows-msvc/release --mosquitto "${{ runner.temp }}/neonhearth-mosquitto" --output "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-x64" --version "${{ steps.version.outputs.full }}"
+          $signed = @()
+          if ("${{ vars.AZURE_CLIENT_ID }}") { $signed = @('--signed-by', "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}") }
+          python scripts/package-home-hub.py --target target/x86_64-pc-windows-msvc/release --mosquitto "${{ runner.temp }}/neonhearth-mosquitto" --output "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-x64" --version "${{ steps.version.outputs.full }}" @signed
           if ($LASTEXITCODE -ne 0) { throw 'Home Hub packaging failed' }
+      - name: Check the packaged signatures
+        if: vars.AZURE_CLIENT_ID != ''
+        shell: pwsh
+        run: |
+          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-x64"
+          ./scripts/windows-signing/verify.ps1 -Publisher "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}" "$hub/NeonHearth.exe" "$hub/bin/lattice-service.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged signature check failed' }
       - name: Validate exact payload and executable loading
         shell: pwsh
         run: |
@@ -137,6 +180,11 @@ jobs:
     name: Windows service compatibility installer (MSI)
     needs: quality
     runs-on: windows-latest
+    # Holds the trust link that lets this job sign with Azure Artifact Signing.
+    environment: release-signing
+    permissions:
+      contents: read
+      id-token: write
     env:
       CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
@@ -190,6 +238,37 @@ jobs:
           pwsh -File packaging\stage.ps1
           if ($LASTEXITCODE -ne 0) { throw 'Windows staging failed' }
 
+      # Code signing with Azure Artifact Signing. The job signs in with GitHub's
+      # OIDC identity (no stored secret). Without the AZURE_CLIENT_ID repository
+      # variable every signing step is skipped and the output stays unsigned.
+      # The signing token lasts about an hour and cannot be renewed in the job,
+      # so the sign-in comes after the long compile.
+      - name: Sign in to Azure for code signing
+        if: vars.AZURE_CLIENT_ID != ''
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Prepare code signing
+        if: vars.AZURE_CLIENT_ID != ''
+        shell: pwsh
+        run: ./scripts/windows-signing/setup.ps1 -Endpoint "${{ vars.ARTIFACT_SIGNING_ENDPOINT }}" -Account "${{ vars.ARTIFACT_SIGNING_ACCOUNT }}" -CertificateProfile "${{ vars.ARTIFACT_SIGNING_PROFILE }}"
+
+      # stage.ps1 hashes its inputs into STAGING-MANIFEST.txt, so the collector
+      # is signed in the build folder and the layout is staged again from it.
+      - name: Sign the collector and restage
+        if: vars.AZURE_CLIENT_ID != ''
+        shell: pwsh
+        run: |
+          $exe = 'target/x86_64-pc-windows-msvc/release/lattice-service.exe'
+          ./scripts/windows-signing/sign.ps1 $exe
+          if ($LASTEXITCODE -ne 0) { throw 'Signing the collector failed' }
+          pwsh -File packaging\stage.ps1 -SkipRust -SkipUi
+          if ($LASTEXITCODE -ne 0) { throw 'Windows restaging failed' }
+          ./scripts/windows-signing/verify.ps1 -Publisher "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}" packaging/dist/windows/bin/lattice-service.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Staged collector signature check failed' }
+
       # WiX v5 is required: the <Files> wildcard-harvesting element used for
       # the UI bundle does not exist in WiX 4.x. Pinned to the version the
       # .wxs was verified against.
@@ -216,6 +295,14 @@ jobs:
             -wx `
             -o NeonHearth-${{ steps.version.outputs.full }}-x64.msi
           if (-not (Test-Path "NeonHearth-${{ steps.version.outputs.full }}-x64.msi")) { throw 'MSI was not produced' }
+
+      # Signed before the bundle is built: the bundle embeds this exact file.
+      - name: Sign the MSI
+        if: vars.AZURE_CLIENT_ID != ''
+        shell: pwsh
+        run: |
+          ./scripts/windows-signing/sign.ps1 "NeonHearth-${{ steps.version.outputs.full }}-x64.msi"
+          if ($LASTEXITCODE -ne 0) { throw 'Signing the MSI failed' }
 
       # Validation without installing: administrative extract (msiexec /a)
       # unpacks the file table; assert the payload the installer promises.
@@ -257,6 +344,30 @@ jobs:
             -wx `
             -o NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe
           if (-not (Test-Path "NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe")) { throw 'Bundle exe was not produced' }
+
+      # A Burn bundle is an engine with the payload attached. Signing the
+      # finished file alone leaves the engine it extracts and runs unsigned,
+      # so: detach the engine, sign it, reattach, then sign the whole bundle.
+      - name: Sign the setup bundle
+        if: vars.AZURE_CLIENT_ID != ''
+        shell: pwsh
+        run: |
+          $bundle = "NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe"
+          $work = Join-Path $env:RUNNER_TEMP 'burn-sign'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          $engine = Join-Path $work 'engine.exe'
+          $signedBundle = Join-Path $work $bundle
+          wix burn detach $bundle -engine $engine
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $engine)) { throw 'Could not detach the bundle engine' }
+          ./scripts/windows-signing/sign.ps1 $engine
+          if ($LASTEXITCODE -ne 0) { throw 'Signing the bundle engine failed' }
+          wix burn reattach $bundle -engine $engine -o $signedBundle
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $signedBundle)) { throw 'Could not reattach the bundle engine' }
+          Move-Item -Force $signedBundle $bundle
+          ./scripts/windows-signing/sign.ps1 $bundle
+          if ($LASTEXITCODE -ne 0) { throw 'Signing the setup bundle failed' }
+          ./scripts/windows-signing/verify.ps1 -Publisher "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}" $bundle "NeonHearth-${{ steps.version.outputs.full }}-x64.msi"
+          if ($LASTEXITCODE -ne 0) { throw 'Installer signature check failed' }
 
       # Validation without installing: extract the bundle's attached
       # container and require the embedded payload to be byte-identical to
@@ -438,7 +549,7 @@ jobs:
           files: |
             release-assets/*
           body: |
-            **Pre-release: unsigned, not clean-machine tested.**
+            **Pre-release: ${{ vars.AZURE_CLIENT_ID != '' && format('Windows programs and installers are code-signed by {0};', vars.ARTIFACT_SIGNING_PUBLISHER) || 'unsigned,' }} not clean-machine tested.**
 
             **Recommended Windows download: NeonHearth-Home-Hub-...-windows-x64.zip.**
             Extract the complete folder and open NeonHearth.exe. It includes the

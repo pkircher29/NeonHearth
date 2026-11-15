@@ -30,8 +30,8 @@ class PackageTests(unittest.TestCase):
         (self.root/'Cargo.toml').write_text('[workspace.package]\nversion="0.1.0"\n')
         self.output = self.root / 'package'
 
-    def run_package(self):
-        with patch.object(package, 'ROOT', self.root), patch.object(sys, 'argv', [str(SCRIPT), '--mosquitto', str(self.root/'mqtt'), '--output', str(self.output)]):
+    def run_package(self, *extra):
+        with patch.object(package, 'ROOT', self.root), patch.object(sys, 'argv', [str(SCRIPT), '--mosquitto', str(self.root/'mqtt'), '--output', str(self.output), *extra]):
             def command(args, **kwargs):
                 if args[:2] == ['git', 'rev-parse']:
                     return 'a' * 40
@@ -99,6 +99,25 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(rows[name]['bytes'],len(content))
             self.assertEqual(rows[name]['sha256'],hashlib.sha256(content).hexdigest())
         self.assertNotIn('lattice.db', rows)
+
+    def test_package_states_unsigned_unless_the_build_names_a_verified_signer(self):
+        self.complete_inputs()
+        self.run_package()
+        info = json.loads((self.output/'BUILD-INFO.json').read_text())
+        self.assertIs(info['unsigned'], True)
+        self.assertNotIn('signed_by', info)
+        self.assertIn('This development package is unsigned.', (self.output/'Read me.txt').read_text())
+
+    def test_signed_package_records_the_publisher(self):
+        self.complete_inputs()
+        self.run_package('--signed-by', 'Example Publisher')
+        info = json.loads((self.output/'BUILD-INFO.json').read_text())
+        self.assertIs(info['unsigned'], False)
+        self.assertEqual(info['signed_by'], 'Example Publisher')
+        readme = (self.output/'Read me.txt').read_text()
+        self.assertIn('code-signed by Example Publisher.', readme)
+        self.assertNotIn('unsigned', readme)
+        self.assertNotIn('{signing_note}', readme)
 
     def test_changed_broker_is_rejected_before_output(self):
         self.complete_inputs()
