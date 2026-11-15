@@ -53,15 +53,12 @@ pub(crate) async fn import_route(
         .try_lock()
         .map_err(|_| StatusCode::CONFLICT)?;
     let observations = tokio::task::spawn_blocking(move || {
-        lattice_sensor::OfflinePassiveAdapter.ingest_pcap(
-            "owner_capture",
-            &bytes,
-            &lattice_sensor::PassiveOptions::default(),
-        )
+        lattice_sensor::OfflinePassiveAdapter.ingest_pcap_link_discovery("owner_capture", &bytes)
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    .map_err(|_| StatusCode::BAD_REQUEST)?
+    .observations;
     let now = Utc::now();
     let findings = observations
         .into_iter()

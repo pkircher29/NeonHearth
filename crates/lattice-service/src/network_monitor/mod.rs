@@ -5,7 +5,7 @@ mod router;
 #[cfg(test)]
 mod tests;
 use chrono::Utc;
-use futures_util::{StreamExt, stream};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use std::{
@@ -151,10 +151,13 @@ impl NetworkMonitor {
         }
         Ok(())
     }
-    pub fn start(&self, shutdown: watch::Receiver<bool>) {
+    /// Spawns the discovery loop and the router feed. The returned handle finishes when either
+    /// of them stops (shutdown or panic), so a finished handle outside shutdown means
+    /// the monitor is no longer fully running (the other task is left to finish on its own).
+    pub fn start(&self, shutdown: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         let mut stop = shutdown.clone();
-        tokio::spawn(async move {
+        let mut discovery_task = tokio::spawn(async move {
             loop {
                 if *stop.borrow() {
                     break;
@@ -174,7 +177,7 @@ impl NetworkMonitor {
         });
         let this = self.clone();
         let mut stop = shutdown;
-        tokio::spawn(async move {
+        let mut feed_task = tokio::spawn(async move {
             loop {
                 if *stop.borrow() {
                     break;
@@ -183,6 +186,12 @@ impl NetworkMonitor {
                 tokio::select! { _ = stop.changed() => { if *stop.borrow() || stop.has_changed().is_err() { break; } }, _ = tokio::time::sleep(Duration::from_secs(3)) => {} }
             }
         });
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = &mut discovery_task => {}
+                _ = &mut feed_task => {}
+            }
+        })
     }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
@@ -252,28 +261,30 @@ impl NetworkMonitor {
         let targets = plan.targets.clone();
         let mut sightings = Vec::new();
         let mut errors = 0;
-        let mut probes = stream::iter(plan.targets)
-            .map(|target| async move {
-                if self.cancel.load(Ordering::Acquire) {
-                    return None;
-                }
-                Some(lan::probe(target).await)
-            })
-            .buffer_unordered(16);
-        while let Some(result) = probes.next().await {
-            let Some(result) = result else { continue };
-            let mut status = self.discovery.lock().await;
-            if let Some(status) = status.as_mut() {
-                status.completed += 1;
-                match result {
-                    Ok(Some(sighting)) => {
-                        status.responding += 1;
-                        sightings.push(sighting);
-                    }
-                    Ok(None) => {}
-                    Err(()) => {
-                        status.errors += 1;
-                        errors += 1;
+        // The plan is validated once for the sweep; probes run in batches that share one
+        // neighbor snapshot (previously every target re-planned the whole network).
+        let names: std::collections::BTreeMap<u32, String> = inventory
+            .interfaces()
+            .map(|i| (i.id.get(), i.name.clone()))
+            .collect();
+        for batch in plan.targets.chunks(lan::BATCH) {
+            if self.cancel.load(Ordering::Acquire) {
+                break;
+            }
+            for result in lan::probe_batch(batch, &names).await {
+                let mut status = self.discovery.lock().await;
+                if let Some(status) = status.as_mut() {
+                    status.completed += 1;
+                    match result {
+                        Ok(Some(sighting)) => {
+                            status.responding += 1;
+                            sightings.push(sighting);
+                        }
+                        Ok(None) => {}
+                        Err(()) => {
+                            status.errors += 1;
+                            errors += 1;
+                        }
                     }
                 }
             }

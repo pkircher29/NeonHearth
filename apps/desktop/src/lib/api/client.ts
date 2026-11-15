@@ -157,7 +157,7 @@ export type DoctorRunOutcome = { status: 'completed'; run: DoctorRun } | { statu
 export interface DoctorApproval { approval_id: string; expires_at: string }
 
 /** History: one hash-chained audit entry as GET /audit returns it. */
-export type AuditActor = 'owner' | 'service' | 'module';
+export type AuditActor = 'owner' | 'service' | 'module' | 'phone';
 export type AuditCategory = 'approval' | 'scan' | 'enforcement' | 'doctor_action' | 'audit_module';
 export interface AuditEntry { id: number; occurred_at: string; actor: AuditActor; category: AuditCategory; action: string; subject: string | null; detail: unknown; prev_hash: string; entry_hash: string }
 export interface ChainHead { id: number; entry_hash: string }
@@ -181,7 +181,7 @@ export type DoctorSettingsUpdate = Partial<Omit<DoctorSettings, 'gateway_source'
 /** A 400 from PUT /doctor/settings carries the reason; surfaced as a typed outcome. */
 export type DoctorSettingsOutcome = { status: 'saved'; settings: DoctorSettings } | { status: 'rejected'; error: string };
 
-const AUDIT_ACTORS: readonly string[] = ['owner', 'service', 'module'];
+const AUDIT_ACTORS: readonly string[] = ['owner', 'service', 'module', 'phone'];
 const AUDIT_CATEGORIES: readonly string[] = ['approval', 'scan', 'enforcement', 'doctor_action', 'audit_module'];
 const CHAIN_BREAKS: readonly string[] = ['id_gap', 'prev_hash_mismatch', 'entry_hash_mismatch', 'invalid_row', 'head_mismatch'];
 const HEX64 = /^[0-9a-f]{64}$/;

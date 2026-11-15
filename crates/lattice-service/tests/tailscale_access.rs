@@ -61,11 +61,22 @@ struct Fixture {
     pool: SqlitePool,
     clock: Arc<TestClock>,
     tailscale: Arc<FakeTailscaleControl>,
+    remote: RemoteAccessState,
 }
 
 async fn fixture() -> Fixture {
-    let clock = TestClock::starting_at(epoch());
+    fixture_at(epoch()).await
+}
+
+async fn fixture_at(start: DateTime<Utc>) -> Fixture {
+    let clock = TestClock::starting_at(start);
     let pool = connect_memory().await.unwrap();
+    fixture_on(pool, clock).await
+}
+
+/// A service instance over an existing database: a second call with the same
+/// pool is a "restarted" service (fresh in-memory state, same durable state).
+async fn fixture_on(pool: SqlitePool, clock: Arc<TestClock>) -> Fixture {
     let state = AppState::new(TOKEN, M2StateRepository::new(pool.clone())).unwrap();
     let tailscale = Arc::new(FakeTailscaleControl::new());
     let remote = RemoteAccessState::with_parts(
@@ -75,11 +86,12 @@ async fn fixture() -> Fixture {
         LOOPBACK_PORT,
     );
     Fixture {
-        router: app_with_remote_access(state.clone(), remote),
+        router: app_with_remote_access(state.clone(), remote.clone()),
         state,
         pool,
         clock,
         tailscale,
+        remote,
     }
 }
 
@@ -1230,7 +1242,7 @@ async fn a_concurrent_duplicate_command_waits_and_replays_instead_of_executing()
             assert_eq!(json_body(response).await["version"], 1);
         }
     }
-    let version: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM phone_commands")
+    let version: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM phone_command_replays")
         .fetch_one(&fixture.pool)
         .await
         .unwrap();
@@ -1344,6 +1356,385 @@ async fn session_last_use_is_written_once_a_minute_not_per_request() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Review fixes: PIN budget, replay durability, principals, session lifetime.
+// ---------------------------------------------------------------------------
+
+/// Review finding 1: the budget bounds the verifications performed, not just
+/// their outcome. Before the fix every request that loaded the session before
+/// the first failure committed was evaluated, so 60 racing guesses cost 60
+/// Argon2 runs (and a correct one among them won).
+#[tokio::test]
+async fn sixty_concurrent_pin_guesses_verify_at_most_the_budget() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id, secret);
+
+    let guesses = (0..60).map(|index| {
+        // The correct PIN is deliberately last in line: it must not win
+        // merely because it raced the lock.
+        let pin = if index == 59 {
+            "123456".to_owned()
+        } else {
+            format!("{:06}", index + 1)
+        };
+        let fixture = &fixture;
+        let phone = &phone;
+        async move { stepup(fixture, phone, &pin).await.status() }
+    });
+    let statuses = futures_util::future::join_all(guesses).await;
+    assert_eq!(
+        fixture.remote.pin_verifications(),
+        5,
+        "only the 5-attempt budget may ever be verified"
+    );
+    assert!(statuses.iter().all(|status| {
+        *status == StatusCode::FORBIDDEN || *status == StatusCode::TOO_MANY_REQUESTS
+    }));
+    assert!(!statuses.contains(&StatusCode::OK), "no guess may succeed");
+}
+
+/// A correct PIN arriving after the budget is spent is refused, and does not
+/// even reach verification.
+#[tokio::test]
+async fn a_correct_pin_during_a_lock_is_refused_unverified() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id, secret);
+    for _ in 0..5 {
+        stepup(&fixture, &phone, "000000").await;
+    }
+    assert_eq!(fixture.remote.pin_verifications(), 5);
+    let response = stepup(&fixture, &phone, "123456").await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(fixture.remote.pin_verifications(), 5);
+    // And no step-up grace exists: high-impact routes stay closed.
+    let denied = send_with_headers(
+        &fixture.router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(empty_plan_save(0)),
+        &phone,
+        &[("x-command-id", "018f47a0-9b5c-7a22-8a33-1122334455aa")],
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+}
+
+/// Review finding 6: a command that already ran is never re-executed by a
+/// restarted service, and an id reused for a different request is a conflict.
+#[tokio::test]
+async fn replays_survive_a_restart_and_ids_bind_to_their_request() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id, secret);
+    assert_eq!(
+        stepup(&fixture, &phone, "123456").await.status(),
+        StatusCode::OK
+    );
+    let command_id = "018f47a0-9b5c-7a22-8a33-1122334455aa";
+    let first = send_with_headers(
+        &fixture.router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(empty_plan_save(0)),
+        &phone,
+        &[("x-command-id", command_id)],
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // "Restart": a brand-new service over the same database.
+    let restarted = fixture_on(fixture.pool.clone(), fixture.clock.clone()).await;
+    let replay = send_with_headers(
+        &restarted.router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(empty_plan_save(0)),
+        &phone,
+        &[("x-command-id", command_id)],
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(replay.headers().get("x-command-replayed").unwrap(), "true");
+    assert_eq!(json_body(replay).await["version"], 1);
+
+    // Same id, different body: refused, not replayed and not executed.
+    let different = send_with_headers(
+        &restarted.router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(empty_plan_save(1)),
+        &phone,
+        &[("x-command-id", command_id)],
+    )
+    .await;
+    assert_eq!(different.status(), StatusCode::CONFLICT);
+    assert!(different.headers().get("x-command-replayed").is_none());
+}
+
+/// A command whose handler never completed (crash, timeout, client
+/// disconnect) stays claimed: the retry is refused instead of running the
+/// command a second time.
+#[tokio::test]
+async fn an_unfinished_command_is_never_executed_again() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id.clone(), secret);
+    assert_eq!(
+        stepup(&fixture, &phone, "123456").await.status(),
+        StatusCode::OK
+    );
+    let command_id = "018f47a0-9b5c-7a22-8a33-1122334455cc";
+    // The first attempt claimed the id and died before completing.
+    let repo = lattice_store::RemoteAccessRepository::new(fixture.pool.clone());
+    repo.claim_command(
+        uuid::Uuid::parse_str(&id).unwrap(),
+        uuid::Uuid::parse_str(command_id).unwrap(),
+        &"0".repeat(64),
+        epoch(),
+    )
+    .await
+    .unwrap();
+    let retry = send_with_headers(
+        &fixture.router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(empty_plan_save(0)),
+        &phone,
+        &[("x-command-id", command_id)],
+    )
+    .await;
+    assert_eq!(retry.status(), StatusCode::CONFLICT);
+    // The plan was never saved by the retry.
+    let home = send(&fixture.router, "GET", "/api/v1/home", None, &phone).await;
+    assert_eq!(json_body(home).await["plan"]["version"], 0);
+}
+
+/// Review finding 5: phone-initiated audit rows are attributed to the phone.
+#[tokio::test]
+async fn phone_actions_are_audited_as_the_phone_session() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id.clone(), secret);
+    stepup(&fixture, &phone, "000000").await;
+    stepup(&fixture, &phone, "123456").await;
+    let rows = approval_audit_rows(&fixture.pool).await;
+    for action in ["stepup_failed", "stepup_granted"] {
+        let row = rows.iter().find(|row| row.action == action).unwrap();
+        assert_eq!(row.actor, lattice_store::AuditActor::Phone, "{action}");
+        assert_eq!(row.detail["principal"]["phone_session"], id.as_str());
+    }
+    // Owner-driven rows stay attributed to the owner.
+    let paired = rows
+        .iter()
+        .find(|row| row.action == "phone_session_paired")
+        .unwrap();
+    assert_eq!(paired.actor, lattice_store::AuditActor::Owner);
+}
+
+/// Review finding 10: sliding expiry stops at an absolute age.
+#[tokio::test]
+async fn a_session_dies_at_its_absolute_lifetime_however_often_it_is_used() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id, secret);
+    for _ in 0..6 {
+        fixture.clock.advance(Duration::days(29));
+        let response = send(&fixture.router, "GET", "/api/v1/state", None, &phone).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    // Day 174 of 180 is alive and sliding; day 181 is past the cap even
+    // though the last use was a week earlier.
+    fixture.clock.advance(Duration::days(7));
+    let response = send(&fixture.router, "GET", "/api/v1/state", None, &phone).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Review finding 4: tickets are quota'd per principal, so a phone session
+/// cannot starve the owner.
+#[tokio::test]
+async fn a_phone_session_cannot_exhaust_the_owners_event_tickets() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id, secret);
+    let mut refused = false;
+    for _ in 0..20 {
+        let response = send(
+            &fixture.router,
+            "POST",
+            "/api/v1/events/ticket",
+            None,
+            &phone,
+        )
+        .await;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            refused = true;
+            break;
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert!(refused, "the phone's own quota must run out");
+    let owner = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/events/ticket",
+        None,
+        &Auth::Owner,
+    )
+    .await;
+    assert_eq!(owner.status(), StatusCode::OK);
+}
+
+/// Review finding 3: revoking a session closes the socket it already holds.
+#[tokio::test]
+async fn revoking_a_phone_session_closes_its_live_event_socket() {
+    use tokio_tungstenite::tungstenite::Message;
+    let fixture = fixture_at(Utc::now()).await;
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id.clone(), secret);
+    let ticket = json_body(
+        send(
+            &fixture.router,
+            "POST",
+            "/api/v1/events/ticket",
+            None,
+            &phone,
+        )
+        .await,
+    )
+    .await["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = fixture.router.clone();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{address}/api/v1/events?ticket={ticket}&after_sequence=0"
+    ))
+    .await
+    .unwrap();
+
+    let revoked = send(
+        &fixture.router,
+        "DELETE",
+        &format!("/api/v1/remote/sessions/{id}"),
+        None,
+        &Auth::Owner,
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return true,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("the socket must close promptly after revocation");
+    assert!(closed);
+}
+
+/// Review finding 3 (backstop): even with no revoke announcement, a socket
+/// notices a dead session at its next storage re-check.
+#[tokio::test]
+async fn a_socket_rechecks_its_session_when_no_revocation_was_announced() {
+    use tokio_tungstenite::tungstenite::Message;
+    let fixture = fixture_at(Utc::now()).await;
+    let state = fixture
+        .state
+        .clone()
+        .with_socket_limits(lattice_service::SocketLimits {
+            session_recheck: std::time::Duration::from_millis(100),
+            ..Default::default()
+        });
+    let remote = RemoteAccessState::with_parts(
+        &state,
+        Arc::clone(&fixture.tailscale) as Arc<dyn TailscaleControl>,
+        fixture.clock.clone(),
+        LOOPBACK_PORT,
+    );
+    let router = app_with_remote_access(state, remote);
+    let (id, secret) = pair(&fixture, "pixel", "123456").await;
+    let phone = Auth::Phone(id.clone(), secret);
+    let ticket = json_body(send(&router, "POST", "/api/v1/events/ticket", None, &phone).await)
+        .await["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{address}/api/v1/events?ticket={ticket}&after_sequence=0"
+    ))
+    .await
+    .unwrap();
+    // Revoke straight in storage: nothing is announced.
+    lattice_store::RemoteAccessRepository::new(fixture.pool.clone())
+        .revoke_phone_session(uuid::Uuid::parse_str(&id).unwrap())
+        .await
+        .unwrap();
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return true,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("the periodic re-check must close the socket");
+    assert!(closed);
+}
+
+/// Reports `funnel_conflict` for a Funnel on 8443 proxying to `target`.
+async fn funnel_conflict_for(fixture: &Fixture, target: String) -> bool {
+    fixture.tailscale.set_serve(Ok(ServeState {
+        mappings: vec![ServeMapping {
+            https_port: 8443,
+            target,
+        }],
+        funnel_ports: vec![8443],
+    }));
+    let response = send(
+        &fixture.router,
+        "GET",
+        "/api/v1/remote/status",
+        None,
+        &Auth::Owner,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await["funnel_conflict"]
+        .as_bool()
+        .unwrap()
+}
+
+/// Review finding 11: the status route reports a Funnel conflict however the
+/// operator spelled the loopback target (`localhost` is the same listener as
+/// `127.0.0.1`), and not for a different port.
+#[tokio::test]
+async fn status_reports_funnel_conflicts_whatever_the_loopback_spelling() {
+    let fixture = fixture().await;
+    for ours in [
+        format!("http://127.0.0.1:{LOOPBACK_PORT}"),
+        format!("http://localhost:{LOOPBACK_PORT}"),
+        format!("localhost:{LOOPBACK_PORT}"),
+        format!("http://[::1]:{LOOPBACK_PORT}"),
+    ] {
+        assert!(funnel_conflict_for(&fixture, ours.clone()).await, "{ours}");
+    }
+    assert!(
+        !funnel_conflict_for(&fixture, format!("http://localhost:{}", LOOPBACK_PORT + 1)).await
+    );
+}
+
 #[tokio::test]
 async fn concurrent_commands_and_restart_never_repeat_execution() {
     let fixture = fixture().await;
@@ -1403,8 +1794,17 @@ async fn concurrent_commands_and_restart_never_repeat_execution() {
         &headers,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM phone_commands")
+    // The reservation survived the restart together with the stored response:
+    // the retry is answered from it (never re-executed). The original main
+    // behaviour was a bare 409; replaying the settled answer is stricter
+    // about side effects and kinder to the client.
+    assert!(response.status() == StatusCode::OK || response.status() == StatusCode::CONFLICT);
+    assert_eq!(
+        response.status() == StatusCode::OK,
+        response.headers().get("x-command-replayed").is_some(),
+        "a 200 after restart must be a replay, never a second execution"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM phone_command_replays")
         .fetch_one(&fixture.pool)
         .await
         .unwrap();

@@ -129,6 +129,8 @@ pub trait Vault: Send + Sync {
     ) -> Result<(), VaultError>;
 }
 
+/// In-memory vault for tests; not part of the production API surface.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct FakeVault {
     credentials: Mutex<HashMap<(CameraId, CredentialRef), SecretString>>,
@@ -138,6 +140,7 @@ pub struct FakeVault {
     labels: Mutex<Vec<String>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl FakeVault {
     pub fn new() -> Self {
         Self::default()
@@ -173,6 +176,7 @@ impl FakeVault {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl Vault for FakeVault {
     async fn put_credential(
@@ -465,6 +469,14 @@ pub async fn platform_vault(
     }
 }
 
+/// Backups: `lattice-store`'s `backup_to` is `VACUUM INTO` of the SQLite database
+/// only. The vault directory is never part of that backup, so a database
+/// backup cannot carry the key next to the ciphertext. Anything that copies
+/// the whole state directory (manual copy, a disk image) DOES copy both: the
+/// file vault protects against casual reads and a leaked database backup, not
+/// against an attacker who holds the state directory; use the OS keyring
+/// backend where it is available.
+///
 /// Encrypted file-backed vault: `<dir>/vault.key` (32 random bytes) and
 /// `<dir>/vault.dat` (XChaCha20-Poly1305 over the JSON slot map, keyed by
 /// the key file, authenticated with the container magic). Both files and the
@@ -724,7 +736,7 @@ fn restrict_directory(dir: &Path) -> Result<(), VaultError> {
 
 /// Writes `bytes` to `path` owner-only via temp file + fsync + rename, then
 /// fsyncs the directory so the rename itself is durable.
-fn write_private_atomically(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+pub(crate) fn write_private_atomically(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
     let parent = path.parent().ok_or(VaultError::Unavailable)?;
     let temp = parent.join(format!(
         ".{}.{}.tmp",

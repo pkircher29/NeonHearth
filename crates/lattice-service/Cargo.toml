@@ -45,6 +45,7 @@ md5-digest = { package = "md-5", version = "0.10" }
 percent-encoding = "2.3"
 reqwest = { workspace = true, features = ["stream"] }
 url = "2.5"
+socket2.workspace = true
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 keyring.workspace = true
@@ -67,6 +68,7 @@ windows-sys = { workspace = true, features = [
 windows-service.workspace = true
 
 [dev-dependencies]
+lattice-service = { path = ".", features = ["test-support"] }
 async-trait.workspace = true
 chrono.workspace = true
 tower = { version = "0.5", features = ["util"] }
@@ -78,6 +80,11 @@ lattice-service = { path = ".", features = ["test-support"] }
 
 [features]
 # Test doubles (fake camera registry/connector). Never enabled in release builds.
+test-support = []
+
+[features]
+# In-memory test doubles (FakeVault, FakeTailscaleControl). Enabled for this
+# crate's own tests through the dev-dependency below; never in production builds.
 test-support = []
 
 [lib]

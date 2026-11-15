@@ -84,6 +84,36 @@ pub struct PinFailureOutcome {
     pub locked_until: Option<DateTime<Utc>>,
 }
 
+/// (fingerprint, completed, status, content_type, body, body_omitted).
+type ReplayRow = (String, i64, i64, Option<String>, Option<Vec<u8>>, i64);
+
+/// Outcome of [`RemoteAccessRepository::reserve_pin_attempt`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PinReservation {
+    /// The attempt was admitted; the caller may now verify the PIN.
+    Reserved {
+        attempt: u32,
+    },
+    /// The budget is spent or the session is locked; do not verify.
+    Locked {
+        until: DateTime<Utc>,
+    },
+    NoSession,
+}
+
+/// A durable replay record for one phone command id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandReplay {
+    pub fingerprint: String,
+    /// False while the command may still be (or may have been) executing.
+    pub completed: bool,
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+    /// The response was too large to retain; only its status is replayed.
+    pub body_omitted: bool,
+}
+
 /// The hash-free projection served to the owner session list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhoneSessionSummary {
@@ -266,15 +296,75 @@ impl RemoteAccessRepository {
     }
 
     /// Records a successful authentication and slides the expiry forward.
+    /// Only a live session is touched: a revoked or already-expired row is
+    /// never resurrected. Returns false when nothing was updated.
     pub async fn touch_phone_session(
         &self,
         id: Uuid,
-        last_used_at: DateTime<Utc>,
+        now: DateTime<Utc>,
         expires_at: DateTime<Utc>,
-    ) -> Result<(), RemoteAccessStoreError> {
-        sqlx::query("UPDATE phone_sessions SET last_used_at = ?, expires_at = ? WHERE id = ?")
-            .bind(encode_time(last_used_at))
-            .bind(encode_time(expires_at))
+    ) -> Result<bool, RemoteAccessStoreError> {
+        let result = sqlx::query(
+            "UPDATE phone_sessions SET last_used_at = ?, expires_at = ? \
+             WHERE id = ? AND revoked = 0 AND expires_at > ?",
+        )
+        .bind(encode_time(now))
+        .bind(encode_time(expires_at))
+        .bind(id.to_string())
+        .bind(encode_time(now))
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Deletes sessions that can never authenticate again: expired ones, and
+    /// revoked ones older than `revoked_retention` (kept briefly so the owner
+    /// still sees them in the list). Replay records cascade. Returns the
+    /// number of sessions removed. Intended for the maintenance task.
+    pub async fn purge_dead_phone_sessions(
+        &self,
+        now: DateTime<Utc>,
+        revoked_retention: chrono::Duration,
+    ) -> Result<u64, RemoteAccessStoreError> {
+        let result = sqlx::query(
+            "DELETE FROM phone_sessions WHERE expires_at <= ?1 \
+             OR (revoked = 1 AND COALESCE(last_used_at, created_at) <= ?2)",
+        )
+        .bind(encode_time(now))
+        .bind(encode_time(now - revoked_retention))
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(result.rows_affected())
+    }
+
+    /// Grants a step-up grace window and clears PIN failure state. Refused
+    /// (returns false) while the session is PIN-locked: a correct PIN that
+    /// arrives after the budget was spent, or raced the lock, never wins.
+    pub async fn grant_stepup(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, RemoteAccessStoreError> {
+        let result = sqlx::query(
+            "UPDATE phone_sessions SET stepup_expires_at = ?, pin_failed_count = 0, \
+             pin_window_started_at = NULL, pin_locked_until = NULL \
+             WHERE id = ? AND (pin_locked_until IS NULL OR pin_locked_until <= ?)",
+        )
+        .bind(encode_time(expires_at))
+        .bind(id.to_string())
+        .bind(encode_time(now))
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Withdraws a step-up grace window (used when the grant could not be audited).
+    pub async fn revoke_stepup(&self, id: Uuid) -> Result<(), RemoteAccessStoreError> {
+        sqlx::query("UPDATE phone_sessions SET stepup_expires_at = NULL WHERE id = ?")
             .bind(id.to_string())
             .execute(&self.pool)
             .await
@@ -282,18 +372,182 @@ impl RemoteAccessRepository {
         Ok(())
     }
 
-    /// Grants a step-up grace window and clears PIN failure state.
-    pub async fn grant_stepup(
+    /// Atomically reserves one PIN attempt BEFORE the PIN is verified.
+    ///
+    /// The window check, the budget check and the increment are one
+    /// `UPDATE ... RETURNING`, so no more than `max_attempts` verifications
+    /// can ever be admitted per window no matter how many requests race: the
+    /// request that cannot reserve is refused without being evaluated. A
+    /// successful verification calls [`Self::grant_stepup`] (which resets the
+    /// counter); a failed one calls [`Self::finish_pin_failure`].
+    pub async fn reserve_pin_attempt(
         &self,
         id: Uuid,
-        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+        window: chrono::Duration,
+        max_attempts: u32,
+    ) -> Result<PinReservation, RemoteAccessStoreError> {
+        let window_floor = encode_time(now - window);
+        let now_text = encode_time(now);
+        let row: Option<(i64,)> = sqlx::query_as(
+            "UPDATE phone_sessions SET \
+                pin_failed_count = CASE \
+                    WHEN pin_window_started_at IS NOT NULL AND pin_window_started_at > ?1 \
+                    THEN pin_failed_count + 1 ELSE 1 END, \
+                pin_window_started_at = CASE \
+                    WHEN pin_window_started_at IS NOT NULL AND pin_window_started_at > ?1 \
+                    THEN pin_window_started_at ELSE ?2 END \
+             WHERE id = ?4 \
+               AND (pin_window_started_at IS NULL OR pin_window_started_at <= ?1 \
+                    OR pin_failed_count < ?3) \
+               AND (pin_locked_until IS NULL OR pin_locked_until <= ?2) \
+             RETURNING pin_failed_count",
+        )
+        .bind(window_floor)
+        .bind(&now_text)
+        .bind(i64::from(max_attempts))
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage)?;
+        if let Some((count,)) = row {
+            return Ok(PinReservation::Reserved {
+                attempt: u32::try_from(count).map_err(|_| {
+                    RemoteAccessStoreError::Corrupt("negative pin failure count".into())
+                })?,
+            });
+        }
+        let existing: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT pin_locked_until, pin_window_started_at FROM phone_sessions WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage)?;
+        let Some((locked_until, started)) = existing else {
+            return Ok(PinReservation::NoSession);
+        };
+        let until = match decode_opt_time(locked_until)? {
+            Some(until) if until > now => until,
+            _ => decode_opt_time(started)?.map_or(now + window, |started| started + window),
+        };
+        Ok(PinReservation::Locked { until })
+    }
+
+    /// Completes a failed, previously reserved attempt. `attempt` is the
+    /// number [`PinReservation::Reserved`] reported; the reservation that
+    /// spent the last of the budget (`attempt >= max_attempts`) locks the
+    /// session until `now + window`. Returns `None` for an unknown session.
+    pub async fn finish_pin_failure(
+        &self,
+        id: Uuid,
+        attempt: u32,
+        now: DateTime<Utc>,
+        window: chrono::Duration,
+        max_attempts: u32,
+    ) -> Result<Option<PinFailureOutcome>, RemoteAccessStoreError> {
+        let locks = attempt >= max_attempts;
+        let locked_until = now + window;
+        let result = sqlx::query(
+            "UPDATE phone_sessions SET pin_locked_until = CASE WHEN ?1 THEN ?2 ELSE pin_locked_until END
+             WHERE id = ?3",
+        )
+        .bind(locks)
+        .bind(encode_time(locked_until))
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(PinFailureOutcome {
+            failed_count: attempt,
+            locked_until: locks.then_some(locked_until),
+        }))
+    }
+
+    /// Claims `command_id` for the request with `fingerprint`, writing an
+    /// in-flight record. Returns the existing record when the id was already
+    /// claimed (replay / conflict / outcome unknown), or `None` when the claim
+    /// was newly made and the caller must execute the command.
+    pub async fn claim_command(
+        &self,
+        session_id: Uuid,
+        command_id: Uuid,
+        fingerprint: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CommandReplay>, RemoteAccessStoreError> {
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO phone_command_replays \
+             (session_id, command_id, request_fingerprint, created_at, seq) \
+             VALUES (?1, ?2, ?3, ?4, \
+                COALESCE((SELECT MAX(seq) FROM phone_command_replays WHERE session_id = ?1), 0) + 1)",
+        )
+        .bind(session_id.to_string())
+        .bind(command_id.to_string())
+        .bind(fingerprint)
+        .bind(encode_time(now))
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        if inserted.rows_affected() > 0 {
+            return Ok(None);
+        }
+        let row: Option<ReplayRow> = sqlx::query_as(
+            "SELECT request_fingerprint, completed, status, content_type, body, body_omitted \
+                 FROM phone_command_replays WHERE session_id = ? AND command_id = ?",
+        )
+        .bind(session_id.to_string())
+        .bind(command_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage)?;
+        let Some((fingerprint, completed, status, content_type, body, omitted)) = row else {
+            return Err(RemoteAccessStoreError::Storage(
+                "command record vanished during claim".into(),
+            ));
+        };
+        Ok(Some(CommandReplay {
+            fingerprint,
+            completed: completed != 0,
+            status: u16::try_from(status).unwrap_or(500),
+            content_type,
+            body: body.unwrap_or_default(),
+            body_omitted: omitted != 0,
+        }))
+    }
+
+    /// Completes a claimed command with its response, then drops the stored bodies of
+    /// all but the newest `keep` settled records. The ids stay reserved for the
+    /// session's lifetime, so an old id can still never run twice.
+    pub async fn complete_command(
+        &self,
+        session_id: Uuid,
+        command_id: Uuid,
+        status: u16,
+        content_type: Option<&str>,
+        body: Option<&[u8]>,
+        keep: u32,
     ) -> Result<(), RemoteAccessStoreError> {
         sqlx::query(
-            "UPDATE phone_sessions SET stepup_expires_at = ?, pin_failed_count = 0, \
-             pin_window_started_at = NULL, pin_locked_until = NULL WHERE id = ?",
+            "UPDATE phone_command_replays SET completed = 1, status = ?, content_type = ?, \
+             body = ?, body_omitted = ? WHERE session_id = ? AND command_id = ?",
         )
-        .bind(encode_time(expires_at))
-        .bind(id.to_string())
+        .bind(i64::from(status))
+        .bind(content_type)
+        .bind(body)
+        .bind(i64::from(body.is_none()))
+        .bind(session_id.to_string())
+        .bind(command_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        sqlx::query(
+            "UPDATE phone_command_replays SET body = NULL, body_omitted = 1 WHERE session_id = ?1 AND completed = 1 AND body_omitted = 0 AND seq <= (SELECT MAX(seq) FROM phone_command_replays WHERE session_id = ?1) - ?2",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::from(keep))
         .execute(&self.pool)
         .await
         .map_err(storage)?;
