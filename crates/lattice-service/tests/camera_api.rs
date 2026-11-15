@@ -601,3 +601,21 @@ async fn camera_openapi_schema_has_all_boundary_constraints() {
             .contains("possible_camera")
     );
 }
+
+#[tokio::test]
+async fn media_routes_explain_that_camera_media_is_not_enabled_in_this_build() {
+    let (router, _) = fixture().await;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/camera-sessions/018f0000-0000-7000-8000-000000000001/playlist.m3u8")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"], "camera media is not enabled in this build");
+}

@@ -532,3 +532,113 @@ async fn verified_permanent_ban_is_not_overclaimed_as_a_quarantine_downgrade() -
     );
     Ok(())
 }
+
+/// Verified enforcement that takes long enough for a second evaluator to
+/// interleave, and whose readback proves the earlier reservation never landed.
+#[derive(Clone)]
+struct SlowProvenAbsent(Arc<AtomicUsize>);
+#[async_trait]
+impl PolicyActuator for SlowProvenAbsent {
+    async fn enforce(&self, _: DeviceId, _: RequestedAction) -> EnforcementResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        EnforcementResult::Verified
+    }
+    async fn reconcile(&self, _: DeviceId, _: RequestedAction) -> ActuationReconciliation {
+        ActuationReconciliation::ProvenNotApplied
+    }
+}
+
+async fn enrolled_device(
+    pool: &sqlx::SqlitePool,
+    repo: &PolicyRepository,
+    decision: lattice_domain::OwnerDecision,
+) -> anyhow::Result<DeviceId> {
+    let d = DeviceId::new();
+    sqlx::query(
+        "INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_confirmed) VALUES(?,?,?,0)",
+    )
+    .bind(d.to_string())
+    .bind(at(60).to_rfc3339())
+    .bind(at(60).to_rfc3339())
+    .execute(pool)
+    .await?;
+    repo.enroll(d).await?;
+    repo.set_owner_decision(d, decision).await?;
+    Ok(d)
+}
+
+#[tokio::test]
+async fn two_coordinators_never_both_drive_an_irreversible_action_for_one_device()
+-> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let d = enrolled_device(&pool, &repo, lattice_domain::OwnerDecision::Rejected).await?;
+    repo.reserve_actuation(d, 1, RequestedAction::PermanentBan, at(60))
+        .await?;
+    let count = Arc::new(AtomicUsize::new(0));
+    // The API builds a coordinator per request and discovery owns another:
+    // separate instances over one store.
+    let api = PolicyCoordinator::with_actuator(repo.clone(), None, SlowProvenAbsent(count.clone()));
+    let sweep =
+        PolicyCoordinator::with_actuator(repo.clone(), None, SlowProvenAbsent(count.clone()));
+    let policy = repo.load(d).await?.unwrap();
+    let (first, second) = tokio::join!(
+        api.evaluate(policy.clone(), at(60)),
+        sweep.evaluate(policy, at(60))
+    );
+    first?;
+    second?;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "the irreversible action was driven twice"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sweep_attempts_every_device_even_when_one_fails() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let mut ids = [DeviceId::new(), DeviceId::new()];
+    ids.sort_by_key(ToString::to_string);
+    for d in ids {
+        sqlx::query(
+            "INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_confirmed) VALUES(?,?,?,0)",
+        )
+        .bind(d.to_string())
+        .bind(at(60).to_rfc3339())
+        .bind(at(60).to_rfc3339())
+        .execute(&pool)
+        .await?;
+        repo.enroll(d).await?;
+        repo.set_owner_decision(d, lattice_domain::OwnerDecision::Rejected)
+            .await?;
+    }
+    // The first device in sweep order cannot publish its decision.
+    sqlx::query(&format!(
+        "CREATE TRIGGER poison BEFORE INSERT ON policy_outbox WHEN NEW.device_id = '{}' \
+         BEGIN SELECT RAISE(ABORT, 'poisoned'); END",
+        ids[0]
+    ))
+    .execute(&pool)
+    .await?;
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = PolicyCoordinator::with_actuator(repo.clone(), None, Counter(count));
+    let error = c.sweep(at(60)).await.unwrap_err();
+    assert!(error.to_string().contains("1 device"), "{error}");
+    assert!(
+        repo.published_decision(ids[1]).await?.is_some(),
+        "a later device was starved by the earlier failure"
+    );
+    Ok(())
+}

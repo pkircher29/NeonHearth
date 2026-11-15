@@ -2209,6 +2209,7 @@ dependencies = [
  "lattice-intelligence",
  "lattice-policy",
  "lattice-sensor",
+ "lattice-service",
  "lattice-store",
  "lattice-w6",
  "libc",

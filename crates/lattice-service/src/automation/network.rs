@@ -98,12 +98,13 @@ impl AutomationHub {
         {
             return Ok(cached.details.clone());
         }
-        let evidence: Vec<(String, String, String)> = sqlx::query_as(
+        let mut evidence: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT DISTINCT device_id,source,fact_value FROM evidence WHERE family='link_layer' AND fact_key='mac' AND length(fact_value)=17 AND length(source)<128 AND length(device_id)=36 LIMIT 4097"
         ).fetch_all(&self.pool).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if evidence.len() > 4096 {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
+        // More evidence than the bound degrades to a partial answer, flagged
+        // in `status`, instead of making the whole endpoint unavailable.
+        let evidence_truncated = evidence.len() > 4096;
+        evidence.truncate(4096);
         let mut devices: BTreeMap<String, NetworkDeviceDetails> = BTreeMap::new();
         let mut identities: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         for (id, source, address) in evidence {
@@ -149,10 +150,12 @@ impl AutomationHub {
                 .ok(),
             None => None,
         };
-        let status = if neighbors.is_some() {
-            "ready"
-        } else {
+        let status = if neighbors.is_none() {
             "unavailable"
+        } else if evidence_truncated {
+            "partial"
+        } else {
+            "ready"
         };
         for row in neighbors.into_iter().flatten() {
             let source = format!("neighbor-interface-{}", row.interface().get());

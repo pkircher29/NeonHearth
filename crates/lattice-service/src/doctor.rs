@@ -262,7 +262,9 @@ impl DoctorSettings {
 
     fn validate(&self) -> Result<(), &'static str> {
         if !valid_name(&self.interface) {
-            return Err("interface must be 1..=253 printable characters");
+            return Err(
+                "interface must start with a letter or digit and use only letters, digits, . _ : - @ (max 253)",
+            );
         }
         if let Some(gateway) = &self.gateway
             && gateway.parse::<IpAddr>().is_err()
@@ -319,10 +321,17 @@ impl DoctorSettings {
     }
 }
 
+/// Interface names reach probe and repair tooling as arguments, so only a
+/// conservative alphabet is accepted and a leading `-` (an option) never is.
 fn valid_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_SETTING_LEN
-        && value.chars().all(|c| !c.is_control() && !c.is_whitespace())
+    value.len() <= MAX_SETTING_LEN
+        && value
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-' | '@'))
 }
 
 fn valid_hostname(value: &str) -> bool {
@@ -856,12 +865,13 @@ fn default_context() -> RepairContext {
     }
 }
 
-/// Clears the running flag even if the run future is dropped mid-flight.
-struct RunningGuard<'a>(&'a AtomicBool);
+/// Clears the running flag even if the run future is dropped mid-flight. It
+/// owns its share of the state so a detached repair task can carry it.
+struct RunningGuard(Arc<DoctorShared>);
 
-impl Drop for RunningGuard<'_> {
+impl Drop for RunningGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.running.store(false, Ordering::SeqCst);
     }
 }
 
@@ -895,7 +905,7 @@ pub(crate) async fn run_route(
     {
         return StatusCode::CONFLICT.into_response();
     }
-    let _guard = RunningGuard(&shared.running);
+    let _guard = RunningGuard(Arc::clone(shared));
     let settings = shared.settings.read().await.clone();
     let Ok(engine) = DiagnosticEngine::with_clock(
         settings.to_config(&shared.profile),
@@ -1027,7 +1037,7 @@ pub(crate) async fn repair_route(
     let Ok(Json(request)) = body else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let shared = &doctor.shared;
+    let shared = Arc::clone(&doctor.shared);
     // Single-flight: a repair's snapshot/apply/restore must never interleave
     // with a diagnostic run or another repair touching the same state keys.
     // Taken before the approval is consumed so a refused request keeps its
@@ -1039,7 +1049,7 @@ pub(crate) async fn repair_route(
     {
         return StatusCode::CONFLICT.into_response();
     }
-    let _guard = RunningGuard(&shared.running);
+    let guard = RunningGuard(Arc::clone(&shared));
     let plan = {
         let inner = shared.inner.lock().await;
         let Some(run) = &inner.latest else {
@@ -1054,8 +1064,8 @@ pub(crate) async fn repair_route(
         };
         finding.plan.clone()
     };
-    let executable = match plan {
-        RepairPlan::SafeAutomatic { action, .. } => ExecutableRepair::Safe { action },
+    let (executable, spend_approval) = match plan {
+        RepairPlan::SafeAutomatic { action, .. } => (ExecutableRepair::Safe { action }, None),
         RepairPlan::ApprovalRequiredReversible { action, .. } => {
             let Some(approval_id) = request.approval_id.as_deref() else {
                 return StatusCode::FORBIDDEN.into_response();
@@ -1065,21 +1075,23 @@ pub(crate) async fn repair_route(
             };
             let now = shared.clock.now();
             {
-                // Validate and consume under one lock so a token is never
-                // spent twice.
-                let mut inner = shared.inner.lock().await;
-                let Some(record) = inner.approvals.get_mut(approval_id) else {
+                // Validate only: the token is spent after the intent is on
+                // the audit log, so a failed audit write cannot burn it.
+                let inner = shared.inner.lock().await;
+                let Some(record) = inner.approvals.get(approval_id) else {
                     return StatusCode::FORBIDDEN.into_response();
                 };
                 if record.used || now >= record.expires_at || record.fingerprint != fingerprint {
                     return StatusCode::FORBIDDEN.into_response();
                 }
-                record.used = true;
             }
             let Ok(token) = ApprovalId::try_new(approval_id) else {
                 return StatusCode::FORBIDDEN.into_response();
             };
-            ExecutableRepair::Approved(ApprovedRepair::new(action, token))
+            (
+                ExecutableRepair::Approved(ApprovedRepair::new(action, token)),
+                Some((approval_id.to_owned(), fingerprint)),
+            )
         }
         RepairPlan::GuidedPhysical { .. } | RepairPlan::ObservationOnly { .. } => {
             return StatusCode::BAD_REQUEST.into_response();
@@ -1090,39 +1102,89 @@ pub(crate) async fn repair_route(
         // plan table and symptom table diverged.
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let executor = RepairExecutor::with_clock(SharedClock(Arc::clone(&shared.clock)));
-    let repair = executor
-        .execute(
-            &RepairAdapter(shared.repairs.as_ref()),
-            &executable,
-            &symptom,
-        )
-        .await;
-    let audited = append_audit(
+    // Intent first: nothing executes unless the audit log recorded that it is
+    // about to.
+    let intent = append_audit(
         &state,
         NewAuditEntry {
             occurred_at: shared.clock.now(),
             actor: AuditActor::Owner,
             category: AuditCategory::DoctorAction,
-            action: "repair_executed".to_owned(),
+            action: "repair_intent".to_owned(),
             subject: Some(kind_tag(&request.diagnosis_kind).to_owned()),
             detail: serde_json::json!({
                 "diagnosis_kind": request.diagnosis_kind,
-                "class": repair.class,
-                "description": repair.description,
-                "outcome": repair.outcome,
-                "rollback": repair.rollback,
                 "approval_id": request.approval_id,
             }),
         },
     )
     .await;
-    if audited.is_err() {
-        // The contract requires every execution to be audited; refuse to
-        // report an execution the log did not record.
+    if intent.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    Json(DoctorRepairResponse { repair }).into_response()
+    if let Some((approval_id, fingerprint)) = spend_approval {
+        // Spend under the lock, re-validating: a token is never used twice.
+        let now = shared.clock.now();
+        let mut inner = shared.inner.lock().await;
+        let Some(record) = inner.approvals.get_mut(&approval_id) else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        if record.used || now >= record.expires_at || record.fingerprint != fingerprint {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        record.used = true;
+    }
+    // The execution (and its result audit) runs in a detached task: a client
+    // disconnect or the request timeout must not abandon a repair half-way
+    // through snapshot/apply/restore. The task owns the single-flight guard.
+    let diagnosis_kind = request.diagnosis_kind.clone();
+    let approval_id = request.approval_id.clone();
+    let task = tokio::spawn(async move {
+        let _guard = guard;
+        let executor = RepairExecutor::with_clock(SharedClock(Arc::clone(&shared.clock)));
+        let repair = executor
+            .execute(
+                &RepairAdapter(shared.repairs.as_ref()),
+                &executable,
+                &symptom,
+            )
+            .await;
+        let audited = append_audit(
+            &state,
+            NewAuditEntry {
+                occurred_at: shared.clock.now(),
+                actor: AuditActor::Owner,
+                category: AuditCategory::DoctorAction,
+                action: "repair_executed".to_owned(),
+                subject: Some(kind_tag(&diagnosis_kind).to_owned()),
+                detail: serde_json::json!({
+                    "diagnosis_kind": diagnosis_kind,
+                    "class": repair.class,
+                    "description": repair.description,
+                    "outcome": repair.outcome,
+                    "rollback": repair.rollback,
+                    "approval_id": approval_id,
+                }),
+            },
+        )
+        .await;
+        (repair, audited.is_ok())
+    });
+    match task.await {
+        Ok((repair, audited)) => {
+            // The repair already happened: report it even when the result
+            // entry could not be written (the intent entry is on record).
+            let mut response = Json(DoctorRepairResponse { repair }).into_response();
+            if !audited {
+                response.headers_mut().insert(
+                    crate::automation::AUDIT_WARNING_HEADER,
+                    axum::http::HeaderValue::from_static("result-audit-unavailable"),
+                );
+            }
+            response
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 #[utoipa::path(get, path = "/api/v1/doctor/settings", responses((status = 200, body = DoctorSettings), (status = 401)), security(("bearer_auth" = [])))]
@@ -1145,23 +1207,22 @@ pub(crate) async fn update_settings_route(
     };
     let shared = &doctor.shared;
     let now = shared.clock.now();
-    let (previous, next) = {
-        let mut settings = shared.settings.write().await;
-        let previous = settings.clone();
-        let mut next = previous.clone();
-        next.apply(update);
-        if let Err(error) = next.validate() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(DoctorSettingsRejected {
-                    error: error.to_owned(),
-                }),
-            )
-                .into_response();
-        }
-        *settings = next.clone();
-        (previous, next)
-    };
+    // The write lock is held from validation through the audit entry, so a
+    // concurrent update can neither interleave nor be clobbered by a revert,
+    // and no run ever sees targets that were not recorded.
+    let mut settings = shared.settings.write().await;
+    let previous = settings.clone();
+    let mut next = previous.clone();
+    next.apply(update);
+    if let Err(error) = next.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DoctorSettingsRejected {
+                error: error.to_owned(),
+            }),
+        )
+            .into_response();
+    }
     let audited = append_audit(
         &state,
         NewAuditEntry {
@@ -1178,10 +1239,11 @@ pub(crate) async fn update_settings_route(
     )
     .await;
     if audited.is_err() {
-        // An unaudited change must not stand: restore the previous targets.
-        *shared.settings.write().await = previous;
+        // An unaudited change must not stand: it was never applied.
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    *settings = next.clone();
+    drop(settings);
     Json(next).into_response()
 }
 

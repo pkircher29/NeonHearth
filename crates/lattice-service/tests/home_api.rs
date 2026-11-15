@@ -731,3 +731,72 @@ async fn responses_use_bytes_that_serde_accepts_after_body_collect() {
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(value["plan"].is_object());
 }
+
+#[tokio::test]
+async fn a_saved_plan_cannot_change_its_home_id() {
+    let (router, _, _) = fixture().await;
+    save_plan(&router, 0, "Home").await;
+    let mut stranger = sample_plan("Home");
+    stranger["home_id"] = serde_json::json!("018f47a0-9b5c-7a22-8a33-1122334455ff");
+    let response = send(
+        &router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(save_request(1, stranger)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert!(body["error"].as_str().unwrap().contains("home id"));
+    let snapshot = json_body(send(&router, "GET", "/api/v1/home", None).await).await;
+    assert_eq!(snapshot["plan"]["home_id"], HOME_ID);
+    assert_eq!(snapshot["plan"]["version"], 1);
+}
+
+#[tokio::test]
+async fn placements_must_reference_a_floor_of_the_saved_plan() {
+    let (router, _, _) = fixture().await;
+    let uri = format!("/api/v1/home/placements/{DEVICE_ID}");
+    // No plan yet.
+    assert_eq!(
+        send(&router, "PUT", &uri, Some(placement_body()))
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    save_plan(&router, 0, "Home").await;
+    let mut elsewhere = placement_body();
+    elsewhere["floor_id"] = serde_json::json!("018f47a0-9b5c-7a22-8a33-1122334455fe");
+    assert_eq!(
+        send(&router, "PUT", &uri, Some(elsewhere)).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let snapshot = json_body(send(&router, "GET", "/api/v1/home", None).await).await;
+    assert_eq!(snapshot["placements"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn rejected_bodies_use_the_problem_shape_and_their_own_status() {
+    let (router, _, _) = fixture().await;
+    let response = send_raw(
+        &router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(b"{not json".to_vec()),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert!(body["error"].is_string(), "{body}");
+    // A draft that is not UTF-8 is a client error, not "too large".
+    let response = send_raw(
+        &router,
+        "PUT",
+        "/api/v1/home/draft",
+        Some(vec![0xff, 0xfe, 0xfd]),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

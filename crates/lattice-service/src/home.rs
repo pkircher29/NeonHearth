@@ -82,6 +82,25 @@ pub struct DraftCorrupt {
     pub corrupt: bool,
 }
 
+/// Problem body for a JSON body the extractor refused. Syntax and data errors
+/// stay 400 (the documented contract), a missing content type is 415 and a
+/// body over the limit is 413.
+fn body_problem(rejection: &axum::extract::rejection::JsonRejection) -> Response {
+    use axum::extract::rejection::JsonRejection;
+    let status = match rejection {
+        JsonRejection::BytesRejection(inner) => inner.status(),
+        JsonRejection::MissingJsonContentType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (
+        status,
+        Json(PlanRejected {
+            error: "the request body was rejected".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 fn repository(state: &AppState) -> HomeRepository {
     HomeRepository::new(state.state_repository().pool().clone())
 }
@@ -142,7 +161,9 @@ fn parse_canonical_device_id(value: &str) -> Option<DeviceId> {
 fn storage_status(error: &HomeStoreError) -> StatusCode {
     match error {
         HomeStoreError::VersionConflict { .. } => StatusCode::CONFLICT,
-        HomeStoreError::InvalidPlan(_) | HomeStoreError::Invalid => StatusCode::BAD_REQUEST,
+        HomeStoreError::InvalidPlan(_)
+        | HomeStoreError::Invalid
+        | HomeStoreError::HomeIdChanged => StatusCode::BAD_REQUEST,
         HomeStoreError::DraftTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         HomeStoreError::DraftCorrupt | HomeStoreError::Corrupt | HomeStoreError::Storage => {
             StatusCode::SERVICE_UNAVAILABLE
@@ -180,8 +201,9 @@ pub(crate) async fn save_plan_route(
     State(state): State<AppState>,
     body: Result<Json<SavePlanRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Ok(Json(request)) = body else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(rejection) => return body_problem(&rejection),
     };
     if let Err(reason) = request.plan.validate() {
         return (
@@ -217,6 +239,13 @@ pub(crate) async fn save_plan_route(
             }),
         )
             .into_response(),
+        Err(error @ HomeStoreError::HomeIdChanged) => (
+            StatusCode::BAD_REQUEST,
+            Json(PlanRejected {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
         Err(error) => storage_status(&error).into_response(),
     }
 }
@@ -228,8 +257,12 @@ pub(crate) async fn upsert_placement_route(
     path: Result<AxumPath<String>, axum::extract::rejection::PathRejection>,
     body: Result<Json<PlacementRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let (Ok(AxumPath(device_id)), Ok(Json(request))) = (path, body) else {
+    let Ok(AxumPath(device_id)) = path else {
         return StatusCode::BAD_REQUEST.into_response();
+    };
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(rejection) => return body_problem(&rejection),
     };
     let Some(device_id) = parse_canonical_device_id(&device_id) else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -315,10 +348,17 @@ pub(crate) async fn put_draft_route(
     State(state): State<AppState>,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
-    // A body the framework refused to buffer can only exceed limits far above
-    // the draft cap, so it is reported the same way.
-    let Ok(body) = body else {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    // A body the framework refused to buffer keeps its own status: 413 for a
+    // limit, 400 for a client that aborted or sent a malformed body.
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            return (
+                rejection.status(),
+                Json(serde_json::json!({"error": "the request body was rejected"})),
+            )
+                .into_response();
+        }
     };
     if body.len() > MAX_DRAFT_BYTES {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();

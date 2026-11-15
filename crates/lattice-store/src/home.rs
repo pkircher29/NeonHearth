@@ -17,6 +17,10 @@ const MAX_ESTIMATE_EVIDENCE: usize = 32;
 const MAX_EVIDENCE_ENTRY_CHARS: usize = 128;
 const MAX_PLACEMENT_HEIGHT_M: f64 = 6.0;
 const MAX_COORDINATE_M: f64 = 1000.0;
+/// Upper bound on owner placements (one per device).
+pub const MAX_PLACEMENTS: u32 = 4096;
+/// Placeholder identity served (and drafts stored) before any plan is saved.
+const UNSET_HOME_ID: &str = "00000000-0000-0000-0000-000000000000";
 
 type PlacementRow = (
     String,
@@ -52,6 +56,8 @@ pub enum HomeStoreError {
     InvalidPlan(PlanValidationError),
     #[error("home record is invalid")]
     Invalid,
+    #[error("the home id of an existing plan cannot change")]
+    HomeIdChanged,
     #[error("draft exceeds the {MAX_DRAFT_BYTES}-byte cap")]
     DraftTooLarge,
     #[error("stored draft was corrupt and has been discarded")]
@@ -137,13 +143,13 @@ impl HomeRepository {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(map_sqlx)?;
-        let actual: Option<i64> =
-            sqlx::query_scalar("SELECT version FROM home_plans WHERE singleton = 1")
+        let current: Option<(i64, String)> =
+            sqlx::query_as("SELECT version, home_id FROM home_plans WHERE singleton = 1")
                 .fetch_optional(&mut *transaction)
                 .await
                 .map_err(map_sqlx)?;
-        let actual = match actual {
-            Some(version) => u32::try_from(version).map_err(|_| HomeStoreError::Corrupt)?,
+        let actual = match &current {
+            Some((version, _)) => u32::try_from(*version).map_err(|_| HomeStoreError::Corrupt)?,
             None => 0,
         };
         if actual != expected_version {
@@ -151,6 +157,13 @@ impl HomeRepository {
                 expected: expected_version,
                 actual,
             });
+        }
+        // History, drafts and placements are keyed to the plan's identity; a
+        // save may not strand them under a different id.
+        if let Some((_, stored_home_id)) = &current
+            && *stored_home_id != stored.home_id.to_string()
+        {
+            return Err(HomeStoreError::HomeIdChanged);
         }
         sqlx::query(
             "INSERT INTO home_plans(singleton, home_id, version, plan, saved_at) \
@@ -172,6 +185,25 @@ impl HomeRepository {
         .bind(i64::from(new_version))
         .bind(&json)
         .bind(&saved_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_sqlx)?;
+        if current.is_none() {
+            // The editor draft saved before the first commit lives under the
+            // placeholder id and can never be reached again afterwards.
+            sqlx::query("DELETE FROM home_drafts WHERE home_id = ?")
+                .bind(UNSET_HOME_ID)
+                .execute(&mut *transaction)
+                .await
+                .map_err(map_sqlx)?;
+        }
+        // Placements on a floor the saved plan no longer has would dangle
+        // invisibly; the device returns to the unplaced tray instead.
+        sqlx::query(
+            "DELETE FROM owner_placements WHERE floor_id NOT IN \
+             (SELECT json_extract(value, '$.floor_id') FROM json_each(?, '$.floors'))",
+        )
+        .bind(&json)
         .execute(&mut *transaction)
         .await
         .map_err(map_sqlx)?;
@@ -257,6 +289,44 @@ impl HomeRepository {
         {
             return Err(HomeStoreError::Invalid);
         }
+        // Validate against the stored plan and the cap in the same write
+        // transaction as the upsert, so a concurrent plan save cannot slip
+        // between the check and the write.
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx)?;
+        let plan_json: Option<String> =
+            sqlx::query_scalar("SELECT plan FROM home_plans WHERE singleton = 1")
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(map_sqlx)?;
+        let plan_json = plan_json.ok_or(HomeStoreError::Invalid)?;
+        let plan: HomePlan =
+            serde_json::from_str(&plan_json).map_err(|_| HomeStoreError::Corrupt)?;
+        if !plan
+            .floors
+            .iter()
+            .any(|floor| floor.floor_id == value.floor_id)
+        {
+            return Err(HomeStoreError::Invalid);
+        }
+        let existing: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM owner_placements WHERE device_id = ?")
+                .bind(value.device_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(map_sqlx)?;
+        if existing.is_none() {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owner_placements")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(map_sqlx)?;
+            if count >= i64::from(MAX_PLACEMENTS) {
+                return Err(HomeStoreError::Invalid);
+            }
+        }
         sqlx::query(
             "INSERT INTO owner_placements(device_id, placement_id, floor_id, x, y, height_m, mounting) \
              VALUES(?, ?, ?, ?, ?, ?, ?) \
@@ -271,9 +341,10 @@ impl HomeRepository {
         .bind(value.y)
         .bind(value.height_m)
         .bind(value.mounting.map(mounting_string))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(map_sqlx)?;
+        transaction.commit().await.map_err(map_sqlx)?;
         Ok(())
     }
 

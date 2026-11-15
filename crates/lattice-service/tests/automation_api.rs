@@ -93,6 +93,11 @@ impl Drop for HaFixture {
     }
 }
 async fn ha_fixture() -> HaFixture {
+    ha_fixture_with(Duration::ZERO, true).await
+}
+/// `call_delay` is how long the fixture sits on each `call_service`; `mutate`
+/// says whether the call changes the entity (and so its `last_changed`).
+async fn ha_fixture_with(call_delay: Duration, mutate: bool) -> HaFixture {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let calls = Arc::new(Mutex::new(vec![]));
@@ -139,6 +144,17 @@ async fn ha_fixture() -> HaFixture {
                         "get_services" => services(),
                         "call_service" => {
                             calls.lock().unwrap().push(request.clone());
+                            tokio::time::sleep(call_delay).await;
+                            if !mutate {
+                                if socket
+                                    .send(Message::Text(json!({"id":request["id"],"type":"result","success":true,"result":{"context":{"id":"fixture"}}}).to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
                             current[0]["state"] = json!(if request["service"] == "turn_on" {
                                 "on"
                             } else {
@@ -483,4 +499,242 @@ async fn invalid_credentials_never_import_or_enable_controls() {
             .is_empty()
     );
     assert!(ha.calls.lock().unwrap().is_empty());
+}
+
+async fn setup_with_pool() -> (Router, AppState, sqlx::SqlitePool) {
+    let pool = connect_memory().await.unwrap();
+    let state = AppState::new(OWNER, M2StateRepository::new(pool.clone())).unwrap();
+    (app(state.clone()), state, pool)
+}
+
+async fn break_audit(pool: &sqlx::SqlitePool) {
+    sqlx::query(
+        "CREATE TRIGGER fail_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn grant_desk(router: &Router) {
+    assert_eq!(
+        call(
+            router,
+            "PUT",
+            "/permissions",
+            Some(json!({"entity_ids":["light.desk"]})),
+            Some(OWNER)
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+}
+
+async fn response_with_headers(
+    router: &Router,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, bool) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(format!("/api/v1/automation{path}"))
+        .header("authorization", format!("Bearer {OWNER}"));
+    if body.is_some() {
+        request = request.header("content-type", "application/json");
+    }
+    let response = router
+        .clone()
+        .oneshot(
+            request
+                .body(Body::from(body.map(|v| v.to_string()).unwrap_or_default()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    (
+        response.status(),
+        response.headers().contains_key("x-audit-warning"),
+    )
+}
+
+#[tokio::test]
+async fn disconnect_takes_effect_even_when_the_audit_log_is_down() {
+    let ha = ha_fixture().await;
+    let (router, state, pool) = setup_with_pool().await;
+    connect(&router, &state, &ha).await;
+    grant_desk(&router).await;
+    break_audit(&pool).await;
+    let (status, warned) = response_with_headers(&router, "POST", "/disconnect", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        warned,
+        "the unrecorded revocation is surfaced to the caller"
+    );
+    let snapshot = state.automation().snapshot().await.unwrap();
+    assert_eq!(snapshot.status, "disconnected");
+    assert!(
+        snapshot
+            .devices
+            .iter()
+            .flat_map(|d| &d.entities)
+            .all(|e| !e.control_enabled)
+    );
+    assert_eq!(
+        call(&router, "POST", "/commands", Some(command()), Some(OWNER))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn clearing_permissions_takes_effect_but_granting_stays_audit_first() {
+    let ha = ha_fixture().await;
+    let (router, state, pool) = setup_with_pool().await;
+    connect(&router, &state, &ha).await;
+    grant_desk(&router).await;
+    break_audit(&pool).await;
+    // Narrowing to nothing is applied and audited best-effort.
+    let (status, warned) = response_with_headers(
+        &router,
+        "PUT",
+        "/permissions",
+        Some(json!({"entity_ids":[]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(warned);
+    assert!(
+        state
+            .automation()
+            .snapshot()
+            .await
+            .unwrap()
+            .devices
+            .iter()
+            .flat_map(|d| &d.entities)
+            .all(|e| !e.control_enabled)
+    );
+    // Granting authority is refused while it cannot be recorded.
+    let (status, _) = response_with_headers(
+        &router,
+        "PUT",
+        "/permissions",
+        Some(json!({"entity_ids":["light.desk"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        state
+            .automation()
+            .snapshot()
+            .await
+            .unwrap()
+            .devices
+            .iter()
+            .flat_map(|d| &d.entities)
+            .all(|e| !e.control_enabled)
+    );
+}
+
+#[tokio::test]
+async fn a_queued_command_whose_caller_gave_up_is_never_sent_to_home_assistant() {
+    // Every call_service sits at HA for 900 ms without changing the entity.
+    let ha = ha_fixture_with(Duration::from_millis(900), false).await;
+    let (router, state) = setup().await;
+    connect(&router, &state, &ha).await;
+    grant_desk(&router).await;
+    state
+        .automation()
+        .set_command_timeout(Duration::from_millis(300));
+    let first: lattice_service::automation::CommandRequest =
+        serde_json::from_value(command()).unwrap();
+    let second: lattice_service::automation::CommandRequest =
+        serde_json::from_value(command()).unwrap();
+    let hub = state.automation().clone();
+    let first_hub = hub.clone();
+    let first_task = tokio::spawn(async move { first_hub.command(first).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Queued behind the first command; its caller gives up after 300 ms.
+    let queued = hub.command(second).await;
+    assert_eq!(queued.unwrap_err(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        first_task.await.unwrap().unwrap_err(),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+    // Let the first command finish at HA, then give the queue time to drain.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        ha.calls.lock().unwrap().len(),
+        1,
+        "the abandoned command must not be sent after its caller was told it failed"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_database_never_stalls_the_session_lock() {
+    let (_, state, pool) = setup_with_pool().await;
+    // Take every pooled connection so the stored-inventory read has to wait.
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.unwrap());
+    }
+    let hub = state.automation().clone();
+    let reader = tokio::spawn(async move { hub.snapshot().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        state.automation().mqtt_status("connected", "probe"),
+    )
+    .await
+    .expect("a snapshot waiting on the database must not hold the session lock");
+    drop(held);
+    reader.await.unwrap().unwrap();
+}
+
+fn many_states(count: usize) -> Value {
+    let mut states: Vec<Value> = (0..count)
+        .map(|index| {
+            json!({"entity_id":format!("sensor.s{index}"),"state":"1","last_changed":TIME,"last_updated":TIME,"attributes":{}})
+        })
+        .collect();
+    // The controllable entity sits past the cut.
+    states.push(
+        json!({"entity_id":"light.desk","state":"off","last_changed":TIME,"last_updated":TIME,"attributes":{"friendly_name":"Desk lamp"}}),
+    );
+    Value::Array(states)
+}
+
+#[test]
+fn an_oversized_inventory_is_truncated_and_flagged_instead_of_rejected() {
+    use lattice_service::automation::ha::project_bounded;
+    let states = many_states(5000);
+    // The legacy entry point no longer fails either.
+    let (devices, _) = project(&areas(), &devices(), &registry(), &states, &services()).unwrap();
+    assert!(devices.len() <= 4096);
+    let projection = project_bounded(
+        &areas(),
+        &devices_value(),
+        &registry(),
+        &states,
+        &services(),
+    )
+    .unwrap();
+    assert!(projection.devices.len() <= 4096);
+    let note = projection.truncated.expect("truncation is reported");
+    assert!(note.contains("4096") && note.contains("5001"), "{note}");
+    // Controllable entities survive the cut.
+    assert!(
+        projection
+            .devices
+            .iter()
+            .flat_map(|d| &d.entities)
+            .any(|e| e.entity_id == "light.desk" && e.power_capable)
+    );
+}
+
+fn devices_value() -> Value {
+    devices()
 }
