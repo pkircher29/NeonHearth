@@ -276,10 +276,13 @@ async fn command_claims_are_durable_exclusive_and_bodies_trimmed() {
             .await
             .unwrap();
     }
-    // Trimmed to the newest two settled records.
+    // Only the newest two settled records keep their bodies; the oldest id is
+    // still reserved, so it replays as status-only and can never run again.
     let first = repo
         .claim_command(id, command, &fingerprint, now)
         .await
-        .unwrap();
-    assert_eq!(first, None, "the oldest record was evicted");
+        .unwrap()
+        .expect("the oldest id stays reserved");
+    assert!(first.completed && first.status == 200);
+    assert!(first.body_omitted && first.body.is_empty());
 }
