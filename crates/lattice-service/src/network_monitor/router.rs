@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::net::Ipv4Addr;
 
 const MAX_LINE: usize = 65536;
+const SETTINGS_RECHECK: Duration = Duration::from_secs(5);
+const PRUNE_EVERY: Duration = Duration::from_secs(60);
 const MAX_SESSION_BYTES: usize = 2 * 1024 * 1024;
 fn counter(value: &Value) -> Option<f64> {
     let number = value.as_f64().or_else(|| value.as_str()?.parse().ok())?;
@@ -90,7 +92,9 @@ impl NetworkMonitor {
             .redirect(reqwest::redirect::Policy::none())
             .local_address(std::net::IpAddr::V4(target.source))
             .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(20));
+            // The feed is a long-lived stream: bound idle time, not total time. A total
+            // timeout cut the stream every 20 s and forced a reconnect gap each time.
+            .read_timeout(Duration::from_secs(15));
         #[cfg(target_os = "linux")]
         let builder = {
             let Ok(inventory) = lattice_sensor::SystemInterfaceManager.snapshot() else {
@@ -130,6 +134,8 @@ impl NetworkMonitor {
         let mut stream = response.bytes_stream();
         let mut feed = Feed::default();
         let mut received = 0;
+        let mut settings_checked = std::time::Instant::now();
+        let mut last_prune: Option<std::time::Instant> = None;
         while let Some(Ok(chunk)) = stream.next().await {
             received += chunk.len();
             if received > MAX_SESSION_BYTES || feed.push(&chunk).is_err() {
@@ -138,9 +144,13 @@ impl NetworkMonitor {
             let Some((download, upload)) = feed.rate.take() else {
                 continue;
             };
-            let _lock = self.settings_lock.lock().await;
-            if self.settings().await.ok().as_ref() != Some(&settings) {
-                return;
+            // Settings are re-read at most every few seconds, not once per sample.
+            if settings_checked.elapsed() >= SETTINGS_RECHECK {
+                let _lock = self.settings_lock.lock().await;
+                if self.settings().await.ok().as_ref() != Some(&settings) {
+                    return;
+                }
+                settings_checked = std::time::Instant::now();
             }
             let now = Utc::now();
             let source = format!("{ip}:{}", settings.router_port);
@@ -158,9 +168,14 @@ impl NetworkMonitor {
                 self.router.lock().await.status = "history_unavailable".into();
                 continue;
             }
-            // One day of raw rates, a hard ceiling even across clock changes.
-            let _ = sqlx::query("DELETE FROM network_router_samples WHERE at < ? OR at NOT IN (SELECT at FROM network_router_samples ORDER BY at DESC LIMIT 50000)")
-                .bind(now.timestamp()-86400).execute(&self.pool).await;
+            // One day of raw rates, a hard ceiling even across clock changes. Pruned once a
+            // minute: the old per-sample `NOT IN (SELECT ... LIMIT 50000)` re-sorted the table
+            // every second.
+            if last_prune.is_none_or(|at| at.elapsed() >= PRUNE_EVERY) {
+                last_prune = Some(std::time::Instant::now());
+                let _ = sqlx::query("DELETE FROM network_router_samples WHERE at < ? OR at <= COALESCE((SELECT at FROM network_router_samples ORDER BY at DESC LIMIT 1 OFFSET 50000), -1)")
+                    .bind(now.timestamp()-86400).execute(&self.pool).await;
+            }
         }
     }
 }

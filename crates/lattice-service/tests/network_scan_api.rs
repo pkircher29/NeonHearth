@@ -114,3 +114,22 @@ async fn lldp_import_preserves_capture_time_and_never_creates_a_device() {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(value["devices"].as_array().unwrap().len(), 0);
 }
+
+/// SNMP sends the owner's credential, so "scan everything" must be refused with a clear reason
+/// before any lookup or packet.
+#[tokio::test]
+async fn snmp_requires_an_explicit_device_list() {
+    let (_dir, app) = fixture().await;
+    let request = Request::post("/api/v1/network/scan")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"protocols":["snmp"],"snmp":{"version":"v2c","community":"public"}}"#,
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["error"], "snmp_requires_explicit_devices");
+}

@@ -58,8 +58,11 @@ fn table<T: Copy>(family: u16, tcp: bool, offset: usize) -> Result<Vec<T>, &'sta
         match read(data.as_mut_ptr().cast(), &mut size) {
             ERROR_SUCCESS => {
                 let count = unsafe { ptr::read_unaligned(data.as_ptr().cast::<u32>()) } as usize;
-                if count > MAX_ROWS || offset + count * size_of::<T>() > size as usize {
-                    return Err("connection count limit");
+                // A host with more sockets than we track keeps the first MAX_ROWS instead of
+                // reporting the whole monitor unavailable.
+                let count = count.min(MAX_ROWS);
+                if offset + count * size_of::<T>() > size as usize {
+                    return Err("connection table is inconsistent");
                 }
                 return Ok((0..count)
                     .map(|n| unsafe {
@@ -296,13 +299,15 @@ fn ipv6(bytes: [u8; 16], scope: u32) -> String {
         ip.to_string()
     }
 }
-pub fn snapshot() -> Result<HostSnapshot, &'static str> {
+pub fn snapshot(app_counters: bool) -> Result<HostSnapshot, &'static str> {
     let mut before = FILETIME::default();
     unsafe {
         GetSystemTimeAsFileTime(&mut before);
     }
     let elevated = unsafe { IsUserAnAdmin() } != 0;
-    let mut result=HostSnapshot {status:"ready".into(),detail:"This computer only. Physical-interface bytes include all protocols. App bytes cover sampled TCP connections; short connections and UDP bytes are not attributed.".into(),app_counters:if elevated {"sampled_tcp"} else {"requires_elevation"}.into(),firewall_available:elevated,..Default::default()};
+    // EStats are read and enabled only when the owner opted in (see `set_app_counters`).
+    let collect_stats = elevated && app_counters;
+    let mut result=HostSnapshot {status:"ready".into(),detail:"This computer only. Physical-interface bytes include all protocols. App bytes cover sampled TCP connections; short connections and UDP bytes are not attributed.".into(),app_counters:if collect_stats {"sampled_tcp"} else if elevated {"disabled"} else {"requires_elevation"}.into(),firewall_available:elevated,..Default::default()};
     result.interfaces = interfaces()?;
     let mut memory = MEMORYSTATUSEX {
         dwLength: size_of::<MEMORYSTATUSEX>() as u32,
@@ -317,7 +322,11 @@ pub fn snapshot() -> Result<HostSnapshot, &'static str> {
         true,
         std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table),
     )? {
-        let (sent_bytes, received_bytes) = stats4(&row, elevated);
+        let (sent_bytes, received_bytes) = if collect_stats {
+            stats4(&row, elevated)
+        } else {
+            (None, None)
+        };
         result.connections.push(Connection {
             pid: row.dwOwningPid,
             protocol: "tcp".into(),
@@ -337,7 +346,11 @@ pub fn snapshot() -> Result<HostSnapshot, &'static str> {
         true,
         std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table),
     )? {
-        let (sent_bytes, received_bytes) = stats6(&row, elevated);
+        let (sent_bytes, received_bytes) = if collect_stats {
+            stats6(&row, elevated)
+        } else {
+            (None, None)
+        };
         result.connections.push(Connection {
             pid: row.dwOwningPid,
             protocol: "tcp".into(),
@@ -380,9 +393,7 @@ pub fn snapshot() -> Result<HostSnapshot, &'static str> {
             ..Default::default()
         });
     }
-    if result.connections.len() > MAX_ROWS {
-        return Err("connection limit");
-    }
+    result.connections.truncate(MAX_ROWS);
     let mut apps = BTreeMap::new();
     for connection in &mut result.connections {
         let app = apps

@@ -396,16 +396,7 @@ fn chunks(bytes: &[u8]) -> Result<(Vec<u8>, bool), ActiveError> {
 }
 
 fn text(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| {
-            !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        })
-        .scan(0, |len, c| {
-            *len += c.len_utf8();
-            (*len <= MAX_FACT_VALUE_BYTES).then_some(c)
-        })
-        .collect()
+    crate::sanitize::display_text(value, MAX_FACT_VALUE_BYTES)
 }
 
 fn auth_realm(value: &str) -> Option<String> {
