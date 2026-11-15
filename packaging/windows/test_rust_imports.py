@@ -34,6 +34,14 @@ class ImportGateTests(unittest.TestCase):
         image = fixture(); struct.pack_into('<II', image, 208, 0, 0)
         self.assertEqual(gate.imports(image), [])
 
+    def test_arm64_executables_are_accepted_and_other_machines_rejected(self):
+        image = fixture(); struct.pack_into('<H', image, 68, 0xAA64)  # ARM64
+        self.assertEqual(gate.imports(image), ['KERNEL32.dll'])
+        for machine in (0x014c, 0x01c4, 0):  # x86, ARM32, unknown
+            image = fixture(); struct.pack_into('<H', image, 68, machine)
+            with self.assertRaises(gate.InvalidPE):
+                gate.imports(image)
+
     def test_runtime_families_rejected_case_insensitively(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder)/'owned.exe'

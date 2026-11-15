@@ -32,9 +32,19 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   windows-home-hub:
-    name: Windows native Home Hub (recommended ZIP)
+    name: Windows native Home Hub ${{ matrix.arch }} (recommended ZIP)
+    # ARM64 is cross-compiled with the x64 runner's MSVC ARM64 tools, then signed
+    # and packaged here; windows-arm64-smoke runs the result on an ARM64 runner.
     runs-on: windows-latest
     needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
     # Holds the trust link that lets this job sign with Azure Artifact Signing.
     environment: release-signing
     permissions:
@@ -42,8 +52,9 @@ jobs:
       id-token: write
     env:
       # Rust EXEs must load before the launcher can explain the broker's separate prerequisite.
-      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+      CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -52,8 +63,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-09-03
         with:
           toolchain: 1.96.0
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -77,7 +90,7 @@ jobs:
           python packaging/windows/test_windows_stage.py
           if ($LASTEXITCODE -ne 0) { throw 'Staging target tests failed' }
       - name: Build locked native launcher and collector
-        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p lattice-service -p lattice-launcher
+        run: cargo build --locked --release --target ${{ matrix.target }} -p lattice-service -p lattice-launcher
       # Code signing with Azure Artifact Signing. The job signs in with GitHub's
       # OIDC identity (no stored secret). Without the AZURE_CLIENT_ID repository
       # variable every signing step is skipped and the output stays unsigned.
@@ -100,7 +113,7 @@ jobs:
         if: vars.AZURE_CLIENT_ID != ''
         shell: pwsh
         run: |
-          $release = 'target/x86_64-pc-windows-msvc/release'
+          $release = 'target/${{ matrix.target }}/release'
           foreach ($name in 'NeonHearth.exe', 'lattice-service.exe') {
             ./scripts/windows-signing/sign.ps1 "$release/$name"
             if ($LASTEXITCODE -ne 0) { throw "Signing $name failed" }
@@ -121,19 +134,19 @@ jobs:
         run: |
           $signed = @()
           if ("${{ vars.AZURE_CLIENT_ID }}") { $signed = @('--signed-by', "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}") }
-          python scripts/package-home-hub.py --target target/x86_64-pc-windows-msvc/release --mosquitto "${{ runner.temp }}/neonhearth-mosquitto" --output "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-x64" --version "${{ steps.version.outputs.full }}" @signed
+          python scripts/package-home-hub.py --target target/${{ matrix.target }}/release --platform windows-${{ matrix.arch }} --mosquitto "${{ runner.temp }}/neonhearth-mosquitto" --output "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-${{ matrix.arch }}" --version "${{ steps.version.outputs.full }}" @signed
           if ($LASTEXITCODE -ne 0) { throw 'Home Hub packaging failed' }
       - name: Check the packaged signatures
         if: vars.AZURE_CLIENT_ID != ''
         shell: pwsh
         run: |
-          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-x64"
+          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-${{ matrix.arch }}"
           ./scripts/windows-signing/verify.ps1 -Publisher "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}" "$hub/NeonHearth.exe" "$hub/bin/lattice-service.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Packaged signature check failed' }
       - name: Validate exact payload and executable loading
         shell: pwsh
         run: |
-          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-x64"
+          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-${{ matrix.arch }}"
           python packaging/windows/check-rust-imports.py "$hub/NeonHearth.exe" "$hub/bin/lattice-service.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Shipped Rust executable requires an external VC runtime' }
           $manifest = Get-Content -Raw "$hub/PACKAGE-MANIFEST.json" | ConvertFrom-Json
@@ -144,16 +157,21 @@ jobs:
           }
           $info = Get-Content -Raw "$hub/BUILD-INFO.json" | ConvertFrom-Json
           if ($info.source_commit -ne $env:GITHUB_SHA -or $info.source_dirty) { throw 'Candidate source does not match the clean checkout' }
-          $process = Start-Process -FilePath "$PWD/$hub/NeonHearth.exe" -ArgumentList '--help' -WindowStyle Hidden -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw 'Native launcher could not load' }
+          if ($info.platform -ne 'windows-${{ matrix.arch }}') { throw 'Package platform does not match this build' }
+          if ('${{ matrix.arch }}' -eq 'x64') {
+            # An x64 runner cannot start the ARM64 launcher; windows-arm64-smoke does that.
+            $process = Start-Process -FilePath "$PWD/$hub/NeonHearth.exe" -ArgumentList '--help' -WindowStyle Hidden -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw 'Native launcher could not load' }
+          }
           $archive = "$hub.zip"
           "$((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower())  $(Split-Path -Leaf $archive)" | Set-Content "$archive.sha256"
       - name: Validate candidate and run isolated native smoke
+        if: matrix.arch == 'x64'
         shell: pwsh
         run: |
           python -m pip install psutil==7.2.2
           if ($LASTEXITCODE -ne 0) { throw 'Smoke test dependency install failed' }
-          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-x64"
+          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-${{ matrix.arch }}"
           python scripts/verify-candidate.py --package $hub --output "${{ runner.temp }}/home-hub-verify.json"
           if ($LASTEXITCODE -ne 0) { throw 'Candidate verification failed' }
           # Hosted VMs may have no eligible physical adapter. This checks the
@@ -163,18 +181,65 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: windows-home-hub-verification
+          name: windows-home-hub-verification-${{ matrix.arch }}
           path: |
             ${{ runner.temp }}/home-hub-verify.json
             ${{ runner.temp }}/home-hub-smoke.json
           if-no-files-found: ignore
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-home-hub
+          name: windows-home-hub-${{ matrix.arch }}
           path: |
             packaging/dist/NeonHearth-Home-Hub-*.zip
             packaging/dist/NeonHearth-Home-Hub-*.zip.sha256
           if-no-files-found: error
+
+  windows-arm64-smoke:
+    name: Windows ARM64 Home Hub runs on ARM64
+    # The only place the ARM64 launcher and collector are actually started.
+    runs-on: windows-11-arm
+    needs: windows-home-hub
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: windows-home-hub-arm64
+          path: hub
+      - name: Start the ARM64 launcher and run the isolated smoke
+        shell: pwsh
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') { throw "Expected an ARM64 runner, got $env:PROCESSOR_ARCHITECTURE" }
+          $archive = Get-ChildItem hub -Filter 'NeonHearth-Home-Hub-*-windows-arm64.zip' | Select-Object -First 1
+          if (-not $archive) { throw 'ARM64 Home Hub archive not found' }
+          Expand-Archive $archive.FullName -DestinationPath extracted
+          $hub = (Get-ChildItem extracted -Directory | Select-Object -First 1).FullName
+          python packaging/windows/check-rust-imports.py "$hub/NeonHearth.exe" "$hub/bin/lattice-service.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Shipped Rust executable requires an external VC runtime' }
+          foreach ($name in 'NeonHearth.exe', 'bin/lattice-service.exe') {
+            $machine = [System.BitConverter]::ToUInt16([System.IO.File]::ReadAllBytes("$hub/$name"), [System.BitConverter]::ToInt32([System.IO.File]::ReadAllBytes("$hub/$name"), 60) + 4)
+            if ($machine -ne 0xAA64) { throw "$name is not an ARM64 program" }
+          }
+          $process = Start-Process -FilePath "$hub/NeonHearth.exe" -ArgumentList '--help' -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'ARM64 launcher could not load' }
+          python -m pip install psutil==7.2.2
+          if ($LASTEXITCODE -ne 0) { throw 'Smoke test dependency install failed' }
+          python scripts/verify-candidate.py --package $hub --output "${{ runner.temp }}/home-hub-verify.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate verification failed' }
+          python scripts/soak-candidate.py --package $hub --state "${{ runner.temp }}/home-hub-smoke-state" --output "${{ runner.temp }}/home-hub-smoke.json" --port 58131 --mqtt-port 58193 --duration-seconds 15
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated native smoke failed' }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: windows-arm64-smoke
+          path: |
+            ${{ runner.temp }}/home-hub-verify.json
+            ${{ runner.temp }}/home-hub-smoke.json
+          if-no-files-found: ignore
 
   windows-installer:
     name: Windows service compatibility installer (MSI)
@@ -409,25 +474,41 @@ jobs:
           if-no-files-found: error
 
   linux-packages:
-    name: Linux packages (deb, rpm)
+    name: Linux packages ${{ matrix.arch }} (deb, rpm)
     needs: quality
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            rpm_arch: x86_64
+            machine: x86-64
+            nfpm_sha256: 3f1cf344bd0b57373ca55636a78c08b0491f7293d609a456a9ac3b0b150fda97
+          # Built natively on an ARM64 runner (Raspberry Pi 4/5 and other 64-bit ARM hosts).
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            rpm_arch: aarch64
+            machine: aarch64
+            nfpm_sha256: 27419eb382695a7942be8ad52259f3ec1854fad001b3ae4baed34ce39a223b97
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Derive version from tag
+      - name: Derive version from tag or manual input
         id: version
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
         run: |
-          full="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then full="${GITHUB_REF_NAME#v}"; else full="$MANUAL_VERSION"; fi
           base="${full%%-*}"
           case "$base" in
             [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "Tag '$GITHUB_REF_NAME' does not start with a numeric x.y.z version" >&2; exit 1 ;;
+            *) echo "Version '$full' does not start with a numeric x.y.z version" >&2; exit 1 ;;
           esac
           workspace="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
           if [ "$base" != "$workspace" ]; then
-            echo "Tag base version $base does not match workspace version $workspace" >&2
+            echo "Version base $base does not match workspace version $workspace" >&2
             exit 1
           fi
           echo "full=$full" >> "$GITHUB_OUTPUT"
@@ -454,6 +535,8 @@ jobs:
           cargo --version
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.arch }}
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -466,8 +549,8 @@ jobs:
 
       - name: Install nfpm (pinned, checksum-verified)
         run: |
-          curl -sSLo nfpm.deb https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_amd64.deb
-          echo "3f1cf344bd0b57373ca55636a78c08b0491f7293d609a456a9ac3b0b150fda97  nfpm.deb" | sha256sum -c -
+          curl -sSLo nfpm.deb https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_${{ matrix.arch }}.deb
+          echo "${{ matrix.nfpm_sha256 }}  nfpm.deb" | sha256sum -c -
           sudo dpkg -i nfpm.deb
           rm nfpm.deb
           nfpm --version
@@ -475,6 +558,7 @@ jobs:
       - name: Build deb and rpm packages
         env:
           NEONHEARTH_VERSION: ${{ steps.version.outputs.full }}
+          NEONHEARTH_ARCH: ${{ matrix.arch }}
         run: |
           cd packaging/linux
           nfpm package --config nfpm.yaml --packager deb --target ../dist/
@@ -486,6 +570,9 @@ jobs:
           deb="$(ls packaging/dist/*.deb)"
           rpm="$(ls packaging/dist/*.rpm)"
           echo "== $deb =="
+          [ "$(dpkg-deb -f "$deb" Architecture)" = "${{ matrix.arch }}" ] || { echo 'deb architecture mismatch' >&2; exit 1; }
+          case "$rpm" in *.${{ matrix.rpm_arch }}.rpm) ;; *) echo "rpm is not ${{ matrix.rpm_arch }}: $rpm" >&2; exit 1 ;; esac
+          file target/release/lattice-service | grep -q "${{ matrix.machine }}" || { echo 'service binary is not ${{ matrix.machine }}' >&2; file target/release/lattice-service >&2; exit 1; }
           dpkg-deb --contents "$deb"
           dpkg-deb --contents "$deb" | grep -q '/usr/libexec/neonhearth/lattice-service' || { echo 'deb missing service binary' >&2; exit 1; }
           dpkg-deb --contents "$deb" | grep -q '/usr/lib/systemd/system/neonhearth.service' || { echo 'deb missing systemd unit' >&2; exit 1; }
@@ -505,7 +592,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: linux-packages
+          name: linux-packages-${{ matrix.arch }}
           path: |
             packaging/dist/*.deb
             packaging/dist/*.rpm
@@ -515,7 +602,7 @@ jobs:
   release:
     name: Publish GitHub pre-release
     runs-on: ubuntu-latest
-    needs: [windows-home-hub, windows-installer, linux-packages]
+    needs: [windows-home-hub, windows-arm64-smoke, windows-installer, linux-packages]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -533,11 +620,13 @@ jobs:
           find artifacts -type f \( -name '*.zip' -o -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
           cd release-assets
           ls -la
-          [ -n "$(ls NeonHearth-Home-Hub-*.zip 2>/dev/null)" ] || { echo 'no native Home Hub artifact' >&2; exit 1; }
+          [ -n "$(ls NeonHearth-Home-Hub-*-windows-x64.zip 2>/dev/null)" ] || { echo 'no x64 Home Hub artifact' >&2; exit 1; }
+          [ -n "$(ls NeonHearth-Home-Hub-*-windows-arm64.zip 2>/dev/null)" ] || { echo 'no ARM64 Home Hub artifact' >&2; exit 1; }
           [ -n "$(ls *.msi 2>/dev/null)" ] || { echo 'no MSI artifact' >&2; exit 1; }
           [ -n "$(ls *.exe 2>/dev/null)" ] || { echo 'no setup exe artifact' >&2; exit 1; }
-          [ -n "$(ls *.deb 2>/dev/null)" ] || { echo 'no deb artifact' >&2; exit 1; }
-          [ -n "$(ls *.rpm 2>/dev/null)" ] || { echo 'no rpm artifact' >&2; exit 1; }
+          for name in '*_amd64.deb' '*_arm64.deb' '*.x86_64.rpm' '*.aarch64.rpm'; do
+            [ -n "$(ls $name 2>/dev/null)" ] || { echo "no $name artifact" >&2; exit 1; }
+          done
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
@@ -549,9 +638,10 @@ jobs:
           files: |
             release-assets/*
           body: |
-            **Pre-release: ${{ vars.AZURE_CLIENT_ID != '' && format('Windows programs and installers are code-signed by {0};', vars.ARTIFACT_SIGNING_PUBLISHER) || 'unsigned,' }} not clean-machine tested.**
+            **Pre-release.** ${{ vars.AZURE_CLIENT_ID != '' && format('Windows programs and installers are code-signed by {0}.', vars.ARTIFACT_SIGNING_PUBLISHER) || 'Windows programs and installers are unsigned.' }}
 
-            **Recommended Windows download: NeonHearth-Home-Hub-...-windows-x64.zip.**
+            **Recommended Windows download: NeonHearth-Home-Hub-...-windows-x64.zip**
+            (or **-windows-arm64.zip** for Windows 11 on ARM).
             Extract the complete folder and open NeonHearth.exe. It includes the
             native launcher, collector and authenticated local MQTT broker.
             No Npcap, Python, Node or administrator rights are needed to run it;
@@ -559,19 +649,26 @@ jobs:
             Install or repair it from https://aka.ms/vc14/vc_redist.x64.exe if
             startup reports a missing DLL; Windows may request admin approval
             for this prerequisite. Then open NeonHearth again.
-            The MSI/Setup EXE remain separate legacy-service compatibility assets.
-            Existing service users must back up and deliberately stop that service
-            before switching; private databases are not silently migrated.
+            In the ARM64 package the launcher and collector are native ARM64;
+            the broker is the same x64 build, run by Windows' x64 emulation.
+            The MSI/Setup EXE remain separate x64 legacy-service compatibility
+            assets. Existing service users must back up and deliberately stop
+            that service before switching; private databases are not silently
+            migrated.
 
-            These installer artifacts are built and payload-validated in CI
-            (MSI administrative extract, setup-exe bundle extraction, deb/rpm
-            content listing), but:
+            Linux: deb and rpm packages for x86-64 (amd64) and 64-bit ARM
+            (arm64/aarch64, for example Raspberry Pi 4 or 5 on a 64-bit OS).
 
-            - Nothing is code-signed (RLS7 untouched); Windows SmartScreen and
-              apt/rpm signature checks will flag them.
+            These artifacts are built and payload-validated in CI (Home Hub
+            smoke on x64 and ARM64 runners, MSI administrative extract,
+            setup-exe bundle extraction, deb/rpm content listing), but:
+
+            - Linux packages are not signed; apt/rpm signature checks will
+              flag them.
             - No clean-machine install/upgrade/uninstall acceptance has been
-              performed, so RLS4 (Windows installer) and RLS5 (Linux packages)
-              remain **not complete**.
+              performed on these exact files, so RLS4 (Windows installer) and
+              RLS5 (Linux packages) remain **not complete**. The ARM64 builds
+              have only been run on CI runners, not on owner hardware.
             - Windows discovery uses native APIs; Npcap is not required by
               either the Home Hub or current service compatibility package.
 

@@ -119,6 +119,24 @@ class PackageTests(unittest.TestCase):
         self.assertNotIn('unsigned', readme)
         self.assertNotIn('{signing_note}', readme)
 
+    def test_default_package_is_x64_and_arm64_states_the_emulated_broker(self):
+        self.complete_inputs()
+        self.run_package()
+        self.assertEqual(json.loads((self.output/'BUILD-INFO.json').read_text())['platform'], 'windows-x64')
+        readme = (self.output/'Read me.txt').read_text()
+        self.assertTrue(readme.startswith('NeonHearth Home Hub for Windows x64\n\nOpen NeonHearth.exe.'))
+        self.assertNotIn('emulation', readme)
+
+    def test_arm64_package_records_its_platform_and_the_x64_broker(self):
+        self.complete_inputs()
+        self.run_package('--platform', 'windows-arm64')
+        self.assertEqual(json.loads((self.output/'BUILD-INFO.json').read_text())['platform'], 'windows-arm64')
+        readme = (self.output/'Read me.txt').read_text()
+        self.assertTrue(readme.startswith('NeonHearth Home Hub for Windows 11 on ARM (ARM64)\n'))
+        self.assertIn('native ARM64 programs', readme)
+        self.assertIn('built-in x64 emulation', readme)
+        self.assertIn('Open NeonHearth.exe.', readme)
+
     def test_changed_broker_is_rejected_before_output(self):
         self.complete_inputs()
         (self.root/'mqtt/mosquitto.exe').write_bytes(b'tampered broker')
