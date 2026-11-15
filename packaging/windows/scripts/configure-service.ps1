@@ -61,7 +61,7 @@ function Write-Log {
     try { Add-Content -LiteralPath $logPath -Value $line } catch {}
 }
 
-if (-not (Test-Path -LiteralPath $serviceKey)) {
+if (-not (Test-Path -Path $serviceKey)) {
     throw "Service '$ServiceName' is not registered; run the installer first."
 }
 
@@ -139,7 +139,7 @@ Write-Log "State directory ACL set explicitly: SYSTEM/Administrators full, NT SE
 # Environment value again (fail closed: the service refuses to start without a
 # token, and re-running this script generates one).
 $keyInherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit
-$keyAcl = Get-Acl -LiteralPath $serviceKey
+$keyAcl = Get-Acl -Path $serviceKey
 $keyAcl.SetAccessRuleProtection($true, $false)
 foreach ($rule in @($keyAcl.Access | Where-Object { -not $_.IsInherited })) {
     [void]$keyAcl.RemoveAccessRuleSpecific($rule)
@@ -150,9 +150,9 @@ $keyAcl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new(
     $sidAdmins, 'FullControl', $keyInherit, $noProp, $allow))
 $keyAcl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new(
     $serviceSid, 'ReadKey', $keyInherit, $noProp, $allow))
-Set-Acl -LiteralPath $serviceKey -AclObject $keyAcl
+Set-Acl -Path $serviceKey -AclObject $keyAcl
 $permitted = @($sidSystem.Value, $sidAdmins.Value, $serviceSid.Value)
-$applied = Get-Acl -LiteralPath $serviceKey
+$applied = Get-Acl -Path $serviceKey
 $stray = @($applied.Access | Where-Object {
     $_.AccessControlType -eq 'Allow' -and
     ($permitted -notcontains $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value)
@@ -171,11 +171,11 @@ Write-Log "Service registry key ACL set and verified: SYSTEM/Administrators full
 $generationKey = 'HKLM:\SOFTWARE\NeonHearth'
 $generation = 0
 try {
-    $generation = [int](Get-ItemProperty -LiteralPath $generationKey -Name 'TokenGeneration' -ErrorAction Stop).TokenGeneration
+    $generation = [int](Get-ItemProperty -Path $generationKey -Name 'TokenGeneration' -ErrorAction Stop).TokenGeneration
 } catch { $generation = 0 }
 
 $existing = @()
-$existingProp = Get-ItemProperty -LiteralPath $serviceKey -Name 'Environment' -ErrorAction SilentlyContinue
+$existingProp = Get-ItemProperty -Path $serviceKey -Name 'Environment' -ErrorAction SilentlyContinue
 if ($null -ne $existingProp) { $existing = @($existingProp.Environment) }
 
 $entries = [System.Collections.Generic.List[string]]::new()
@@ -227,16 +227,16 @@ Set-EnvEntry -List $entries -Name 'LATTICE_UI_DIR' -Value $uiDir
 Write-Log "Service will serve the dashboard UI from $uiDir on http://127.0.0.1:58120/."
 
 try {
-    Set-ItemProperty -LiteralPath $serviceKey -Name 'Environment' `
+    Set-ItemProperty -Path $serviceKey -Name 'Environment' `
         -Value ([string[]]$entries) -Type MultiString
     # Read back: the ACL must still be the hardened one when the secret lands.
-    $after = Get-Acl -LiteralPath $serviceKey
+    $after = Get-Acl -Path $serviceKey
     if (-not $after.AreAccessRulesProtected) { throw 'Service key ACL is no longer protected.' }
     New-Item -Path $generationKey -Force | Out-Null
-    Set-ItemProperty -LiteralPath $generationKey -Name 'TokenGeneration' -Value 2 -Type DWord
+    Set-ItemProperty -Path $generationKey -Name 'TokenGeneration' -Value 2 -Type DWord
 } catch {
     # Fail closed: never leave a token behind a key we could not verify.
-    Remove-ItemProperty -LiteralPath $serviceKey -Name 'Environment' -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $serviceKey -Name 'Environment' -ErrorAction SilentlyContinue
     throw
 }
 Write-Log 'Service Environment registry value written.'
