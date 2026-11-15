@@ -1,10 +1,16 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { createPoller } from '../polling';
+  import { SNMP_NEEDS_DEVICES } from '../api/networkScan';
   import type { CaptureReport, ScanApi, ScanInput, ScanStatus } from '../api/networkScan';
-  let { api, onchange }: { api: ScanApi; onchange: (scan: ScanStatus) => void } = $props();
+  let { api, onchange, devices = [] }: { api: ScanApi; onchange: (scan: ScanStatus) => void; /** Observed devices the owner may choose for an SNMP scan. */ devices?: Array<{ id: string; label: string }> } = $props();
+  let selected = $state<string[]>([]);
+  function toggleDevice(id: string) { selected = selected.includes(id) ? selected.filter(item => item !== id) : [...selected, id]; }
   let scan = $state<ScanStatus | null>(null);
   let mode = $state<ScanInput['port_mode']>('common');
   let protocols = $state(['icmp','mdns','smb','netbios']);
+  const wantsSnmp = $derived(protocols.includes('snmp'));
+  const snmpBlocked = $derived(wantsSnmp && selected.length === 0);
   let customPorts = $state('');
   let webIdentification = $state(true);
   let error = $state('');
@@ -24,6 +30,10 @@
       const ports = mode === 'custom' ? customPorts.split(',').map(p => Number(p.trim())) : [];
       if (mode === 'custom' && (!ports.length || ports.some(p => !Number.isInteger(p) || p < 1 || p > 65535))) throw new Error('Enter port numbers from 1 to 65535, separated by commas.');
       const input: ScanInput = { port_mode: mode, protocols, ports, web_identification: webIdentification };
+      if (protocols.includes('snmp')) {
+        if (selected.length === 0) throw new Error(SNMP_NEEDS_DEVICES);
+        input.device_ids = [...selected];
+      }
       if (protocols.includes('snmp')) input.snmp = { version: snmpVersion, community, username, authentication_password: authPassword, privacy_password: privacyPassword };
       const pending = api.start(input);
       community = ''; authPassword = ''; privacyPassword = '';
@@ -39,10 +49,10 @@
     finally { importBusy = false; input.value = ''; }
   }
   onMount(() => {
-    let active = true; let timer: ReturnType<typeof setTimeout>;
+    let active = true;
     void Promise.allSettled([api.capabilities(),api.capture()]).then(results => { if (!active) return; if (results[0].status === 'fulfilled') capabilities = results[0].value; if (results[1].status === 'fulfilled') capture = results[1].value; });
-    async function poll() { try { const result = await api.status(); if (active) { update(result); statusError = ''; } } catch { if (active) statusError = 'Scan status is unavailable.'; } finally { if (active) timer = setTimeout(() => void poll(), 1500); } }
-    void poll(); return () => { active = false; clearTimeout(timer); };
+    async function poll() { try { const result = await api.status(); if (active) { update(result); statusError = ''; } } catch { if (active) statusError = 'Scan status is unavailable.'; } }
+    const poller = createPoller(poll, 1500); return () => { active = false; poller.stop(); };
   });
 </script>
 <details class="scan-panel">
@@ -63,8 +73,12 @@
         {#if snmpVersion === 'v3'}<label>SNMP username<input bind:value={username} maxlength="128" autocomplete="off" /></label><label>Authentication password<input type="password" bind:value={authPassword} maxlength="128" autocomplete="new-password" /></label><label>Privacy password<input type="password" bind:value={privacyPassword} maxlength="128" autocomplete="new-password" /></label>
         {:else}<label>SNMP community<input type="password" bind:value={community} maxlength="128" autocomplete="new-password" /></label>{/if}
       </div><p>Supply the credentials configured on your devices. Credentials are kept only for this scan.</p>
+      <fieldset class="snmp-devices" aria-describedby="snmp-devices-help"><legend>Devices to query with SNMP</legend>
+        <p id="snmp-devices-help">SNMP is only sent to the devices you tick here, and choosing devices limits this whole scan to them. {selected.length ? `${selected.length} chosen.` : SNMP_NEEDS_DEVICES}</p>
+        {#if devices.length}<div class="device-pick">{#each devices as device (device.id)}<label><input type="checkbox" checked={selected.includes(device.id)} onchange={() => toggleDevice(device.id)} />{device.label}</label>{/each}</div>{:else}<p>No observed devices to choose from yet.</p>{/if}
+      </fieldset>
     {/if}
-    <button type="button" onclick={() => void start()}>Scan all devices</button>
+    <button type="button" disabled={snmpBlocked} aria-describedby={snmpBlocked ? 'snmp-devices-help' : undefined} onclick={() => void start()}>{wantsSnmp ? `Scan ${selected.length} chosen ${selected.length === 1 ? 'device' : 'devices'}` : 'Scan all devices'}</button>
   </fieldset>
   {#if running}<button type="button" disabled={scan?.state === 'cancelling'} onclick={() => void cancel()}>Cancel scan</button>{/if}
   {#if error}<p role="alert">{error}</p>{/if}
@@ -87,7 +101,7 @@
   .scan-panel{margin:18px 0;padding:16px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
   summary{cursor:pointer;font-weight:600;min-height:32px}p{font-size:13px;color:var(--muted-strong,var(--ink-mute));line-height:1.5}
   fieldset{border:0;padding:0;display:grid;gap:14px;min-width:0}label{display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:13px}
-  .protocols{display:flex;gap:16px;flex-wrap:wrap}.credentials{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}.credentials label{display:grid}
+  .device-pick{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:6px;max-height:220px;overflow:auto}.snmp-devices{border:1px solid var(--line);border-radius:8px;padding:10px}.protocols{display:flex;gap:16px;flex-wrap:wrap}.credentials{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}.credentials label{display:grid}
   select,input:not([type=checkbox]){min-height:40px;max-width:100%;padding:8px;background:var(--surface-2,var(--surface));color:var(--ink);border:1px solid var(--line);border-radius:6px}
   button{min-height:42px;justify-self:start;padding:10px 16px;border:1px solid var(--accent,var(--ember));border-radius:6px;background:var(--surface);color:var(--ink);cursor:pointer}button:disabled{opacity:.5}progress{width:100%;height:12px}
 </style>
