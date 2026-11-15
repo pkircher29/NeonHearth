@@ -75,9 +75,16 @@ contents:
     file_info:
       mode: 0644
 
+  # Data-retention note (package-owned; postinstall never writes into the
+  # service-owned state directory).
+  - src: README-DATA.txt
+    dst: /usr/share/doc/neonhearth/README-DATA.txt
+    file_info:
+      mode: 0644
+
   # Desktop UI bundle (Vite build of apps/desktop staged by stage.sh).
-  # Installed as data; the service does not serve these over HTTP in this
-  # build (loopback API only).
+  # Installed as data and served by the service on the loopback API
+  # (LATTICE_UI_DIR in the unit).
   - src: ../dist/linux/ui
     dst: /usr/share/neonhearth/ui
     type: tree

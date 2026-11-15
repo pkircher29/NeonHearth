@@ -31,22 +31,73 @@ BROKER_NOTE = {
 }
 
 
+def generate_notices(destination, metadata=None):
+    """Write third-party notices from the locked Rust sources and the npm lockfile."""
+    destination = Path(destination)
+    if metadata is None:
+        metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--format-version', '1', '--locked'], cwd=ROOT))
+    lock = json.loads((ROOT / 'apps/desktop/package-lock.json').read_text(encoding='utf-8'))
+    def copy(source, relative):
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    packages = []
+    for package in metadata['packages']:
+        packages.append({key:package.get(key) for key in ['name','version','license','repository']})
+        directory = Path(package['manifest_path']).parent
+        for path in directory.iterdir():
+            if path.is_file() and (path.name.upper().startswith(('LICENSE','COPYING','NOTICE')) or path.name == 'NEONHEARTH-PATCH.md') and path.stat().st_size <= 256 * 1024:
+                copy(path, f"rust/{package['name']}-{package['version']}/{path.name}")
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / 'rust-components.json').write_text(json.dumps(packages,indent=2),encoding='utf-8')
+    packages = []
+    for location, package in lock['packages'].items():
+        if not location:
+            continue
+        source = package.get('resolved', location) if package.get('link') else location
+        info = lock['packages'].get(source, package) if package.get('link') else package
+        directory = (ROOT / 'apps/desktop' / source).resolve()
+        name = info.get('name') or location.rsplit('node_modules/',1)[-1]
+        component_version = info.get('version') or 'unversioned'
+        if not re.fullmatch(r'(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+', name) or name in ('.','..'):
+            raise ValueError('Unsupported npm component name: '+name)
+        if not isinstance(component_version,str) or not re.fullmatch(r'[A-Za-z0-9_.+-]+',component_version) or component_version in ('.','..'):
+            raise ValueError('Unsupported npm component version')
+        packages.append({'name':name,'version':component_version,'license':info.get('license'),'integrity':info.get('integrity'), 'source':source})
+        if directory.is_dir():
+            for path in directory.iterdir():
+                if path.is_file() and (path.name.upper().startswith(('LICENSE','COPYING','NOTICE','OFL')) or path.name == 'PATCH.md') and path.stat().st_size <= 256 * 1024:
+                    copy(path, f"npm/{name}/{component_version}/{path.name}")
+    (destination / 'npm-components.json').write_text(json.dumps(packages,indent=2),encoding='utf-8')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--target', type=Path, default=ROOT / 'target' / 'release')
-    parser.add_argument('--mosquitto', type=Path, required=True)
-    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--mosquitto', type=Path)
+    parser.add_argument('--ui', type=Path, help='Built dashboard folder (default apps/desktop/dist)')
+    parser.add_argument('--notices', type=Path, help='Pre-generated third-party notices from --emit-notices')
+    parser.add_argument('--emit-notices', type=Path, help='Only write third-party notices into this new folder, then exit')
+    parser.add_argument('--output', type=Path)
     parser.add_argument('--version', help='Release tag version without v; defaults to Cargo workspace version')
     parser.add_argument('--platform', choices=sorted(PLATFORMS), default='windows-x64', help='Windows architecture the launcher and collector were built for')
     parser.add_argument('--signed-by', help='Publisher whose code signature the build already verified on NeonHearth.exe and lattice-service.exe; omit for an unsigned package')
     args = parser.parse_args()
+    if args.emit_notices:
+        if args.emit_notices.exists():
+            raise ValueError('Choose a new notices folder')
+        generate_notices(args.emit_notices)
+        print(json.dumps({'notices':str(args.emit_notices.resolve())}))
+        return
+    if not args.mosquitto or not args.output:
+        parser.error('--mosquitto and --output are required')
     output = args.output.resolve()
     archive = output.with_name(output.name + '.zip')
     if output.exists():
         raise ValueError('Choose a new empty package destination; existing packages are preserved')
     if archive.exists():
         raise ValueError('Archive already exists')
-    ui = ROOT / 'apps' / 'desktop' / 'dist'
+    ui = args.ui.resolve() if args.ui else ROOT / 'apps' / 'desktop' / 'dist'
     inputs = [args.target / 'NeonHearth.exe', args.target / 'lattice-service.exe', ui / 'index.html', ROOT / 'LICENSE']
     inputs += [args.mosquitto / name for name in BROKER_FILES + BROKER_NOTICES]
     inputs += [ROOT / name for name in ['docs/owner/home-automation.md', 'docs/owner/traffic-monitor.md', 'docs/owner/network-monitor.md', 'docs/build/windows-delivery.md', 'crates/lattice-service/data/mac-assignments.json']]
@@ -67,8 +118,7 @@ def main():
         raise ValueError('Could not identify the source commit')
     source_dirty = bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip())
     # Resolve metadata before writing a customer-looking package directory.
-    metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--format-version', '1', '--locked'], cwd=ROOT))
-    lock = json.loads((ROOT / 'apps/desktop/package-lock.json').read_text(encoding='utf-8'))
+    metadata = None if args.notices else json.loads(subprocess.check_output(['cargo', 'metadata', '--format-version', '1', '--locked'], cwd=ROOT))
     output.mkdir(parents=True)
     def copy(source, destination):
         target = output / destination
@@ -88,34 +138,18 @@ def main():
     copy(ROOT / 'docs/build/windows-delivery.md', 'Windows delivery.md')
     copy(args.mosquitto/'SOURCE-MANIFEST.json', 'licenses/mosquitto/SOURCE-MANIFEST.json')
     copy(ROOT / 'crates/lattice-service/data/mac-assignments.json', 'licenses/ieee-assignment-sources.json')
-    # Include dependency notices from the installed, locked source trees.
-    packages = []
-    for package in metadata['packages']:
-        packages.append({key:package.get(key) for key in ['name','version','license','repository']})
-        directory = Path(package['manifest_path']).parent
-        for path in directory.iterdir():
-            if path.is_file() and (path.name.upper().startswith(('LICENSE','COPYING','NOTICE')) or path.name == 'NEONHEARTH-PATCH.md') and path.stat().st_size <= 256 * 1024:
-                copy(path, f"licenses/rust/{package['name']}-{package['version']}/{path.name}")
-    (output / 'licenses' / 'rust-components.json').write_text(json.dumps(packages,indent=2),encoding='utf-8')
-    packages = []
-    for location, package in lock['packages'].items():
-        if not location:
-            continue
-        source = package.get('resolved', location) if package.get('link') else location
-        info = lock['packages'].get(source, package) if package.get('link') else package
-        directory = (ROOT / 'apps/desktop' / source).resolve()
-        name = info.get('name') or location.rsplit('node_modules/',1)[-1]
-        component_version = info.get('version') or 'unversioned'
-        if not re.fullmatch(r'(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+', name) or name in ('.','..'):
-            raise ValueError('Unsupported npm component name: '+name)
-        if not isinstance(component_version,str) or not re.fullmatch(r'[A-Za-z0-9_.+-]+',component_version) or component_version in ('.','..'):
-            raise ValueError('Unsupported npm component version')
-        packages.append({'name':name,'version':component_version,'license':info.get('license'),'integrity':info.get('integrity'), 'source':source})
-        if directory.is_dir():
-            for path in directory.iterdir():
-                if path.is_file() and (path.name.upper().startswith(('LICENSE','COPYING','NOTICE','OFL')) or path.name == 'PATCH.md') and path.stat().st_size <= 256 * 1024:
-                    copy(path, f"licenses/npm/{name}/{component_version}/{path.name}")
-    (output / 'licenses' / 'npm-components.json').write_text(json.dumps(packages,indent=2),encoding='utf-8')
+    if args.notices:
+        # Pre-generated by `--emit-notices` in the unprivileged build job, so the
+        # signing-adjacent packaging step needs neither cargo nor node_modules.
+        notices = args.notices.resolve()
+        if not notices.is_dir() or notices.is_symlink():
+            raise ValueError('Notices folder not found')
+        for name in ['rust-components.json', 'npm-components.json']:
+            if not (notices / name).is_file():
+                raise ValueError('Notices folder is incomplete: ' + name)
+        shutil.copytree(notices, output / 'licenses', dirs_exist_ok=True, symlinks=False)
+    else:
+        generate_notices(output / 'licenses', metadata)
     (output / 'BUILD-INFO.json').write_text(json.dumps({'format_version':1, 'source_commit':source_commit,
         'source_dirty':source_dirty, 'version':version, 'platform':args.platform, 'delivery':'portable-home-hub',
         'unsigned':not args.signed_by, **({'signed_by':args.signed_by} if args.signed_by else {}), 'broker':{'name':'mosquitto', 'version':BROKER_SOURCE['version'],

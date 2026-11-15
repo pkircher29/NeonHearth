@@ -1,10 +1,12 @@
 # Prepares a GitHub Actions Windows runner to sign with Azure Artifact Signing.
 #
-# Run it after azure/login. It downloads Microsoft's signing client, writes the
-# signing metadata, fetches the signing token while the sign-in is still fresh,
-# and writes a Tauri config fragment that points bundle.windows.signCommand at
-# sign.ps1. Later steps read these from the job environment:
-#   ARTIFACT_SIGNING_DLIB, ARTIFACT_SIGNING_METADATA, TAURI_SIGNING_CONFIG
+# Run it after azure/login, in a job that runs nothing but signing. It
+# downloads Microsoft's signing client (SHA-256 pinned), writes the signing
+# metadata, and fetches the signing token while the sign-in is still fresh.
+# The two paths sign.ps1 needs are written as STEP OUTPUTS (dlib, metadata);
+# the signing step passes them to sign.ps1 as step-local environment. They are
+# deliberately NOT exported through GITHUB_ENV, which would hand them to every
+# later step in the job.
 param(
     [Parameter(Mandatory)][string]$Endpoint,
     [Parameter(Mandatory)][string]$Account,
@@ -61,22 +63,8 @@ $expires = az account get-access-token --scope 'https://codesigning.azure.net/.d
 if ($LASTEXITCODE -ne 0) { throw 'Could not get an Azure Artifact Signing token' }
 Write-Host "Signing token is valid until $expires"
 
-$signScript = Join-Path $PSScriptRoot 'sign.ps1'
-$tauriConfig = Join-Path $workDir 'tauri.signing.conf.json'
-@{
-    bundle = @{
-        windows = @{
-            signCommand = @{
-                cmd  = 'pwsh'
-                args = @('-NoProfile', '-NonInteractive', '-File', $signScript, '%1')
-            }
-        }
-    }
-} | ConvertTo-Json -Depth 6 | Set-Content -Path $tauriConfig -Encoding utf8
-
-if ($env:GITHUB_ENV) {
-    "ARTIFACT_SIGNING_DLIB=$dlib" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
-    "ARTIFACT_SIGNING_METADATA=$metadata" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
-    "TAURI_SIGNING_CONFIG=$tauriConfig" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+if ($env:GITHUB_OUTPUT) {
+    "dlib=$dlib" | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
+    "metadata=$metadata" | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
 }
 Write-Host "Code signing is ready (account $Account, profile $CertificateProfile)"
