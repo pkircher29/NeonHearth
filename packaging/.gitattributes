@@ -2,3 +2,4 @@
 *.sh text eol=lf
 linux/scripts/* text eol=lf
 linux/*.service text eol=lf
+linux/neonhearth-token text eol=lf

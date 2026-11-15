@@ -2,16 +2,20 @@
 #
 # Invoked by the Start-menu "NeonHearth" shortcut (powershell.exe
 # -WindowStyle Hidden ... -File this-script). What it does:
-#   1. Reads LATTICE_SERVICE_TOKEN (and optional LATTICE_BIND) from the
-#      service-private Environment registry value that
-#      configure-service.ps1 wrote at install time.
+#   1. Reads the owner token the way the service resolves it: the
+#      %ProgramData%\NeonHearth\owner-token file first (written by
+#      configure-service.ps1 and rewritten when the owner rotates the token),
+#      then, for installs that predate that file, LATTICE_SERVICE_TOKEN from
+#      the service-private Environment registry value. LATTICE_BIND (the
+#      port) always comes from the registry value.
 #   2. Opens http://127.0.0.1:<port>/#token=<token> in the default browser.
 #      The token travels in the URL FRAGMENT: fragments are never sent over
 #      the network, and the service listens on loopback only anyway. The UI
 #      parses the fragment on load, stores the token in sessionStorage, and
 #      immediately strips it from the address bar (apps/desktop pairing.ts).
 #
-# Reading the service Environment value requires administrator rights, so
+# Reading the service Environment value or the token file requires
+# administrator rights (both are ACL'd to SYSTEM/Administrators/service), so
 # this script self-elevates (one UAC prompt) when the read is denied. The
 # browser itself is launched through the non-elevated shell (explorer.exe)
 # so the elevated context does not leak into the browser process.
@@ -85,10 +89,24 @@ foreach ($entry in $entries) {
     }
 }
 
+# The token file wins over the registry value, as in the service. It is read
+# at every launch, so a rotation is picked up without reinstalling. Only
+# administrators can read it; this point is reached elevated (a standard user
+# is denied the registry read above and relaunched elevated).
+$tokenFile = Join-Path $env:ProgramData 'NeonHearth\owner-token'
+try {
+    if (Test-Path -LiteralPath $tokenFile -PathType Leaf) {
+        $fromFile = ([System.IO.File]::ReadAllText($tokenFile)).Trim()
+        if ($fromFile) { $token = $fromFile }
+    }
+} catch {
+    # Unreadable: keep the registry value, if any.
+}
+
 if (-not $token) {
     Show-Failure "No pairing token is configured for the $ServiceName service. Re-run the installer or configure-service.ps1."
 }
-if ($token -notmatch '^[A-Za-z0-9._-]+$') {
+if ($token -notmatch '^[A-Za-z0-9._-]{32,}\z') {
     Show-Failure 'The stored pairing token is malformed. Re-run configure-service.ps1 to regenerate it.'
 }
 

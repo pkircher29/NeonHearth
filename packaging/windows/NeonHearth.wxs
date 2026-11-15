@@ -178,7 +178,8 @@
 
     <!-- Start-menu entry (all-users). A non-advertised shortcut to
          powershell.exe running open-neonhearth.ps1, which reads the pairing
-         token from the service's Environment registry value (self-elevating
+         token from %ProgramData%\NeonHearth\owner-token, falling back to
+         the service's Environment registry value (self-elevating
          with a UAC prompt when the read is denied) and opens the dashboard
          at http://127.0.0.1:58120/#token=... in the default browser.
          Target is given explicitly, so WiX authors this as a regular
@@ -216,10 +217,34 @@
                   Impersonate="no"
                   Return="check" />
 
+    <!-- Full uninstall removes the owner token file (state is otherwise kept):
+         a stale owner-token would win over the token a later install
+         generates, because the service reads that file before any other
+         source. Inline cmd.exe instead of a script because the scripts folder
+         is already being removed on this path. Deferred, no impersonation
+         (the state directory is ACL'd to SYSTEM/Administrators/service).
+         Return="ignore": del reports an error when the file is already gone.
+         NOT run for the old product during a major upgrade
+         (UPGRADINGPRODUCTCODE is set there), or the upgrade would discard a
+         rotated token. -->
+    <SetProperty Id="RemoveNeonHearthOwnerToken"
+                 Value="&quot;[System64Folder]cmd.exe&quot; /c del /f /q &quot;[CommonAppDataFolder]NeonHearth\owner-token&quot;"
+                 Sequence="execute"
+                 Before="RemoveNeonHearthOwnerToken" />
+    <CustomAction Id="RemoveNeonHearthOwnerToken"
+                  DllEntry="WixQuietExec64"
+                  BinaryRef="Wix4UtilCA_X64"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
     <InstallExecuteSequence>
       <Custom Action="ConfigureNeonHearthService"
               After="InstallServices"
               Condition="NOT Installed OR REINSTALL" />
+      <Custom Action="RemoveNeonHearthOwnerToken"
+              After="StopServices"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
 
     <Feature Id="Main" Title="NeonHearth" Level="1">
