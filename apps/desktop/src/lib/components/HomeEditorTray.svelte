@@ -64,7 +64,7 @@
 <style>
   .device-tray{display:flex;flex-direction:column;max-height:300px;padding:12px 14px;border:1px solid var(--line-mid);border-radius:10px;background:var(--surface)}
   .device-tray h2{margin:0 0 8px;font:600 14px var(--font-display);color:var(--ink)}
-  .device-tray h3{margin:14px 0 8px;font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.08em;color:var(--gold)}
+  .device-tray h3{margin:14px 0 8px;font:12px var(--font-display);color:var(--gold)}
   .tray-search{position:relative;margin:0 0 8px}
   .tray-search input{box-sizing:border-box;width:100%;min-height:34px;padding:5px 30px 5px 9px;border:1px solid var(--line-strong);border-radius:5px;background:#0e2430;color:var(--ink);font:12px var(--font-display)}
   .tray-clear{position:absolute;right:3px;top:3px;width:28px;height:28px;border:0;border-radius:4px;background:transparent;color:var(--muted-strong);font-size:16px;cursor:pointer}
@@ -81,5 +81,5 @@
   .estimate-list li{display:grid;gap:2px;padding:8px;border:1px dashed var(--line-strong);border-radius:6px}
   .estimate-list strong{font:600 12px var(--font-display);color:var(--ink)}
   .estimate-list span{color:var(--muted-strong);font-size:11px}
-  .estimate-list em{color:var(--gold);font:10px var(--font-mono);font-style:normal;text-transform:uppercase;letter-spacing:.06em}
+  .estimate-list em{color:var(--gold);font:12px var(--font-display);font-style:normal}
 </style>
