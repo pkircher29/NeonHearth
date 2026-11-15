@@ -5,13 +5,14 @@
   import type { LiveState } from '../stores/live';
   import type { AutomationSnapshot, NetworkDetails } from '../api/automation';
   import type { TwinDevice } from '../twin/geometry';
+  import { motionReduced } from '../stores/preferences';
   import HomeEditorView from './HomeEditorView.svelte';
   import HomeTwin3D from './HomeTwin3D.svelte';
-  import { sameTwinDevices, toBandwidthMap, toHomeDeviceRefs, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
+  import { buildDeviceRefs, sameTwinDevices, toBandwidthMap, toTwinDeviceInfo, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
 
   // `api` is a test seam: when absent, the view builds the real loopback client on mount
   // exactly the way App builds the camera client.
-  let { liveState, api = null, automation = null, network = null }: { liveState: LiveState; api?: HomeApi | null; automation?: AutomationSnapshot | null; network?: NetworkDetails | null } = $props();
+  let { liveState, api = null, automation = null, network = null, onselectdevice }: { liveState: LiveState; api?: HomeApi | null; automation?: AutomationSnapshot | null; network?: NetworkDetails | null; onselectdevice?: (deviceId: string) => void } = $props();
 
   type HomeTab = 'editor' | 'twin';
   let tab = $state<HomeTab>('editor');
@@ -30,7 +31,7 @@
     const info = addresses.get(id);
     return liveState.devices[id]?.owner_name ?? info?.home_assistant?.name ?? info?.mac_addresses[0] ?? null;
   }
-  const deviceRefs = $derived([...toHomeDeviceRefs(liveState.devices).map(d => ({ ...d, name: knownName(d.device_id) ?? d.name })), ...(automation?.devices ?? []).map(d => ({ device_id: d.device_id, name: d.name }))]);
+  const deviceRefs = $derived(buildDeviceRefs(liveState.devices, network, automation?.devices ?? []));
   // Memoized by content (audit H-5): a fresh array per bandwidth frame would
   // make the twin rebuild its scene and reset the camera several times a second.
   let twinCache: TwinDevice[] = [];
@@ -40,6 +41,8 @@
     return twinCache;
   });
   const presence = $derived(toPresenceMap(liveState.devices));
+  // Evidence and last-seen change with live frames; they feed the twin's detail card only, never its scene.
+  const deviceInfo = $derived(toTwinDeviceInfo(liveState.devices));
   const bandwidth = $derived(toBandwidthMap(liveState.devices));
   const selectedName = $derived(
     selectedDeviceId === null
@@ -79,10 +82,13 @@
 
   onMount(() => {
     if (typeof window.matchMedia === 'function') {
-      reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      reducedMotion = motionReduced();
     }
+    const syncMotion = () => { reducedMotion = motionReduced(); };
+    window.addEventListener('neonhearth:motion', syncMotion);
     homeApi = withEmptyPlanOn404(api ?? createHomeApi({ baseUrl: window.location.origin }));
     void loadSnapshot();
+    return () => window.removeEventListener('neonhearth:motion', syncMotion);
   });
 </script>
 
@@ -126,11 +132,13 @@
           plan={snapshot.plan}
           placements={snapshot.placements}
           devices={twinDevices}
+          {deviceInfo}
           {presence}
           {bandwidth}
           {reducedMotion}
           visible={tab === 'twin'}
           onselect={onTwinSelect}
+          {onselectdevice}
           onfallback={onTwinFallback}
         />
       </div>

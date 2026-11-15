@@ -30,7 +30,9 @@ export const defaultView = (): ViewState => ({ scale: DEFAULT_SCALE, origin: { x
 
 /** The SVG viewBox for a view state over an element of `size` CSS pixels. */
 export function viewBox(view: ViewState, size: Size): string {
-  return `${view.origin.x * view.scale} ${view.origin.y * view.scale} ${Math.max(1, size.width)} ${Math.max(1, size.height)}`;
+  // Rounded to a thousandth of a pixel so float noise from repeated zooms never leaks into the attribute.
+  const round = (value: number) => Number(value.toFixed(3));
+  return `${round(view.origin.x * view.scale)} ${round(view.origin.y * view.scale)} ${Math.max(1, size.width)} ${Math.max(1, size.height)}`;
 }
 
 /** Plan meters → SVG user units (pixels at the current zoom). */
@@ -103,4 +105,21 @@ export function scaleBar(scale: number): { meters: number; px: number; label: st
   const meters = SCALE_BAR_STEPS.find((step) => step * scale >= 60) ?? SCALE_BAR_STEPS.at(-1)!;
   const label = meters < 1 ? `${(meters * 100).toFixed(0)} cm` : `${meters} m`;
   return { meters, px: meters * scale, label };
+}
+
+export interface TouchPair { a: { x: number; y: number }; b: { x: number; y: number } }
+
+/**
+ * Two-finger pinch + pan in one step: the plan point that was under the previous finger
+ * midpoint ends up under the new midpoint, and the zoom changes by the ratio of finger spacing.
+ */
+export function pinchView(view: ViewState, prev: TouchPair, next: TouchPair): ViewState {
+  const spacing = (pair: TouchPair) => Math.hypot(pair.a.x - pair.b.x, pair.a.y - pair.b.y);
+  const centre = (pair: TouchPair) => ({ x: (pair.a.x + pair.b.x) / 2, y: (pair.a.y + pair.b.y) / 2 });
+  const before = spacing(prev);
+  const scale = before < 1 ? view.scale : clampScale((view.scale * spacing(next)) / before);
+  const from = centre(prev);
+  const to = centre(next);
+  const anchor = toPlan(view, from.x, from.y);
+  return { scale, origin: { x: anchor.x - to.x / scale, y: anchor.y - to.y / scale } };
 }

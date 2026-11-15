@@ -140,3 +140,35 @@ export function newRoomCandidates(
 ): RoomCandidate[] {
   return detectRoomCycles(walls).filter((candidate) => !rooms.some((room) => samePolygon(room.polygon, candidate.polygon)));
 }
+
+/** Even-odd point-in-polygon test (points exactly on an edge may fall either way). */
+export function pointInPolygon(point: PlanPoint, polygon: readonly PlanPoint[]): boolean {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+    const a = polygon[i];
+    const b = polygon[j];
+    if ((a.y > point.y) !== (b.y > point.y) && point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+/**
+ * Rooms that a later wall has divided: the room is no longer a closed cycle of
+ * the wall graph, and the cycles lying inside it are all rooms themselves and
+ * together cover its area. Keeping such a room would double-count the floor.
+ */
+export function dividedRooms<T extends Pick<Room, 'polygon'>>(
+  walls: readonly Pick<Wall, 'wall_id' | 'start' | 'end'>[],
+  rooms: readonly T[]
+): T[] {
+  const cycles = detectRoomCycles(walls);
+  return rooms.filter((room) => {
+    if (cycles.some((cycle) => samePolygon(cycle.polygon, room.polygon))) return false;
+    const pieces = cycles.filter((cycle) => pointInPolygon(cycle.centroid, room.polygon));
+    if (pieces.length < 2) return false;
+    const area = polygonArea(room.polygon);
+    const covered = pieces.reduce((total, piece) => total + piece.area, 0);
+    if (area <= 0 || Math.abs(covered - area) > area * 0.01) return false;
+    return pieces.every((piece) => rooms.some((other) => other !== room && samePolygon(other.polygon, piece.polygon)));
+  });
+}

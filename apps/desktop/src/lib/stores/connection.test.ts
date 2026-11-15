@@ -229,10 +229,31 @@ describe('createLiveConnection', () => {
     expect(connection.getState().connected).toBe(true);
     expect(scheduled.map((entry) => entry.delay)).toEqual([20_000]);
     scheduled[0]!.callback(); // silence past the window: a full resync, not a plain retry
+    // Routine on a quiet home: the view must not flash "offline" while it resyncs.
+    expect(connection.getState().connected).toBe(true);
     await Promise.resolve();
     await Promise.resolve();
     expect(client.snapshotAll).toHaveBeenCalledTimes(2);
     expect(client.openEvents).toHaveBeenCalledTimes(2);
+    expect(connection.getState().connected).toBe(true);
+    connection.stop();
+  });
+
+  it('drops to disconnected when the resync after a silent socket cannot fetch a snapshot', async () => {
+    const scheduled: Array<{ callback: () => void; delay: number }> = [];
+    const timers = { setTimeout: vi.fn((callback: () => void, delay: number) => { scheduled.push({ callback, delay }); return scheduled.length; }), clearTimeout: vi.fn() };
+    let onState: ((state: 'open' | 'closed' | 'error') => void) | undefined;
+    const client = clientStub({ openEvents: vi.fn(async (_sequence, _onMessage, callback) => { onState = callback; return { close: vi.fn() } as unknown as WebSocket; }) });
+    const connection = createLiveConnection({ client, timers, random: () => 0.5, openTimeoutMs: 0, staleAfterMs: 20_000 });
+
+    await connection.start();
+    onState?.('open');
+    vi.mocked(client.snapshotAll).mockRejectedValueOnce(new Error('Request failed with status 503'));
+    scheduled[0]!.callback();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(connection.getState().connected).toBe(false);
+    expect(scheduled.at(-1)!.delay).toBe(250); // a retry is pending
     connection.stop();
   });
 

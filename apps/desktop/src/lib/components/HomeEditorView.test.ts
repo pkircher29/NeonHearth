@@ -235,4 +235,436 @@ describe('HomeEditorView', () => {
     await screen.findByText(/Plan saved as version 4/);
     expect(onsnapshot).toHaveBeenCalledWith(expect.objectContaining({ plan: expect.objectContaining({ version: 4 }) }));
   });
+
+  describe('v2 editor', () => {
+    const canvasOf = (container: HTMLElement) => container.querySelector('.plan-canvas')!;
+    const wallAttrs = (element: Element) => ['x1', 'y1', 'x2', 'y2'].map((name) => element.getAttribute(name));
+    const click = (canvas: Element, x: number, y: number, extra: MouseEventInit = {}) => fireEvent.click(canvas, { clientX: x, clientY: y, ...extra });
+    const key = (canvas: Element, name: string, extra: KeyboardEventInit = {}) => fireEvent.keyDown(canvas, { key: name, ...extra });
+    async function openEditor(api = apiStub()) {
+      const view = render(HomeEditorView, { api, devices });
+      await screen.findByRole('button', { name: /Ground/ });
+      return { view, api, canvas: canvasOf(view.container) };
+    }
+    const squareWalls = (): HomePlan => {
+      const plan = fixturePlan();
+      const ids = ['21', '22', '23', '24'].map((suffix) => `018f47a0-9b5c-7a22-8a33-aabbccdd00${suffix}`);
+      plan.floors[0].walls = [
+        { wall_id: ids[0], start: { x: 2, y: 2 }, end: { x: 5, y: 2 }, openings: [] }, { wall_id: ids[1], start: { x: 5, y: 2 }, end: { x: 5, y: 5 }, openings: [] },
+        { wall_id: ids[2], start: { x: 5, y: 5 }, end: { x: 2, y: 5 }, openings: [] }, { wall_id: ids[3], start: { x: 2, y: 5 }, end: { x: 2, y: 2 }, openings: [] }
+      ];
+      plan.floors[0].rooms = [];
+      return plan;
+    };
+
+    it('chains walls: each wall starts where the last ended, and Escape or Enter ends the chain', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await click(canvas, 80, 80);
+      await click(canvas, 200, 80);
+      await click(canvas, 200, 200);
+      let walls = view.container.querySelectorAll('.wall');
+      expect(walls).toHaveLength(3);
+      expect(wallAttrs(walls[1])).toEqual(['80', '80', '200', '80']);
+      expect(wallAttrs(walls[2])).toEqual(['200', '80', '200', '200']); // started from the previous end, not a fresh click
+      await key(canvas, 'Escape');
+      await click(canvas, 400, 400);
+      await click(canvas, 440, 400);
+      walls = view.container.querySelectorAll('.wall');
+      expect(walls).toHaveLength(4);
+      expect(wallAttrs(walls[3])).toEqual(['400', '400', '440', '400']); // a fresh chain after Escape
+      await key(canvas, 'Enter'); // Enter also ends a chain
+      await click(canvas, 500, 400);
+      await click(canvas, 540, 400);
+      expect(wallAttrs(view.container.querySelectorAll('.wall')[4])).toEqual(['500', '400', '540', '400']);
+    });
+
+    it('closing a chain on its first point ends it and offers the room, with its area', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      for (const [x, y] of [[80, 80], [200, 80], [200, 200], [80, 200], [80, 80]]) await click(canvas, x, y);
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(5);
+      const offer = screen.getByRole('region', { name: 'Detected rooms' });
+      expect(offer.textContent).toMatch(/9\.0 m²/);
+      expect((screen.getByLabelText('Name for detected room 1') as HTMLInputElement).value).toBe('Room 2'); // the Kitchen holds the first slot
+      expect(view.container.querySelectorAll('.candidate')).toHaveLength(1);
+      await fireEvent.input(screen.getByLabelText('Name for detected room 1'), { target: { value: 'Studio' } });
+      await fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+      expect(screen.queryByRole('region', { name: 'Detected rooms' })).toBeNull();
+      expect(screen.getByText('Studio', { selector: '.room-label' })).toBeTruthy();
+      const labels = [...view.container.querySelectorAll('.room-area')].map((element) => element.textContent);
+      expect(labels).toEqual(['12.0 m²', '9.0 m²']); // Kitchen 4 x 3, Studio 3 x 3
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(view.container.querySelectorAll('.room')).toHaveLength(1);
+    });
+
+    it('Detect rooms finds closed walls, adds all in one undo step, and reports when there is nothing', async () => {
+      const second = squareWalls();
+      second.floors[0].walls.push(
+        { wall_id: '018f47a0-9b5c-7a22-8a33-aabbccdd0031', start: { x: 8, y: 2 }, end: { x: 10, y: 2 }, openings: [] },
+        { wall_id: '018f47a0-9b5c-7a22-8a33-aabbccdd0032', start: { x: 10, y: 2 }, end: { x: 10, y: 4 }, openings: [] },
+        { wall_id: '018f47a0-9b5c-7a22-8a33-aabbccdd0033', start: { x: 10, y: 4 }, end: { x: 8, y: 4 }, openings: [] },
+        { wall_id: '018f47a0-9b5c-7a22-8a33-aabbccdd0034', start: { x: 8, y: 4 }, end: { x: 8, y: 2 }, openings: [] }
+      );
+      const api = apiStub({ fetchHome: vi.fn(async () => ({ plan: second, placements: [], estimates: [] })) });
+      const { view } = await openEditor(api);
+      await fireEvent.click(screen.getByRole('button', { name: 'Detect rooms' }));
+      expect(screen.getByRole('region', { name: 'Detected rooms' }).textContent).toMatch(/2 closed rooms were found/);
+      await fireEvent.click(screen.getByRole('button', { name: 'Add all' }));
+      expect(view.container.querySelectorAll('.room')).toHaveLength(2);
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(view.container.querySelectorAll('.room')).toHaveLength(0); // both rooms came out together
+      await fireEvent.click(screen.getByRole('button', { name: 'Redo' }));
+      await fireEvent.click(screen.getByRole('button', { name: 'Detect rooms' }));
+      expect(screen.getByText(/No new closed rooms found/)).toBeTruthy();
+    });
+
+    it('splits the wall it lands on so the new wall truly joins it, in one undo step', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await click(canvas, 41, 121); // (1, 3)
+      await click(canvas, 41, 1); // 0.025 m off the Kitchen wall: "on wall"
+      const walls = [...view.container.querySelectorAll('.wall')];
+      expect(walls).toHaveLength(3);
+      expect(wallAttrs(walls[0])).toEqual(['0', '0', '40', '0']);
+      expect(wallAttrs(walls[1])).toEqual(['40', '0', '168', '0']);
+      expect(wallAttrs(walls[2])).toEqual(['40', '120', '40', '0']);
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(1);
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['0', '0', '168', '0']);
+    });
+
+    it('shows the snap marker with its label and a live length and angle readout while drawing', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await fireEvent.pointerMove(canvas, { clientX: 3, clientY: 2 }); // right on the Kitchen wall's start
+      expect(view.container.querySelector('.snap-marker')!.getAttribute('data-snap-kind')).toBe('endpoint');
+      expect(view.container.querySelector('.snap-label')!.textContent).toBe('endpoint');
+      await click(canvas, 3, 2);
+      await fireEvent.pointerMove(canvas, { clientX: 0, clientY: 200 }); // straight down from the start, 5 m
+      expect(view.container.querySelector('.readout-length')!.textContent).toBe('5.00 m');
+      expect(view.container.querySelector('.readout-angle')!.textContent).toBe('270°');
+    });
+
+    it('typing digits while a wall is in progress builds an exact length that Enter commits', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await click(canvas, 80, 200);
+      await fireEvent.pointerMove(canvas, { clientX: 200, clientY: 200 });
+      for (const digit of ['3', '.', '4', '5']) await key(canvas, digit);
+      expect(view.container.querySelector('.readout-length')!.textContent).toContain('3.45 m');
+      await key(canvas, 'Backspace');
+      expect(view.container.querySelector('.readout-length')!.textContent).toContain('3.4 m');
+      await key(canvas, '5');
+      await key(canvas, 'Enter');
+      const added = [...view.container.querySelectorAll('.wall')].at(-1)!;
+      expect(wallAttrs(added)).toEqual(['80', '200', '218', '200']); // 2 + 3.45 m = 5.45 m exactly, not snapped to the grid
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(2); // Backspace did not delete a selected wall
+    });
+
+    it('the Rectangle tool makes four walls and a room in ONE undo step', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Rectangle' }));
+      await click(canvas, 80, 120);
+      await fireEvent.pointerMove(canvas, { clientX: 240, clientY: 240 });
+      expect(view.container.querySelector('.preview-rect')).toBeTruthy();
+      expect(view.container.querySelector('.readout-length')!.textContent).toBe('4.00 m × 3.00 m');
+      await click(canvas, 240, 240);
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(5);
+      expect(screen.getByText('Room 2', { selector: '.room-label' })).toBeTruthy();
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(1);
+      expect(view.container.querySelectorAll('.room')).toHaveLength(1);
+    });
+
+    it('walls render as bands of true thickness and the inspector edits it, saved on new and edited walls', async () => {
+      const { view, canvas, api } = await openEditor();
+      expect(view.container.querySelector('.wall')!.getAttribute('stroke-width')).toBe('4'); // default 0.1 m at 40 px/m
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall, 4.20 m' }));
+      const input = screen.getByLabelText('Thickness (m)') as HTMLInputElement;
+      expect(input.valueAsNumber).toBe(0.1);
+      await fireEvent.change(input, { target: { value: '0.25' } });
+      expect(view.container.querySelector('.wall')!.getAttribute('stroke-width')).toBe('10');
+      await fireEvent.change(screen.getByLabelText('Thickness (m)'), { target: { value: '5' } }); // out of range: refused
+      expect(view.container.querySelector('.wall')!.getAttribute('stroke-width')).toBe('10');
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await click(canvas, 80, 80);
+      await click(canvas, 200, 80);
+      await fireEvent.click(screen.getByRole('button', { name: 'Save plan' }));
+      const saved = vi.mocked(api.savePlan).mock.calls[0][0].floors[0].walls;
+      expect(saved.map((wall) => wall.thickness_m)).toEqual([0.25, 0.1]);
+    });
+
+    it('thin walls never render thinner than 2 px when zoomed out', async () => {
+      const { view } = await openEditor();
+      for (let step = 0; step < 6; step += 1) await fireEvent.click(screen.getByRole('button', { name: 'Zoom out' }));
+      expect(Number(view.container.querySelector('.wall')!.getAttribute('stroke-width'))).toBeGreaterThanOrEqual(2);
+    });
+
+    it('zoom buttons change the viewBox about the centre, 100% restores it, and the view persists per floor', async () => {
+      const { view } = await openEditor();
+      const svg = () => view.container.querySelector('.plan-canvas')!.getAttribute('viewBox');
+      expect(svg()).toBe('0 0 720 480');
+      await fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }));
+      expect(svg()).toBe('90 60 720 480'); // 50 px/m with the centre (9 m, 6 m) pinned
+      expect(screen.getByLabelText('Current zoom').textContent).toBe('50 px/m');
+      expect(JSON.parse(localStorage.getItem('neonhearth.home.view.' + groundId)!)).toMatchObject({ scale: 50 });
+      await fireEvent.click(screen.getByRole('button', { name: 'Zoom out' }));
+      expect(svg()).toBe('0 0 720 480');
+      await fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }));
+      await fireEvent.click(screen.getByRole('button', { name: '100%' }));
+      expect(svg()).toBe('0 0 720 480');
+      await fireEvent.click(screen.getByRole('button', { name: 'Fit plan' }));
+      expect(svg()).not.toBe('0 0 720 480');
+      expect(Number(screen.getByLabelText('Current zoom').textContent!.replace(' px/m', ''))).toBeGreaterThan(100);
+      // Another floor keeps its own view; coming back restores this one.
+      await fireEvent.click(screen.getByRole('button', { name: /Upstairs/ }));
+      expect(svg()).toBe('0 0 720 480');
+      await fireEvent.click(screen.getByRole('button', { name: /Ground/ }));
+      expect(Number(screen.getByLabelText('Current zoom').textContent!.replace(' px/m', ''))).toBeGreaterThan(100);
+    });
+
+    it('the grid rects always cover the viewBox, and the minor grid fades out when zoomed out', async () => {
+      const { view } = await openEditor();
+      const grid = () => view.container.querySelector('rect.grid-major-fill')!;
+      await fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }));
+      expect([grid().getAttribute('x'), grid().getAttribute('y'), grid().getAttribute('width'), grid().getAttribute('height')]).toEqual(['90', '60', '720', '480']);
+      expect(view.container.querySelector('rect.grid-minor-fill')).toBeTruthy();
+      for (let step = 0; step < 5; step += 1) await fireEvent.click(screen.getByRole('button', { name: 'Zoom out' }));
+      expect(view.container.querySelector('rect.grid-minor-fill')).toBeNull();
+    });
+
+    it('wheel zooms about the cursor', async () => {
+      const { canvas } = await openEditor();
+      await fireEvent.wheel(canvas, { deltaY: -200, clientX: 0, clientY: 0 });
+      expect(Number(screen.getByLabelText('Current zoom').textContent!.replace(' px/m', ''))).toBeGreaterThan(40);
+      expect(canvas.getAttribute('viewBox')!.startsWith('0 0 ')).toBe(true); // the cursor sat on the origin, so it stays put
+      await fireEvent.wheel(canvas, { deltaY: 400, clientX: 360, clientY: 240 });
+      expect(Number(screen.getByLabelText('Current zoom').textContent!.replace(' px/m', ''))).toBeLessThan(40);
+    });
+
+    it('the Pan tool drags the view without drawing', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Pan' }));
+      await fireEvent.pointerDown(canvas, { button: 0, clientX: 100, clientY: 100, pointerId: 1 });
+      await fireEvent.pointerMove(canvas, { clientX: 150, clientY: 120, pointerId: 1 });
+      await fireEvent.pointerUp(canvas, { clientX: 150, clientY: 120, pointerId: 1 });
+      expect(canvas.getAttribute('viewBox')).toBe('-50 -20 720 480');
+      await click(canvas, 150, 120); // the click that ends a drag does nothing
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(1);
+    });
+
+    it('middle-mouse drags pan in any tool', async () => {
+      const { canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await fireEvent.pointerDown(canvas, { button: 1, clientX: 200, clientY: 200, pointerId: 2 });
+      await fireEvent.pointerMove(canvas, { clientX: 160, clientY: 200, pointerId: 2 });
+      await fireEvent.pointerUp(canvas, { clientX: 160, clientY: 200, pointerId: 2 });
+      expect(canvas.getAttribute('viewBox')).toBe('40 0 720 480');
+    });
+
+    it('Space held pans and its release stops it', async () => {
+      const { canvas } = await openEditor();
+      await key(canvas, ' ');
+      expect(canvas.classList.contains('pan-ready')).toBe(true);
+      await fireEvent.pointerDown(canvas, { button: 0, clientX: 100, clientY: 100, pointerId: 3 });
+      await fireEvent.pointerMove(canvas, { clientX: 140, clientY: 100, pointerId: 3 });
+      await fireEvent.pointerUp(canvas, { clientX: 140, clientY: 100, pointerId: 3 });
+      expect(canvas.getAttribute('viewBox')).toBe('-40 0 720 480');
+      await fireEvent.keyUp(canvas, { key: ' ' });
+      expect(canvas.classList.contains('pan-ready')).toBe(false);
+    });
+
+    it('single-letter shortcuts switch tools but never fire while typing in a field', async () => {
+      const { canvas } = await openEditor();
+      const pressed = (name: string) => screen.getByRole('button', { name }).getAttribute('aria-pressed');
+      await key(canvas, 'w');
+      expect(pressed('Wall')).toBe('true');
+      await key(canvas, 'r');
+      expect(pressed('Room')).toBe('true');
+      await key(canvas, 'o');
+      expect(pressed('Opening')).toBe('true');
+      await key(canvas, 'p');
+      expect(pressed('Place device')).toBe('true');
+      await key(canvas, 'h');
+      expect(pressed('Pan')).toBe('true');
+      await key(canvas, 'b');
+      expect(pressed('Rectangle')).toBe('true');
+      await key(canvas, 'v');
+      expect(pressed('Select')).toBe('true');
+      // In a text field or a select the same keys do nothing.
+      await fireEvent.click(screen.getByRole('button', { name: /Ground/ }));
+      await fireEvent.keyDown(screen.getByLabelText('Floor name'), { key: 'w' });
+      await fireEvent.keyDown(screen.getByRole('combobox', { name: 'Measurement units' }), { key: 'r' });
+      expect(pressed('Select')).toBe('true');
+    });
+
+    it('typing in a field does not feed the length entry while a wall is in progress', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await click(canvas, 80, 200);
+      await fireEvent.click(screen.getByRole('button', { name: /Ground/ }));
+      await fireEvent.keyDown(screen.getByLabelText('Floor name'), { key: '7' });
+      expect(view.container.querySelector('.readout')).toBeNull();
+    });
+
+    it('shows a hint line that follows the tool and the drawing state', async () => {
+      const { view, canvas } = await openEditor();
+      const hint = () => view.container.querySelector('.tool-hint')!.textContent!;
+      expect(hint()).toMatch(/select/i);
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      expect(hint()).toMatch(/Click to start a wall/);
+      await click(canvas, 80, 80);
+      expect(hint()).toMatch(/type a length/i);
+      await fireEvent.click(screen.getByRole('button', { name: 'Rectangle' }));
+      expect(hint()).toMatch(/one corner/);
+    });
+
+    it('drags a selected wall endpoint with snapping, and drags a wall body to move it whole', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall, 4.20 m' }));
+      const handle = view.container.querySelector('[data-handle="end"]')!;
+      await fireEvent.pointerDown(handle, { button: 0, clientX: 168, clientY: 0, pointerId: 4 });
+      await fireEvent.pointerMove(canvas, { clientX: 241, clientY: 1, pointerId: 4 });
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['0', '0', '240', '0']); // live preview
+      await fireEvent.pointerUp(canvas, { clientX: 241, clientY: 1, pointerId: 4 });
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['0', '0', '240', '0']);
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['0', '0', '168', '0']);
+
+      const body = screen.getByRole('button', { name: 'Wall, 4.20 m' });
+      await fireEvent.pointerDown(body, { button: 0, clientX: 40, clientY: 0, pointerId: 5 });
+      await fireEvent.pointerMove(canvas, { clientX: 120, clientY: 40, pointerId: 5 });
+      await fireEvent.pointerUp(canvas, { clientX: 120, clientY: 40, pointerId: 5 });
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['80', '40', '248', '40']);
+    });
+
+    it('an endpoint dragged onto another wall endpoint lands exactly on it', async () => {
+      const plan = fixturePlan();
+      plan.floors[0].walls.push({ wall_id: '018f47a0-9b5c-7a22-8a33-aabbccdd0021', start: { x: 0.0507, y: 3 }, end: { x: 3, y: 3 }, openings: [] });
+      const api = apiStub({ fetchHome: vi.fn(async () => ({ plan, placements: [], estimates: [] })) });
+      const { view, canvas } = await openEditor(api);
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall, 4.20 m' }));
+      const handle = view.container.querySelector('[data-handle="start"]')!;
+      await fireEvent.pointerDown(handle, { button: 0, clientX: 0, clientY: 0, pointerId: 6 });
+      await fireEvent.pointerMove(canvas, { clientX: 3, clientY: 118, pointerId: 6 }); // near (0.0507, 3)
+      await fireEvent.pointerUp(canvas, { clientX: 3, clientY: 118, pointerId: 6 });
+      await fireEvent.click(screen.getByRole('button', { name: 'Save plan' }));
+      const walls = vi.mocked(api.savePlan).mock.calls[0][0].floors[0].walls;
+      expect(walls[0].start).toEqual({ x: 0.0507, y: 3 });
+    });
+
+    it('draws room labels as SVG text positioned from the plan, so they keep a constant screen size', async () => {
+      const { view } = await openEditor();
+      const before = view.container.querySelector('.room-label')!.getAttribute('y');
+      await fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }));
+      expect(view.container.querySelector('.room-label')!.getAttribute('y')).not.toBe(before);
+      expect(view.container.querySelector('.scale-bar text')!.textContent).toMatch(/\d/);
+    });
+
+    it('shows each floor total area in the floor bar', async () => {
+      await openEditor();
+      expect(screen.getByRole('button', { name: /Ground.*12\.0 m²/ })).toBeTruthy();
+    });
+  });
+
+  describe('v2 editor follow-up', () => {
+    const canvasOf = (container: HTMLElement) => container.querySelector('.plan-canvas')!;
+    const wallAttrs = (element: Element) => ['x1', 'y1', 'x2', 'y2'].map((name) => element.getAttribute(name));
+    async function openEditor(api = apiStub()) {
+      const view = render(HomeEditorView, { api, devices });
+      await screen.findByRole('button', { name: /Ground/ });
+      return { view, api, canvas: canvasOf(view.container) };
+    }
+    const touch = (pointerId: number, x: number, y: number) => ({ pointerType: 'touch', pointerId, clientX: x, clientY: y, isPrimary: pointerId === 11 });
+
+    it('keeps the controls compact: zoom cluster inside the canvas frame, Detect rooms beside the room tools, Copy footprint on the floor row', async () => {
+      const { view } = await openEditor();
+      const frame = view.container.querySelector('.canvas-frame')!;
+      expect(frame.querySelector('[role="toolbar"][aria-label="Plan view"]')).toBeTruthy();
+      const tools = screen.getByRole('toolbar', { name: 'Editor tools' });
+      expect(tools.querySelector('button.detect')).toBeNull(); // not inside the tools toolbar (name collisions), but its sibling
+      expect(tools.nextElementSibling!.textContent).toBe('Detect rooms');
+      expect(tools.lastElementChild!.textContent).toBe('Rectangle');
+      const row = view.container.querySelector('.floor-row')!;
+      expect(row.contains(screen.getByRole('combobox', { name: 'Footprint destination' }))).toBe(true);
+      expect(row.contains(screen.getByRole('button', { name: 'Copy footprint' }))).toBe(true);
+      // Undo / Redo / Save share the toolbar row with the tools.
+      const toolbar = view.container.querySelector('.editor-toolbar')!;
+      expect(toolbar.contains(screen.getByRole('button', { name: 'Undo' }))).toBe(true);
+      expect(toolbar.contains(screen.getByRole('button', { name: 'Save plan' }))).toBe(true);
+    });
+
+    it('two-finger pinch zooms about the finger midpoint and two-finger drag pans, without drawing', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await fireEvent.pointerDown(canvas, touch(11, 100, 100));
+      await fireEvent.pointerDown(canvas, touch(12, 200, 100));
+      await fireEvent.pointerMove(canvas, touch(12, 300, 100)); // spacing 100 -> 200: 40 -> 80 px/m
+      expect(screen.getByLabelText('Current zoom').textContent).toBe('80 px/m');
+      expect(canvas.getAttribute('viewBox')).toBe('100 100 720 480'); // the plan point under the old midpoint is under the new one
+      await fireEvent.pointerMove(canvas, touch(11, 140, 100)); // both fingers move right 40: pure pan
+      await fireEvent.pointerMove(canvas, touch(12, 340, 100));
+      expect(screen.getByLabelText('Current zoom').textContent).toBe('80 px/m');
+      expect(canvas.getAttribute('viewBox')).toBe('60 100 720 480'); // midpoint moved 40 px right at 80 px/m
+      await fireEvent.pointerUp(canvas, touch(12, 340, 100));
+      await fireEvent.pointerUp(canvas, touch(11, 140, 100));
+      await fireEvent.click(canvas, { clientX: 140, clientY: 100 }); // the click ending the gesture is swallowed
+      expect(view.container.querySelector('.pending-start')).toBeNull();
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(1);
+    });
+
+    it('Ctrl+D duplicates the selected wall one grid step over, in one undo step, and selects the copy', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall, 4.20 m' }));
+      await fireEvent.keyDown(canvas, { key: 'd', ctrlKey: true });
+      const walls = [...view.container.querySelectorAll('.wall')];
+      expect(walls).toHaveLength(2);
+      expect(wallAttrs(walls[1])).toEqual(['40', '40', '208', '40']);
+      expect(walls[1].classList.contains('selected')).toBe(true);
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(1);
+    });
+
+    it('Ctrl+D duplicates a selected room with a new name, and does nothing in a text field or with no selection', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.keyDown(canvas, { key: 'd', ctrlKey: true });
+      expect(view.container.querySelectorAll('.room')).toHaveLength(1);
+      await fireEvent.click(screen.getByRole('button', { name: 'Room Kitchen' }));
+      await fireEvent.keyDown(screen.getByLabelText('Room name'), { key: 'd', ctrlKey: true });
+      expect(view.container.querySelectorAll('.room')).toHaveLength(1);
+      await fireEvent.keyDown(canvas, { key: 'd', ctrlKey: true });
+      expect(view.container.querySelectorAll('.room')).toHaveLength(2);
+      expect(screen.getByText('Kitchen copy', { selector: '.room-label' })).toBeTruthy();
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(view.container.querySelectorAll('.room')).toHaveLength(1);
+    });
+
+    it('endpoint handles are focusable, labelled, and arrow keys nudge just that endpoint (Shift = 10 steps)', async () => {
+      const { view } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall, 4.20 m' }));
+      const start = screen.getByRole('button', { name: 'Wall start handle' });
+      const end = screen.getByRole('button', { name: 'Wall end handle' });
+      expect(start.getAttribute('tabindex')).toBe('0');
+      expect(end.getAttribute('tabindex')).toBe('0');
+      await fireEvent.keyDown(start, { key: 'ArrowRight' });
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['4', '0', '168', '0']); // only the start moved, by 0.1 m
+      await fireEvent.keyDown(end, { key: 'ArrowDown', shiftKey: true });
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['4', '0', '168', '40']); // ten steps = 1 m
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['4', '0', '168', '0']);
+    });
+
+    it('says exactly why a wall could not be joined when its end lands inside a door opening', async () => {
+      const plan = fixturePlan();
+      plan.floors[0].walls[0].openings = [{ opening_id: '018f47a0-9b5c-7a22-8a33-aabbccdd0030', kind: 'door', offset_m: 0.8, width_m: 0.9 }];
+      const api = apiStub({ fetchHome: vi.fn(async () => ({ plan, placements: [], estimates: [] })) });
+      const { view, canvas } = await openEditor(api);
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await fireEvent.click(canvas, { clientX: 41, clientY: 121 });
+      await fireEvent.click(canvas, { clientX: 41, clientY: 1 }); // (1, 0) is inside the door's 0.8-1.7 m span
+      expect(screen.getByText('That point is inside a door opening — the wall was drawn but not joined.')).toBeTruthy();
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(2); // drawn, not split
+    });
+  });
 });

@@ -6,7 +6,7 @@ import type { DeviceSnapshot } from '../api/types';
 import type { HomeApi, HomeSnapshot } from '../stores/home';
 import { initialLiveState, type LiveState } from '../stores/live';
 import HomeView from './HomeView.svelte';
-import { isNotFound, sameTwinDevices, toBandwidthMap, toHomeDeviceRefs, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
+import { isNotFound, sameTwinDevices, toBandwidthMap, toHomeDeviceRefs, toPresenceMap, toTwinDeviceInfo, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
 
 // The twin's WebGL seam is the documented mock point (src/lib/twin/webgl.ts):
 // enabled=true keeps the 3D mode alive in jsdom, enabled=false exercises the fallback.
@@ -243,5 +243,25 @@ describe('homeViewData', () => {
     expect(isNotFound(new Error('Request failed with status 404'))).toBe(true);
     expect(isNotFound(new Error('Request failed with status 4041'))).toBe(false);
     expect(isNotFound('404')).toBe(false);
+  });
+});
+
+describe('HomeView twin detail card wiring', () => {
+  it('threads "Show in Devices" from the twin card to onselectdevice', async () => {
+    webgl.enabled = true;
+    const onselectdevice = vi.fn();
+    render(HomeView, { liveState: liveFixture(), api: apiStub(), onselectdevice });
+    await fireEvent.click(await screen.findByRole('tab', { name: '3D view' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Front Door Cam — online' }));
+    const card = await screen.findByRole('complementary', { name: 'Device details' });
+    expect(within(card).getByRole('heading', { name: 'Front Door Cam' })).toBeTruthy();
+    await fireEvent.click(within(card).getByRole('button', { name: 'Show in Devices' }));
+    expect(onselectdevice).toHaveBeenCalledWith(cameraId);
+  });
+
+  it('derives card info (evidence, last seen) from live devices', () => {
+    const info = toTwinDeviceInfo(liveFixture().devices);
+    expect(Object.keys(info).sort()).toEqual([cameraId, laptopId].sort());
+    expect(typeof info[cameraId]!.last_seen_at === 'string' || info[cameraId]!.last_seen_at === null).toBe(true);
   });
 });

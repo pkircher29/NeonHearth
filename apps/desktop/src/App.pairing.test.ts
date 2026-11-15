@@ -60,7 +60,7 @@ describe('App pairing recovery', () => {
 
     render(App);
 
-    await waitFor(() => expect(screen.getByText('Your network, breathing.')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('Your network, in motion.')).toBeTruthy());
     expect(screen.queryByText("This window's pairing expired.")).toBeNull();
     expect(sessionStorage.getItem(STORAGE_KEY)).toBeNull();
     expect(JSON.parse(sessionStorage.getItem('neonhearth.session')!)).toEqual({ kind: 'owner', token: STALE });

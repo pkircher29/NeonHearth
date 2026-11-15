@@ -2,13 +2,29 @@
   import type { ServerMessage } from '../api/types';
   import type { NetworkSnapshot } from '../api/networkMonitor';
   import { topDevices, type LiveState } from '../stores/live';
+  import type { HostApi } from '../api/hostMonitor';
+  import type { AutomationApi } from '../api/automation';
+  import { deviceMetaFrom, hostFlowFrom, type DeviceMeta, type HostFlow, type HostSample } from './flowMap';
   import HearthPulse from './HearthPulse.svelte';
+  import FlowMap from './FlowMap.svelte';
   import { formatThroughput } from './networkFormat';
 
-  interface Props { state?: LiveState | null; network?: NetworkSnapshot | null; onselectdevice?: (deviceId: string) => void; onopentraffic?: () => void; }
-  let { state: liveState = null, network = null, onselectdevice, onopentraffic }: Props = $props();
+  interface Props { state?: LiveState | null; network?: NetworkSnapshot | null; onselectdevice?: (deviceId: string) => void; onopentraffic?: () => void; hostApi?: HostApi | null; automationApi?: AutomationApi | null; }
+  let { state: liveState = null, network = null, onselectdevice, onopentraffic, hostApi = null, automationApi = null }: Props = $props();
   let animationPaused = $state(false);
+  const HERO_KEY = 'neonhearth.pulse.hero';
+  type Hero = 'flow' | 'hearth';
+  function readHero(): Hero { try { return globalThis.localStorage?.getItem(HERO_KEY) === 'hearth' ? 'hearth' : 'flow'; } catch { return 'flow'; } }
+  let hero = $state<Hero>(readHero());
+  function chooseHero(next: Hero) { hero = next; try { globalThis.localStorage?.setItem(HERO_KEY, next); } catch { /* storage unavailable: choice lasts for this session */ } }
+  // Inventory details (MAC maker, IP) name and group devices that carry no stated type.
+  let meta = $state<ReadonlyMap<string, DeviceMeta> | undefined>(undefined);
+  // This computer's live traffic: the honest fallback when per-device counters need the router feed.
+  let hostFlow = $state<HostFlow | null>(null);
   const hasThroughput = $derived(Boolean(liveState?.connected && liveState.throughput.length));
+  const hostSource = $derived(!hasThroughput && Boolean(liveState?.connected) && hostFlow !== null);
+  const flowUpload = $derived(hasThroughput && liveState ? liveState.aggregate.upload : hostSource && hostFlow ? hostFlow.up : null);
+  const flowDownload = $derived(hasThroughput && liveState ? liveState.aggregate.download : hostSource && hostFlow ? hostFlow.down : null);
   const currentBps = $derived(hasThroughput && liveState ? liveState.aggregate.upload + liveState.aggregate.download : null);
   const allDevices = $derived(liveState ? liveState.deviceOrder.map((id) => liveState.devices[id]).filter((device): device is NonNullable<typeof device> => Boolean(device)) : []);
   const devices = $derived(liveState ? topDevices(liveState, 4) : []);
@@ -16,6 +32,44 @@
   const recentEvents = $derived(liveState?.timeline.slice(-8).reverse() ?? []);
   const curvePath = $derived(pathFor(liveState ? liveState.throughput : []));
   const householdReady = $derived(network?.router.status === 'ready' && network.router.download !== null && network.router.upload !== null);
+
+  $effect(() => {
+    const api = automationApi;
+    if (!api) { meta = undefined; return; }
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function load() {
+      try {
+        const details = await api!.network();
+        if (alive) meta = new Map(details.devices.map((device) => [device.device_id, deviceMetaFrom(device)]));
+      } catch { /* inventory unavailable: devices keep their short ids */ }
+      if (alive) timer = setTimeout(() => void load(), 30_000);
+    }
+    void load();
+    return () => { alive = false; clearTimeout(timer); };
+  });
+
+  $effect(() => {
+    const api = hostApi;
+    const wanted = !hasThroughput && Boolean(liveState?.connected);
+    if (!api || !wanted) { hostFlow = null; return; }
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let previous: HostSample | null = null;
+    async function tick() {
+      if (typeof document === 'undefined' || !document.hidden) {
+        try {
+          const snapshot = await api!.snapshot();
+          if (alive) { hostFlow = hostFlowFrom(previous, snapshot); previous = snapshot; }
+        } catch { if (alive) { hostFlow = null; previous = null; } }
+      }
+      if (alive) timer = setTimeout(() => void tick(), 5_000);
+    }
+    void tick();
+    return () => { alive = false; clearTimeout(timer); };
+  });
+
+  const makerGrouped = $derived(Boolean(meta) && allDevices.some((device) => !device.owner_type && !device.identity.classification));
 
   function pathFor(points: LiveState['throughput']): string {
     const bounded = points.slice(-60); if (bounded.length < 2) return '';
@@ -40,7 +94,7 @@
 </script>
 
 <section class="pulse-view" aria-labelledby="pulse-heading">
-  <div class="view-heading"><div><p class="kicker">PULSE / NOW</p><h1 id="pulse-heading">Your network, breathing.</h1><p class="muted">A calm read of what is happening at home.</p></div><button class="pause-button" type="button" aria-pressed={animationPaused} aria-label={animationPaused ? 'Resume decorative animation; data continues' : 'Pause decorative animation; data continues'} onclick={() => animationPaused = !animationPaused}>{animationPaused ? 'Resume motion' : 'Pause motion'}</button></div>
+  <div class="view-heading"><div><p class="kicker">PULSE / NOW</p><h1 id="pulse-heading">{hero === 'flow' ? 'Your network, in motion.' : 'Your network, breathing.'}</h1><p class="muted">A calm read of what is happening at home.</p></div><button class="pause-button" type="button" aria-pressed={animationPaused} aria-label={animationPaused ? 'Resume decorative animation; data continues' : 'Pause decorative animation; data continues'} onclick={() => animationPaused = !animationPaused}>{animationPaused ? 'Resume motion' : 'Pause motion'}</button></div>
   {#if onopentraffic}
     <section class="household-source" aria-label="Household internet traffic">
       <div><p class="kicker">HOUSEHOLD INTERNET / ROUTER SOURCE</p>
@@ -56,9 +110,34 @@
       <button class="pause-button" type="button" onclick={onopentraffic}>Open Traffic</button>
     </section>
   {/if}
-  <p class="source-note">The hearth below uses per-device counters. Router totals are kept separate; device activity stays unavailable when those counters are missing.</p>
-  <div class="hearth-panel">
-    <div class="hearth-stage"><HearthPulse devices={allDevices} upload={hasThroughput && liveState ? liveState.aggregate.upload : null} download={hasThroughput && liveState ? liveState.aggregate.download : null} connected={Boolean(liveState?.connected)} paused={animationPaused} onselect={onselectdevice}/></div>
+  <p class="source-note">{#if hero === 'flow' && hostSource}The flow map below is showing this computer's live traffic, because per-device traffic needs the router feed. It is not whole-home traffic.{:else}The {hero === 'flow' ? 'flow map' : 'hearth'} below uses per-device counters.{/if} Router totals are kept separate; device activity stays unavailable when those counters are missing.</p>
+  <div class="hearth-panel" class:flow-panel={hero === 'flow'}>
+    <div class="hearth-switch" role="group" aria-label="Pulse visual"><button type="button" aria-pressed={hero === 'flow'} onclick={() => chooseHero('flow')}>Flow</button><button type="button" aria-pressed={hero === 'hearth'} onclick={() => chooseHero('hearth')}>Hearth</button></div>
+    <div class="hearth-stage">{#if hero === 'flow'}<FlowMap devices={allDevices} upload={flowUpload} download={flowDownload} connected={Boolean(liveState?.connected)} paused={animationPaused} onselect={onselectdevice} {meta} hostApps={hostSource && hostFlow ? hostFlow.apps : []} coreLabel={hostSource ? 'This computer' : null}/>{:else}<HearthPulse devices={allDevices} upload={hasThroughput && liveState ? liveState.aggregate.upload : null} download={hasThroughput && liveState ? liveState.aggregate.download : null} connected={Boolean(liveState?.connected)} paused={animationPaused} onselect={onselectdevice}/>{/if}</div>
+    {#if hero === 'flow'}
+    <aside class="hearth-legend" aria-label="How to read the flow map">
+      <p class="kicker">READING THE FLOW MAP</p>
+      <dl>
+        <div><dt><i class="swatch down"></i>Download</dt><dd>Orange to gold particles travel out from the core to a device. Faster rate, more and quicker particles.</dd></div>
+        <div><dt><i class="swatch up"></i>Upload</dt><dd>Violet to magenta particles travel in from a device to the core.</dd></div>
+        <div><dt><i class="swatch width"></i>Stream width</dt><dd>The device's share of measured device traffic, on a log scale. Idle devices keep a hairline; no line means no counters.</dd></div>
+        <div><dt><i class="swatch ring"></i>History ring</dt><dd>The last 60 seconds around the core, newest at 12 o'clock and sweeping clockwise. Download rises outside the baseline, upload dips inside it.</dd></div>
+        <div><dt><i class="swatch sector"></i>Sectors</dt><dd>Devices are grouped by type. The busiest sit closest to the core, idle ones further out.</dd></div>
+        {#if makerGrouped}<div><dt><i class="swatch maker"></i>Grouped by maker</dt><dd>Devices with no stated type are grouped by the maker of their network card (MAC vendor). That is inferred, not confirmed.</dd></div>{/if}
+        {#if hostSource}<div><dt><i class="swatch computer"></i>This computer</dt><dd>Showing this computer's traffic. Per-device traffic needs the router feed. The core and ring are not whole-home traffic; diamonds are its busiest applications.</dd></div>{/if}
+      </dl>
+      <p class="kicker">NODES</p>
+      <ol class="tiers">
+        <li><i class="node online"></i><span>Online</span><small>filled, glowing</small></li>
+        <li><i class="node quiet"></i><span>Quiet</span><small>violet ember</small></li>
+        <li><i class="node offline"></i><span>Offline</span><small>hollow ring</small></li>
+        <li><i class="node blocked"></i><span>Blocked</span><small>red ring</small></li>
+        <li><i class="node unknown"></i><span>Unknown</span><small>dashed ring</small></li>
+        <li><i class="node present"></i><span>Online, no counters</span><small>dim, no stream</small></li>
+      </ol>
+      <p class="counts"><b>{presenceCounts.online}</b> online · <b>{presenceCounts.quiet}</b> quiet · <b>{presenceCounts.blocked}</b> blocked</p>
+    </aside>
+    {:else}
     <aside class="hearth-legend" aria-label="How to read the hearth">
       <p class="kicker">READING THE HEARTH</p>
       <dl>
@@ -75,6 +154,7 @@
       </ol>
       <p class="counts"><b>{presenceCounts.online}</b> online · <b>{presenceCounts.quiet}</b> quiet · <b>{presenceCounts.blocked}</b> blocked</p>
     </aside>
+    {/if}
     <div class="hearth-caption"><span class="status-cue watch">△</span><strong>{liveState?.connected ? 'Live readings connected' : 'Collector connection unavailable'}</strong><span class="muted">{liveState?.connected ? 'Data updates continue when motion is paused.' : 'Check the local collector and sign in if requested. Existing measurements may be stale.'}</span></div>
   </div>
   <div class="metrics"><article><span class="metric-label">THROUGHPUT</span><strong>{formatThroughput(currentBps)}</strong><span class="metric-note">{hasThroughput ? 'Measured devices · upload + download now' : liveState?.connected ? 'No per-device counter source' : 'Collector connection unavailable'}</span></article><article><span class="metric-label">PROTOCOL MIX</span>{#if liveState?.protocolMix}<strong>{Object.keys(liveState.protocolMix).length} <small>observed</small></strong><span class="metric-note">Traffic categories from collector</span>{:else}<strong>Unavailable</strong><span class="metric-note">No protocol data received</span>{/if}</article><article><span class="metric-label">COVERAGE</span><strong class="coverage-badge {liveState?.coverage ?? 'unavailable'}"><span aria-hidden="true">{liveState?.coverage === 'complete' ? '✓' : liveState?.coverage === 'mixed' ? '△' : '○'}</span> {liveState?.coverage ?? 'UNAVAILABLE'}</strong><span class="metric-note">Evidence quality, not a heat score</span></article></div>

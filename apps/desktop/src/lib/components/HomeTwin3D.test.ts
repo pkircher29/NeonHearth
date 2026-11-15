@@ -241,3 +241,98 @@ describe('HomeTwin3D without a plan', () => {
     expect(view.container.querySelectorAll('button[data-device-id]')).toHaveLength(0);
   });
 });
+
+describe('HomeTwin3D v2: presets and detail card (stub renderer)', () => {
+  beforeEach(() => {
+    mocks.detectWebGL.mockReturnValue(true);
+  });
+
+  it('offers Top, Isometric, Front and Frame selection; Isometric is the default', async () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    const root = view.container.querySelector('.twin')!;
+    expect(root.getAttribute('data-camera-preset')).toBe('iso');
+    expect(screen.getByRole('button', { name: 'Isometric' }).getAttribute('aria-pressed')).toBe('true');
+    await fireEvent.click(screen.getByRole('button', { name: 'Top' }));
+    expect(root.getAttribute('data-camera-preset')).toBe('top');
+    expect(screen.getByRole('button', { name: 'Top' }).getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByRole('button', { name: 'Isometric' }).getAttribute('aria-pressed')).toBe('false');
+    await fireEvent.click(screen.getByRole('button', { name: 'Front' }));
+    expect(root.getAttribute('data-camera-preset')).toBe('front');
+    expect(screen.getByRole('button', { name: 'Frame selection' })).toBeTruthy();
+  });
+
+  it('renders the preset change as one immediate frame under reduced motion', async () => {
+    render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    const stub = mocks.createTwinRenderer.mock.results.at(-1)!.value as { render: ReturnType<typeof vi.fn> };
+    const before = stub.render.mock.calls.length;
+    await fireEvent.click(screen.getByRole('button', { name: 'Front' }));
+    expect(stub.render.mock.calls.length).toBeGreaterThan(before);
+  });
+
+  it('opens a detail card for the selected device with em-dashes for missing values', async () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, presence: { 'device-1': 'online' }, reducedMotion: true });
+    expect(screen.queryByRole('complementary', { name: 'Device details' })).toBeNull();
+    await fireEvent.click(view.container.querySelector('button[data-device-id="device-1"]')!);
+    const card = screen.getByRole('complementary', { name: 'Device details' });
+    expect(card.querySelector('h3')?.textContent).toBe('Living room TV');
+    expect(card.querySelector('[data-field="presence"]')?.textContent).toBe('Online');
+    expect(card.querySelector('[data-field="room"]')?.textContent).toBe('Kitchen');
+    expect(card.querySelector('[data-field="evidence"]')?.textContent).toBe('—');
+    expect(card.querySelector('[data-field="last-seen"]')?.textContent).toBe('—');
+  });
+
+  it('shows evidence and last seen when provided, and Show in Devices calls onselectdevice', async () => {
+    const onselectdevice = vi.fn();
+    const view = render(HomeTwin3D, {
+      plan, placements, devices, reducedMotion: true, onselectdevice,
+      deviceInfo: { 'device-1': { evidence: ['mdns'], last_seen_at: '2020-01-02T03:04:05Z' } }
+    });
+    await fireEvent.click(view.container.querySelector('button[data-device-id="device-1"]')!);
+    const card = screen.getByRole('complementary', { name: 'Device details' });
+    expect(card.querySelector('[data-field="evidence"]')?.textContent).toBe('mdns');
+    expect(card.querySelector('[data-field="last-seen"]')?.textContent).not.toBe('—');
+    await fireEvent.click(screen.getByRole('button', { name: 'Show in Devices' }));
+    expect(onselectdevice).toHaveBeenCalledWith('device-1');
+  });
+
+  it('omits the Show in Devices action when no handler is wired, and closes on demand', async () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    await fireEvent.click(view.container.querySelector('button[data-device-id="device-2"]')!);
+    expect(screen.queryByRole('button', { name: 'Show in Devices' })).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Close device details' }));
+    expect(screen.queryByRole('complementary', { name: 'Device details' })).toBeNull();
+    expect(view.container.querySelector('.twin')?.getAttribute('data-selected')).toBe('');
+  });
+});
+
+describe('HomeTwin3D room labels (stub renderer)', () => {
+  beforeEach(() => {
+    mocks.detectWebGL.mockReturnValue(true);
+  });
+
+  it('floats a name and area label over each room, without intercepting pointer events', () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    const label = view.container.querySelector('.twin-room-label[data-room-id="room-1"]');
+    expect(label?.textContent).toContain('Kitchen');
+    expect(label?.textContent).toContain('12.0 m²');
+    expect(view.container.querySelector('.twin-labels')).toBeTruthy();
+  });
+
+  it('keeps labels when walls are hidden', async () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    await fireEvent.click(screen.getByRole('button', { name: 'Hide walls' }));
+    expect(view.container.querySelector('.twin-room-label[data-room-id="room-1"]')).toBeTruthy();
+  });
+
+  it('hides labels in the Front preset, where floors are seen edge-on', async () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    await fireEvent.click(screen.getByRole('button', { name: 'Front' }));
+    expect(view.container.querySelector('.twin-room-label')).toBeNull();
+  });
+
+  it('has no labels in the 2D fallback', () => {
+    mocks.detectWebGL.mockReturnValue(false);
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    expect(view.container.querySelector('.twin-room-label')).toBeNull();
+  });
+});

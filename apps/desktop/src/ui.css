@@ -36,6 +36,28 @@
 .hearth-caption { border-top:1px solid var(--line-mid); padding:13px 18px; display:flex; gap:9px; align-items:center; font-size:12px}
 .status-dot { width:8px; height:8px; border:1px solid var(--gold); border-radius:50%}
 .hearth-caption .muted { margin-left:auto; font-size:11px}
+/* Flow Map variant of the Pulse hero. */
+.hearth-panel { position: relative; }
+.hearth-switch { position: absolute; top: 12px; left: 14px; z-index: 2; display: inline-flex; padding: 2px; border: 1px solid var(--line-mid); border-radius: 999px; background: rgba(8, 10, 18, .6); backdrop-filter: blur(6px); }
+.hearth-switch button { min-height: 28px; padding: 0 12px; border: 0; border-radius: 999px; background: none; color: var(--muted); font: 600 11px var(--font-mono); letter-spacing: .06em; cursor: pointer; }
+.hearth-switch button[aria-pressed="true"] { color: var(--ink); background: var(--surface-raised); box-shadow: inset 0 0 0 1px var(--line-strong); }
+.flow-panel .hearth-stage { padding: 34px 0 0; background: radial-gradient(ellipse at center, rgba(124, 77, 255, .08), transparent 66%); }
+.flow-panel .hearth-stage > * { width: 100%; max-width: 900px; }
+.hearth-legend .swatch.down { background: linear-gradient(90deg, #ff6d3b, #ffc53d); }
+.hearth-legend .swatch.up { background: linear-gradient(90deg, #7c4dff, #e040fb); }
+.hearth-legend .swatch.width { height: 8px; background: linear-gradient(90deg, rgba(233, 251, 252, .25), rgba(233, 251, 252, .8)); clip-path: polygon(0 40%, 100% 0, 100% 100%, 0 60%); }
+.hearth-legend .swatch.ring { width: 10px; height: 10px; border-radius: 50%; border: 2px solid #ffc53d; border-right-color: #7c4dff; border-bottom-color: #7c4dff; margin-inline: 3px; background: none; }
+.hearth-legend .swatch.sector { width: 16px; height: 6px; border-radius: 3px; background: rgba(233, 251, 252, .5); }
+.hearth-legend .tiers i.node { box-sizing: border-box; }
+.hearth-legend .tiers i.node.online { background: radial-gradient(circle at 35% 35%, #fff 0, #ffc53d 35%, #ff6d3b); box-shadow: 0 0 6px rgba(255, 109, 59, .6); }
+.hearth-legend .tiers i.node.quiet { background: #7c4dff; box-shadow: 0 0 5px rgba(124, 77, 255, .5); }
+.hearth-legend .tiers i.node.offline { border: 1.5px solid rgba(233, 251, 252, .45); }
+.hearth-legend .tiers i.node.blocked { border: 2px solid #ff4757; background: rgba(255, 71, 87, .14); }
+.hearth-legend .tiers i.node.unknown { border: 1.5px dashed rgba(233, 251, 252, .6); }
+.hearth-legend .tiers i.node.present { background: #ff6d3b; opacity: .7; }
+.hearth-legend .swatch.maker { width: 16px; height: 6px; border-radius: 3px; background: repeating-linear-gradient(90deg, rgba(233,251,252,.6) 0 3px, transparent 3px 5px); }
+.hearth-legend .swatch.computer { width: 10px; height: 10px; border-radius: 1px; transform: rotate(45deg); background: #0e101a; border: 2px solid #ff9d3b; margin-inline: 3px; }
+
 .metrics { display:grid; grid-template-columns:repeat(3,1fr); border-block:1px solid var(--line)}
 .metrics article { padding:17px 15px; border-right:1px solid var(--line); display:grid; gap:7px}
 .metrics strong { font:600 22px var(--font-display)}
