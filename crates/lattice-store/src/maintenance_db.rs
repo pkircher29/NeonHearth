@@ -230,7 +230,17 @@ impl DbMaintenance {
     ///
     /// Consumes `self` and closes the pool first, so a restore cannot run
     /// underneath open connections; reconnect with [`crate::connect_path`]
-    /// afterwards. Refuses any backup that fails [`Self::verify_backup`].
+    /// afterwards. Refuses any backup that fails [`Self::verify_backup`] or
+    /// that carries a newer schema than this build knows.
+    ///
+    /// Failure guarantees: every refusal (unverifiable, newer schema, live
+    /// path, failed staging copy) happens before the current database is
+    /// touched. The swap is two renames (current -> `.pre-restore`, staged ->
+    /// current); if the second fails the first is rolled back best-effort. The
+    /// one non-atomic step is that the old `-wal`/`-shm` sidecars are removed
+    /// just before the swap, so a crash in that window can lose writes that
+    /// were still only in the old WAL. After success the caller must reconcile
+    /// (see [`RestoreReport::reconcile_required`]).
     pub async fn restore_from(self, backup: &Path) -> Result<RestoreReport, MaintenanceError> {
         let verification = Self::verify_backup(backup)
             .await
@@ -238,6 +248,20 @@ impl DbMaintenance {
                 MaintenanceError::BackupInvalid(reason) => MaintenanceError::RestoreRefused(reason),
                 other => other,
             })?;
+        // A backup written by a newer build carries migrations this binary
+        // does not know; sqlx refuses to open such a database at startup, so
+        // restoring it would leave the service unable to start. Refuse before
+        // anything is touched.
+        let newest_known = crate::latest_migration_version();
+        let backup_version = verification
+            .migration_version
+            .max(verification.install_schema_version.unwrap_or(0));
+        if backup_version > newest_known {
+            return Err(MaintenanceError::RestoreRefused(format!(
+                "backup is from a newer schema (version {backup_version}) than this build supports \
+                 (version {newest_known}); upgrade NeonHearth before restoring it"
+            )));
+        }
         let backup_text = utf8_path(backup)?;
         self.refuse_live_paths(backup)?;
         self.pool.close().await;
