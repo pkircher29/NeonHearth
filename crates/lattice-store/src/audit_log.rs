@@ -73,6 +73,8 @@ pub enum AuditActor {
     Owner,
     Service,
     Module,
+    /// A paired phone session acting remotely (the session id is in `detail`).
+    Phone,
 }
 
 impl AuditActor {
@@ -81,6 +83,7 @@ impl AuditActor {
             Self::Owner => "owner",
             Self::Service => "service",
             Self::Module => "module",
+            Self::Phone => "phone",
         }
     }
 
@@ -89,6 +92,7 @@ impl AuditActor {
             "owner" => Some(Self::Owner),
             "service" => Some(Self::Service),
             "module" => Some(Self::Module),
+            "phone" => Some(Self::Phone),
             _ => None,
         }
     }
@@ -1022,7 +1026,12 @@ mod tests {
 
     #[test]
     fn actor_and_category_round_trip() {
-        for actor in [AuditActor::Owner, AuditActor::Service, AuditActor::Module] {
+        for actor in [
+            AuditActor::Owner,
+            AuditActor::Service,
+            AuditActor::Module,
+            AuditActor::Phone,
+        ] {
             assert_eq!(AuditActor::parse(actor.as_str()), Some(actor));
         }
         for category in [
