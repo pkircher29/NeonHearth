@@ -134,6 +134,38 @@ class ReleaseWiringTests(unittest.TestCase):
         self.assertIn('requires signing', plan)
         self.assertIn('refs/heads/main', plan)
 
+    def test_unsigned_candidates_still_run_the_arm64_smoke_and_tags_require_signing(self):
+        smoke = self.jobs['windows-arm64-smoke']['if']
+        self.assertIn('!cancelled()', smoke)
+        self.assertIn("needs.package-home-hub.result == 'success'", smoke)
+        release = self.jobs['release']
+        self.assertIn('!cancelled()', release['if'])
+        self.assertIn("needs.plan.outputs.sign == 'true'", release['if'])
+        for job in ('sign-programs', 'sign-msi', 'sign-bundle', 'package-home-hub', 'windows-arm64-smoke', 'finalize-installer', 'linux-packages'):
+            self.assertIn(f"needs.{job}.result == 'success'", release['if'])
+            self.assertIn(job, release['needs'])
+
+    def test_jobs_after_skippable_signing_jobs_have_explicit_conditions(self):
+        """A skipped job skips every transitive dependent that has no explicit `if`."""
+        def needs_of(name):
+            needs = self.jobs[name].get('needs', [])
+            return [needs] if isinstance(needs, str) else list(needs)
+        skippable = {n for n, j in self.jobs.items() if j.get('uses', '').endswith('sign.yml')}
+        changed = True
+        while changed:
+            changed = False
+            for name in self.jobs:
+                if name not in skippable and any(n in skippable for n in needs_of(name)):
+                    skippable.add(name)
+                    changed = True
+        for name in skippable:
+            if self.jobs[name].get('uses', '').endswith('sign.yml'):
+                continue
+            condition = self.jobs[name].get('if', '')
+            signing_only = condition.startswith("needs.plan.outputs.sign == 'true'")
+            self.assertTrue('!cancelled()' in condition or signing_only,
+                            f'{name} would be skipped together with an unsigned candidate's signing jobs')
+
     def test_signing_check_workflow_is_gone(self):
         self.assertFalse((WORKFLOWS / 'signing-check.yml').exists())
 
