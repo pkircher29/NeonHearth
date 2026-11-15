@@ -116,7 +116,7 @@ say so on screen instead of pretending.
 - Automatic pairing between the desktop app and the service.
 - Phone access over Tailscale (planned as private Tailscale Serve only; not
   yet implemented — and public exposure will remain prohibited).
-- The Home, Doctor, History, and Settings navigation destinations show a
+- The Home, History, and Settings navigation destinations show a
   "still being wired" notice in this build.
 - Automated router enforcement (see [Guard and policy](guard-and-policy.md)
   for what happens instead today).
