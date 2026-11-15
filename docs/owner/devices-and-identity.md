@@ -86,9 +86,11 @@ of coverages across devices is shown as *mixed*.
 
 ## Not yet available
 
-- On-screen controls to confirm or correct a device's identity (the Devices
-  view shows "Needs your confirmation" but the confirm action is not wired
-  into the app yet).
+- Confirming or correcting anything about a device other than its name. In
+  the Devices and Guard views you can confirm a suggested name ("Confirm
+  name"), edit it, or name an unnamed device; confirming a name does not
+  approve the device's network access. There is no control to correct the
+  device's type, vendor or model.
 - A merge-proposal review screen (proposals exist inside the identity
   engine; there is no owner-facing surface for them yet).
 - Real-hardware departure/rejoin acceptance is still pending: the join and
