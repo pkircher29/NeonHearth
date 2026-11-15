@@ -31,11 +31,6 @@ pub struct NeighborRuntime {
     repository: M2StateRepository,
 }
 
-/// Temporary mount of `src/maintenance.rs`. Once `lib.rs` declares `pub mod maintenance;`,
-/// delete this declaration.
-#[path = "maintenance.rs"]
-pub mod maintenance;
-
 /// How often the running worker checks whether the eligible interface set changed.
 const REPLAN_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 const RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(5);

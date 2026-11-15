@@ -10,6 +10,7 @@ pub mod home;
 pub mod host_monitor;
 pub mod integrations;
 pub mod mac_vendor;
+pub mod maintenance;
 pub mod mqtt;
 pub mod network_monitor;
 pub mod network_scan;
