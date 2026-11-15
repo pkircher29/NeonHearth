@@ -199,7 +199,7 @@ impl M2StateRepository {
         let state: Option<String> = sqlx::query_scalar(
             "SELECT to_state FROM presence_transitions
              WHERE device_id=? AND trigger_kind IN ('enforcement_blocked','enforcement_unblocked')
-             ORDER BY occurred_at DESC, transition_id ASC LIMIT 1",
+             ORDER BY julianday(occurred_at) DESC, occurred_at DESC, transition_id ASC LIMIT 1",
         )
         .bind(device_id.to_string())
         .fetch_optional(&self.pool)
@@ -228,7 +228,7 @@ impl M2StateRepository {
         let current: Option<String> = sqlx::query_scalar(
             "SELECT to_state FROM presence_transitions WHERE device_id=?
              ORDER BY CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN 1 ELSE 0 END DESC,
-                      occurred_at DESC,
+                      julianday(occurred_at) DESC, occurred_at DESC,
                       CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN transition_id END ASC,
                       transition_id DESC LIMIT 1",
         ).bind(device_id.to_string()).fetch_optional(&mut *tx).await?;
@@ -271,7 +271,7 @@ impl M2StateRepository {
         let latest_control: Option<String> = sqlx::query_scalar(
             "SELECT to_state FROM presence_transitions
              WHERE device_id=? AND trigger_kind IN ('enforcement_blocked','enforcement_unblocked')
-             ORDER BY occurred_at DESC, transition_id ASC LIMIT 1",
+             ORDER BY julianday(occurred_at) DESC, occurred_at DESC, transition_id ASC LIMIT 1",
         )
         .bind(device_id.to_string())
         .fetch_optional(&mut *tx)
@@ -516,7 +516,7 @@ impl M2StateRepository {
             std::collections::HashMap::new();
         if !ids.is_empty() {
             let mut query = sqlx::QueryBuilder::new(
-                "SELECT device_id,to_state,occurred_at,trigger_source,trigger_kind FROM (SELECT device_id,to_state,occurred_at,trigger_source,trigger_kind, ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN 1 ELSE 0 END DESC, occurred_at DESC, CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN transition_id END ASC, transition_id DESC) AS rn FROM presence_transitions WHERE device_id IN (",
+                "SELECT device_id,to_state,occurred_at,trigger_source,trigger_kind FROM (SELECT device_id,to_state,occurred_at,trigger_source,trigger_kind, ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN 1 ELSE 0 END DESC, julianday(occurred_at) DESC, occurred_at DESC, CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN transition_id END ASC, transition_id DESC) AS rn FROM presence_transitions WHERE device_id IN (",
             );
             let mut separated = query.separated(", ");
             for id in &ids {

@@ -120,3 +120,83 @@ async fn flow_apply_and_blocks_do_not_fail_under_contention() -> anyhow::Result<
     }
     Ok(())
 }
+
+/// Finding 6: lock contention is a retryable error, never a sequence conflict.
+#[test]
+fn busy_and_locked_errors_are_recognised_as_retryable() {
+    use std::borrow::Cow;
+    use std::error::Error as StdError;
+    use std::fmt;
+    #[derive(Debug)]
+    struct Fake(&'static str, &'static str);
+    impl fmt::Display for Fake {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.1)
+        }
+    }
+    impl StdError for Fake {}
+    impl sqlx::error::DatabaseError for Fake {
+        fn message(&self) -> &str {
+            self.1
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.0))
+        }
+        fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+    let busy = sqlx::Error::Database(Box::new(Fake("5", "database is locked")));
+    let snapshot = sqlx::Error::Database(Box::new(Fake("517", "database is locked")));
+    let unique = sqlx::Error::Database(Box::new(Fake("2067", "UNIQUE constraint failed")));
+    assert!(lattice_store::is_busy_error(&busy));
+    assert!(lattice_store::is_busy_error(&snapshot));
+    assert!(!lattice_store::is_busy_error(&unique));
+}
+
+/// Finding 17: ordering by `occurred_at` must follow the instant even when
+/// rows were written with different spellings (`Z` vs `+00:00`, fractions).
+#[tokio::test]
+async fn control_state_ordering_follows_the_instant_not_the_text() -> anyhow::Result<()> {
+    let directory = tempdir()?;
+    let pool = connect_path(directory.path().join("mixed.db")).await?;
+    let repository = M2StateRepository::new(pool.clone());
+    let id = DeviceId::new();
+    add_device(&pool, id).await?;
+    // Blocked at T (written with `Z`), unblocked at T+0.5s (written with
+    // `+00:00`). As text "...:00Z" sorts after "...:00.500+00:00".
+    for (transition_id, to, at) in [
+        (-1_i64, "blocked", "2026-01-01T00:00:00Z"),
+        (-2_i64, "unknown", "2026-01-01T00:00:00.500+00:00"),
+    ] {
+        let kind = if to == "blocked" {
+            "enforcement_blocked"
+        } else {
+            "enforcement_unblocked"
+        };
+        sqlx::query("INSERT INTO presence_transitions(transition_id,device_id,from_state,to_state,occurred_at,reason,trigger_source,trigger_kind,evidence_observed_at,evidence_valid_until,trigger_arrival_at,correction_of) VALUES(?,?,?,?,?,?,?,?,?,NULL,?,NULL)")
+            .bind(transition_id)
+            .bind(id.to_string())
+            .bind("unknown")
+            .bind(to)
+            .bind(at)
+            .bind("test")
+            .bind("policy")
+            .bind(kind)
+            .bind(at)
+            .bind(at)
+            .execute(&pool)
+            .await?;
+    }
+    assert!(!repository.verified_control_blocked(id).await?);
+    Ok(())
+}
