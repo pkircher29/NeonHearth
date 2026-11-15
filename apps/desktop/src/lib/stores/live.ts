@@ -85,7 +85,10 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
     }
   }
   if (event.payload.type === 'bandwidth_frame') {
-    next.devices = { ...next.devices };
+    // Each frame describes the current collector interval, not a patch.
+    next.devices = Object.fromEntries(Object.entries(next.devices).map(([id, device]) => [id, {
+      ...device, bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null }
+    }]));
     let upload = 0; let download = 0;
     for (const sample of event.payload.data.samples) {
       upload += sample.upload_bytes_per_second; download += sample.download_bytes_per_second;
@@ -125,5 +128,5 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
   return summarize(next);
 }
 
-export function bandwidthTier(totalBps: number): 'blue' | 'cyan' | 'gold' | 'pink' { const megabits = totalBps / 1_000_000; return megabits < 1 ? 'blue' : megabits <= 10 ? 'cyan' : megabits <= 30 ? 'gold' : 'pink'; }
+export function bandwidthTier(totalBps: number): 'blue' | 'cyan' | 'gold' | 'pink' { const megabits = totalBps * 8 / 1_000_000; return megabits < 1 ? 'blue' : megabits <= 10 ? 'cyan' : megabits <= 30 ? 'gold' : 'pink'; }
 export function topDevices(state: LiveState, limit = 5): DeviceSnapshot[] { return state.deviceOrder.map((id) => state.devices[id]).filter((device): device is DeviceSnapshot => Boolean(device) && device.bandwidth.available).sort((a, b) => (b.bandwidth.upload ?? 0) + (b.bandwidth.download ?? 0) - (a.bandwidth.upload ?? 0) - (a.bandwidth.download ?? 0)).slice(0, limit); }

@@ -1135,3 +1135,96 @@ async fn openapi_documents_the_remote_routes() {
         );
     }
 }
+
+#[tokio::test]
+async fn concurrent_commands_and_restart_never_repeat_execution() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "parallel", "123456").await;
+    let phone = Auth::Phone(id, secret);
+    assert_eq!(
+        stepup(&fixture, &phone, "123456").await.status(),
+        StatusCode::OK
+    );
+    let headers = [("x-command-id", "018f47a0-9b5c-7a22-8a33-1122334455aa")];
+    let (a, b) = tokio::join!(
+        send_with_headers(
+            &fixture.router,
+            "PUT",
+            "/api/v1/home/plan",
+            Some(empty_plan_save(0)),
+            &phone,
+            &headers
+        ),
+        send_with_headers(
+            &fixture.router,
+            "PUT",
+            "/api/v1/home/plan",
+            Some(empty_plan_save(0)),
+            &phone,
+            &headers
+        )
+    );
+    assert!(a.status() == StatusCode::OK || b.status() == StatusCode::OK);
+    for response in [a, b] {
+        assert!(response.status() == StatusCode::OK || response.status() == StatusCode::CONFLICT);
+    }
+    // Same id with a changed payload must not return the earlier success.
+    let changed = send_with_headers(
+        &fixture.router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(empty_plan_save(1)),
+        &phone,
+        &headers,
+    )
+    .await;
+    assert_eq!(changed.status(), StatusCode::CONFLICT);
+    let remote = RemoteAccessState::with_parts(
+        &fixture.state,
+        fixture.tailscale.clone(),
+        fixture.clock.clone(),
+        LOOPBACK_PORT,
+    );
+    let restarted = app_with_remote_access(fixture.state.clone(), remote);
+    let response = send_with_headers(
+        &restarted,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(empty_plan_save(0)),
+        &phone,
+        &headers,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM phone_commands")
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn concurrent_pin_requests_are_accounted_or_rejected_before_verification() {
+    let fixture = fixture().await;
+    let (id, secret) = pair(&fixture, "parallel", "123456").await;
+    let phone = Auth::Phone(id.clone(), secret);
+    let (a, b) = tokio::join!(
+        stepup(&fixture, &phone, "000000"),
+        stepup(&fixture, &phone, "000000")
+    );
+    let attempted = [a.status(), b.status()]
+        .iter()
+        .filter(|s| **s == StatusCode::FORBIDDEN)
+        .count();
+    assert!(attempted >= 1);
+    let count: i64 = sqlx::query_scalar("SELECT pin_failed_count FROM phone_sessions WHERE id = ?")
+        .bind(id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, attempted as i64);
+    assert_eq!(
+        stepup(&fixture, &phone, "123456").await.status(),
+        StatusCode::OK
+    );
+}

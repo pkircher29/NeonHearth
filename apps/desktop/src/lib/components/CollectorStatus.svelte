@@ -9,6 +9,6 @@
   <div class="signal" aria-hidden="true"><span></span><span></span><span></span></div>
   <div class="status-copy">
     <p class="status-label">{statusText[state]}</p>
-    <p class="status-detail">{state === 'ready' ? 'Public collector health is responding. Protected live data remains paired on this device.' : state === 'offline' ? 'The public health check is not responding. Protected live data has not been requested.' : 'Contacting the public health endpoint. Protected live data has not been requested.'}</p>
+    <p class="status-detail">{state === 'ready' ? 'The local collector is responding. Live data requires an authorized connection.' : state === 'offline' ? 'The local collector is not responding. Check that NeonHearth is running.' : 'Checking the local collector connection.'}</p>
   </div>
 </section>

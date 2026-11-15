@@ -23,8 +23,12 @@ Locked 2026-08-24 for the Tailscale (T1–T4) and integrations (I1–I2) lanes.
   limited and audited.
 - **No replay (T4)**: command-carrying requests over a phone session include
   a client-generated `command_id` (uuid); the service keeps a bounded
-  per-session dedup window and returns the original result for a replayed
-  id instead of re-executing. WebSocket reconnects resume the event stream
+  per-session response window and returns the original result for a replayed
+  id instead of re-executing. SQLite reservations bind each id to the method,
+  URI and body and survive restart. Concurrent in-flight requests, changed
+  payloads, and reservations whose response is no longer cached return 409;
+  clients must refresh state before deciding whether to issue a new command.
+  Reservations remain for the session lifetime, even after response eviction. WebSocket reconnects resume the event stream
   by sequence (existing snapshot/resume protocol) and never re-deliver
   commands.
 
@@ -46,3 +50,8 @@ Locked 2026-08-24 for the Tailscale (T1–T4) and integrations (I1–I2) lanes.
 
 Every minting/revocation and step-up failure is appended to the audit log
 (category `approval` for pairings/tokens).
+
+PIN hashing runs on blocking workers with one admitted operation per service.
+Busy requests return 429 before verification. Attempts are durably debited
+before hashing; successful verification clears the debit. Interrupted attempts
+remain counted, so cancellation cannot bypass the attempt budget.

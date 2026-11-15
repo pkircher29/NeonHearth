@@ -1,6 +1,6 @@
 # NeonHearth
 
-**See your network breathe.**
+**Your network. Under control.**
 
 NeonHearth is a local-first Windows and Linux home-network monitor. It discovers and identifies devices independently of the router, shows live traffic and presence, enforces owner approval policies through verified router capabilities, detects cameras, assesses device security, renders a live 3D Home Twin, and provides a private phone interface through Tailscale.
 

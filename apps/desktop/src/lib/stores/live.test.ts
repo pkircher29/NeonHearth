@@ -57,12 +57,12 @@ describe('reduceLiveMessage', () => {
     expect(initialLiveState.devices).toEqual({});
     expect(initialLiveState.coverage).toBe('unavailable');
     expect(initialLiveState.protocolMix).toBeNull();
-    expect(bandwidthTier(999_999)).toBe('blue');
-    expect(bandwidthTier(1_000_000)).toBe('cyan');
-    expect(bandwidthTier(10_000_000)).toBe('cyan');
-    expect(bandwidthTier(10_000_001)).toBe('gold');
-    expect(bandwidthTier(30_000_000)).toBe('gold');
-    expect(bandwidthTier(30_000_001)).toBe('pink');
+    expect(bandwidthTier(124_999)).toBe('blue');
+    expect(bandwidthTier(125_000)).toBe('cyan');
+    expect(bandwidthTier(1_250_000)).toBe('cyan');
+    expect(bandwidthTier(1_250_001)).toBe('gold');
+    expect(bandwidthTier(3_750_000)).toBe('gold');
+    expect(bandwidthTier(3_750_001)).toBe('pink');
   });
   it('returns the identical state for duplicate or out-of-order events', () => {
     const current = { ...initialLiveState, sequence: 4, connected: true, serviceStatus: 'ready' };
@@ -298,3 +298,14 @@ describe('reduceLiveMessage', () => {
 function resultDevice(device_id: string) {
   return { device_id, first_seen_at: '2026-08-23T00:00:00Z', last_seen_at: '2026-08-23T00:00:00Z', owner_name: null, owner_type: null, owner_confirmed: false, presence: { state: 'unknown' as const, observed_at: null, source: null, kind: null }, evidence: null, identity: { available: false, classification: null, confidence: null }, bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null }, policy: null };
 }
+
+it('clears omitted readings from the next interval', () => {
+ const first = reduceLiveMessage(initialLiveState, { type: 'event', data: bandwidth(1) });
+ const empty = bandwidth(2);
+ if (empty.payload.type !== 'bandwidth_frame') throw new Error('fixture');
+ empty.payload.data.samples = [];
+ const next = reduceLiveMessage(first, { type: 'event', data: empty });
+ expect(next.aggregate).toEqual({ upload: 0, download: 0 });
+ expect(topDevices(next)).toEqual([]);
+ expect(first.aggregate.upload).toBe(2_000_000);
+});
