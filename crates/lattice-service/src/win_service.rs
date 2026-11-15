@@ -13,13 +13,11 @@
 //! path the console flow runs — so the two modes cannot drift.
 
 use anyhow::{Context, Result};
+use lattice_service::service_stop::{self, FIRST_STOP_CHECKPOINT, SHUTDOWN_DRAIN, STOP_WAIT_HINT};
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use lattice_service::service_stop::{
-    self, FIRST_STOP_CHECKPOINT, SHUTDOWN_DRAIN, STOP_WAIT_HINT,
-};
 use tokio::sync::watch;
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,

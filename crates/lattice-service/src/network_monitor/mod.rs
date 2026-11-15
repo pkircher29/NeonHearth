@@ -247,7 +247,11 @@ impl NetworkMonitor {
     }
     async fn run_discovery(&self) -> Result<(), ()> {
         self.run_sweep(
-            || lattice_sensor::SystemInterfaceManager.snapshot().map_err(|_| ()),
+            || {
+                lattice_sensor::SystemInterfaceManager
+                    .snapshot()
+                    .map_err(|_| ())
+            },
             lan::plan,
             |batch, names| async move { lan::probe_batch(&batch, &names).await },
         )

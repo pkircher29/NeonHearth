@@ -1,8 +1,8 @@
 use super::*;
-use std::net::Ipv4Addr;
 use lattice_sensor::{
     Address, Interface, InterfaceClass, InterfaceId, InterfaceInventory, InterfaceRole,
 };
+use std::net::Ipv4Addr;
 
 fn interface(id: u32, class: InterfaceClass, ip: &str, prefix: u8) -> Interface {
     Interface {
@@ -266,15 +266,28 @@ async fn sweep_snapshots_and_plans_once_and_probes_every_target_once() {
         }
     };
     hub.run_sweep(snapshot, planner, prober).await.unwrap();
-    assert_eq!(snapshots.load(Ordering::SeqCst), 1, "one interface snapshot per sweep");
+    assert_eq!(
+        snapshots.load(Ordering::SeqCst),
+        1,
+        "one interface snapshot per sweep"
+    );
     assert_eq!(plans.load(Ordering::SeqCst), 1, "one plan per sweep");
-    assert!(batches.load(Ordering::SeqCst) > 1, "the sweep must span several batches");
+    assert!(
+        batches.load(Ordering::SeqCst) > 1,
+        "the sweep must span several batches"
+    );
     let mut probed = probed.lock().unwrap().clone();
     probed.sort();
     let expected: Vec<Ipv4Addr> = (1..=200u8).map(|n| Ipv4Addr::new(192, 168, 1, n)).collect();
-    assert_eq!(probed, expected, "every planned target is probed exactly once");
+    assert_eq!(
+        probed, expected,
+        "every planned target is probed exactly once"
+    );
     let status = hub.discovery.lock().await.clone().unwrap();
-    assert_eq!((status.total, status.completed, status.errors), (200, 200, 0));
+    assert_eq!(
+        (status.total, status.completed, status.errors),
+        (200, 200, 0)
+    );
 }
 #[test]
 fn router_prune_runs_first_then_at_most_once_per_interval() {
@@ -308,12 +321,14 @@ async fn router_prune_drops_day_old_and_excess_samples_and_keeps_fresh_ones() {
         (now - 86_400, "edge"),
         (now - 5, "fresh"),
     ] {
-        sqlx::query("INSERT INTO network_router_samples(at,source,download,upload) VALUES(?,?,1,1)")
-            .bind(at)
-            .bind(label)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO network_router_samples(at,source,download,upload) VALUES(?,?,1,1)",
+        )
+        .bind(at)
+        .bind(label)
+        .execute(&pool)
+        .await
+        .unwrap();
     }
     router::prune_samples(&pool, now).await.unwrap();
     let kept: Vec<String> =

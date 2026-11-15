@@ -116,9 +116,7 @@ mod tests {
     #[test]
     fn runtime_with_finished_work_shuts_down_within_the_drain() {
         let runtime = runtime();
-        let value = runtime.block_on(async {
-            tokio::task::spawn_blocking(|| 7).await.unwrap()
-        });
+        let value = runtime.block_on(async { tokio::task::spawn_blocking(|| 7).await.unwrap() });
         assert_eq!(value, 7);
         shutdown_runtime(runtime, SHUTDOWN_DRAIN);
     }
