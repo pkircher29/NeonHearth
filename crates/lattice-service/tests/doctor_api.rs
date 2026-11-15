@@ -826,7 +826,8 @@ async fn a_duplicate_ip_repair_with_a_chosen_claimant_succeeds() {
     let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(repairs)).await;
     let run = run_doctor(&fixture.router).await;
     let kind = finding_kind(&run, "duplicate_ip");
-    let approval = json_body(mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await).await;
+    let approval =
+        json_body(mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await).await;
     let response = send(
         &fixture.router,
         "POST",
@@ -857,7 +858,8 @@ async fn a_chosen_device_that_is_not_a_claimant_is_rejected() {
     let response = mint_duplicate_ip_approval(&fixture, &kind, Some(stranger)).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     // A valid approval cannot be used with a stranger either.
-    let approval = json_body(mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await).await;
+    let approval =
+        json_body(mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await).await;
     let response = send(
         &fixture.router,
         "POST",
@@ -881,7 +883,8 @@ async fn an_approval_for_one_claimant_cannot_execute_for_another() {
     let fixture = mixed_fixture().await;
     let run = run_doctor(&fixture.router).await;
     let kind = finding_kind(&run, "duplicate_ip");
-    let approval = json_body(mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await).await;
+    let approval =
+        json_body(mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await).await;
     for chosen in [Some(CLAIMANT_B), None] {
         let mut body = serde_json::json!({
             "diagnosis_kind": kind,
@@ -890,7 +893,14 @@ async fn an_approval_for_one_claimant_cannot_execute_for_another() {
         if let Some(chosen) = chosen {
             body["chosen"] = serde_json::json!(chosen);
         }
-        let response = send(&fixture.router, "POST", "/api/v1/doctor/repair", Some(body), true).await;
+        let response = send(
+            &fixture.router,
+            "POST",
+            "/api/v1/doctor/repair",
+            Some(body),
+            true,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{chosen:?}");
     }
     // The refused attempts did not spend the token: the right choice still works.

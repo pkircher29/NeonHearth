@@ -1,8 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use lattice_store::{
     AppendedEntry, AuditActor, AuditCategory, AuditFilter, AuditLog, AuditLogError, AuditPage,
-    ChainBreakKind, ChainHead, ChainScope, HeadAnchor, MAX_ACTION_BYTES, MAX_DETAIL_BYTES, NewAuditEntry,
-    connect_memory, connect_path, genesis_hash,
+    ChainBreakKind, ChainHead, ChainScope, HeadAnchor, MAX_ACTION_BYTES, MAX_DETAIL_BYTES,
+    NewAuditEntry, connect_memory, connect_path, genesis_hash,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -567,13 +567,15 @@ async fn recorded_head_survives_retention_pruning() -> anyhow::Result<()> {
         log.append(entry(index)).await?;
     }
     // Nothing is older than the cutoff-free row cap of 2: rows 1..=4 go.
-    log.retention_prune(None, Some(2), at(1_800_000_000)).await?;
+    log.retention_prune(None, Some(2), at(1_800_000_000))
+        .await?;
     let pruned = log.verify_chain_anchored(ChainScope::All).await?;
     assert!(pruned.report.is_valid(), "{pruned:?}");
     assert_eq!(pruned.anchor, HeadAnchor::Matches);
 
     // Pruning everything leaves the retention anchor as the head.
-    log.retention_prune(None, Some(0), at(1_800_000_001)).await?;
+    log.retention_prune(None, Some(0), at(1_800_000_001))
+        .await?;
     let emptied = log.verify_chain_anchored(ChainScope::All).await?;
     assert!(emptied.report.is_valid(), "{emptied:?}");
     assert_eq!(emptied.anchor, HeadAnchor::Matches);

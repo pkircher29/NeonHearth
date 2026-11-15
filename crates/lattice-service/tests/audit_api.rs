@@ -188,7 +188,10 @@ async fn verify_reports_the_recorded_head_and_catches_a_truncated_chain() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(verify["anchor"], json!("mismatch"));
     assert_eq!(verify["valid"], json!(false));
-    assert_eq!(verify["report"]["first_break"]["kind"], json!("head_mismatch"));
+    assert_eq!(
+        verify["report"]["first_break"]["kind"],
+        json!("head_mismatch")
+    );
     assert_eq!(verify["report"]["first_break"]["id"], json!(5));
 }
 
