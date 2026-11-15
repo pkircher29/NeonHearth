@@ -121,7 +121,7 @@ async fn reopen_restores_checkpoint_and_duplicate_is_still_inert() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<()> {
+async fn corrupt_checkpoint_refuses_open_and_source_mismatch_recovers_with_backup() -> anyhow::Result<()> {
     let pool = connect_memory().await?;
     let repo = M2StateRepository::new(pool.clone());
     let mut pipeline = PersistentDiscoveryPipeline::open(

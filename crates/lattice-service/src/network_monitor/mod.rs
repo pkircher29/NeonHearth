@@ -151,10 +151,13 @@ impl NetworkMonitor {
         }
         Ok(())
     }
-    pub fn start(&self, shutdown: watch::Receiver<bool>) {
+    /// Spawns the discovery loop and the router feed. The returned handle finishes when either
+    /// of them stops (shutdown or panic), so a finished handle outside shutdown means
+    /// the monitor is no longer fully running (the other task is left to finish on its own).
+    pub fn start(&self, shutdown: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         let mut stop = shutdown.clone();
-        tokio::spawn(async move {
+        let mut discovery_task = tokio::spawn(async move {
             loop {
                 if *stop.borrow() {
                     break;
@@ -174,7 +177,7 @@ impl NetworkMonitor {
         });
         let this = self.clone();
         let mut stop = shutdown;
-        tokio::spawn(async move {
+        let mut feed_task = tokio::spawn(async move {
             loop {
                 if *stop.borrow() {
                     break;
@@ -183,6 +186,12 @@ impl NetworkMonitor {
                 tokio::select! { _ = stop.changed() => { if *stop.borrow() || stop.has_changed().is_err() { break; } }, _ = tokio::time::sleep(Duration::from_secs(3)) => {} }
             }
         });
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = &mut discovery_task => {}
+                _ = &mut feed_task => {}
+            }
+        })
     }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);

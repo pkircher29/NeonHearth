@@ -140,7 +140,9 @@ impl HostMonitor {
     fn demanded(&self) -> bool {
         self.demand_until.load(Ordering::Relaxed) >= Utc::now().timestamp()
     }
-    pub fn start(&self, mut shutdown: watch::Receiver<bool>) {
+    /// Spawns the collector. The returned handle finishes only when the collector stops (shutdown,
+    /// or a panic), so a supervisor can restart or report it.
+    pub fn start(&self, mut shutdown: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -167,7 +169,7 @@ impl HostMonitor {
                     }
                 }
             }
-        });
+        })
     }
     async fn collect(&self) {
         let app_counters = self.app_counters.load(Ordering::Relaxed);
