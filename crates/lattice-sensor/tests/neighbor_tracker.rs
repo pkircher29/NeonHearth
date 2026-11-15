@@ -277,33 +277,34 @@ fn max_rows_failure_is_atomic_for_departure_misses() {
         t.observe(vec![], at(2)).unwrap().as_slice(),
         [NeighborEvent::Missed { .. }]
     ));
-    assert_eq!(
-        t.observe(
+    // Overflowing max_rows keeps the first row (previously the whole cycle failed).
+    let events = t
+        .observe(
             vec![
                 row(
                     "192.168.1.3".parse().unwrap(),
                     mac(2),
-                    NeighborReachability::Reachable
+                    NeighborReachability::Reachable,
                 ),
                 row(
                     "192.168.1.4".parse().unwrap(),
                     mac(3),
-                    NeighborReachability::Reachable
+                    NeighborReachability::Reachable,
                 ),
             ],
             at(3),
-        ),
-        Err(NeighborError::Capacity)
-    );
+        )
+        .unwrap();
     assert!(matches!(
-        t.observe(vec![], at(4)).unwrap().as_slice(),
+        events.as_slice(),
         [
+            NeighborEvent::Appeared { device, .. },
             NeighborEvent::Missed {
                 consecutive_misses: 2,
                 ..
             },
             NeighborEvent::Departed { .. }
-        ]
+        ] if device.link_address() == mac(2)
     ));
 }
 
@@ -326,18 +327,24 @@ fn max_devices_failures_are_atomic_and_respect_live_capacity() {
         NeighborReachability::Reachable,
     );
     t.observe(vec![a.clone()], at(1)).unwrap();
-    assert_eq!(
-        t.observe(vec![a.clone(), b.clone()], at(2)),
-        Err(NeighborError::Capacity)
-    );
+    // At capacity a flood of new neighbors is dropped; the known device keeps reporting.
+    assert!(matches!(
+        t.observe(vec![a.clone(), b.clone()], at(2)).unwrap().as_slice(),
+        [NeighborEvent::Confirmed { device, .. }] if device.link_address() == mac(1)
+    ));
     assert!(matches!(
         t.observe(vec![a.clone()], at(3)).unwrap().as_slice(),
         [NeighborEvent::Confirmed { device, .. }] if device.link_address() == mac(1)
     ));
-    assert_eq!(
-        t.observe(vec![b.clone()], at(4)),
-        Err(NeighborError::Capacity)
-    );
+    // The known device is absent and the new one is over capacity: only the miss is reported.
+    assert!(matches!(
+        t.observe(vec![b.clone()], at(4)).unwrap().as_slice(),
+        [NeighborEvent::Missed {
+            consecutive_misses: 1,
+            ..
+        }]
+    ));
+    t.observe(vec![a.clone()], at(5)).unwrap();
     assert!(matches!(
         t.observe(vec![], at(5)).unwrap().as_slice(),
         [NeighborEvent::Missed {
@@ -627,13 +634,15 @@ fn clock_rollback_after_a_miss_is_atomic_and_equal_time_is_allowed() {
 
 #[test]
 fn failed_future_snapshot_does_not_advance_the_clock() {
+    // max_rows overflow used to be the failing input here; it now truncates (and therefore
+    // succeeds), so a conflicting duplicate is the failure that must not advance the clock.
     let mut t = NeighborTracker::new(NeighborTrackerConfig {
         max_rows: 1,
         ..Default::default()
     })
     .unwrap();
-    assert_eq!(
-        t.observe(
+    let events = t
+        .observe(
             vec![
                 row(
                     "192.168.1.2".parse().unwrap(),
@@ -647,22 +656,9 @@ fn failed_future_snapshot_does_not_advance_the_clock() {
                 ),
             ],
             at(100),
-        ),
-        Err(NeighborError::Capacity)
-    );
-    assert!(matches!(
-        t.observe(
-            vec![row(
-                "192.168.1.2".parse().unwrap(),
-                mac(1),
-                NeighborReachability::Reachable,
-            )],
-            at(1),
         )
-        .unwrap()
-        .as_slice(),
-        [NeighborEvent::Appeared { .. }]
-    ));
+        .unwrap();
+    assert_eq!(events.len(), 1);
 
     let mut conflict_tracker = NeighborTracker::new(NeighborTrackerConfig::default()).unwrap();
     let ip: IpAddr = "192.168.1.2".parse().unwrap();

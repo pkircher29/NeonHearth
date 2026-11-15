@@ -1,4 +1,10 @@
 //! Bounded, offline normalization of Ethernet PCAPs. Packet bodies never leave this module.
+//!
+//! Production use as of this change: only the owner-started PCAP import, restricted to
+//! LLDP/CDP via [`OfflinePassiveAdapter::ingest_pcap_link_discovery`]. There is no live
+//! passive capture caller; the ARP/DHCP/mDNS/SSDP decoders are exercised by tests only.
+//! If they are ever fed live traffic, `arp()` must also check the sender hardware address
+//! against the Ethernet source and drop sender 0.0.0.0 (it now drops 0.0.0.0).
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use hickory_proto::{op::Message, rr::RData};
 use lattice_domain::{EvidenceFact, EvidenceFamily};
@@ -50,6 +56,8 @@ impl Default for PassiveOptions {
 pub struct PcapIngest {
     pub observations: Vec<PassiveObservation>,
     pub skipped_frames: usize,
+    /// More than [`MAX_PCAP_RECORDS`] packets: only the first records were examined.
+    pub truncated: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PassiveObservation {
@@ -108,11 +116,29 @@ impl OfflinePassiveAdapter {
     /// contain such frames (odd-length NetBIOS datagrams, non-UTF-8 SSDP
     /// banners), and one of them must not hide the rest of the evidence. More
     /// than [`MAX_SKIPPED_FRAMES`] skips still rejects the capture.
+    /// Import path for owner captures that only need CDP/LLDP: every other frame is skipped
+    /// before any IP/DNS/XML decoding.
+    pub fn ingest_pcap_link_discovery(
+        &self,
+        i: &str,
+        b: &[u8],
+    ) -> Result<PcapIngest, PassiveParseError> {
+        self.ingest_pcap_inner(i, b, &PassiveOptions::default(), true)
+    }
     pub fn ingest_pcap_report(
         &self,
         i: &str,
         b: &[u8],
         o: &PassiveOptions,
+    ) -> Result<PcapIngest, PassiveParseError> {
+        self.ingest_pcap_inner(i, b, o, false)
+    }
+    fn ingest_pcap_inner(
+        &self,
+        i: &str,
+        b: &[u8],
+        o: &PassiveOptions,
+        link_discovery_only: bool,
     ) -> Result<PcapIngest, PassiveParseError> {
         if b.len() > MAX_PCAP_BYTES {
             return Err(PassiveParseError::OversizedFrame);
@@ -129,10 +155,13 @@ impl OfflinePassiveAdapter {
         let mut records = 0usize;
         let mut skipped = 0usize;
         let mut value_bytes = 0usize;
+        let mut truncated = false;
         while let Some(next) = r.next_packet() {
             records += 1;
             if records > MAX_PCAP_RECORDS {
-                return Err(PassiveParseError::Metadata);
+                // A long capture is examined up to the cap rather than rejected outright.
+                truncated = true;
+                break;
             }
             let p = next.map_err(|_| PassiveParseError::Truncated)?;
             if p.data.len() > MAX_FRAME_BYTES
@@ -148,9 +177,20 @@ impl OfflinePassiveAdapter {
                 .timestamp_opt(secs, p.timestamp.subsec_nanos())
                 .single()
                 .ok_or(PassiveParseError::PcapHeader)?;
-            let observations = match self.normalize(i, t, &p.data, o) {
+            let normalized = if link_discovery_only {
+                self.normalize_link_discovery(i, t, &p.data, o)
+            } else {
+                self.normalize(i, t, &p.data, o)
+            };
+            let observations = match normalized {
+                // InvalidLength is what snaplen-truncated frames produce; skip them like any
+                // other malformed frame instead of rejecting the capture.
                 Ok(observations) => observations,
-                Err(PassiveParseError::Metadata | PassiveParseError::Truncated) => {
+                Err(
+                    PassiveParseError::Metadata
+                    | PassiveParseError::Truncated
+                    | PassiveParseError::InvalidLength,
+                ) => {
                     skipped += 1;
                     if skipped > MAX_SKIPPED_FRAMES {
                         return Err(PassiveParseError::Metadata);
@@ -175,7 +215,31 @@ impl OfflinePassiveAdapter {
         Ok(PcapIngest {
             observations: out,
             skipped_frames: skipped,
+            truncated,
         })
+    }
+}
+impl OfflinePassiveAdapter {
+    fn normalize_link_discovery(
+        &self,
+        i: &str,
+        t: DateTime<Utc>,
+        f: &[u8],
+        o: &PassiveOptions,
+    ) -> Result<Vec<PassiveObservation>, PassiveParseError> {
+        if f.len() > MAX_FRAME_BYTES {
+            return Err(PassiveParseError::OversizedFrame);
+        }
+        if f.len() < 14 {
+            return Err(PassiveParseError::Truncated);
+        }
+        match link_discovery::decode(i, t, f, o)? {
+            Some(observations) => {
+                validate_normalized(&observations, MAX_OBSERVATIONS_PER_FRAME)?;
+                Ok(observations)
+            }
+            None => Ok(vec![]),
+        }
     }
 }
 impl PassiveAdapter for OfflinePassiveAdapter {
@@ -218,6 +282,9 @@ fn fact(
     t: DateTime<Utc>,
     ttl: i64,
 ) -> Result<EvidenceFact, PassiveParseError> {
+    // Names, banners and service strings are device-controlled; sanitise at the single point
+    // where passive evidence is constructed.
+    let value = crate::sanitize::display_text(&value, usize::MAX);
     if key.len() > 64 || value.len() > MAX_VALUE_BYTES {
         return Err(PassiveParseError::Metadata);
     }
@@ -324,6 +391,10 @@ fn arp(
         return Ok(vec![]);
     }
     let sip = Ipv4Addr::new(p[14], p[15], p[16], p[17]);
+    // ARP probes announce sender 0.0.0.0; that is not an address claim.
+    if sip.is_unspecified() {
+        return Ok(vec![]);
+    }
     let sm = mac(&p[8..14])?;
     observation(
         i,
@@ -1375,5 +1446,47 @@ mod trim_name_tests {
         assert_eq!(trim_name("x\\377y"), "x\u{fffd}y");
         assert_eq!(trim_name("trailing\\12"), "trailing\\12");
         assert_eq!(trim_name("end\\"), "end\\");
+    }
+}
+
+#[cfg(test)]
+mod arp_tests {
+    use super::*;
+
+    fn payload(sender_ip: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0, 1, 8, 0, 6, 4, 0, 1];
+        p.extend([2, 0, 0, 0, 0, 9]);
+        p.extend(sender_ip);
+        p.extend([0; 6]);
+        p.extend([192, 168, 1, 1]);
+        p
+    }
+
+    #[test]
+    fn arp_probe_from_0_0_0_0_is_not_an_address_claim() {
+        let t = Utc::now();
+        assert!(
+            arp("i", t, None, &payload([0, 0, 0, 0]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            arp("i", t, None, &payload([192, 168, 1, 9])).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn mdns_names_cannot_carry_bidi_overrides_into_facts() {
+        let f = fact(
+            "s",
+            "service_instance",
+            "Living\u{202e}Room".into(),
+            EvidenceFamily::Service,
+            Utc::now(),
+            60,
+        )
+        .unwrap();
+        assert_eq!(f.value, "LivingRoom");
     }
 }

@@ -127,7 +127,7 @@ async fn native_windows_inventory_identifies_an_owned_tcp_connection_without_sen
     let address = listener.local_addr().unwrap();
     let client = tokio::net::TcpStream::connect(address).await.unwrap();
     let (_peer, _) = listener.accept().await.unwrap();
-    let snapshot = tokio::task::spawn_blocking(platform::snapshot)
+    let snapshot = tokio::task::spawn_blocking(|| platform::snapshot(false))
         .await
         .unwrap()
         .unwrap();
@@ -150,4 +150,43 @@ async fn native_windows_inventory_identifies_an_owned_tcp_connection_without_sen
     assert!(app.executable.is_some());
     assert!(!app.started.is_empty());
     assert!(snapshot.memory_total_bytes.is_some());
+}
+
+#[tokio::test]
+async fn unchanged_connections_are_not_rewritten_every_tick() {
+    let pool = connect_memory().await.unwrap();
+    let monitor = HostMonitor::new(pool.clone());
+    let mut old = snapshot(100, "a");
+    let mut new = snapshot(110, "a");
+    let at = Utc::now().to_rfc3339();
+    old.observed_at = at.clone();
+    new.observed_at = at;
+    monitor.persist(&old, None, &[]).await.unwrap();
+    sqlx::query("UPDATE host_connections SET last_seen_at='sentinel'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Same connection, same state, same minute: previously rewritten on every 2 s tick.
+    monitor.persist(&new, Some(&old), &[]).await.unwrap();
+    let seen: String = sqlx::query_scalar("SELECT last_seen_at FROM host_connections")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(seen, "sentinel");
+    // A state change is written immediately.
+    new.connections[0].state = "close_wait".into();
+    monitor.persist(&new, Some(&old), &[]).await.unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM host_connections")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "close_wait");
+}
+
+#[tokio::test]
+async fn collector_demand_window_follows_live_view_requests() {
+    let monitor = HostMonitor::new(connect_memory().await.unwrap());
+    assert!(!monitor.demanded());
+    let _ = monitor.snapshot().await;
+    assert!(monitor.demanded());
 }

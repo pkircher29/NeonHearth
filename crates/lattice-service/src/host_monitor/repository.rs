@@ -27,6 +27,11 @@ impl HostMonitor {
     ) -> Result<(), sqlx::Error> {
         // Serialize the privacy check with settings writes. Once disabling
         // recording returns, an earlier collector read cannot write a frame.
+        // Cheap pre-check without the writer lock: while history is off, a 2-second tick
+        // must not queue behind (or block) the discovery pipeline's writes.
+        if !self.settings().await?.record_history {
+            return Ok(());
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row=sqlx::query("SELECT record_history,snooze_until,retention_days,monthly_budget_bytes FROM host_settings WHERE id=1").fetch_one(&mut *tx).await?;
         let settings = HostSettings {
@@ -44,6 +49,11 @@ impl HostMonitor {
         let bucket = DateTime::from_timestamp(now.timestamp().div_euclid(60) * 60, 0)
             .unwrap_or(now)
             .to_rfc3339();
+        let maintenance_due = previous.is_none_or(|p| {
+            DateTime::parse_from_rfc3339(&p.observed_at).map_or(true, |at| {
+                at.timestamp().div_euclid(60) != now.timestamp().div_euclid(60)
+            })
+        });
         let apps: BTreeMap<_, _> = snapshot
             .applications
             .iter()
@@ -52,24 +62,40 @@ impl HostMonitor {
         for app in apps.values() {
             let inserted=sqlx::query("INSERT INTO host_apps(app_id,name,executable,first_seen_at,last_seen_at) VALUES(?,?,?,?,?) ON CONFLICT(app_id) DO NOTHING")
                 .bind(&app.app_id).bind(&app.name).bind(&app.executable).bind(&snapshot.observed_at).bind(&snapshot.observed_at).execute(&mut *tx).await?.rows_affected();
-            sqlx::query("UPDATE host_apps SET last_seen_at=? WHERE app_id=?")
-                .bind(&snapshot.observed_at)
-                .bind(&app.app_id)
-                .execute(&mut *tx)
-                .await?;
+            // Liveness timestamps are refreshed once a minute, not on every 2-second tick.
+            if maintenance_due || inserted == 1 {
+                sqlx::query("UPDATE host_apps SET last_seen_at=? WHERE app_id=?")
+                    .bind(&snapshot.observed_at)
+                    .bind(&app.app_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
             if inserted == 1 && previous.is_some() && app.executable.is_some() {
                 sqlx::query("INSERT INTO host_alerts(observed_at,kind,app_id,detail) VALUES(?,'new_application',?,?)").bind(&snapshot.observed_at).bind(&app.app_id).bind(format!("{} first observed using a network socket.",app.name)).execute(&mut *tx).await?;
             }
         }
-        let previous_connections: std::collections::BTreeSet<_> = previous
+        let previous_connections: std::collections::BTreeMap<&str, &str> = previous
             .into_iter()
-            .flat_map(|s| s.connections.iter().map(|c| c.connection_id.as_str()))
+            .flat_map(|s| {
+                s.connections
+                    .iter()
+                    .map(|c| (c.connection_id.as_str(), c.state.as_str()))
+            })
             .collect();
         for connection in &snapshot.connections {
+            // Unchanged connections are written once a minute (to refresh last_seen), not on
+            // every tick: only new connections and state changes hit the database now.
+            if !maintenance_due
+                && previous_connections
+                    .get(connection.connection_id.as_str())
+                    .is_some_and(|state| *state == connection.state)
+            {
+                continue;
+            }
             let inserted=sqlx::query("INSERT INTO host_connections(connection_id,app_id,protocol,local_address,local_port,remote_address,remote_port,state,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(connection_id) DO UPDATE SET state=excluded.state,last_seen_at=excluded.last_seen_at")
                 .bind(&connection.connection_id).bind(&connection.app_id).bind(&connection.protocol).bind(&connection.local_address).bind(connection.local_port as i64).bind(&connection.remote_address).bind(connection.remote_port.map(i64::from)).bind(&connection.state).bind(&snapshot.observed_at).bind(&snapshot.observed_at).execute(&mut *tx).await?.rows_affected();
             let is_new = previous.is_some()
-                && !previous_connections.contains(connection.connection_id.as_str());
+                && !previous_connections.contains_key(connection.connection_id.as_str());
             if inserted > 0
                 && is_new
                 && connection.protocol == "tcp"
@@ -92,11 +118,6 @@ impl HostMonitor {
         // Minutely aggregation keeps long history affordable. All tables also
         // have hard caps; age cleanup and capacity cleanup use bound values.
         let cutoff = (now - Duration::days(i64::from(settings.retention_days))).to_rfc3339();
-        let maintenance_due = previous.is_none_or(|p| {
-            DateTime::parse_from_rfc3339(&p.observed_at).map_or(true, |at| {
-                at.timestamp().div_euclid(60) != now.timestamp().div_euclid(60)
-            })
-        });
         if maintenance_due {
             if let Some(budget) = settings.monthly_budget_bytes {
                 let month = now.format("%Y-%m-01T00:00:00+00:00").to_string();

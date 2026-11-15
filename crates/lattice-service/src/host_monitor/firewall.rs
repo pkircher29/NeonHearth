@@ -60,6 +60,10 @@ impl HostMonitor {
             .firewall_lock
             .try_lock()
             .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+        // A firewall decision needs a current process list even if nobody is watching the
+        // live view (the collector idles in that case).
+        self.touch();
+        self.collect().await;
         let snapshot = self.snapshot().await;
         if !snapshot.firewall_available {
             return Err(StatusCode::FORBIDDEN);

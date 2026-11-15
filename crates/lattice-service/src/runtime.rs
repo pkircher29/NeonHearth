@@ -1,7 +1,8 @@
 //! Production wiring for the bounded M2 neighbor worker.
 //!
-//! Interface inventory is intentionally startup-static in M2; a later slice can add a
-//! refresh mechanism without treating a failed refresh as an empty inventory.
+//! The worker re-checks the eligible interface set periodically and rebuilds when it changes.
+//! A failed inventory read or a momentarily empty set never tears down a running worker, and
+//! startup without an eligible interface retries with backoff instead of staying degraded.
 use crate::discovery::{
     NeighborCoordinator, NeighborCoordinatorConfig, NeighborInterfaceBinding,
     PersistentDiscoveryPipeline, neighbor_discovery_sources,
@@ -20,9 +21,25 @@ pub const MAX_NEIGHBOR_ROWS: usize = 4096;
 pub const FLOW_BATCH_LIMIT: usize = 4096;
 pub const LIVE_ROW_LIMIT: usize = 4096;
 
+/// Owns the neighbor worker for the life of the process. It builds the coordinator from the
+/// current inventory, retries with backoff while no interface is eligible yet (service started
+/// before the network was up), and rebuilds when the set of eligible interfaces changes.
 pub struct NeighborRuntime {
-    coordinator: NeighborCoordinator<SystemNeighborSnapshotSource>,
+    coordinator: Option<NeighborCoordinator<SystemNeighborSnapshotSource>>,
+    planned: Vec<InterfaceId>,
+    state: AppState,
+    repository: M2StateRepository,
 }
+
+/// Temporary mount of `src/maintenance.rs`. Once `lib.rs` declares `pub mod maintenance;`,
+/// delete this declaration.
+#[path = "maintenance.rs"]
+pub mod maintenance;
+
+/// How often the running worker checks whether the eligible interface set changed.
+const REPLAN_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+const RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(5);
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A startup plan deliberately contains only stable interface identifiers and derived bindings.
 /// It never carries names, descriptions, or addresses from the OS inventory.
@@ -73,9 +90,19 @@ pub fn plan_inventory(
         .map_err(|_| SanitizedStartupError::InvalidPlan)?;
     let sources =
         neighbor_discovery_sources(&bindings).map_err(|_| SanitizedStartupError::InvalidPlan)?;
+    let networks = inventory
+        .interfaces()
+        .flat_map(|interface| {
+            interface
+                .addresses
+                .iter()
+                .map(move |address| (interface.id, address.clone()))
+        })
+        .collect();
     let snapshot =
         NeighborSnapshotConfig::new(MAX_NEIGHBOR_ROWS, bindings.iter().map(|b| b.interface()))
-            .map_err(|_| SanitizedStartupError::InvalidPlan)?;
+            .map_err(|_| SanitizedStartupError::InvalidPlan)?
+            .with_networks(networks);
     Ok(RuntimePlan {
         bindings,
         sources,
@@ -90,12 +117,35 @@ pub enum StartupResult {
 
 /// Build the worker from the startup inventory. Failures are deliberately summarized so raw
 /// interface names, addresses, and checkpoint contents never reach callers or logs.
+///
+/// Production never stays degraded: when the inventory is unavailable or has no eligible
+/// interface yet, the returned worker retries in the background.
 pub async fn build(state: AppState, repository: M2StateRepository) -> StartupResult {
     let inventory = match SystemInterfaceManager.snapshot() {
         Ok(inventory) => inventory,
-        Err(_) => return degraded(state).await,
+        Err(_) => return deferred(state, repository).await,
     };
-    build_from_inventory(state, repository, inventory).await
+    match build_from_inventory(state.clone(), repository.clone(), inventory).await {
+        StartupResult::Degraded => StartupResult::Worker(Box::new(NeighborRuntime {
+            coordinator: None,
+            planned: Vec::new(),
+            state,
+            repository,
+        })),
+        worker => worker,
+    }
+}
+
+async fn deferred(state: AppState, repository: M2StateRepository) -> StartupResult {
+    state
+        .transition_service_status(ServiceRuntimeStatus::Degraded, Utc::now())
+        .await;
+    StartupResult::Worker(Box::new(NeighborRuntime {
+        coordinator: None,
+        planned: Vec::new(),
+        state,
+        repository,
+    }))
 }
 
 pub async fn build_from_inventory(
@@ -103,12 +153,31 @@ pub async fn build_from_inventory(
     repository: M2StateRepository,
     inventory: InterfaceInventory,
 ) -> StartupResult {
-    let plan = match plan_inventory(&inventory) {
-        Ok(plan) => plan,
-        Err(_) => return degraded(state).await,
-    };
-    let pipeline = match PersistentDiscoveryPipeline::open(
-        repository,
+    match construct(&state, &repository, &inventory).await {
+        Some((coordinator, planned)) => StartupResult::Worker(Box::new(NeighborRuntime {
+            coordinator: Some(coordinator),
+            planned,
+            state,
+            repository,
+        })),
+        None => degraded(state).await,
+    }
+}
+
+type Built = (
+    NeighborCoordinator<SystemNeighborSnapshotSource>,
+    Vec<InterfaceId>,
+);
+
+async fn construct(
+    state: &AppState,
+    repository: &M2StateRepository,
+    inventory: &InterfaceInventory,
+) -> Option<Built> {
+    let plan = plan_inventory(inventory).ok()?;
+    let planned: Vec<InterfaceId> = plan.bindings.iter().map(|b| b.interface()).collect();
+    let mut pipeline = PersistentDiscoveryPipeline::open(
+        repository.clone(),
         plan.sources,
         std::iter::repeat_with(DeviceId::new),
         Default::default(),
@@ -116,21 +185,19 @@ pub async fn build_from_inventory(
         LIVE_ROW_LIMIT,
     )
     .await
-    {
-        Ok(p) => p,
-        Err(_) => return degraded(state).await,
-    };
+    .ok()?;
+    // Devices last seen through an interface that is gone must not stay Online forever.
+    pipeline.reconcile_orphans(Utc::now());
     let source = SystemNeighborSnapshotSource::new(plan.snapshot.clone());
-    match NeighborCoordinator::new(
+    let coordinator = NeighborCoordinator::new(
         source,
         pipeline,
         state.clone(),
         plan.bindings,
         NeighborCoordinatorConfig::default(),
-    ) {
-        Ok(coordinator) => StartupResult::Worker(Box::new(NeighborRuntime { coordinator })),
-        Err(_) => degraded(state).await,
-    }
+    )
+    .ok()?;
+    Some((coordinator, planned))
 }
 
 async fn degraded(state: AppState) -> StartupResult {
@@ -140,9 +207,79 @@ async fn degraded(state: AppState) -> StartupResult {
     StartupResult::Degraded
 }
 
+/// The eligible interface ids right now, or `None` when the inventory cannot be read or has
+/// no eligible interface (a momentary gap must not tear the running worker down).
+async fn eligible_now() -> Option<Vec<InterfaceId>> {
+    let inventory = tokio::task::spawn_blocking(|| SystemInterfaceManager.snapshot())
+        .await
+        .ok()?
+        .ok()?;
+    let plan = plan_inventory(&inventory).ok()?;
+    Some(plan.bindings.iter().map(|b| b.interface()).collect())
+}
+
+/// Resolves when the eligible interface set differs from `planned`.
+async fn interface_set_changed(planned: &[InterfaceId]) {
+    loop {
+        tokio::time::sleep(REPLAN_PERIOD).await;
+        if eligible_now().await.is_some_and(|now| now != planned) {
+            return;
+        }
+    }
+}
+
 impl NeighborRuntime {
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
-        run_loop(&mut self.coordinator, &mut shutdown).await;
+        let mut backoff = RETRY_INITIAL;
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            if self.coordinator.is_none() {
+                let inventory = tokio::task::spawn_blocking(|| SystemInterfaceManager.snapshot())
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                let built = match inventory {
+                    Some(inventory) => construct(&self.state, &self.repository, &inventory).await,
+                    None => None,
+                };
+                match built {
+                    Some((coordinator, planned)) => {
+                        self.coordinator = Some(coordinator);
+                        self.planned = planned;
+                        backoff = RETRY_INITIAL;
+                    }
+                    None => {
+                        self.state
+                            .transition_service_status(ServiceRuntimeStatus::Degraded, Utc::now())
+                            .await;
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    return;
+                                }
+                            }
+                            () = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(RETRY_MAX);
+                        continue;
+                    }
+                }
+            }
+            let Some(coordinator) = self.coordinator.as_mut() else {
+                continue;
+            };
+            let changed = tokio::select! {
+                () = run_loop(coordinator, &mut shutdown) => false,
+                () = interface_set_changed(&self.planned) => true,
+            };
+            if !changed {
+                return;
+            }
+            tracing::info!("discovery interface set changed; rebuilding the neighbor worker");
+            self.coordinator = None;
+        }
     }
 }
 

@@ -1,3 +1,8 @@
+//! Drives `Scheduler` with an `ActiveEngine`.
+//!
+//! No production caller as of this change: the service's owner-started scans use
+//! `ActiveEngine` directly. If this is enabled, note that `dispatch_ready` re-queues every
+//! rate-limited item on each wake (O(queue) per completion) and every `Timeout` is retried.
 use super::{
     ActiveEngine, ActiveError, AdmissionDecision, AttemptTransport, Clock, ProbeCatalog,
     ProbeCredential, ProbeOutcome, ProbeRequest, Scheduler, SchedulerConfig, WorkKey,

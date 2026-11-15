@@ -121,7 +121,8 @@ async fn reopen_restores_checkpoint_and_duplicate_is_still_inert() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<()> {
+async fn corrupt_checkpoint_refuses_open_and_source_mismatch_recovers_with_backup()
+-> anyhow::Result<()> {
     let pool = connect_memory().await?;
     let repo = M2StateRepository::new(pool.clone());
     let mut pipeline = PersistentDiscoveryPipeline::open(
@@ -189,7 +190,14 @@ async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<
         32,
     )
     .await;
-    assert!(mismatch.is_err());
+    // A source-set change is recoverable (finding 2): it opens and the old checkpoint is kept
+    // in state_checkpoint_backups. Refusing to open here was the bug. A corrupt checkpoint
+    // still errors (asserted above).
+    assert!(mismatch.is_ok());
+    let backups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM state_checkpoint_backups")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(backups, 1);
     Ok(())
 }
 fn rollup(device_id: DeviceId, t: chrono::DateTime<Utc>) -> RollupChange {

@@ -17,6 +17,7 @@ pub mod flow;
 pub mod live;
 pub mod neighbor;
 pub mod passive;
+pub mod sanitize;
 #[cfg(windows)]
 mod windows_interfaces;
 pub use passive::{
@@ -345,6 +346,8 @@ pub enum TargetGuardError {
     TargetNotPrivate,
     #[error("target does not belong to the approved prefix for the selected interface")]
     OutsideApprovedPrefix,
+    #[error("target is a subnet network or broadcast address of an attached interface network")]
+    BroadcastOrNetworkAddress,
 }
 
 impl TargetGuard {
@@ -410,6 +413,16 @@ impl TargetGuard {
         }
         if !is_permitted_target(target) {
             return Err(TargetGuardError::TargetNotPrivate);
+        }
+        // Judged against the networks actually attached to the interface, not the (possibly
+        // /32) approval: a /32 approval of x.x.x.255 must not become a subnet broadcast.
+        if self.interfaces.get(&interface).is_some_and(|attached| {
+            attached
+                .addresses
+                .iter()
+                .any(|address| is_network_or_broadcast(address, target))
+        }) {
+            return Err(TargetGuardError::BroadcastOrNetworkAddress);
         }
         if self.prefixes.iter().any(|prefix| {
             prefix.interface == interface
@@ -497,6 +510,28 @@ fn is_permitted_target(target: IpAddr) -> bool {
                 && (is_ula(address) || address.is_unicast_link_local())
         }
     }
+}
+
+/// True when `target` is the all-ones address or the network/broadcast address of an IPv4
+/// network of 30 bits or fewer (point-to-point /31 and host /32 networks have neither).
+pub fn is_network_or_broadcast(network: &Address, target: IpAddr) -> bool {
+    let (IpAddr::V4(base), IpAddr::V4(target)) = (network.ip, target) else {
+        return false;
+    };
+    if target == Ipv4Addr::BROADCAST {
+        return true;
+    }
+    if network.prefix > 30 || !prefix_contains(network, IpAddr::V4(target)) {
+        return false;
+    }
+    let mask = if network.prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - network.prefix)
+    };
+    let network_address = u32::from(base) & mask;
+    let value = u32::from(target);
+    value == network_address || value == network_address | !mask
 }
 
 fn is_ipv4_broadcast(prefix: &Address, target: IpAddr) -> bool {

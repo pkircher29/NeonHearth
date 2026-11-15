@@ -13,6 +13,20 @@ fn read(path: impl AsRef<Path>, limit: u64) -> Option<String> {
     file.take(limit + 1).read_to_string(&mut text).ok()?;
     (text.len() as u64 <= limit).then_some(text)
 }
+/// Like [`read`], but a table larger than `limit` yields its complete leading lines instead of
+/// failing.
+fn read_prefix(path: impl AsRef<Path>, limit: u64) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > limit {
+        bytes.truncate(limit as usize);
+        if let Some(end) = bytes.iter().rposition(|b| *b == b'\n') {
+            bytes.truncate(end + 1);
+        }
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
 fn endpoint(raw: &str) -> Option<(String, u16)> {
     let (address, port) = raw.split_once(':')?;
     let port = u16::from_str_radix(port, 16).ok()?;
@@ -115,7 +129,7 @@ pub fn snapshot() -> Result<HostSnapshot, &'static str> {
         ("udp", "udp"),
         ("udp6", "udp"),
     ] {
-        let text = read(format!("/proc/net/{file}"), 4 * 1024 * 1024)
+        let text = read_prefix(format!("/proc/net/{file}"), 4 * 1024 * 1024)
             .ok_or("connection table unavailable")?;
         for line in text.lines().skip(1) {
             let parts: Vec<_> = line.split_whitespace().collect();
@@ -159,10 +173,11 @@ pub fn snapshot() -> Result<HostSnapshot, &'static str> {
             } else {
                 parts[9].to_owned()
             };
-            sockets.insert(key, connection);
-            if sockets.len() > 8192 {
-                return Err("connection count limit");
+            if sockets.len() >= 8192 && !sockets.contains_key(&key) {
+                // Truncate rather than report the whole monitor unavailable.
+                break;
             }
+            sockets.insert(key, connection);
         }
     }
     let mut apps = BTreeMap::new();
@@ -185,7 +200,7 @@ pub fn snapshot() -> Result<HostSnapshot, &'static str> {
         for fd in fds.take(8192).flatten() {
             checked += 1;
             if checked > 100_000 {
-                return Err("process descriptor limit");
+                break;
             }
             let Ok(link) = fs::read_link(fd.path()) else {
                 continue;

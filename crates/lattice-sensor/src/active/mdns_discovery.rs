@@ -1,4 +1,8 @@
 //! RFC 6762 one-shot discovery. Replies are advisory and restricted to approved peers.
+//!
+//! Scope note: the question itself is multicast to 224.0.0.251 and therefore reaches every host
+//! on the selected link, not only the approved targets (that is how mDNS works); only replies
+//! from approved peers are read, and the multicast interface is pinned to the approved one.
 use super::*;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query},
