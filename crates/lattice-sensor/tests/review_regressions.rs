@@ -134,3 +134,38 @@ fn non_utf8_http_header_bytes_do_not_discard_the_response() {
     assert!(facts.contains(&("server".into(), "nginx".into())));
     assert!(facts.contains(&("status".into(), "200".into())));
 }
+
+/// Finding 12: one malformed (snaplen-truncated) frame in a capture is skipped, not fatal, and
+/// the rest of the capture is still ingested.
+#[test]
+fn pcap_with_a_truncated_frame_is_skipped_and_the_rest_ingested() {
+    use lattice_sensor::{OfflinePassiveAdapter, PassiveOptions};
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pcap/arp.pcap");
+    let original = std::fs::read(path).unwrap();
+    let adapter = OfflinePassiveAdapter;
+    let options = PassiveOptions::default();
+    let baseline = adapter.ingest_pcap_report("fixture0", &original, &options).unwrap();
+    assert!(!baseline.observations.is_empty());
+
+    // Append one record whose frame is 3 bytes: too short for an Ethernet header.
+    let little = matches!(original[0], 0xd4 | 0x4d);
+    let word = |value: u32| {
+        if little {
+            value.to_le_bytes()
+        } else {
+            value.to_be_bytes()
+        }
+    };
+    let mut damaged = original.clone();
+    damaged.extend_from_slice(&word(1_700_000_000));
+    damaged.extend_from_slice(&word(0));
+    damaged.extend_from_slice(&word(3));
+    damaged.extend_from_slice(&word(3));
+    damaged.extend_from_slice(&[0xde, 0xad, 0xbe]);
+
+    let result = adapter.ingest_pcap_report("fixture0", &damaged, &options).unwrap();
+    assert_eq!(result.observations, baseline.observations);
+    assert!(result.skipped_frames <= 1);
+    let link_only = adapter.ingest_pcap_link_discovery("fixture0", &damaged);
+    assert!(link_only.is_ok(), "link-discovery import also tolerates it");
+}
