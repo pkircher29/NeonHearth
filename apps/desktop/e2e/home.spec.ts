@@ -504,4 +504,117 @@ test('3D twin v2: the close button dismisses the detail card; hovering a room na
   await expect(tip).toContainText(/6\.\d m²/);
   await page.mouse.move(box.x + 4, box.y + 4); // off the room: the tip goes away
   await expect(tip).toHaveCount(0);
+
+// Real multi-touch: CDP Input.dispatchTouchEvent makes Chromium emit genuine pointer events with
+// pointerType "touch" (and the browser's own touch-action handling), unlike the jsdom synthetic events.
+test.describe('touch gestures on the plan canvas', () => {
+  test.use({ hasTouch: true });
+
+  type Finger = { x: number; y: number; id: number };
+  async function openTouchEditor(page: Page) {
+    await installHomeFixture(page, { plan: seededTwinPlan() });
+    await page.goto('/');
+    await openHome(page);
+    await planCanvas(page).scrollIntoViewIfNeeded();
+    const box = (await planCanvas(page).boundingBox())!;
+    const cdp = await page.context().newCDPSession(page);
+    const send = (type: 'touchStart' | 'touchMove' | 'touchEnd', fingers: Finger[]) =>
+      cdp.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : fingers.map((f) => ({ x: box.x + f.x, y: box.y + f.y, id: f.id })) });
+    /** Move fingers from one layout to another in small steps, like a real gesture. */
+    async function drag(from: Finger[], to: Finger[], steps = 12) {
+      for (let step = 1; step <= steps; step += 1) {
+        const t = step / steps;
+        await send('touchMove', from.map((f, i) => ({ id: f.id, x: f.x + (to[i].x - f.x) * t, y: f.y + (to[i].y - f.y) * t })));
+      }
+    }
+    const state = async () => {
+      const [vx, vy] = (await planCanvas(page).getAttribute('viewBox'))!.split(' ').map(Number);
+      const scale = Number((await page.locator('.zoom-readout').innerText()).replace(' px/m', ''));
+      return { vx, vy, scale };
+    };
+    return { box, send, drag, state };
+  }
+
+  test('canvas opts out of browser touch handling and the page never zooms or scrolls', async ({ page }) => {
+    const { send, drag } = await openTouchEditor(page);
+    expect(await planCanvas(page).evaluate((svg) => getComputedStyle(svg).touchAction)).toBe('none');
+    const scrollBefore = await page.evaluate(() => window.scrollY);
+    const f = (dx: number): Finger[] => [{ id: 0, x: 300 - dx, y: 200 }, { id: 1, x: 300 + dx, y: 200 }];
+    await send('touchStart', f(40));
+    await drag(f(40), f(140));
+    await send('touchEnd', []);
+    expect(await page.evaluate(() => window.visualViewport?.scale ?? 1)).toBe(1);
+    expect(await page.evaluate(() => window.scrollY)).toBe(scrollBefore);
+  });
+
+  test('(a) spreading two fingers zooms about the pinch midpoint', async ({ page }) => {
+    const { send, drag, state } = await openTouchEditor(page);
+    const before = await state();
+    expect(before.scale).toBe(40);
+    const mid = { x: 300, y: 200 };
+    const plan = { x: (before.vx + mid.x) / before.scale, y: (before.vy + mid.y) / before.scale }; // the plan point under the midpoint
+    const f = (dx: number): Finger[] => [{ id: 0, x: mid.x - dx, y: mid.y }, { id: 1, x: mid.x + dx, y: mid.y }];
+    await send('touchStart', f(40));
+    await drag(f(40), f(120));
+    const during = await state();
+    expect(during.scale).toBeGreaterThan(100); // 80 px apart -> 240 px apart is 3x
+    expect(during.scale).toBeLessThan(130);
+    // The same plan point is still under the (unmoved) midpoint, within a few px.
+    expect(plan.x * during.scale - during.vx).toBeCloseTo(mid.x, -1);
+    expect(Math.abs(plan.x * during.scale - during.vx - mid.x)).toBeLessThan(4);
+    expect(Math.abs(plan.y * during.scale - during.vy - mid.y)).toBeLessThan(4);
+    await page.screenshot({ path: 'D:/worktrees/nh-editor/output/editor-v2/5-pinch.png' }); // mid-pinch, fingers still down
+    await send('touchEnd', []);
+    // Pinching back in reduces the zoom again.
+    await send('touchStart', f(120));
+    await drag(f(120), f(60));
+    await send('touchEnd', []);
+    expect((await state()).scale).toBeLessThan(during.scale);
+  });
+
+  test('(b) two fingers moving together pan without changing zoom', async ({ page }) => {
+    const { send, drag, state } = await openTouchEditor(page);
+    const before = await state();
+    const start: Finger[] = [{ id: 0, x: 250, y: 200 }, { id: 1, x: 350, y: 200 }];
+    const end: Finger[] = start.map((p) => ({ ...p, x: p.x + 60, y: p.y + 30 }));
+    await send('touchStart', start);
+    await drag(start, end);
+    await send('touchEnd', []);
+    const after = await state();
+    expect(after.scale).toBe(before.scale);
+    expect(after.vx).toBeCloseTo(before.vx - 60, 0);
+    expect(after.vy).toBeCloseTo(before.vy - 30, 0);
+  });
+
+  test('(c) lifting the fingers after a pinch and a pan draws nothing, even with the Wall tool armed', async ({ page }) => {
+    const { send, drag } = await openTouchEditor(page);
+    await editorTools(page).getByRole('button', { name: 'Wall' }).tap();
+    await expect(editorTools(page).getByRole('button', { name: 'Wall' })).toHaveAttribute('aria-pressed', 'true');
+    const walls = planCanvas(page).locator('line.wall');
+    const count = await walls.count();
+    const f = (dx: number, oy = 0): Finger[] => [{ id: 0, x: 300 - dx, y: 200 + oy }, { id: 1, x: 300 + dx, y: 200 + oy }];
+    await send('touchStart', f(40));
+    await drag(f(40), f(100));
+    await send('touchEnd', []);
+    await send('touchStart', f(100));
+    await drag(f(100), f(100, 40));
+    await send('touchEnd', []);
+    await page.waitForTimeout(150); // any stray click from the lift would land by now
+    await expect(planCanvas(page).locator('.pending-start')).toHaveCount(0);
+    await expect(walls).toHaveCount(count);
+    await expect(planCanvas(page).locator('g.placement')).toHaveCount(0);
+  });
+
+  test('(d) a single-finger tap with the Wall tool still starts a wall', async ({ page }) => {
+    const { send } = await openTouchEditor(page);
+    await editorTools(page).getByRole('button', { name: 'Wall' }).tap();
+    const tap: Finger[] = [{ id: 0, x: 500, y: 300 }];
+    await send('touchStart', tap);
+    await send('touchEnd', []);
+    await expect(planCanvas(page).locator('.pending-start')).toHaveCount(1);
+    // ...and a second tap finishes it.
+    await send('touchStart', [{ id: 0, x: 620, y: 300 }]);
+    await send('touchEnd', []);
+    await expect(planCanvas(page).locator('line.wall')).toHaveCount(5); // the seeded plan has 4
+  });
 });
