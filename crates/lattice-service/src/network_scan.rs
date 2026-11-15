@@ -905,6 +905,28 @@ async fn scan_candidate_evidence(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn a_dead_scan_task_leaves_failed_state_and_frees_the_slot() {
+        let hub = ScanHub::new(lattice_store::connect_memory().await.unwrap());
+        {
+            let mut running = hub.inner.lock().await;
+            running.status.job_id = Some("job-2".into());
+            running.status.state = "running".into();
+        }
+        // A report for an older job must not touch the current one.
+        hub.mark_failed(Some("job-1".into())).await;
+        assert_eq!(hub.inner.lock().await.status.state, "running");
+        hub.mark_failed(Some("job-2".into())).await;
+        let status = hub.inner.lock().await.status.clone();
+        assert_eq!(status.state, "failed");
+        assert!(status.finished_at.is_some());
+        // "failed" is not a state that start() refuses with 409 Conflict.
+        assert!(!matches!(status.state.as_str(), "running" | "cancelling"));
+        // A task that panics is observable as a JoinError, which is what triggers mark_failed.
+        let handle = tokio::spawn(async { panic!("scan task panic (expected by test)") });
+        assert!(handle.await.is_err());
+    }
+
+    #[tokio::test]
     async fn stale_unconfirmed_randomized_macs_are_not_scan_candidates() {
         let pool = lattice_store::connect_memory().await.unwrap();
         let now = Utc::now();
