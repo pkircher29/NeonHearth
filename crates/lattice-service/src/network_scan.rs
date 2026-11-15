@@ -130,7 +130,23 @@ impl SnmpInput {
         }
     }
 }
+/// Why a scan request is refused before any packet is sent. Returned as a 422 body.
+pub struct RequestProblem {
+    pub code: &'static str,
+    pub detail: &'static str,
+}
 impl ScanRequest {
+    /// Credentialed probes (SNMP) must name the devices that receive the credential. The
+    /// "all observed devices" default would send a clear-text community string to every host
+    /// on the link, including ones the owner has never seen.
+    pub fn problem(&self) -> Option<RequestProblem> {
+        (self.protocols.contains(&Protocol::Snmp) && self.device_ids.is_empty()).then_some(
+            RequestProblem {
+                code: "snmp_requires_explicit_devices",
+                detail: "SNMP sends the credential you supply to each selected device. Choose the devices explicitly; scanning all devices with a credential is not allowed.",
+            },
+        )
+    }
     fn port_list(&self) -> Result<Vec<u16>, StatusCode> {
         if self.device_ids.len() > MAX_DEVICES
             || self
@@ -279,10 +295,7 @@ impl ScanHub {
         Ok(current.status.clone())
     }
     async fn targets(&self, requested: &[String]) -> Result<(Vec<Target>, usize), StatusCode> {
-        let evidence: Vec<(String,String,String)> = sqlx::query_as("SELECT DISTINCT device_id,source,fact_value FROM evidence WHERE family='link_layer' AND fact_key='mac' AND length(fact_value)=17 AND length(source)<128 AND length(device_id)=36 LIMIT 4097").fetch_all(&self.pool).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if evidence.len() > 4096 {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
+        let evidence: Vec<(String,String,String)> = sqlx::query_as("SELECT DISTINCT device_id,source,fact_value FROM evidence WHERE family='link_layer' AND fact_key='mac' AND length(fact_value)=17 AND length(source)<128 AND length(device_id)=36 ORDER BY device_id LIMIT 4096").fetch_all(&self.pool).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let mut identities: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         let mut known = BTreeSet::new();
         for (id, source, mac) in evidence {
@@ -333,6 +346,18 @@ impl ScanHub {
             {
                 continue;
             }
+            // A neighbor entry naming a subnet network or broadcast address is never a device.
+            if inventory
+                .interfaces()
+                .filter(|i| i.id == row.interface())
+                .any(|i| {
+                    i.addresses
+                        .iter()
+                        .any(|a| lattice_sensor::is_network_or_broadcast(a, row.ip()))
+                })
+            {
+                continue;
+            }
             let Ok(guard) = TargetGuard::new(
                 inventory.clone(),
                 [],
@@ -359,8 +384,10 @@ impl ScanHub {
                 targets.insert(id.clone(), target);
             }
         }
-        if targets.len() > MAX_DEVICES {
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        // More devices than a scan covers: take a deterministic prefix and report the rest as
+        // skipped rather than refusing the scan.
+        while targets.len() > MAX_DEVICES {
+            targets.pop_last();
         }
         let skipped = known.len().saturating_sub(targets.len());
         let approvals = targets.values().map(|t| TargetApproval {
@@ -385,6 +412,9 @@ impl ScanHub {
             .start_lock
             .try_lock()
             .map_err(|_| StatusCode::CONFLICT)?;
+        if input.problem().is_some() {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
         let ports = Arc::new(input.port_list()?);
         let credential = if input.protocols.contains(&Protocol::Snmp) {
             Some(Arc::new(
@@ -397,36 +427,84 @@ impl ScanHub {
         } else {
             None
         };
-        if matches!(
-            self.inner.lock().await.status.state.as_str(),
-            "running" | "cancelling"
-        ) {
-            return Err(StatusCode::CONFLICT);
+        {
+            let current = self.inner.lock().await;
+            let stale = current.status.started_at.as_deref().is_some_and(|at| {
+                chrono::DateTime::parse_from_rfc3339(at).is_ok_and(|at| {
+                    // The longest job is 24 h; a "running" job older than that has no task.
+                    Utc::now().signed_duration_since(at) > chrono::Duration::hours(25)
+                })
+            });
+            if matches!(current.status.state.as_str(), "running" | "cancelling") && !stale {
+                return Err(StatusCode::CONFLICT);
+            }
         }
         let (targets, skipped) = self.targets(&input.device_ids).await?;
         if targets.is_empty() {
             return Err(StatusCode::UNPROCESSABLE_ENTITY);
         }
         let cancel = CancellationToken::new();
-        let status = ScanStatus { job_id: Some(uuid::Uuid::new_v4().to_string()), state: "running".into(), started_at: Some(Utc::now().to_rfc3339()), devices: targets.len(), skipped_devices: skipped, total: targets.len() * (ports.len() + input.protocols.len()), detail: "Scanning observed local addresses. Service labels are hints; no device settings are changed.".into(), ..Default::default() };
+        let status = ScanStatus {
+            job_id: Some(uuid::Uuid::new_v4().to_string()),
+            state: "running".into(),
+            started_at: Some(Utc::now().to_rfc3339()),
+            devices: targets.len(),
+            skipped_devices: skipped,
+            total: targets.len() * (ports.len() + input.protocols.len()),
+            detail: if input.snmp.as_ref().is_some_and(|s| s.version != "v3")
+                && input.protocols.contains(&Protocol::Snmp)
+            {
+                "Scanning observed local addresses. Warning: SNMP v1/v2c sends the community string in clear text to the selected devices; prefer v3. Service labels are hints; no device settings are changed.".into()
+            } else {
+                "Scanning observed local addresses. Service labels are hints; no device settings are changed.".into()
+            },
+            ..Default::default()
+        };
         self.persist(&status).await?;
         *self.inner.lock().await = Running {
             status: status.clone(),
             cancel: cancel.clone(),
         };
         let hub = self.clone();
+        let job_id = status.job_id.clone();
         tokio::spawn(async move {
-            hub.run(
-                targets,
-                ports,
-                input.protocols,
-                credential,
-                cancel,
-                input.web_identification,
-            )
-            .await;
+            // The job runs in its own task so a panic cannot leave the state at "running"
+            // (which would refuse every later scan until restart).
+            let runner = hub.clone();
+            let handle = tokio::spawn(async move {
+                runner
+                    .run(
+                        targets,
+                        ports,
+                        input.protocols,
+                        credential,
+                        cancel,
+                        input.web_identification,
+                    )
+                    .await;
+            });
+            if handle.await.is_err() {
+                hub.mark_failed(job_id).await;
+            }
         });
         Ok(status)
+    }
+    /// Records that the job task died (panic) and frees the scan slot.
+    async fn mark_failed(&self, job_id: Option<String>) {
+        let _finish = self.start_lock.lock().await;
+        let status = {
+            let mut running = self.inner.lock().await;
+            if running.status.job_id != job_id {
+                return;
+            }
+            running.status.state = "failed".into();
+            running.status.finished_at = Some(Utc::now().to_rfc3339());
+            running.status.detail =
+                "The scan stopped unexpectedly. Partial results are shown; start a new scan to retry."
+                    .into();
+            running.status.clone()
+        };
+        let _ = self.persist(&status).await;
     }
     async fn persist(&self, status: &ScanStatus) -> Result<(), StatusCode> {
         let json = serde_json::to_string(status).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -712,14 +790,7 @@ impl ScanHub {
     }
 }
 fn bounded_text(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| !c.is_control())
-        .scan(0, |bytes, c| {
-            *bytes += c.len_utf8();
-            (*bytes <= 256).then_some(c)
-        })
-        .collect()
+    lattice_sensor::sanitize::display_text(value, 256)
 }
 fn service_hint(port: u16) -> Option<&'static str> {
     Some(match port {
@@ -762,12 +833,21 @@ pub(crate) async fn start_route(
     _: LocalOwner,
     State(state): State<AppState>,
     Json(input): Json<ScanRequest>,
-) -> Result<(StatusCode, Json<ScanStatus>), StatusCode> {
+) -> Result<(StatusCode, Json<ScanStatus>), axum::response::Response> {
+    use axum::response::IntoResponse;
+    if let Some(problem) = input.problem() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": problem.code, "detail": problem.detail})),
+        )
+            .into_response());
+    }
     state
         .scans()
         .start(input)
         .await
         .map(|s| (StatusCode::ACCEPTED, Json(s)))
+        .map_err(IntoResponse::into_response)
 }
 #[utoipa::path(post,path="/api/v1/network/scan/cancel",responses((status=204),(status=401)),security(("bearer_auth"=[])))]
 pub(crate) async fn cancel_route(_: LocalOwner, State(state): State<AppState>) -> StatusCode {
