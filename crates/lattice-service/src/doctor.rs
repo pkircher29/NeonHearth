@@ -39,7 +39,7 @@ use lattice_doctor::{
         plan_repair,
     },
 };
-use lattice_store::{AuditActor, AuditCategory, AuditLog, NewAuditEntry};
+use lattice_store::{AuditCategory, AuditLog, NewAuditEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -48,7 +48,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{AppState, auth::Authorized};
+use crate::{
+    AppState,
+    auth::{Authorized, Principal},
+};
 
 /// How long a minted approval stays live (contract: 10 minutes, single-use).
 const APPROVAL_TTL_MINUTES: i64 = 10;
@@ -974,7 +977,7 @@ pub(crate) async fn report_route(
 
 #[utoipa::path(post, path = "/api/v1/doctor/approvals", request_body = DoctorApprovalRequest, responses((status = 200, body = DoctorApproval), (status = 400), (status = 401), (status = 404, description = "the latest run has no approval-required plan for this diagnosis"), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn approvals_route(
-    _: Authorized,
+    principal: Principal,
     State(state): State<AppState>,
     Extension(doctor): Extension<DoctorState>,
     body: Result<Json<DoctorApprovalRequest>, axum::extract::rejection::JsonRejection>,
@@ -1017,15 +1020,15 @@ pub(crate) async fn approvals_route(
         &state,
         NewAuditEntry {
             occurred_at: now,
-            actor: AuditActor::Owner,
+            actor: principal.audit_actor(),
             category: AuditCategory::DoctorAction,
             action: "approval_minted".to_owned(),
             subject: Some(kind_tag(&request.diagnosis_kind).to_owned()),
-            detail: serde_json::json!({
+            detail: principal.annotate(serde_json::json!({
                 "approval_id": approval_id,
                 "diagnosis_kind": request.diagnosis_kind,
                 "expires_at": expires_at,
-            }),
+            })),
         },
     )
     .await;
@@ -1043,7 +1046,7 @@ pub(crate) async fn approvals_route(
 
 #[utoipa::path(post, path = "/api/v1/doctor/repair", request_body = DoctorRepairRequest, responses((status = 200, body = DoctorRepairResponse), (status = 400, description = "guided/observation plans are never executable"), (status = 401), (status = 403, description = "missing, expired, used, or mismatched approval"), (status = 404, description = "the latest run has no plan for this diagnosis"), (status = 409, description = "a diagnostic run or another repair is in progress"), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn repair_route(
-    _: Authorized,
+    principal: Principal,
     State(state): State<AppState>,
     Extension(doctor): Extension<DoctorState>,
     body: Result<Json<DoctorRepairRequest>, axum::extract::rejection::JsonRejection>,
@@ -1122,14 +1125,14 @@ pub(crate) async fn repair_route(
         &state,
         NewAuditEntry {
             occurred_at: shared.clock.now(),
-            actor: AuditActor::Owner,
+            actor: principal.audit_actor(),
             category: AuditCategory::DoctorAction,
             action: "repair_intent".to_owned(),
             subject: Some(kind_tag(&request.diagnosis_kind).to_owned()),
-            detail: serde_json::json!({
+            detail: principal.annotate(serde_json::json!({
                 "diagnosis_kind": request.diagnosis_kind,
                 "approval_id": request.approval_id,
-            }),
+            })),
         },
     )
     .await;
@@ -1168,18 +1171,18 @@ pub(crate) async fn repair_route(
             &state,
             NewAuditEntry {
                 occurred_at: shared.clock.now(),
-                actor: AuditActor::Owner,
+                actor: principal.audit_actor(),
                 category: AuditCategory::DoctorAction,
                 action: "repair_executed".to_owned(),
                 subject: Some(kind_tag(&diagnosis_kind).to_owned()),
-                detail: serde_json::json!({
+                detail: principal.annotate(serde_json::json!({
                     "diagnosis_kind": diagnosis_kind,
                     "class": repair.class,
                     "description": repair.description,
                     "outcome": repair.outcome,
                     "rollback": repair.rollback,
                     "approval_id": approval_id,
-                }),
+                })),
             },
         )
         .await;
@@ -1212,7 +1215,7 @@ pub(crate) async fn settings_route(
 
 #[utoipa::path(put, path = "/api/v1/doctor/settings", request_body = DoctorSettingsUpdate, responses((status = 200, body = DoctorSettings), (status = 400, body = DoctorSettingsRejected), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn update_settings_route(
-    _: Authorized,
+    principal: Principal,
     State(state): State<AppState>,
     Extension(doctor): Extension<DoctorState>,
     body: Result<Json<DoctorSettingsUpdate>, axum::extract::rejection::JsonRejection>,
@@ -1242,14 +1245,14 @@ pub(crate) async fn update_settings_route(
         &state,
         NewAuditEntry {
             occurred_at: now,
-            actor: AuditActor::Owner,
+            actor: principal.audit_actor(),
             category: AuditCategory::DoctorAction,
             action: "settings_updated".to_owned(),
             subject: Some("doctor_settings".to_owned()),
-            detail: serde_json::json!({
+            detail: principal.annotate(serde_json::json!({
                 "previous": previous,
                 "settings": next,
-            }),
+            })),
         },
     )
     .await;
