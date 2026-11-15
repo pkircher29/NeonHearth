@@ -189,7 +189,14 @@ async fn corrupt_checkpoint_and_source_mismatch_refuse_open() -> anyhow::Result<
         32,
     )
     .await;
-    assert!(mismatch.is_err());
+    // A source-set change is recoverable (finding 2): it opens and the old checkpoint is kept
+    // in state_checkpoint_backups. Refusing to open here was the bug. A corrupt checkpoint
+    // still errors (asserted above).
+    assert!(mismatch.is_ok());
+    let backups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM state_checkpoint_backups")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(backups, 1);
     Ok(())
 }
 fn rollup(device_id: DeviceId, t: chrono::DateTime<Utc>) -> RollupChange {
