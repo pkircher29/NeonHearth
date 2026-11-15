@@ -323,6 +323,11 @@ async fn rotating_the_owner_token_replaces_it_and_is_owner_only() {
 // Every registered route has an explicit phone-session verdict.
 // ---------------------------------------------------------------------------
 
+/// Route registrations are found by scanning these sources for
+/// `.route("/api/v1/...")` (axum offers no way to enumerate a built router, so
+/// this is a SOURCE SCAN, not a walk of the live router). Every file here
+/// exists (`include_str!` fails the build otherwise); a route registered in a
+/// file that is not listed would be missed, so add new route modules here.
 const ROUTE_SOURCES: [&str; 10] = [
     include_str!("../src/lib.rs"),
     include_str!("../src/audit_api.rs"),
@@ -336,7 +341,8 @@ const ROUTE_SOURCES: [&str; 10] = [
     include_str!("../src/home.rs"),
 ];
 
-/// Every path registered through `.route("...")` in the service sources.
+/// Every `/api/v1/...` path registered through `.route("...")` in the listed
+/// sources (a literal first argument is required; computed paths are not seen).
 fn registered_paths() -> std::collections::BTreeSet<String> {
     let mut paths = std::collections::BTreeSet::new();
     for source in ROUTE_SOURCES {
@@ -414,8 +420,16 @@ fn concrete(path: &str) -> String {
     out
 }
 
+/// Source scan plus the reviewed verdict table (`expected`), exercised against
+/// the real router: for every scanned path and method the phone-session
+/// outcome must match the table, and anything the table does not list must be
+/// refused. It cannot enumerate routes the scan does not see.
+///
+/// Safe by construction: requests carry an invalid JSON body, so every
+/// JSON-taking handler rejects before doing work, `doctor/run` is skipped, and
+/// the remaining reachable handlers are reads or deletes of a nonexistent id.
 #[tokio::test]
-async fn every_registered_route_has_an_explicit_phone_verdict() {
+async fn every_scanned_route_has_an_explicit_phone_verdict() {
     let paths = registered_paths();
     assert!(
         paths.len() > 50,
@@ -489,9 +503,11 @@ async fn every_registered_route_has_an_explicit_phone_verdict() {
                 .header("content-type", "application/json")
                 // Distinct command ids so replay never masks a verdict.
                 .header("x-command-id", uuid::Uuid::new_v4().to_string());
+            // Malformed JSON: a handler that reads a body rejects it before
+            // doing any work.
             let response = router
                 .clone()
-                .oneshot(request.body(Body::from("{}")).unwrap())
+                .oneshot(request.body(Body::from("{")).unwrap())
                 .await
                 .unwrap();
             let got = response.status();
@@ -506,6 +522,16 @@ async fn every_registered_route_has_an_explicit_phone_verdict() {
                     StatusCode::UNAUTHORIZED,
                     "{method} {path} accepts integration tokens only"
                 ),
+                // The event socket answers 401 itself when no ticket is
+                // supplied, so for it only "not refused by the phone
+                // allowlist" can be asserted.
+                Verdict::Read if path == "/api/v1/events" => assert_ne!(
+                    got,
+                    StatusCode::FORBIDDEN,
+                    "{method} {path} must pass the phone allowlist"
+                ),
+                // (A handler may itself answer 403, e.g. a missing approval
+                // token, so only 401 is asserted here.)
                 Verdict::Read | Verdict::HighImpact => assert_ne!(
                     got,
                     StatusCode::UNAUTHORIZED,

@@ -442,7 +442,8 @@ impl RemoteAccessRepository {
         let locks = attempt >= max_attempts;
         let locked_until = now + window;
         let result = sqlx::query(
-            "UPDATE phone_sessions SET pin_locked_until = CASE WHEN ?1 THEN ?2 ELSE pin_locked_until END              WHERE id = ?3",
+            "UPDATE phone_sessions SET pin_locked_until = CASE WHEN ?1 THEN ?2 ELSE pin_locked_until END
+             WHERE id = ?3",
         )
         .bind(locks)
         .bind(encode_time(locked_until))

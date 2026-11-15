@@ -1740,4 +1740,180 @@ mod tests {
         assert_ne!(base, request_fingerprint(&Method::POST, "/api/v1/home/plan", b"{}"));
         assert_ne!(base, request_fingerprint(&Method::POST, "/api/v1/policy/action", b"{ }"));
     }
+
+    // -- Replay layer and PIN gate, driven through the real layer ---------
+
+    use axum::routing::post;
+    use std::sync::atomic::AtomicUsize as TestCounter;
+    use tower::ServiceExt as _;
+
+    const COMMAND_PATH: &str = "/api/v1/events/ticket";
+
+    async fn remote_for_tests() -> (RemoteAccessState, AppState) {
+        let state = AppState::new(
+            "owner-token-0123456789abcdefghijkl",
+            lattice_store::M2StateRepository::new(lattice_store::connect_memory().await.unwrap()),
+        )
+        .unwrap();
+        let remote = RemoteAccessState::with_parts(
+            &state,
+            Arc::new(FakeTailscaleControl::new()),
+            Arc::new(SystemClock),
+            58120,
+        );
+        (remote, state)
+    }
+
+    /// A router whose only route answers with the given status and body size
+    /// behind the real remote-access layer, plus a live phone credential.
+    async fn command_fixture(
+        status: StatusCode,
+        body_len: usize,
+    ) -> (axum::Router, String, Arc<TestCounter>) {
+        let (remote, _state) = remote_for_tests().await;
+        let secret = random_secret_hex().unwrap();
+        let id = Uuid::new_v4();
+        let now = remote.now();
+        remote
+            .repository()
+            .insert_phone_session(&NewPhoneSession {
+                id,
+                secret_hash: sha256_hex(&secret),
+                device_label: "test".to_owned(),
+                pin_hash: hash_pin("123456").unwrap(),
+                created_at: now,
+                expires_at: now + Duration::days(30),
+            })
+            .await
+            .unwrap();
+        let calls = Arc::new(TestCounter::new(0));
+        let counter = Arc::clone(&calls);
+        let router = axum::Router::new()
+            .route(
+                COMMAND_PATH,
+                post(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (status, vec![b'x'; body_len])
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                remote,
+                remote_access_layer,
+            ));
+        (router, format!("PhoneSession {id}:{secret}"), calls)
+    }
+
+    async fn send_command(router: &axum::Router, credential: &str, command_id: Uuid) -> Response {
+        router
+            .clone()
+            .oneshot(
+                axum::http::Request::post(COMMAND_PATH)
+                    .header(header::AUTHORIZATION, credential)
+                    .header("x-command-id", command_id.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_replayed_and_never_executed_again() {
+        let (router, credential, calls) =
+            command_fixture(StatusCode::INTERNAL_SERVER_ERROR, 4).await;
+        let command_id = Uuid::new_v4();
+        let first = send_command(&router, &credential, command_id).await;
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(first.headers().get(REPLAYED_HEADER).is_none());
+        let retry = send_command(&router, &credential, command_id).await;
+        // The effect may have happened despite the 5xx, so the retry gets the
+        // stored answer and the handler ran exactly once.
+        assert_eq!(retry.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(retry.headers().get(REPLAYED_HEADER).unwrap(), "true");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_response_too_large_to_retain_replays_as_status_only() {
+        let (router, credential, calls) =
+            command_fixture(StatusCode::OK, MAX_PERSISTED_COMMAND_BODY + 1).await;
+        let command_id = Uuid::new_v4();
+        let first = send_command(&router, &credential, command_id).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), MAX_PERSISTED_COMMAND_BODY + 1);
+        let retry = send_command(&router, &credential, command_id).await;
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(retry.headers().get(REPLAYED_HEADER).unwrap(), "true");
+        assert_eq!(retry.headers().get(BODY_OMITTED_HEADER).unwrap(), "true");
+        let body = axum::body::to_bytes(retry.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_response_beyond_the_buffer_limit_settles_as_500_and_is_not_re_run() {
+        let (router, credential, calls) =
+            command_fixture(StatusCode::OK, MAX_COMMAND_RESPONSE_BODY + 1).await;
+        let command_id = Uuid::new_v4();
+        let first = send_command(&router, &credential, command_id).await;
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let retry = send_command(&router, &credential, command_id).await;
+        assert_eq!(retry.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(retry.headers().get(REPLAYED_HEADER).unwrap(), "true");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The gate is an upper bound, so the assertion cannot be flaky: however
+    /// the scheduler interleaves eight tasks, no more than `PIN_WORKERS` may
+    /// ever be inside the blocking section together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pin_work_never_exceeds_the_worker_gate() {
+        let (remote, _state) = remote_for_tests().await;
+        let current = Arc::new(TestCounter::new(0));
+        let peak = Arc::new(TestCounter::new(0));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let remote = remote.clone();
+                let current = Arc::clone(&current);
+                let peak = Arc::clone(&peak);
+                tokio::spawn(async move {
+                    remote
+                        .pin_work(move || {
+                            let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            // Hold the slot long enough for overlap to occur.
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            current.fetch_sub(1, Ordering::SeqCst);
+                        })
+                        .await
+                })
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), Some(()));
+        }
+        let peak = peak.load(Ordering::SeqCst);
+        assert!((1..=PIN_WORKERS).contains(&peak), "peak was {peak}");
+    }
+
+    /// Finding 7: the Serve target follows the port the listener is bound to.
+    #[tokio::test]
+    async fn the_serve_target_follows_the_bound_port() {
+        let (_remote, state) = remote_for_tests().await;
+        state.set_bound_port(58199);
+        let remote = RemoteAccessState::for_service(&state);
+        assert_eq!(remote.shared.loopback_port, 58199);
+        assert_eq!(
+            loopback_target(remote.shared.loopback_port),
+            "http://127.0.0.1:58199"
+        );
+    }
 }

@@ -1664,3 +1664,45 @@ async fn a_socket_rechecks_its_session_when_no_revocation_was_announced() {
     .expect("the periodic re-check must close the socket");
     assert!(closed);
 }
+
+/// Reports `funnel_conflict` for a Funnel on 8443 proxying to `target`.
+async fn funnel_conflict_for(fixture: &Fixture, target: String) -> bool {
+    fixture.tailscale.set_serve(Ok(ServeState {
+        mappings: vec![ServeMapping {
+            https_port: 8443,
+            target,
+        }],
+        funnel_ports: vec![8443],
+    }));
+    let response = send(
+        &fixture.router,
+        "GET",
+        "/api/v1/remote/status",
+        None,
+        &Auth::Owner,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await["funnel_conflict"]
+        .as_bool()
+        .unwrap()
+}
+
+/// Review finding 11: the status route reports a Funnel conflict however the
+/// operator spelled the loopback target (`localhost` is the same listener as
+/// `127.0.0.1`), and not for a different port.
+#[tokio::test]
+async fn status_reports_funnel_conflicts_whatever_the_loopback_spelling() {
+    let fixture = fixture().await;
+    for ours in [
+        format!("http://127.0.0.1:{LOOPBACK_PORT}"),
+        format!("http://localhost:{LOOPBACK_PORT}"),
+        format!("localhost:{LOOPBACK_PORT}"),
+        format!("http://[::1]:{LOOPBACK_PORT}"),
+    ] {
+        assert!(funnel_conflict_for(&fixture, ours.clone()).await, "{ours}");
+    }
+    assert!(
+        !funnel_conflict_for(&fixture, format!("http://localhost:{}", LOOPBACK_PORT + 1)).await
+    );
+}

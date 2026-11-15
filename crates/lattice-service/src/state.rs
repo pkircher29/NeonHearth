@@ -443,6 +443,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotation_persists_to_the_token_file_and_a_bad_token_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("owner-token");
+        let state = state().await.with_token_file(file.clone());
+        let new = "rotated-token-9876543210zyxwvutsrq";
+        state.rotate_token(new.to_owned()).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), new);
+        assert!(state.rotate_token("short".to_owned()).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), new);
+    }
+
+    #[tokio::test]
     async fn a_failed_background_task_degrades_status_and_survives_recovery() {
         let state = state().await;
         assert_eq!(state.service_status().await, "ready");

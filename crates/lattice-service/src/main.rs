@@ -7,8 +7,8 @@ use lattice_store::{InstallRepository, M2StateRepository, PolicyRepository};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 #[cfg(windows)]
 mod win_service;
@@ -128,6 +128,12 @@ fn take_service_token(token_file: &std::path::Path) -> Result<String> {
     // SAFETY: called once at startup from `serve`, before any monitor, worker
     // or child process is started; nothing reads the environment concurrently.
     unsafe { std::env::remove_var("LATTICE_SERVICE_TOKEN") };
+    choose_token(from_env, token_file)
+}
+
+/// A rotated token persisted in `token_file` wins over the environment value
+/// (the environment still holds the pre-rotation token after a restart).
+fn choose_token(from_env: Option<String>, token_file: &std::path::Path) -> Result<String> {
     if let Ok(rotated) = std::fs::read_to_string(token_file) {
         let rotated = rotated.trim();
         if !rotated.is_empty() {
@@ -415,6 +421,25 @@ mod tests {
         for bad in ["", "not-an-address", "127.0.0.1", "127.0.0.1:notaport"] {
             assert!(parse_bind(Some(bad)).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn a_rotated_token_file_wins_over_the_environment_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(OWNER_TOKEN_FILE);
+        // No file: the environment value is used; neither: an error.
+        assert_eq!(choose_token(Some("env".into()), &file).unwrap(), "env");
+        assert!(choose_token(None, &file).is_err());
+        // A rotated token (with the trailing newline an editor may add) wins.
+        std::fs::write(&file, "rotated-token\n").unwrap();
+        assert_eq!(
+            choose_token(Some("env".into()), &file).unwrap(),
+            "rotated-token"
+        );
+        assert_eq!(choose_token(None, &file).unwrap(), "rotated-token");
+        // An empty file is ignored rather than becoming an empty token.
+        std::fs::write(&file, "  \n").unwrap();
+        assert_eq!(choose_token(Some("env".into()), &file).unwrap(), "env");
     }
 
     #[test]

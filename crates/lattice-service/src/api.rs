@@ -874,7 +874,7 @@ pub struct PolicyActionRejected {
 }
 #[utoipa::path(post, path = "/api/v1/policy/action", security(("bearer_auth" = [])), request_body = PolicyActionRequest, responses((status = 200, body = PolicyActionResponse), (status = 400), (status = 401), (status = 404, body = PolicyActionRejected, description = "the device is not enrolled in policy"), (status = 409, body = PolicyActionRejected, description = "a pending release must be reconciled first"), (status = 503, body = PolicyActionRejected)))]
 pub async fn policy_action(
-    _: Authorized,
+    principal: Principal,
     State(state): State<AppState>,
     Json(request): Json<PolicyActionRequest>,
 ) -> Response {
@@ -892,6 +892,32 @@ pub async fn policy_action(
             coordinator.extend_once(request.device_id, until, now).await
         }
     };
+    if result.is_ok() && principal.session_id().is_some() {
+        // Phone-initiated policy changes are attributed to the session, not
+        // the owner. The change already happened, so a failed append is
+        // logged rather than reported as a failed action.
+        let audit = lattice_store::AuditLog::new(state.state_repository().pool().clone());
+        if let Err(error) = audit
+            .append(lattice_store::NewAuditEntry {
+                occurred_at: now,
+                actor: principal.audit_actor(),
+                category: lattice_store::AuditCategory::Approval,
+                action: "policy_action".to_owned(),
+                subject: Some(request.device_id.to_string()),
+                detail: principal.annotate(serde_json::json!({
+                    "action": match request.action {
+                        OwnerAction::Approve => "approve",
+                        OwnerAction::Reject => "reject",
+                        OwnerAction::Quarantine => "quarantine",
+                        OwnerAction::ExtendOnce { .. } => "extend_once",
+                    }
+                })),
+            })
+            .await
+        {
+            tracing::error!(%error, "phone policy action audit append failed");
+        }
+    }
     match result {
         Ok(result) => Json(PolicyActionResponse {
             evaluation: result.evaluation,
