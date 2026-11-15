@@ -26,7 +26,8 @@ test('owner sees separate household WAN readings and can open the supported Traf
   await expect(page.getByText('No per-device counter source',{exact:true})).toBeVisible();
   await expect(page.getByText('Unavailable until paired',{exact:true})).toHaveCount(0);
   await expect(page.getByRole('heading',{name:'Network control.'})).toBeVisible();
-  await expect(page.getByRole('group',{name:'Pulse visual'})).toHaveCount(0);
+  await expect(page.getByRole('group',{name:'Pulse visual'})).toBeVisible();
+  await expect(page.getByRole('heading',{name:'Traffic scope'})).toBeVisible();
   await page.setViewportSize({width:1440,height:1000});
   await page.screenshot({path:info.outputPath('pulse-desktop.png'),fullPage:true});
   for(const width of [320,390,768,1440]){

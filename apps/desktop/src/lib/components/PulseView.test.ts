@@ -54,12 +54,84 @@ it('keeps a valid measured zero distinct from missing household measurements',()
   expect(view.queryByText(/No fresh router readings/)).toBeNull();
 });
 
-it('shows the angular Pulse overview without a decorative network visualization',()=>{
+it('shows the traffic scope and the Flow Map together, with the angular overview heading',()=>{
   const view=render(PulseView,{state:{...initialLiveState,connected:true}});
   expect(view.getByRole('heading',{name:'Network control.'})).toBeTruthy();
   expect(view.getByRole('heading',{name:'Traffic scope'})).toBeTruthy();
-  expect(view.queryByRole('img',{name:/Network (flow map|hearth):/})).toBeNull();
-  expect(view.queryByRole('group',{name:'Pulse visual'})).toBeNull();
+  expect(view.getByRole('heading',{name:'Flow map'})).toBeTruthy();
+  expect(view.getByRole('img',{name:/Network flow map:/})).toBeTruthy();
+  expect(view.getByRole('complementary',{name:'How to read the flow map'})).toBeTruthy();
+  view.unmount();
+});
+
+it('shows the Flow Map by default, can switch to the Hearth, and remembers the choice',async()=>{
+  const memory=new Map<string,string>();
+  vi.stubGlobal('localStorage',{getItem:(k:string)=>memory.get(k)??null,setItem:(k:string,v:string)=>{memory.set(k,v);},removeItem:(k:string)=>{memory.delete(k);}});
+  const first=render(PulseView,{state:{...initialLiveState,connected:true}});
+  expect(first.getByRole('img',{name:/Network flow map:/})).toBeTruthy();
+  expect(first.getByRole('button',{name:'Flow'}).getAttribute('aria-pressed')).toBe('true');
+  await fireEvent.click(first.getByRole('button',{name:'Hearth'}));
+  expect(first.getByRole('img',{name:/Network hearth:/})).toBeTruthy();
+  expect(first.getByRole('heading',{name:'Hearth'})).toBeTruthy();
+  expect(first.getByRole('complementary',{name:'How to read the hearth'})).toBeTruthy();
+  expect(first.queryByRole('img',{name:/Network flow map:/})).toBeNull();
+  // The traffic scope stays whichever visual is chosen.
+  expect(first.getByRole('heading',{name:'Traffic scope'})).toBeTruthy();
+  first.unmount();
+  const second=render(PulseView,{state:{...initialLiveState,connected:true}});
+  expect(second.getByRole('img',{name:/Network hearth:/})).toBeTruthy();
+  expect(memory.get('neonhearth.pulse.hero')).toBe('hearth');
+  second.unmount();
+  vi.unstubAllGlobals();
+});
+
+it('still switches visuals when browser storage throws',async()=>{
+  const boom=()=>{throw new Error('storage blocked');};
+  vi.stubGlobal('localStorage',{getItem:boom,setItem:boom,removeItem:boom});
+  const view=render(PulseView,{state:{...initialLiveState,connected:true}});
+  expect(view.getByRole('img',{name:/Network flow map:/})).toBeTruthy();
+  await fireEvent.click(view.getByRole('button',{name:'Hearth'}));
+  expect(view.getByRole('img',{name:/Network hearth:/})).toBeTruthy();
+  view.unmount();
+  vi.unstubAllGlobals();
+});
+
+it('says plainly that per-device traffic is unavailable and invents no flows when there are no counters',()=>{
+  const view=render(PulseView,{state:{...initialLiveState,connected:true},network:router(),onopentraffic:vi.fn()});
+  expect(view.getByRole('note').textContent).toContain('Per-device traffic is unavailable');
+  expect(view.getByRole('note').textContent).not.toContain('uses per-device counters');
+  expect(view.getByRole('img',{name:/Network flow map:/}).getAttribute('aria-label')).not.toMatch(/Top talkers/);
+  // Router totals stay in the household card and are not fed to the map as device traffic.
+  expect(view.getByRole('region',{name:'Household internet traffic'}).textContent).toContain('20 Mbps');
+  expect(view.queryByText(/This computer/)).toBeNull();
+  view.unmount();
+});
+
+it('says the collector is down rather than implying per-device data when disconnected',()=>{
+  const view=render(PulseView,{state:{...initialLiveState,connected:false}});
+  expect(view.getByRole('note').textContent).toContain('collector connection is down');
+  view.unmount();
+});
+
+it('falls back to the host computer traffic, and says so, when per-device counters are unavailable',async()=>{
+  const host={observed_at:new Date().toISOString(),status:'ready',detail:'This computer only.',interfaces:[],applications:[],connections:[],upload_bytes_per_second:1_000_000,download_bytes_per_second:50_000,app_counters:'sampled_tcp',firewall_available:false,memory_total_bytes:null,memory_available_bytes:null};
+  const hostApi={snapshot:vi.fn(async()=>host)} as never;
+  const automationApi={network:vi.fn(async()=>({status:'ready',observed_at:'',devices:[]}))} as never;
+  const view=render(PulseView,{state:{...initialLiveState,connected:true},hostApi,automationApi});
+  expect(await view.findByText(/shows this computer's live traffic/)).toBeTruthy();
+  expect(view.getByText('This computer')).toBeTruthy();
+  expect(view.getByRole('img',{name:/showing this computer only/})).toBeTruthy();
+  expect(view.getByText(/not whole-home traffic/,{selector:'dd'})).toBeTruthy();
+  view.unmount();
+});
+
+it('does not poll the host and keeps the per-device wording when per-device counters exist',async()=>{
+  const hostApi={snapshot:vi.fn()} as never;
+  const live={...initialLiveState,connected:true,throughput:[{at:'t',upload:1,download:1}],aggregate:{upload:1,download:1}};
+  const view=render(PulseView,{state:live,hostApi});
+  expect(view.getByText(/The flow map below uses per-device counters/)).toBeTruthy();
+  expect((hostApi as {snapshot:ReturnType<typeof vi.fn>}).snapshot).not.toHaveBeenCalled();
+  view.unmount();
 });
 
 it('says which side is missing instead of adding a fake zero, and drops the protocol-mix placeholder',()=>{
