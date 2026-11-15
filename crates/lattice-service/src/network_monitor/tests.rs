@@ -2,6 +2,7 @@ use super::*;
 use lattice_sensor::{
     Address, Interface, InterfaceClass, InterfaceId, InterfaceInventory, InterfaceRole,
 };
+use std::net::Ipv4Addr;
 
 fn interface(id: u32, class: InterfaceClass, ip: &str, prefix: u8) -> Interface {
     Interface {
@@ -213,4 +214,208 @@ async fn discovery_waits_for_other_database_writers_before_reading_previous_stat
         .await
         .unwrap();
     assert_eq!(event, "responding_again");
+}
+#[tokio::test]
+async fn sweep_snapshots_and_plans_once_and_probes_every_target_once() {
+    use std::sync::atomic::AtomicUsize;
+    let hub = NetworkMonitor::new(lattice_store::connect_memory().await.unwrap());
+    *hub.discovery.lock().await = Some(Discovery::default());
+    let snapshots = Arc::new(AtomicUsize::new(0));
+    let plans = Arc::new(AtomicUsize::new(0));
+    let probed: Arc<std::sync::Mutex<Vec<Ipv4Addr>>> = Arc::default();
+    let batches = Arc::new(AtomicUsize::new(0));
+    let snapshot = {
+        let snapshots = Arc::clone(&snapshots);
+        move || {
+            snapshots.fetch_add(1, Ordering::SeqCst);
+            Ok(InterfaceInventory::new(Vec::new()))
+        }
+    };
+    let planner = {
+        let plans = Arc::clone(&plans);
+        move |_: &InterfaceInventory| {
+            plans.fetch_add(1, Ordering::SeqCst);
+            lan::Plan {
+                targets: (1..=200u8)
+                    .map(|n| lan::Target {
+                        interface: 1,
+                        source: Ipv4Addr::new(192, 168, 1, 250),
+                        ip: Ipv4Addr::new(192, 168, 1, n),
+                    })
+                    .collect(),
+                skipped: 0,
+            }
+        }
+    };
+    let prober = {
+        let probed = Arc::clone(&probed);
+        let batches = Arc::clone(&batches);
+        move |batch: Vec<lan::Target>, _names: Arc<BTreeMap<u32, String>>| {
+            let probed = Arc::clone(&probed);
+            batches.fetch_add(1, Ordering::SeqCst);
+            async move {
+                probed
+                    .lock()
+                    .unwrap()
+                    .extend(batch.iter().map(|target| target.ip));
+                batch
+                    .iter()
+                    .map(|_| Ok::<Option<lan::Sighting>, ()>(None))
+                    .collect::<Vec<_>>()
+            }
+        }
+    };
+    hub.run_sweep(snapshot, planner, prober).await.unwrap();
+    assert_eq!(
+        snapshots.load(Ordering::SeqCst),
+        1,
+        "one interface snapshot per sweep"
+    );
+    assert_eq!(plans.load(Ordering::SeqCst), 1, "one plan per sweep");
+    assert!(
+        batches.load(Ordering::SeqCst) > 1,
+        "the sweep must span several batches"
+    );
+    let mut probed = probed.lock().unwrap().clone();
+    probed.sort();
+    let expected: Vec<Ipv4Addr> = (1..=200u8).map(|n| Ipv4Addr::new(192, 168, 1, n)).collect();
+    assert_eq!(
+        probed, expected,
+        "every planned target is probed exactly once"
+    );
+    let status = hub.discovery.lock().await.clone().unwrap();
+    assert_eq!(
+        (status.total, status.completed, status.errors),
+        (200, 200, 0)
+    );
+}
+#[test]
+fn router_prune_runs_first_then_at_most_once_per_interval() {
+    let start = std::time::Instant::now();
+    assert!(router::prune_due(None, start));
+    assert!(!router::prune_due(Some(start), start));
+    assert!(!router::prune_due(
+        Some(start),
+        start + Duration::from_secs(59)
+    ));
+    assert!(router::prune_due(
+        Some(start),
+        start + Duration::from_secs(60)
+    ));
+    assert!(router::prune_due(
+        Some(start),
+        start + Duration::from_secs(3600)
+    ));
+    // A clock that reads earlier than the last prune must not trigger a prune.
+    assert!(!router::prune_due(
+        Some(start + Duration::from_secs(120)),
+        start
+    ));
+}
+#[tokio::test]
+async fn router_prune_drops_day_old_and_excess_samples_and_keeps_fresh_ones() {
+    let pool = lattice_store::connect_memory().await.unwrap();
+    let now: i64 = 2_000_000_000;
+    for (at, label) in [
+        (now - 86_401, "old"),
+        (now - 86_400, "edge"),
+        (now - 5, "fresh"),
+    ] {
+        sqlx::query(
+            "INSERT INTO network_router_samples(at,source,download,upload) VALUES(?,?,1,1)",
+        )
+        .bind(at)
+        .bind(label)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    router::prune_samples(&pool, now).await.unwrap();
+    let kept: Vec<String> =
+        sqlx::query_scalar("SELECT source FROM network_router_samples ORDER BY at")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kept, ["edge", "fresh"]);
+    // Beyond the row ceiling only the newest rows survive, even when all are recent.
+    sqlx::query("DELETE FROM network_router_samples")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 50004) INSERT INTO network_router_samples(at,source,download,upload) SELECT ? + i, 's', 0, 0 FROM n")
+        .bind(now - 80_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+    router::prune_samples(&pool, now).await.unwrap();
+    let (count, oldest): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), MIN(at) FROM network_router_samples")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 50_000);
+    assert_eq!(oldest, now - 80_000 + 5);
+}
+#[tokio::test]
+async fn router_settings_are_cached_between_rechecks_and_a_change_is_picked_up_afterwards() {
+    use std::sync::atomic::AtomicUsize;
+    let start = std::time::Instant::now();
+    let current = Settings::default();
+    let changed = Settings {
+        router_port: 9090,
+        ..Settings::default()
+    };
+    let reads = Arc::new(AtomicUsize::new(0));
+    let reader = |value: Settings| {
+        let reads = Arc::clone(&reads);
+        move || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            async move { Some(value) }
+        }
+    };
+    let mut watch = router::SettingsWatch::new(start);
+    // A burst of samples inside the recheck period never touches the database.
+    for ms in (0..5000).step_by(50) {
+        let at = start + Duration::from_millis(ms);
+        assert!(
+            watch
+                .still_current(at, reader(changed.clone()), &current)
+                .await
+        );
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    // Once the period has elapsed one read confirms unchanged settings...
+    assert!(
+        watch
+            .still_current(
+                start + Duration::from_secs(5),
+                reader(current.clone()),
+                &current
+            )
+            .await
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    // ...and restarts the period: the next samples are served from the cache again.
+    assert!(
+        watch
+            .still_current(
+                start + Duration::from_secs(9),
+                reader(changed.clone()),
+                &current
+            )
+            .await
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    // After the next period a changed setting is noticed (and an unreadable one too).
+    assert!(
+        !watch
+            .still_current(start + Duration::from_secs(10), reader(changed), &current)
+            .await
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert!(
+        !watch
+            .still_current(start + Duration::from_secs(10), || async { None }, &current)
+            .await
+    );
 }
