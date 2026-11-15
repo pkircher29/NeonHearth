@@ -8,7 +8,7 @@
   import { motionReduced } from '../stores/preferences';
   import HomeEditorView from './HomeEditorView.svelte';
   import HomeTwin3D from './HomeTwin3D.svelte';
-  import { sameTwinDevices, toBandwidthMap, toTwinDeviceInfo, toHomeDeviceRefs, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
+  import { buildDeviceRefs, sameTwinDevices, toBandwidthMap, toTwinDeviceInfo, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
 
   // `api` is a test seam: when absent, the view builds the real loopback client on mount
   // exactly the way App builds the camera client.
@@ -31,7 +31,7 @@
     const info = addresses.get(id);
     return liveState.devices[id]?.owner_name ?? info?.home_assistant?.name ?? info?.mac_addresses[0] ?? null;
   }
-  const deviceRefs = $derived([...toHomeDeviceRefs(liveState.devices).map(d => ({ ...d, name: knownName(d.device_id) ?? d.name })), ...(automation?.devices ?? []).map(d => ({ device_id: d.device_id, name: d.name }))]);
+  const deviceRefs = $derived(buildDeviceRefs(liveState.devices, network, automation?.devices ?? []));
   // Memoized by content (audit H-5): a fresh array per bandwidth frame would
   // make the twin rebuild its scene and reset the camera several times a second.
   let twinCache: TwinDevice[] = [];

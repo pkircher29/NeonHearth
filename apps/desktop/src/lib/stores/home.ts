@@ -15,7 +15,11 @@ export interface HomePlan { home_id: string; version: number; name: string; floo
 export type Mounting = 'wall' | 'ceiling' | 'floor' | 'shelf' | null;
 export interface Placement { placement_id: string; device_id: string; floor_id: string; x: number; y: number; height_m: number; mounting: Mounting }
 export interface Estimate { device_id: string; floor_id: string | null; room_id: string | null; confidence: number; evidence: string[]; estimated_at: string }
-export interface HomeDeviceRef { device_id: string; name: string | null }
+/**
+ * `name` is the owner's (or Home Assistant's) name only. The optional fields describe an unnamed
+ * device (vendor from the MAC registry, a MAC, an IP) so the tray can label it usefully.
+ */
+export interface HomeDeviceRef { device_id: string; name: string | null; vendor?: string | null; mac?: string | null; ip?: string | null }
 export interface HomeSnapshot { plan: HomePlan; placements: Placement[]; estimates: Estimate[] }
 
 export const GRID_M = 0.1;

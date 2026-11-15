@@ -3,12 +3,36 @@
 
 import type { DeviceSnapshot, PresenceState } from '../api/types';
 import { emptyHomePlan, type HomeApi, type HomeDeviceRef, type HomeSnapshot } from '../stores/home';
+import type { NetworkDetails } from '../api/automation';
 import type { TwinDevice } from '../twin/geometry';
 import type { TwinDeviceInfo } from '../twin/twinCard';
 
 /** Editor tray refs: the owner's name when set, otherwise null (the tray labels it). */
 export function toHomeDeviceRefs(devices: Record<string, DeviceSnapshot>): HomeDeviceRef[] {
   return Object.values(devices).map((device) => ({ device_id: device.device_id, name: device.owner_name ?? null }));
+}
+
+/**
+ * Tray refs enriched with what the network view knows: owner name, else the Home Assistant
+ * name, else nothing (the tray then labels it by vendor and MAC). Automation-only devices follow.
+ */
+export function buildDeviceRefs(
+  devices: Record<string, DeviceSnapshot>,
+  network: Pick<NetworkDetails, 'devices'> | null | undefined,
+  automationDevices: ReadonlyArray<{ device_id: string; name: string }> = []
+): HomeDeviceRef[] {
+  const info = new Map((network?.devices ?? []).map((device) => [device.device_id, device]));
+  const live = Object.values(devices).map((device): HomeDeviceRef => {
+    const known = info.get(device.device_id);
+    return {
+      device_id: device.device_id,
+      name: device.owner_name ?? known?.home_assistant?.name ?? null,
+      vendor: known?.mac_assignments?.find((assignment) => assignment.organization)?.organization ?? known?.home_assistant?.manufacturer ?? null,
+      mac: known?.mac_addresses[0] ?? null,
+      ip: known?.ip_addresses[0] ?? null
+    };
+  });
+  return [...live, ...automationDevices.map((device) => ({ device_id: device.device_id, name: device.name }))];
 }
 
 export function isCameraClassification(classification: string | null): boolean {

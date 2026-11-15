@@ -17,7 +17,7 @@ export const SPEAKER_DEVICE_NAME = 'Wandering speaker';
 const AT = '2026-01-01T00:00:00Z';
 
 // Same DeviceSnapshot wire shape guard.spec.ts uses; it must pass the client's validators.
-function liveDevice(device_id: string, owner_name: string) {
+function liveDevice(device_id: string, owner_name: string | null) {
   return {
     device_id, first_seen_at: AT, last_seen_at: AT, owner_name, owner_type: null, owner_confirmed: false,
     presence: { state: 'online', observed_at: AT, source: 'fixture', kind: 'test' }, evidence: null,
@@ -104,6 +104,8 @@ export interface HomeServerOptions {
   estimates?: Estimate[];
   draft?: HomeDraft | null;
   conflictOnPlanSave?: boolean;
+  /** Extra live devices with no owner name, with MACs/IPs/vendors served by the network route (a real home has dozens). */
+  unnamedDevices?: number;
 }
 
 export interface HomeServer {
@@ -124,6 +126,15 @@ export interface HomeServer {
  * guard.spec.ts) plus a stateful fake of the Home API. Returns the server object so
  * tests can assert on captured requests and mutate behavior (e.g. clear a conflict).
  */
+const VENDORS = ['Espressif Inc.', 'Apple, Inc.', 'Tuya Smart Inc.', 'Intel Corporate', null, 'Amazon Technologies Inc.'];
+export const unnamedDeviceId = (n: number) => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
+/** The i-th generated unnamed device, as the network route describes it. */
+export function unnamedDeviceInfo(n: number) {
+  const mac = `00:04:4B:${(n * 7 % 256).toString(16).padStart(2, '0')}:${(n * 13 % 256).toString(16).padStart(2, '0')}:${(n * 29 % 256).toString(16).padStart(2, '0')}`.toUpperCase();
+  const vendor = VENDORS[n % VENDORS.length];
+  return { device_id: unnamedDeviceId(n), mac, ip: `192.168.1.${100 + (n % 150)}`, vendor };
+}
+
 export async function installHomeFixture(page: Page, options: HomeServerOptions = {}): Promise<HomeServer> {
   const server: HomeServer = {
     plan: options.plan ?? basePlan(),
@@ -140,8 +151,23 @@ export async function installHomeFixture(page: Page, options: HomeServerOptions 
   await page.route('**/api/v1/state**', (route) => route.fulfill({
     json: {
       sequence: 1,
-      devices: [liveDevice(CAMERA_DEVICE_ID, CAMERA_DEVICE_NAME), liveDevice(SPEAKER_DEVICE_ID, SPEAKER_DEVICE_NAME)],
+      devices: [
+        liveDevice(CAMERA_DEVICE_ID, CAMERA_DEVICE_NAME), liveDevice(SPEAKER_DEVICE_ID, SPEAKER_DEVICE_NAME),
+        ...Array.from({ length: options.unnamedDevices ?? 0 }, (_, i) => liveDevice(unnamedDeviceId(i + 1), null))
+      ],
       next_after: null, service_status: 'ready'
+    }
+  }));
+  await page.route('**/api/v1/automation/network', (route) => route.fulfill({
+    json: {
+      status: 'ok', observed_at: AT,
+      devices: Array.from({ length: options.unnamedDevices ?? 0 }, (_, i) => {
+        const info = unnamedDeviceInfo(i + 1);
+        return {
+          device_id: info.device_id, mac_addresses: [info.mac], ip_addresses: [info.ip], home_assistant: null,
+          mac_assignments: [{ mac_address: info.mac, organization: info.vendor, registry: 'MA-L', status: info.vendor ? 'assigned' : 'unknown' }]
+        };
+      })
     }
   }));
   await page.route('**/api/v1/events/ticket', (route) => route.fulfill({ json: { ticket: 'fixture-ticket', expires_in_seconds: 30 } }));

@@ -11,6 +11,7 @@
 <script lang="ts">
   import { DEFAULT_THICKNESS_M, MAX_CEILING_M, MAX_THICKNESS_M, MIN_CEILING_M, MIN_THICKNESS_M, snap, wallLength, type Mounting } from '../stores/home';
   import { polygonArea } from '../home/rooms';
+  import { deviceLabel } from '../home/deviceLabel';
   import { formatArea, formatLength, fromDisplayLength, gridStep, toDisplayLength, unitSymbol, type HomeUnits } from '../homeUnits';
 
   let { target, units = 'metric', onaction, onclose }: { target: InspectorTarget; units?: HomeUnits; onaction: (action: EditorAction) => void; onclose: () => void } = $props();
@@ -79,7 +80,7 @@
     <dl><div><dt>Corners</dt><dd>{target.room.polygon.length}</dd></div><div><dt>Area</dt><dd>{formatArea(polygonArea(target.room.polygon), units)}</dd></div></dl>
     <button type="button" class="danger" onclick={() => onaction({ type: 'delete_room', floor_id: target.floor_id, room_id: target.room.room_id })}>Delete room</button>
   {:else}
-    <h2>{target.device?.name ?? 'Device'}</h2>
+    <h2>{target.device ? deviceLabel(target.device) : 'Device'}</h2>
     <p class="confirmed-tag">Owner-confirmed placement</p>
     <dl>
       <div><dt>Position</dt><dd>{length(target.placement.x)}, {length(target.placement.y)}</dd></div>

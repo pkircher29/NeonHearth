@@ -5,7 +5,8 @@
 import { test, expect, type Page } from '@playwright/test';
 import {
   atticDraft, basePlan, installHomeFixture, seededCameraPlacement, seededTwinPlan, speakerEstimate,
-  CAMERA_DEVICE_ID, CAMERA_DEVICE_NAME, GROUND_ID, HOME_ID, SPEAKER_DEVICE_ID, SPEAKER_DEVICE_NAME
+  CAMERA_DEVICE_ID, CAMERA_DEVICE_NAME, GROUND_ID, HOME_ID, SPEAKER_DEVICE_ID, SPEAKER_DEVICE_NAME,
+  unnamedDeviceId, unnamedDeviceInfo
 } from './fixtures/home';
 
 // A wide viewport keeps the whole plan canvas reachable for position clicks.
@@ -507,6 +508,57 @@ test('3D twin v2: the close button dismisses the detail card; hovering a room na
   await expect(tip).toContainText(/6\.\d m²/);
   await page.mouse.move(box.x + 4, box.y + 4); // off the room: the tip goes away
   await expect(tip).toHaveCount(0);
+});
+
+test('large tray: 89 unnamed devices are labelled, filterable and scrollable, and the Inspector stays in view', async ({ page }) => {
+  const server = await installHomeFixture(page, { plan: seededTwinPlan(), unnamedDevices: 89 });
+  await page.goto('/#token=fixture-only-large-tray-owner-00000000000'); // an owner session, so the network view (vendors, MACs, IPs) loads
+  await openHome(page);
+  const tray = page.getByRole('complementary', { name: 'Unplaced devices' });
+  await expect(tray.getByRole('heading', { name: 'Unplaced devices · 91' })).toBeVisible();
+  const rows = tray.locator('.tray-device');
+  await expect(rows.first()).toBeVisible();
+  // Fixed-height panel that scrolls inside, not a page-length list.
+  const trayBox = (await tray.boundingBox())!;
+  expect(trayBox.height).toBeLessThanOrEqual(320);
+  const list = tray.getByRole('region', { name: 'Device list' });
+  expect(await list.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
+  // Unnamed devices read "Vendor · last three octets" with the IP beside, never a bare MAC when the vendor is known.
+  await expect(tray.locator('.tray-label').nth(2)).toHaveText(/^[A-Za-z ]+ · [0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}$/);
+  await expect(tray.locator('.tray-ip').first()).toHaveText(/^192\.168\.1\.\d+$/);
+  // Named devices sort first.
+  await expect(rows.first()).toContainText(/Den camera|Wandering speaker/);
+
+  // Select a wall: the Inspector appears above the tray, fully inside the viewport (no page scrolling).
+  await planCanvas(page).click({ position: { x: 240, y: 80 } });
+  const inspector = page.getByRole('complementary', { name: 'Inspector' });
+  await expect(inspector).toBeVisible();
+  const inspectorBox = (await inspector.boundingBox())!;
+  expect(inspectorBox.y).toBeGreaterThanOrEqual(0);
+  expect(inspectorBox.y + inspectorBox.height).toBeLessThanOrEqual(1000);
+  expect(inspectorBox.y).toBeLessThan((await tray.boundingBox())!.y);
+
+  // Filter by vendor, then by an IP, arm the filtered device and place it.
+  const target = unnamedDeviceInfo(7);
+  const filter = tray.getByRole('searchbox', { name: 'Filter devices' });
+  await filter.fill(target.vendor ? target.vendor.split(/[ ,]/)[0] : 'Espressif');
+  const afterVendor = await rows.count();
+  expect(afterVendor).toBeGreaterThan(0);
+  expect(afterVendor).toBeLessThan(89);
+  await filter.fill(target.ip);
+  await expect(rows).toHaveCount(1);
+  const label = (await rows.first().locator('.tray-label').innerText()).trim();
+  await rows.first().click();
+  await expect(page.getByText(`Placing ${label} — click the plan.`)).toBeVisible();
+  await planCanvas(page).click({ position: { x: 120, y: 80 } });
+  await expect.poll(() => server.placementPuts.length).toBe(1);
+  expect(server.placementPuts[0].device_id).toBe(unnamedDeviceId(7));
+  await expect(planCanvas(page).locator(`g.placement[data-device-id="${unnamedDeviceId(7)}"]`)).toHaveAttribute('aria-label', `${label} — owner-placed`);
+  // A miss shows the empty state and clearing restores the list.
+  await filter.fill('zzz-none');
+  await expect(tray.getByText(/No devices match/)).toBeVisible();
+  await tray.getByRole('button', { name: 'Clear filter' }).click();
+  await expect(tray.getByRole('heading', { name: 'Unplaced devices · 90' })).toBeVisible();
 });
 
 // Real multi-touch: CDP Input.dispatchTouchEvent makes Chromium emit genuine pointer events with

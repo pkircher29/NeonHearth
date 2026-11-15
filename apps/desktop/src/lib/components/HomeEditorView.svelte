@@ -15,6 +15,7 @@
   } from '../home/view';
   import { SNAP_LABELS, angleDegrees, computeSnap, constrainAngle, pointAtLength, type SnapResult } from '../home/snap';
   import { dividedRooms, newRoomCandidates, polygonArea, polygonCentroid, type RoomCandidate } from '../home/rooms';
+  import { deviceLabel } from '../home/deviceLabel';
   import { blockedOpening, blockedOpeningNotice, parseLengthEntry, planRectangleBatch, planWallBatch } from '../home/draft';
   import { DEFAULT_CANVAS_SIZE, floorPoints, initialFloorView, readFloorView, saveFloorView } from '../home/viewStore';
 
@@ -191,7 +192,8 @@
 
   const newId = () => crypto.randomUUID();
   function deviceName(deviceId: string): string {
-    return devices.find((device) => device.device_id === deviceId)?.name ?? `Device ${deviceId.slice(0, 8)}`;
+    const ref = devices.find((device) => device.device_id === deviceId);
+    return ref ? deviceLabel(ref) : `Device ${deviceId.slice(0, 8)}`;
   }
   function estimateLabel(estimate: Estimate): string {
     const floor = estimate.floor_id ? plan.floors.find((candidate) => candidate.floor_id === estimate.floor_id) : null;
@@ -1129,10 +1131,10 @@
         {/if}
       </div>
       <div class="side-panel">
-        <HomeEditorTray {unplaced} placing={placingDevice} estimated={estimatedRows} onpick={armPlacement} />
         {#if target}
           <HomeEditorInspector {target} {units} onaction={apply} onclose={() => (selection = null)} />
         {/if}
+        <HomeEditorTray {unplaced} placing={placingDevice} estimated={estimatedRows} onpick={armPlacement} />
       </div>
     </div>
   {/if}
