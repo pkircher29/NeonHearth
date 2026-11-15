@@ -30,6 +30,14 @@ Note that in this build the desktop app does not yet supply the token
 automatically, so this state is expected until pairing is wired — the API
 works when called with the correct token.
 
+After the owner rotates the token the old one is rejected at once. The
+service keeps the new token in its `owner-token` file (see
+[Getting started](getting-started.md#where-the-token-lives-and-rotating-it));
+relaunch NeonHearth from the Start menu, or on Linux read the current token
+with `sudo neonhearth-token`. If the service will not start after someone
+edited that file by hand, delete the file: the install-time value is used
+again.
+
 ## No devices appear
 
 The service only watches network interfaces that are up and confidently

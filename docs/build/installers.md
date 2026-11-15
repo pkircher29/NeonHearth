@@ -256,9 +256,11 @@ preserved because `configure-service.ps1` keeps an existing
 
 ### Security notes (single-owner alpha posture)
 
-- **The pairing token lives in the service's `Environment` registry value**
-  (`HKLM\SYSTEM\CurrentControlSet\Services\NeonHearth`), readable by local
-  administrators. For the single-owner alpha this is accepted: anyone who
+- **The pairing token lives in `%ProgramData%\NeonHearth\owner-token`**
+  (builds before the owner-token change used the service's `Environment`
+  registry value, `HKLM\SYSTEM\CurrentControlSet\Services\NeonHearth`, and
+  migrate from it once), readable by local administrators, SYSTEM and the
+  service account only. For the single-owner alpha this is accepted: anyone who
   is an administrator on the box already owns the box. Future fix
   direction: move the secret to DPAPI-protected storage or the OS
   credential vault (the service already ships a `KeyringVault`
@@ -342,8 +344,9 @@ Windows: MSI installs `lattice-service.exe`, `ui\`, and `scripts\` under
 dedicated virtual account `NT SERVICE\NeonHearth` with restart-on-failure
 recovery (5s/5s/30s, 24h reset — both via `util:ServiceConfig` and mirrored
 with `sc.exe failure` in the configure script), then runs
-`configure-service.ps1` which generates the pairing token into the
-service-private `Environment` registry value, sets explicit non-inherited
+`configure-service.ps1` which generates the pairing token into
+`%ProgramData%\NeonHearth\owner-token` (the file the service reads before any
+environment value; see "Owner token file" below), sets explicit non-inherited
 ACLs on both the state directory and the service registry key, points the
 service at a bundled ffmpeg when present, and starts the service (native
 discovery; Npcap is not used). Uninstall stops/deletes the service and
@@ -356,6 +359,40 @@ hardened unit, the sysusers fragment, and UI assets;
 and enables/starts the unit. `StateDirectory=neonhearth` owns
 `/var/lib/neonhearth`; package removal never deletes it (note file written
 at install).
+
+## Owner token file (authored; not verified on a real install)
+
+The service resolves its owner token at start as: `<state dir>\owner-token`
+(`/var/lib/neonhearth/owner-token` on Linux) if it holds a non-empty value,
+otherwise `LATTICE_SERVICE_TOKEN`. Rotation (`POST /api/v1/service/token/rotate`)
+rewrites that file, so the installers and launchers must treat it as the single
+source of truth:
+
+- **Windows MSI.** `configure-service.ps1` keeps a valid existing file, else
+  migrates a hardened (generation 2) registry token into it, else generates a
+  new 48-byte URL-safe token (PowerShell 5.1 compatible, no
+  `RandomNumberGenerator::Fill`). It then gives the file an explicit protected
+  ACL (SYSTEM/Administrators full, `NT SERVICE\NeonHearth` modify), verifies
+  it, and removes `LATTICE_SERVICE_TOKEN` from the registry `Environment`
+  value. `open-neonhearth.ps1` reads the file first (it already self-elevates
+  because the state directory is not readable by standard users), then the
+  registry value for installs that predate the file. A deferred custom action
+  (`RemoveNeonHearthOwnerToken`, condition `REMOVE="ALL" AND NOT
+  UPGRADINGPRODUCTCODE`) deletes the file on a real uninstall only; the major
+  upgrade's removal of the old product must not discard a rotated token.
+- **Linux deb/rpm.** The service writes the file as the service account, mode
+  0600 (`write_private_atomically`, unit `UMask=0077`); it is not readable by
+  ordinary users and the package does not change that. `/usr/bin/neonhearth-token`
+  (root only) prints the current token. `postinstall.sh` removes a stale file
+  when it generates a new `service.env`; `preremove.sh` deletes the file on a
+  real removal (not on upgrade). The shell scripts remain POSIX `sh`.
+- **Portable launcher (`NeonHearth.exe`).** It starts the service itself with
+  `LATTICE_STATE_BASE=<data folder>\data`, so the file is
+  `<data folder>\data\NeonHearth\owner-token`. `owner_token.rs` reads it first
+  and falls back to the DPAPI-sealed credential, using the service's own
+  validation rule (32+ bytes, 8+ distinct bytes, `[A-Za-z0-9._-]`). The launcher
+  is a one-shot process, so there is no running session to refresh: the file is
+  re-read at every launch.
 
 ## Delivery review fixes, 2026-11 (authored; install scripts untested on a real machine)
 
