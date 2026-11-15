@@ -3,7 +3,9 @@
   import type { ApiClient, CheckResult, Confidence, DiagnosisKind, DoctorApproval, DoctorRun, GuidedAction, Measurement, RepairReport, RollbackOutcome } from '../api/client';
 
   type DoctorClient = Pick<ApiClient, 'doctorRun' | 'doctorReport' | 'doctorApprove' | 'doctorRepair'>;
-  let { client }: { client: DoctorClient } = $props();
+  // `deviceName` resolves a claimant MAC to the owner's name for that device,
+  // when one is known. It is optional so the view works without an inventory.
+  let { client, deviceName = () => null }: { client: DoctorClient; deviceName?: (mac: string) => string | null } = $props();
 
   let loading = $state(true);
   let run = $state<DoctorRun | null>(null);
@@ -18,6 +20,8 @@
   let busy = $state<Record<string, boolean>>({});
   let errors = $state<Record<string, string | null>>({});
   let repairs = $state<Record<string, RepairReport | null>>({});
+  // The claimant the owner picked to keep a duplicated address, per finding.
+  let choices = $state<Record<string, string>>({});
   const repairing = $derived(Object.values(busy).some(Boolean));
   let active = true;
 
@@ -54,7 +58,7 @@
       } else {
         run = outcome.run;
         loadError = null;
-        approvals = {}; busy = {}; errors = {}; repairs = {};
+        approvals = {}; busy = {}; errors = {}; repairs = {}; choices = {};
       }
     } catch (cause) {
       runError = `Could not run diagnostic: ${message(cause)}`;
@@ -63,11 +67,11 @@
     }
   }
 
-  async function requestApproval(key: string, kind: DiagnosisKind): Promise<void> {
+  async function requestApproval(key: string, kind: DiagnosisKind, chosen?: string): Promise<void> {
     errors = { ...errors, [key]: null };
     busy = { ...busy, [key]: true };
     try {
-      const approval = await client.doctorApprove(kind);
+      const approval = chosen === undefined ? await client.doctorApprove(kind) : await client.doctorApprove(kind, chosen);
       approvals = { ...approvals, [key]: approval };
     } catch (cause) {
       errors = { ...errors, [key]: `Could not request approval: ${message(cause)}` };
@@ -76,11 +80,13 @@
     }
   }
 
-  async function executeRepair(key: string, kind: DiagnosisKind, approvalId?: string): Promise<void> {
+  async function executeRepair(key: string, kind: DiagnosisKind, approvalId?: string, chosen?: string): Promise<void> {
     errors = { ...errors, [key]: null };
     busy = { ...busy, [key]: true };
     try {
-      const report = approvalId === undefined ? await client.doctorRepair(kind) : await client.doctorRepair(kind, approvalId);
+      const report = approvalId === undefined ? await client.doctorRepair(kind)
+        : chosen === undefined ? await client.doctorRepair(kind, approvalId)
+        : await client.doctorRepair(kind, approvalId, chosen);
       repairs = { ...repairs, [key]: report };
       approvals = { ...approvals, [key]: null };
     } catch (cause) {
@@ -95,6 +101,13 @@
   }
 
   const label = (value: string) => value.replaceAll('_', ' ');
+  function claimantLabel(mac: string): string {
+    const name = deviceName(mac);
+    return name ? `${name} (${mac})` : mac;
+  }
+  function keepsSentence(count: number, address: string): string {
+    return `This device keeps ${address}; ${count > 2 ? 'the others' : 'the other'} will get a new one.`;
+  }
   function title(kind: DiagnosisKind): string {
     const text = label(kind.kind);
     return text[0].toUpperCase() + text.slice(1);
@@ -237,6 +250,8 @@
             {@const inFlight = Boolean(busy[key])}
             {@const report = repairs[key] ?? null}
             {@const approval = approvals[key] ?? null}
+            {@const duplicate = finding.diagnosis.kind.kind === 'duplicate_ip' ? finding.diagnosis.kind : null}
+            {@const chosen = choices[key]}
             <li class="finding-card class-{plan.class}" aria-busy={inFlight}>
               <h3>{name}</h3>
               <p class="impact">{finding.diagnosis.impact}</p>
@@ -275,15 +290,24 @@
                   <button type="button" class="act" aria-label="Repair {name}" disabled={inFlight} onclick={() => void executeRepair(key, finding.diagnosis.kind)}>{inFlight ? 'Repairing…' : 'Repair'}</button>
                 </div>
               {:else if plan.class === 'approval_required_reversible'}
+                {#if duplicate}
+                  <fieldset class="claimant-choice" disabled={inFlight || approval !== null}>
+                    <legend>Which device should keep {duplicate.address}?</legend>
+                    {#each duplicate.macs as mac (mac)}
+                      <label class="claimant"><input type="radio" name="claimant-{key}" value={mac} checked={chosen === mac} onchange={() => { choices = { ...choices, [key]: mac }; }} /> <span>{claimantLabel(mac)}</span></label>
+                    {/each}
+                    <p class="muted claimant-note">{keepsSentence(duplicate.macs.length, duplicate.address)}</p>
+                  </fieldset>
+                {/if}
                 <div class="repair-actions">
                   {#if approval}
                     <span class="confirm-step">
                       <span class="confirm-question">Approval expires {expiry(approval.expires_at)}</span>
-                      <button type="button" class="act danger" aria-label="Confirm repair {name}" disabled={inFlight} onclick={() => void executeRepair(key, finding.diagnosis.kind, approval.approval_id)}>{inFlight ? 'Repairing…' : 'Confirm repair'}</button>
+                      <button type="button" class="act danger" aria-label="Confirm repair {name}" disabled={inFlight} onclick={() => void executeRepair(key, finding.diagnosis.kind, approval.approval_id, duplicate ? chosen : undefined)}>{inFlight ? 'Repairing…' : 'Confirm repair'}</button>
                       <button type="button" class="act" aria-label="Cancel repair {name}" disabled={inFlight} onclick={() => cancelApproval(key)}>Cancel</button>
                     </span>
                   {:else}
-                    <button type="button" class="act" aria-label="Request approval for {name}" disabled={inFlight} onclick={() => void requestApproval(key, finding.diagnosis.kind)}>{inFlight ? 'Requesting…' : 'Request approval'}</button>
+                    <button type="button" class="act" aria-label="Request approval for {name}" disabled={inFlight || (duplicate !== null && !chosen)} onclick={() => void requestApproval(key, finding.diagnosis.kind, duplicate ? chosen : undefined)}>{inFlight ? 'Requesting…' : 'Request approval'}</button>
                   {/if}
                 </div>
               {:else if plan.class === 'guided_physical'}
@@ -347,6 +371,10 @@
   .act.danger:hover:not(:disabled){border-color:var(--gold)}
   .confirm-step{display:inline-flex;flex-wrap:wrap;gap:8px;align-items:center;padding:4px 8px;border:1px dashed var(--gold);border-radius:5px}
   .confirm-question{color:#ffe0a3;font:11px var(--font-mono);text-transform:uppercase}
+  .claimant-choice{margin:14px 0 0;padding:10px 12px;border:1px solid var(--line-strong);border-radius:5px;display:grid;gap:6px}
+  .claimant-choice legend{padding:0 6px;color:var(--ink);font:600 12px var(--font-display)}
+  .claimant{display:flex;gap:8px;align-items:center;color:var(--ink);font:12px var(--font-mono);cursor:pointer}
+  .claimant-note{margin:4px 0 0;font-size:12px}
   .guided-steps{margin:14px 0 0;padding-left:22px;display:grid;gap:6px;color:var(--ink);font-size:12px}
   .guided-steps li::marker{color:var(--accent);font-weight:700}
   .observation-note{margin:14px 0 0;padding:9px;border:1px dashed var(--muted);color:var(--muted-strong);font:11px var(--font-mono)}

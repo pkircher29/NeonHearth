@@ -196,7 +196,7 @@
           <div><dt>Tailnet name</dt><dd>{remote.daemon?.dns_name ?? 'unknown'}</dd></div>
           <div><dt>Private serve</dt><dd>{remote.serve_configured ? 'On' : 'Off'}{remote.funnel_conflict ? ' · Funnel conflict' : ''}</dd></div>
         </dl>
-        {#if remote.funnel_conflict}<p class="pair-error" role="alert">Funnel is enabled for the serve port. NeonHearth will not expose itself publicly; turn Funnel off in Tailscale, then enable private access here.</p>{/if}
+        {#if remote.funnel_conflict}<div class="pair-error funnel-warning" role="alert"><strong>Tailscale Funnel is exposing NeonHearth to the public internet.</strong><p>NeonHearth does not allow that, so remote access is switched off until Funnel is turned off. To fix it, open Tailscale on this computer (or your Tailscale admin console), turn Funnel off for this computer, then come back here and turn on private access.</p></div>{/if}
         <button type="button" class="confirm" disabled={serveBusy || remote.funnel_conflict || !remote.daemon?.running} onclick={enableServe}>{serveBusy ? 'Configuring…' : remote.serve_configured ? 'Re-apply private access' : 'Turn on private access'}</button>
         {#if serveNotice}<p class="notice" role="status">{serveNotice}</p>{/if}
       {:else}<p class="unavailable-copy">Checking Tailscale…</p>{/if}

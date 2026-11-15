@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createApiClient, isSequence, type AuthSource } from './client';
+import { createApiClient, isSequence, type AuthSource, type DiagnosisKind } from './client';
 
 describe('createApiClient credentials (M-25)', () => {
   it('omits the Authorization header entirely when no credential is held, never sending an empty bearer', async () => {
@@ -708,6 +708,44 @@ describe('createApiClient', () => {
     const noFetch = vi.fn();
     const strict = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: noFetch });
     await expect(strict.doctorApprove({ kind: 'invented' } as never)).rejects.toThrow('Invalid doctor approval request');
+    expect(noFetch).not.toHaveBeenCalled();
+  });
+
+  it('accepts the audit verify response with or without the saved-head anchor and rejects an unknown anchor', async () => {
+    const base = { report: { checked: 1, start_id: 1, end_id: 1, anchored: true, first_break: null }, head: { id: 1, entry_hash: 'a'.repeat(64) }, valid: true };
+    const make = (body: unknown) => createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })) });
+    await expect(make(base).auditVerify()).resolves.toEqual(base);
+    await expect(make({ ...base, anchor: 'matches' }).auditVerify()).resolves.toEqual({ ...base, anchor: 'matches' });
+    await expect(make({ ...base, anchor: 'surprise' }).auditVerify()).rejects.toThrow('Invalid audit verify response');
+  });
+
+  it('reads a remote status without a funnel flag as no conflict and rejects a non-boolean flag', async () => {
+    const status = { daemon: null, daemon_error: null, serve_configured: false, funnel_conflict: true, loopback_port: 58120 };
+    const make = (body: unknown) => createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })) });
+    await expect(make(status).remoteStatus()).resolves.toEqual(status);
+    const { funnel_conflict, ...older } = status;
+    expect(funnel_conflict).toBe(true);
+    await expect(make(older).remoteStatus()).resolves.toEqual({ ...older, funnel_conflict: false });
+    await expect(make({ ...status, funnel_conflict: 'yes' }).remoteStatus()).rejects.toThrow('Invalid remote status response');
+  });
+
+  it('binds the owner choice into the approval and repair bodies and rejects a malformed address', async () => {
+    const approval = { approval_id: 'appr-0001', expires_at: '2026-08-24T00:10:00Z' };
+    const duplicateKind: DiagnosisKind = { kind: 'duplicate_ip', address: '10.0.0.5', macs: ['aa:aa:aa:aa:aa:01', 'ba:bb:bb:bb:bb:02'] };
+    const approveFetch = vi.fn(async () => new Response(JSON.stringify(approval), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: approveFetch });
+    await expect(client.doctorApprove(duplicateKind, 'ba:bb:bb:bb:bb:02')).resolves.toEqual(approval);
+    expect((approveFetch.mock.calls as unknown[][])[0][1]).toMatchObject({ body: JSON.stringify({ diagnosis_kind: duplicateKind, chosen: 'ba:bb:bb:bb:bb:02' }) });
+
+    const repairFetch = vi.fn(async () => new Response(JSON.stringify({ repair: repairReport }), { status: 200 }));
+    const repairing = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: repairFetch });
+    await expect(repairing.doctorRepair(duplicateKind, 'appr-0001', 'ba:bb:bb:bb:bb:02')).resolves.toEqual(repairReport);
+    expect((repairFetch.mock.calls as unknown[][])[0][1]).toMatchObject({ body: JSON.stringify({ diagnosis_kind: duplicateKind, approval_id: 'appr-0001', chosen: 'ba:bb:bb:bb:bb:02' }) });
+
+    const noFetch = vi.fn();
+    const strict = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: noFetch });
+    await expect(strict.doctorApprove(duplicateKind, 'not-a-mac')).rejects.toThrow('Invalid doctor approval request');
+    await expect(strict.doctorRepair(duplicateKind, 'appr-0001', 'not-a-mac')).rejects.toThrow('Invalid doctor repair request');
     expect(noFetch).not.toHaveBeenCalled();
   });
 

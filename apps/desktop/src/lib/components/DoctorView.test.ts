@@ -32,6 +32,10 @@ const gatewayFinding: DoctorFinding = {
   diagnosis: { kind: { kind: 'gateway_unreachable' }, evidence: [measurement('loss_percent', 100, 'percent')], confidence: { basis_points: 9500 }, impact: 'The router cannot be reached; all traffic beyond this host is blocked.' },
   plan: { class: 'approval_required_reversible', action: { action: 'reboot_router' }, rationale: 'a router reboot disconnects every device and needs approval' }
 };
+const duplicateFinding: DoctorFinding = {
+  diagnosis: { kind: { kind: 'duplicate_ip', address: '10.0.0.5', macs: ['aa:aa:aa:aa:aa:01', 'ba:bb:bb:bb:bb:02'] }, evidence: [measurement('conflicting_mac_count', 2, 'count')], confidence: { basis_points: 8000 }, impact: 'Two devices claim the same address; connections will fail intermittently.' },
+  plan: { class: 'approval_required_reversible', action: { action: 'set_dhcp_reservation', address: '10.0.0.5', claimants: ['aa:aa:aa:aa:aa:01', 'ba:bb:bb:bb:bb:02'], chosen: null }, rationale: 'the owner must choose which device keeps the address' }
+};
 const wifiFinding: DoctorFinding = {
   diagnosis: { kind: { kind: 'weak_wifi_quality', rssi_dbm: -82 }, evidence: [measurement('rssi_dbm', -82, 'dbm')], confidence: { basis_points: 7000 }, impact: 'Weak Wi-Fi signal causes slow transfers and dropped connections.' },
   plan: { class: 'guided_physical', action: 'move_hardware', rationale: 'signal strength is a physical placement problem the Doctor cannot change remotely' }
@@ -125,6 +129,27 @@ describe('DoctorView', () => {
 
     expect(client.doctorRepair).toHaveBeenCalledExactlyOnceWith({ kind: 'gateway_unreachable' }, 'appr-0001');
     await waitFor(() => expect(screen.getByText('Repair verified — the symptom improved.')).toBeTruthy());
+  });
+
+  it('requires the owner to choose a claimant before a duplicate address repair can be approved, and sends the choice', async () => {
+    const client = fakeClient({ doctorReport: vi.fn(async () => envelope([duplicateFinding])) });
+    render(DoctorView, { client, deviceName: (mac: string) => (mac === 'aa:aa:aa:aa:aa:01' ? 'Kitchen speaker' : null) });
+    const request = await waitFor(() => screen.getByRole('button', { name: 'Request approval for Duplicate ip' }) as HTMLButtonElement);
+
+    expect(screen.getByText('Kitchen speaker (aa:aa:aa:aa:aa:01)')).toBeTruthy();
+    expect(screen.getByText('ba:bb:bb:bb:bb:02')).toBeTruthy();
+    expect(screen.getByText('This device keeps 10.0.0.5; the other will get a new one.')).toBeTruthy();
+    expect(request.disabled).toBe(true);
+
+    await fireEvent.click(screen.getByRole('radio', { name: /ba:bb:bb:bb:bb:02/ }));
+    expect(request.disabled).toBe(false);
+    await fireEvent.click(request);
+
+    await waitFor(() => screen.getByRole('button', { name: 'Confirm repair Duplicate ip' }));
+    expect(client.doctorApprove).toHaveBeenCalledExactlyOnceWith(duplicateFinding.diagnosis.kind, 'ba:bb:bb:bb:bb:02');
+    await fireEvent.click(screen.getByRole('button', { name: 'Confirm repair Duplicate ip' }));
+
+    expect(client.doctorRepair).toHaveBeenCalledExactlyOnceWith(duplicateFinding.diagnosis.kind, 'appr-0001', 'ba:bb:bb:bb:bb:02');
   });
 
   it('renders guided plans as numbered steps and observation plans as explanation, with no execute control', async () => {

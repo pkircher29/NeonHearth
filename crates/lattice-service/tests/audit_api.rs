@@ -17,6 +17,10 @@ use tower::ServiceExt;
 const TOKEN: &str = "test-token-with-at-least-32-characters-ok";
 
 async fn app_with_entries(count: u32) -> Router {
+    app_with_pool(count).await.0
+}
+
+async fn app_with_pool(count: u32) -> (Router, sqlx::SqlitePool) {
     let pool = connect_memory().await.unwrap();
     let log = AuditLog::new(pool.clone());
     for index in 0..count {
@@ -36,8 +40,8 @@ async fn app_with_entries(count: u32) -> Router {
         .await
         .expect("append");
     }
-    let state = AppState::new(TOKEN, M2StateRepository::new(pool)).unwrap();
-    lattice_service::app(state)
+    let state = AppState::new(TOKEN, M2StateRepository::new(pool.clone())).unwrap();
+    (lattice_service::app(state), pool)
 }
 
 async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
@@ -161,6 +165,47 @@ async fn verify_reports_a_healthy_tail_and_rejects_bad_windows() {
         let (status, _) = get_json(&app, uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
     }
+}
+
+#[tokio::test]
+async fn verify_reports_the_recorded_head_and_catches_a_truncated_chain() {
+    let (app, pool) = app_with_pool(5).await;
+    let (status, verify) = get_json(&app, "/api/v1/audit/verify?tail=all").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(verify["valid"], json!(true));
+    assert_eq!(verify["anchor"], json!("matches"));
+
+    // Dropping the newest entries leaves a prefix that verifies on its own.
+    sqlx::query("DROP TRIGGER audit_log_no_delete")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM audit_log WHERE id >= 4")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, verify) = get_json(&app, "/api/v1/audit/verify?tail=all").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(verify["anchor"], json!("mismatch"));
+    assert_eq!(verify["valid"], json!(false));
+    assert_eq!(
+        verify["report"]["first_break"]["kind"],
+        json!("head_mismatch")
+    );
+    assert_eq!(verify["report"]["first_break"]["id"], json!(5));
+}
+
+#[tokio::test]
+async fn verify_says_unanchored_when_no_head_was_ever_recorded() {
+    let (app, pool) = app_with_pool(3).await;
+    sqlx::query("DELETE FROM audit_head_anchor")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, verify) = get_json(&app, "/api/v1/audit/verify").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(verify["anchor"], json!("unanchored"));
+    assert_eq!(verify["valid"], json!(true));
 }
 
 #[tokio::test]

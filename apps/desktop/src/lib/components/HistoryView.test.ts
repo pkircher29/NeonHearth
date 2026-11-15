@@ -56,6 +56,19 @@ describe('HistoryView', () => {
     await waitFor(() => expect(document.querySelectorAll('.audit-row').length).toBe(1));
   });
 
+  it('reports a saved-head mismatch and an unanchored log in plain words', async () => {
+    const report = { checked: 3, start_id: 1, end_id: 3, anchored: true, first_break: null };
+    const mismatch: AuditVerify = { report: { ...report, first_break: { id: 5, kind: 'head_mismatch' } }, head: { id: 3, entry_hash: HASH }, valid: false, anchor: 'mismatch' };
+    const first = render(HistoryView, { client: client([{ entries: [entry(1)], head: { id: 1, entry_hash: HASH }, next_before: null }], mismatch) });
+    expect(await first.findByText('The log does not match its saved record')).toBeTruthy();
+    first.unmount();
+
+    const unanchored: AuditVerify = { report, head: { id: 3, entry_hash: HASH }, valid: true, anchor: 'unanchored' };
+    const second = render(HistoryView, { client: client([{ entries: [entry(1)], head: { id: 1, entry_hash: HASH }, next_before: null }], unanchored) });
+    expect(await second.findByText('Chain intact')).toBeTruthy();
+    expect(await second.findByText(/No separate record of the newest entry exists yet/)).toBeTruthy();
+  });
+
   it('shows an honest empty state', async () => {
     const api = client([{ entries: [], head: null, next_before: null }]);
     const { findByText } = render(HistoryView, { client: api });

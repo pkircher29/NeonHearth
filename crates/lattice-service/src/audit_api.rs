@@ -21,7 +21,7 @@ use axum::{
 };
 use lattice_store::{
     AppendedEntry, AuditActor, AuditCategory, AuditFilter, AuditLog, AuditLogError, ChainHead,
-    ChainReport, ChainScope, MAX_LIST_PAGE,
+    ChainReport, ChainScope, HeadAnchor, MAX_LIST_PAGE,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -86,7 +86,12 @@ pub struct AuditVerifyQuery {
 pub struct AuditVerifyResponse {
     pub report: ChainReport,
     pub head: Option<ChainHead>,
+    /// False when the chain is broken or the head recorded outside the audit
+    /// table no longer matches it (`anchor` is then `mismatch`).
     pub valid: bool,
+    /// Whether the chain still agrees with the separately recorded head:
+    /// `matches`, `unanchored` (nothing recorded yet) or `mismatch`.
+    pub anchor: HeadAnchor,
 }
 
 fn status_for(error: &AuditLogError) -> StatusCode {
@@ -189,13 +194,14 @@ pub(crate) async fn verify_route(
             Ok(tail) => ChainScope::Tail(tail),
         },
     };
-    let report = match audit.log.verify_chain(scope).await {
-        Ok(report) => report,
+    let anchored = match audit.log.verify_chain_anchored(scope).await {
+        Ok(anchored) => anchored,
         Err(error) => {
             tracing::warn!(%error, "audit verify failed");
             return status_for(&error).into_response();
         }
     };
+    let (report, anchor) = (anchored.report, anchored.anchor);
     let head = match head_or_none(&audit.log).await {
         Ok(head) => head,
         Err(error) => return status_for(&error).into_response(),
@@ -205,6 +211,7 @@ pub(crate) async fn verify_route(
         report,
         head,
         valid,
+        anchor,
     })
     .into_response()
 }

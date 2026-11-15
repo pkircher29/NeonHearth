@@ -1,8 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use lattice_store::{
     AppendedEntry, AuditActor, AuditCategory, AuditFilter, AuditLog, AuditLogError, AuditPage,
-    ChainBreakKind, ChainHead, ChainScope, MAX_ACTION_BYTES, MAX_DETAIL_BYTES, NewAuditEntry,
-    connect_memory, connect_path, genesis_hash,
+    ChainBreakKind, ChainHead, ChainScope, HeadAnchor, MAX_ACTION_BYTES, MAX_DETAIL_BYTES,
+    NewAuditEntry, connect_memory, connect_path, genesis_hash,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -503,5 +503,85 @@ async fn out_of_band_head_commitment_detects_a_rewritten_chain() -> anyhow::Resu
         against.first_break.map(|b| b.kind),
         Some(ChainBreakKind::HeadMismatch)
     );
+    Ok(())
+}
+
+/// The head recorded outside the audit table advances with every append, so a
+/// chain that was rewritten or truncated consistently still fails against it.
+#[tokio::test]
+async fn recorded_head_follows_appends_and_catches_truncation() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    let log = AuditLog::new(pool.clone());
+
+    // Nothing recorded yet: the empty chain is unanchored, not mismatched.
+    let empty = log.verify_chain_anchored(ChainScope::All).await?;
+    assert!(empty.report.is_valid());
+    assert_eq!(empty.anchor, HeadAnchor::Unanchored);
+
+    let mut last = None;
+    for index in 0..5 {
+        last = Some(log.append(entry(index)).await?);
+    }
+    let last = last.unwrap();
+    let stored: (i64, String, i64) = sqlx::query_as(
+        "SELECT head_id, head_hash, diverged FROM audit_head_anchor WHERE singleton = 1",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stored, (5, last.entry_hash.clone(), 0));
+    let healthy = log.verify_chain_anchored(ChainScope::Tail(2)).await?;
+    assert!(healthy.report.is_valid());
+    assert_eq!(healthy.anchor, HeadAnchor::Matches);
+
+    // Truncating the audit table leaves a self-consistent prefix.
+    sqlx::query("DROP TRIGGER audit_log_no_delete")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM audit_log WHERE id >= 4")
+        .execute(&pool)
+        .await?;
+    assert!(log.verify_chain(ChainScope::All).await?.is_valid());
+    let truncated = log.verify_chain_anchored(ChainScope::All).await?;
+    assert_eq!(truncated.anchor, HeadAnchor::Mismatch);
+    let broke = truncated.report.first_break.unwrap();
+    assert_eq!(broke.id, 5);
+    assert_eq!(broke.kind, ChainBreakKind::HeadMismatch);
+
+    // Appending on top of the rewritten chain moves the recorded head on, but
+    // the divergence stays on record.
+    log.append(entry(10)).await?;
+    let after = log.verify_chain_anchored(ChainScope::All).await?;
+    assert_eq!(after.anchor, HeadAnchor::Mismatch);
+    assert_eq!(
+        after.report.first_break.map(|b| b.kind),
+        Some(ChainBreakKind::HeadMismatch)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorded_head_survives_retention_pruning() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    let log = AuditLog::new(pool.clone());
+    for index in 0..6 {
+        log.append(entry(index)).await?;
+    }
+    // Nothing is older than the cutoff-free row cap of 2: rows 1..=4 go.
+    log.retention_prune(None, Some(2), at(1_800_000_000))
+        .await?;
+    let pruned = log.verify_chain_anchored(ChainScope::All).await?;
+    assert!(pruned.report.is_valid(), "{pruned:?}");
+    assert_eq!(pruned.anchor, HeadAnchor::Matches);
+
+    // Pruning everything leaves the retention anchor as the head.
+    log.retention_prune(None, Some(0), at(1_800_000_001))
+        .await?;
+    let emptied = log.verify_chain_anchored(ChainScope::All).await?;
+    assert!(emptied.report.is_valid(), "{emptied:?}");
+    assert_eq!(emptied.anchor, HeadAnchor::Matches);
+    log.append(entry(20)).await?;
+    let again = log.verify_chain_anchored(ChainScope::All).await?;
+    assert!(again.report.is_valid(), "{again:?}");
+    assert_eq!(again.anchor, HeadAnchor::Matches);
     Ok(())
 }

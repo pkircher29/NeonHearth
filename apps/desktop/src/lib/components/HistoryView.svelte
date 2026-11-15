@@ -102,7 +102,8 @@
       {#if verifying && verify === null}<strong>Verifying the chain…</strong><small>Recomputing every hash from the trusted root.</small>
       {:else if verifyError}<strong>Chain not verified</strong><small>{verifyError}</small>
       {:else if verify === null}<strong>Chain not verified yet</strong>
-      {:else if verify.valid}<strong>Chain intact</strong><small>{verify.report.checked} entr{verify.report.checked === 1 ? 'y' : 'ies'} checked{verify.report.anchored ? ' from the trusted root' : ''}{verify.head ? ` · head #${verify.head.id} ${shortHash(verify.head.entry_hash)}` : ''}</small>
+      {:else if verify.valid}<strong>Chain intact</strong><small>{verify.report.checked} entr{verify.report.checked === 1 ? 'y' : 'ies'} checked{verify.report.anchored ? ' from the trusted root' : ''}{verify.head ? ` · head #${verify.head.id} ${shortHash(verify.head.entry_hash)}` : ''}{verify.anchor === 'unanchored' ? '. No separate record of the newest entry exists yet, so this only proves the log agrees with itself.' : ''}</small>
+      {:else if verify.anchor === 'mismatch'}<strong>The log does not match its saved record</strong><small>The newest entry NeonHearth saved separately is missing or different, so entries may have been removed or rewritten. Treat the log as unverified and export your backup.</small>
       {:else}<strong>Chain break at entry #{verify.report.first_break?.id}</strong><small>{verify.report.first_break?.kind.replaceAll('_', ' ')}. Treat entries at and after this point as unverified and export your backup.</small>{/if}
     </div>
     <button type="button" class="quiet" onclick={runVerify} disabled={verifying}>{verifying ? 'Verifying…' : 'Verify again'}</button>
