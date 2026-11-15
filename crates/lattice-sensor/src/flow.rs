@@ -1,5 +1,10 @@
 //! Bounded event-time network-flow rollups.
 //!
+//! No production caller as of this change: the service never constructs a `FlowEngine`
+//! (discovery only holds an empty `FlowLiveAdapter`). `RollupKey::cmp` allocates two strings
+//! per comparison because `DeviceId` has no `Ord`; give it one in `lattice-domain` before
+//! putting this on a hot path.
+//!
 //! Trust is established once, when the engine receives its closed source registry. Observations
 //! carry only an opaque source ID and therefore cannot claim complete visibility. Seconds close
 //! when `bucket + 1s <= watermark`; accepted late events revise that second and deterministically

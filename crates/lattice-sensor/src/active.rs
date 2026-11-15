@@ -616,9 +616,18 @@ impl<T: AttemptTransport> ActiveEngine<T> {
         self.guard
             .authorize(request.interface, request.target)
             .map_err(|_| ActiveError::Unauthorized)?;
+        // Register for the wakeup *before* re-checking the flag: `notify_waiters` stores no
+        // permit, so a stop() landing between the first check and the await was lost until
+        // the probe timed out.
+        let stopped = self.stop_notify.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(ActiveError::Cancelled);
+        }
         let response = tokio::select! {
             biased;
-            () = self.stop_notify.notified() => return Err(ActiveError::Cancelled),
+            () = &mut stopped => return Err(ActiveError::Cancelled),
             result = tokio::time::timeout(descriptor.timeout, self.transport.attempt(&self.guard, &request, &descriptor, credential)) => {
                 match result { Ok(response) => response?, Err(_) => TransportResponse::Timeout }
             }
@@ -642,6 +651,8 @@ fn normalize(
             let now = Utc::now();
             let mut facts = Vec::new();
             for (key, value) in values {
+                // Every active fact value passes here: one sanitiser, whatever the parser.
+                let value = crate::sanitize::display_text(&value, usize::MAX);
                 if key.len() > 64 || value.len() > MAX_FACT_VALUE_BYTES {
                     return Err(ActiveError::ResponseLimit);
                 }
@@ -667,6 +678,9 @@ fn normalize(
 
 /// Bounded numeric-target transport. It never resolves names and never follows redirects.
 pub struct SystemTransport;
+// NOTE: `Scheduler`, `SchedulerRunner`, the token buckets and `CuratedPlan` below have no
+// production caller as of this change: network scans use `ActiveEngine` directly with the
+// service's own `ScanPacer`. They are kept and tested for a future scheduled-discovery feature.
 mod smb;
 #[async_trait]
 impl AttemptTransport for SystemTransport {
@@ -841,7 +855,11 @@ fn certificate_metadata(der: &[u8], max_bytes: usize) -> Result<TransportRespons
         for name in san.value.general_names.iter().take(16) {
             match name {
                 GeneralName::DNSName(value) => names.push((*value).to_owned()),
-                GeneralName::IPAddress(value) => names.push(render_ip_san(value)?),
+                GeneralName::IPAddress(value) => {
+                    if let Ok(ip) = render_ip_san(value) {
+                        names.push(ip);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1015,9 +1033,10 @@ pub fn parse_http_metadata(bytes: &[u8]) -> Result<Vec<(String, String)>, Active
     let head = bytes.split(|byte| *byte == b'\n').take(64);
     let mut facts = Vec::new();
     for (index, raw) in head.enumerate() {
-        let line = std::str::from_utf8(raw)
-            .map_err(|_| ActiveError::Protocol)?
-            .trim_end_matches('\r');
+        // Latin-1 and other non-UTF-8 header bytes are common on embedded devices; decode
+        // lossily so one odd header cannot discard the rest of the identification.
+        let line = String::from_utf8_lossy(raw);
+        let line = line.trim_end_matches('\r');
         if index == 0 {
             if let Some(status) = line
                 .split_ascii_whitespace()

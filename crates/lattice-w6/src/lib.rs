@@ -1,5 +1,10 @@
 //! Fixture-driven connector boundary for W6 network quarantine appliances.
 //! This crate intentionally contains no production HTTP endpoint mapping.
+//!
+//! No production caller as of this change: nothing in the workspace implements `Transport`
+//! outside tests, and `policy.rs` uses the manual-required actuator. Trust here rests on the
+//! appliance's *self-reported* profile fingerprint matching `known_profiles`; a production
+//! transport must authenticate the appliance (pinned certificate or equivalent) first.
 
 use async_trait::async_trait;
 use secrecy::SecretString;
