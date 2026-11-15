@@ -214,6 +214,22 @@ describe('layoutFlow', () => {
     expect(particles).toBeLessThanOrEqual(MAX_PARTICLES);
     expect(particles).toBeGreaterThan(0);
   });
+  it('shrinks nodes for dense networks but never below 60 percent', () => {
+    const mk = (n: number) => Array.from({ length: n }, (_, i) => device(`d-${String(i).padStart(3, '0')}`, { type: 'laptop', rate: [5_000_000, 0] }));
+    const small = layoutFlow(mk(20), SIZE).nodes[0]!.radius;
+    const dense = layoutFlow(mk(150), SIZE).nodes[0]!.radius;
+    expect(dense).toBeLessThan(small);
+    expect(dense).toBeGreaterThanOrEqual(small * 0.6 - 0.01);
+    expect(layoutFlow(mk(40), SIZE).nodes[0]!.radius).toBeCloseTo(small);
+  });
+  it('still labels top talkers among 150 crowded devices', () => {
+    const many = Array.from({ length: 150 }, (_, i) => device(`m-${String(i).padStart(3, '0')}`, { type: 'laptop', rate: i < 4 ? [(10 - i) * 1_000_000, 0] : [i * 100, 0] }));
+    const layout = layoutFlow(many, SIZE);
+    const talkers = topTalkers(layout.nodes);
+    const labels = placeLabels(talkers, layout.nodes, new Map(talkers.map((t) => [t.deviceId, 90])), layout.geo);
+    expect(talkers).toHaveLength(4);
+    expect(labels.length).toBeGreaterThanOrEqual(3);
+  });
   it('reports honest states', () => {
     expect(layoutFlow([], SIZE).state).toBe('empty');
     expect(layoutFlow([device('a', { rate: null })], SIZE).state).toBe('no-counters');

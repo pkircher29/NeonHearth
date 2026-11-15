@@ -46,7 +46,7 @@
 </script>
 
 <section class="pulse-view" aria-labelledby="pulse-heading">
-  <div class="view-heading"><div><p class="kicker">PULSE / NOW</p><h1 id="pulse-heading">Your network, breathing.</h1><p class="muted">A calm read of what is happening at home.</p></div><button class="pause-button" type="button" aria-pressed={animationPaused} aria-label={animationPaused ? 'Resume decorative animation; data continues' : 'Pause decorative animation; data continues'} onclick={() => animationPaused = !animationPaused}>{animationPaused ? 'Resume motion' : 'Pause motion'}</button></div>
+  <div class="view-heading"><div><p class="kicker">PULSE / NOW</p><h1 id="pulse-heading">{hero === 'flow' ? 'Your network, in motion.' : 'Your network, breathing.'}</h1><p class="muted">A calm read of what is happening at home.</p></div><button class="pause-button" type="button" aria-pressed={animationPaused} aria-label={animationPaused ? 'Resume decorative animation; data continues' : 'Pause decorative animation; data continues'} onclick={() => animationPaused = !animationPaused}>{animationPaused ? 'Resume motion' : 'Pause motion'}</button></div>
   {#if onopentraffic}
     <section class="household-source" aria-label="Household internet traffic">
       <div><p class="kicker">HOUSEHOLD INTERNET / ROUTER SOURCE</p>

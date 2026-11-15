@@ -229,11 +229,6 @@
     c.moveTo(g.cx, g.cy - g.histBase + g.histIn + 2);
     c.lineTo(g.cx, g.cy - g.histBase - g.histOut - 5 * u);
     c.stroke();
-    c.font = `500 ${Math.max(8.5, 8.5 * u)}px ${FONT_MONO}`;
-    c.fillStyle = 'rgba(233,251,252,0.5)';
-    c.textAlign = 'center';
-    c.fillText('NOW', g.cx, g.cy - g.histBase - g.histOut - 13 * u);
-
     // Ease drawn positions toward the layout targets (snap when resting, resized or first seen).
     const easing = moving && !snap && dt > 0;
     for (let i = 0; i < L.nodes.length; i += 1) {
@@ -378,7 +373,7 @@
         default: {
           const f = node.status === 'active' ? rateFraction(node.rate) : 0;
           const color = down[Math.round(f * (LUT - 1))]!;
-          if (live) { c.beginPath(); c.fillStyle = rgba(color, 0.12 + 0.2 * f); c.arc(p.x, p.y, r * (1.9 + f), 0, TAU); c.fill(); }
+          if (live && f > 0) { c.beginPath(); c.fillStyle = rgba(color, 0.12 + 0.2 * f); c.arc(p.x, p.y, r * (1.9 + f), 0, TAU); c.fill(); }
           c.beginPath(); c.fillStyle = color; c.globalAlpha = (node.status === 'idle' ? 0.78 : 1) * dim; c.arc(p.x, p.y, r, 0, TAU); c.fill();
           if (node.status === 'active') { c.beginPath(); c.fillStyle = 'rgba(255,255,255,0.55)'; c.arc(p.x - r * 0.28, p.y - r * 0.3, r * 0.34, 0, TAU); c.fill(); }
         }
@@ -388,6 +383,16 @@
       }
     }
     c.globalAlpha = 1;
+
+    // Ring captions sit above nodes so a nearby device never hides them.
+    c.font = `500 ${Math.max(10, 10 * u)}px ${FONT_MONO}`;
+    c.fillStyle = muted;
+    c.textBaseline = 'middle';
+    const tickTop = g.cy - g.histBase - g.histOut - 5 * u;
+    c.textAlign = 'right';
+    c.fillText('NOW', g.cx - 4, tickTop - 7);
+    c.textAlign = 'left';
+    c.fillText('60 s', g.cx + 4, tickTop - 7);
 
     // Gateway core, drawn over the stream roots.
     const pulse = !live || L.state === 'empty' ? (moving ? 0.5 + 0.5 * Math.sin(seconds * 1.1) : 0.5) : 0;
@@ -551,7 +556,7 @@
 </script>
 
 <div class="flow" class:unavailable={!connected} bind:this={wrap}>
-  <div class="stage" role="img" aria-label={description}>
+  <div class="stage" class:with-note={stateCopy !== null && layout.state !== 'empty'} role="img" aria-label={description}>
     <canvas
       bind:this={canvas}
       style={`height:${size.height}px`}
@@ -591,6 +596,7 @@
 <style>
   .flow { position: relative; width: 100%; container-type: inline-size; }
   .stage { position: relative; }
+  .stage.with-note { padding-bottom: 84px; }
   canvas { display: block; width: 100%; touch-action: pan-y; }
   canvas.pointer { cursor: pointer; }
   .note { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); width: min(86%, 360px); display: grid; gap: 3px; text-align: center; padding: 9px 14px; border: 1px solid var(--line-mid, #20424b); border-radius: 10px; background: rgba(10, 12, 20, 0.66); backdrop-filter: blur(6px); pointer-events: none; }

@@ -54,9 +54,22 @@ function snapshotDevice(spec: Spec, index: number) {
   };
 }
 
-async function install(page: Page, opts: { devices?: boolean; socket?: 'live' | 'never' | 'noframes' } = {}) {
-  const devices = opts.devices === false ? [] : SPECS.map(snapshotDevice);
-  const frameSpecs = SPECS.map((spec, index) => ({ spec, index })).filter(({ spec }) => spec.counters !== false);
+/** 150 devices: the 28 above plus generated phones, IoT, media and a few busy ones. */
+function bigSpecs(): Spec[] {
+  const out: Spec[] = [...SPECS];
+  const kinds: Array<Pick<Spec, 'type' | 'cls'>> = [{ type: 'phone' }, { type: 'bulb' }, { type: 'tv' }, { cls: 'camera' }, { type: 'laptop' }, { type: 'sensor' }, { cls: 'guest' }, {}];
+  for (let i = out.length; i < 150; i += 1) {
+    const kind = kinds[i % kinds.length]!;
+    const busy = i % 17 === 0;
+    out.push({ name: `Device ${i}`, ...kind, state: i % 9 === 0 ? 'offline' : i % 13 === 0 ? 'quiet' : 'online', counters: i % 10 !== 0, down: busy ? 3 + (i % 5) * 3 : (i % 4) * 0.05, up: busy ? 0.5 : (i % 3) * 0.01 });
+  }
+  return out;
+}
+
+async function install(page: Page, opts: { devices?: boolean; socket?: 'live' | 'never' | 'noframes'; specs?: Spec[] } = {}) {
+  const SPECS_ = opts.specs ?? SPECS;
+  const devices = opts.devices === false ? [] : SPECS_.map(snapshotDevice);
+  const frameSpecs = SPECS_.map((spec, index) => ({ spec, index })).filter(({ spec }) => spec.counters !== false);
   await page.route('**/api/v1/**', (route) => route.fulfill({ status: 503, json: { error: 'fixture unavailable' } }));
   await page.route('**/api/v1/health', (route) => route.fulfill({ json: { status: 'ok', api_version: 'fixture' } }));
   await page.route('**/api/v1/state**', (route) => route.fulfill({ json: { sequence: 1, devices, next_after: null, service_status: 'ready' } }));
@@ -160,6 +173,37 @@ test.describe('flow map visual review', () => {
     await expect(page.getByText('No per-device counters', { exact: true })).toBeVisible({ timeout: 15000 });
     await page.waitForTimeout(1200);
     await shoot(page, '05-no-counters');
+    await context.close();
+  });
+
+  test('150 devices: frame time and readability', async ({ browser }) => {
+    const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'no-preference', deviceScaleFactor: 1 });
+    const page = await context.newPage();
+    await install(page, { specs: bigSpecs() });
+    // Time every rAF callback (the component's whole paint) so CPU cost is visible even when vsync caps frame deltas.
+    await page.addInitScript(() => {
+      const w = window as unknown as { __cb: number[]; __on: boolean };
+      w.__cb = []; w.__on = false;
+      const raf = window.requestAnimationFrame.bind(window);
+      window.requestAnimationFrame = (cb) => raf((t) => { const s = performance.now(); cb(t); if (w.__on) w.__cb.push(performance.now() - s); });
+    });
+    await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
+    await expect(page.getByRole('img', { name: /Network flow map:/ })).toHaveAttribute('aria-label', /Top talkers/, { timeout: 15000 });
+    await page.waitForTimeout(4000);
+    await page.evaluate(() => { (window as unknown as { __on: boolean }).__on = true; });
+    const stats = await page.evaluate(() => new Promise<{ frames: number; avg: number; worst: number; p95: number; paintAvg: number; paintMax: number }>((resolveStats) => {
+      const deltas: number[] = []; let last = 0; const start = performance.now();
+      const tick = (now: number) => {
+        if (last) deltas.push(now - last);
+        last = now;
+        if (now - start < 10000) requestAnimationFrame(tick);
+        else { const sorted = [...deltas].sort((a, b) => a - b); const cb = (window as unknown as { __cb: number[] }).__cb; resolveStats({ paintAvg: cb.reduce((a, b) => a + b, 0) / Math.max(1, cb.length), paintMax: Math.max(...cb), frames: deltas.length, avg: deltas.reduce((a, b) => a + b, 0) / deltas.length, worst: sorted[sorted.length - 1]!, p95: sorted[Math.floor(sorted.length * 0.95)]! }); }
+      };
+      requestAnimationFrame(tick);
+    }));
+    console.log('FRAME_STATS_150', JSON.stringify(stats));
+    await shoot(page, '08-150-devices');
+    expect(stats.frames).toBeGreaterThan(100);
     await context.close();
   });
 

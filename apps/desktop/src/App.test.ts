@@ -53,7 +53,7 @@ describe('App sign-in', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
 
     await waitFor(() => expect(screen.queryByRole('heading', { name: 'Unlock your home.' })).toBeNull());
-    expect(await screen.findByRole('heading', { name: 'Your network, breathing.' })).toBeTruthy();
+    expect(await screen.findByRole('heading', { name: 'Your network, in motion.' })).toBeTruthy();
     const authorized = fetchMock.mock.calls.filter((call) => (((call[1] as RequestInit | undefined)?.headers ?? {}) as Record<string, string>).Authorization === `Bearer ${ownerToken}`);
     expect(authorized.length).toBeGreaterThan(0);
     expect(window.sessionStorage.getItem('neonhearth.session')).toBeNull();

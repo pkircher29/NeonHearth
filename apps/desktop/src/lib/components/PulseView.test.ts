@@ -60,9 +60,11 @@ it('shows the Flow Map by default, can switch to the Hearth, and remembers the c
   expect(first.getByRole('img',{name:/Network flow map:/})).toBeTruthy();
   expect(first.getByRole('complementary',{name:'How to read the flow map'})).toBeTruthy();
   expect(first.getByText(/The flow map below uses per-device counters/)).toBeTruthy();
+  expect(first.getByRole('heading',{name:'Your network, in motion.'})).toBeTruthy();
   expect(first.getByRole('button',{name:'Flow'}).getAttribute('aria-pressed')).toBe('true');
   await fireEvent.click(first.getByRole('button',{name:'Hearth'}));
   expect(first.getByRole('img',{name:/Network hearth:/})).toBeTruthy();
+  expect(first.getByRole('heading',{name:'Your network, breathing.'})).toBeTruthy();
   expect(first.getByRole('complementary',{name:'How to read the hearth'})).toBeTruthy();
   expect(first.getByText(/The hearth below uses per-device counters/)).toBeTruthy();
   expect(first.queryByRole('img',{name:/Network flow map:/})).toBeNull();

@@ -241,7 +241,7 @@ export function flowGeometry(size: FlowSize): FlowGeometry {
   const compact = width < 520;
   const labelReserve = compact ? 44 : clamp(width * 0.14, 54, 100);
   const nodeMax = Math.max(histBase + histOut + 40, Math.min(height / 2 - 40, width / 2 - labelReserve));
-  const nodeMin = histBase + histOut + 26 * unit;
+  const nodeMin = histBase + histOut + 36 * unit;
   return { width, height, cx: width / 2, cy: height / 2, unit, coreR, histBase, histOut, histIn, nodeMin, nodeMax: Math.max(nodeMax, nodeMin + 20), rimR: Math.max(nodeMax, nodeMin + 20) + 14, compact };
 }
 
@@ -375,8 +375,10 @@ export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, c
   const weights = present.map((group) => Math.max(1, Math.sqrt(byGroup.get(group.id)!.length)));
   const weightSum = weights.reduce((a, b) => a + b, 0);
   const usable = TAU - GROUP_GAP * present.length;
-  const spacing = 19 * geo.unit;
-  const step0 = 19 * geo.unit;
+  // Dense networks shrink their nodes so 150 devices stay readable.
+  const density = devices.length <= 40 ? 1 : Math.max(0.6, Math.sqrt(40 / devices.length));
+  const spacing = 19 * geo.unit * density;
+  const step0 = 19 * geo.unit * density;
 
   const nodes: FlowNode[] = [];
   const groups: FlowGroup[] = [];
@@ -420,7 +422,7 @@ export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, c
           x: geo.cx + Math.cos(angle) * r,
           y: geo.cy + Math.sin(angle) * r,
           angle,
-          radius: geo.unit * (4.2 + 6.2 * (streaming ? rateFraction(total) : 0)),
+          radius: geo.unit * density * (4.2 + 6.2 * (streaming ? rateFraction(total) : 0)),
           hasStream: streaming,
           downLane: streaming && down >= STREAM_FLOOR_BPS ? laneWidth(down / Math.max(measuredTotal, 1), geo.unit) : 0,
           upLane: streaming && up >= STREAM_FLOOR_BPS ? laneWidth(up / Math.max(measuredTotal, 1), geo.unit) : 0,
@@ -563,7 +565,7 @@ export function placeLabels(talkers: readonly FlowNode[], all: readonly FlowNode
     const sides: Array<'left' | 'right'> = preferRight ? ['right', 'left'] : ['left', 'right'];
     const shifts = [0, -1, 1, -2, 2].map((m) => m * (height + 2));
     let chosen: (PlacedLabel & { rect: Rect }) | null = null;
-    search: for (const side of sides) {
+    search: for (const pass of [0, 1]) for (const side of sides) {
       for (const shift of shifts) {
         const gap = node.radius + 6;
         const x = side === 'right' ? node.x + gap : node.x - gap - w;
@@ -573,7 +575,7 @@ export function placeLabels(talkers: readonly FlowNode[], all: readonly FlowNode
         if (overlaps(rect, core, 0)) continue;
         if (obstacles.some((o) => overlaps(rect, o))) continue;
         if (placed.some((p) => overlaps(rect, p.rect))) continue;
-        if (all.some((n) => n.deviceId !== node.deviceId && Math.hypot(Math.max(rect.x - n.x, 0, n.x - (rect.x + rect.w)), Math.max(rect.y - n.y, 0, n.y - (rect.y + rect.h))) < n.radius + 2)) continue;
+        if (pass === 0 && all.some((n) => n.deviceId !== node.deviceId && Math.hypot(Math.max(rect.x - n.x, 0, n.x - (rect.x + rect.w)), Math.max(rect.y - n.y, 0, n.y - (rect.y + rect.h))) < n.radius + 2)) continue;
         chosen = { deviceId: node.deviceId, dx: x - node.x, dy: y - node.y, w, h: height, align: side, rect };
         break search;
       }
