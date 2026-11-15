@@ -1159,7 +1159,7 @@ async fn openapi_documents_the_remote_routes() {
 async fn concurrent_pin_failures_are_each_charged_against_the_budget() {
     let fixture = fixture().await;
     let (id, secret) = pair(&fixture, "pixel", "123456").await;
-    let phone = Auth::Phone(id, secret);
+    let phone = Auth::Phone(id.clone(), secret);
 
     let (a, b, c, d, e) = tokio::join!(
         stepup(&fixture, &phone, "000000"),
