@@ -8,6 +8,7 @@ mod device_labels;
 mod flow;
 mod home;
 mod install;
+mod maintenance;
 mod maintenance_db;
 mod policy;
 mod remote_access;
@@ -23,8 +24,13 @@ pub use flow::{CompactionPolicy, FlowIngestor, FlowRepository, FlowStoreError};
 use fs2::FileExt;
 pub use home::*;
 pub use install::{InstallRepository, InstallState, latest_migration_version};
+pub use maintenance::*;
 pub use maintenance_db::*;
-pub use policy::{ActuationAttempt, ActuationReservation, PendingDecision, PolicyRepository};
+pub use policy::{
+    ActuationAttempt, ActuationReservation, CLOCK_BACKWARD_TOLERANCE, ClockStatus, MAX_EXTENSION,
+    MAX_PLAUSIBLE_CLOCK_GAP, MIN_PLAUSIBLE_CLOCK_UNIX, PendingDecision, PolicyRepository,
+    SkippedPolicyRow, decision_fingerprint,
+};
 pub use remote_access::*;
 use sqlx::{
     SqlitePool,
@@ -78,6 +84,51 @@ async fn connect_options(options: SqliteConnectOptions) -> anyhow::Result<Sqlite
         .context("run SQLite migrations")?;
     lock.unlock().context("release migration lock")?;
     Ok(pool)
+}
+
+/// Begins a write transaction that reserves the database writer up front.
+///
+/// Every transaction that reads before it writes must use this instead of
+/// `pool.begin()`. A deferred transaction that upgrades from a read snapshot
+/// fails immediately with `SQLITE_BUSY(_SNAPSHOT)` when another connection
+/// wrote in between, and `busy_timeout` is never consulted for that case.
+/// `BEGIN IMMEDIATE` waits for the writer lock (honouring `busy_timeout`)
+/// before any snapshot is taken.
+pub async fn begin_write(
+    pool: &SqlitePool,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
+/// True for SQLITE_BUSY / SQLITE_LOCKED style failures that are worth retrying.
+pub fn is_busy_error(error: &sqlx::Error) -> bool {
+    error.as_database_error().is_some_and(|database| {
+        let code = database.code();
+        // Primary codes: 5 BUSY, 6 LOCKED; extended codes keep the low byte.
+        code.as_deref()
+            .and_then(|c| c.parse::<i64>().ok())
+            .is_some_and(|c| matches!(c & 0xff, 5 | 6))
+            || database.message().contains("database is locked")
+            || database.message().contains("database table is locked")
+    })
+}
+
+/// Runs `operation` again (bounded, with backoff) while it fails with a busy error.
+pub(crate) async fn retry_busy<T, F, Fut>(mut operation: F) -> Result<T, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match operation().await {
+            Err(error) if is_busy_error(&error) && attempt < 6 => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt))).await;
+            }
+            other => return other,
+        }
+    }
 }
 
 pub async fn connect_memory() -> anyhow::Result<SqlitePool> {
