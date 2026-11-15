@@ -42,10 +42,7 @@ pub fn is_valid_token(token: &str) -> bool {
 /// passes `LATTICE_STATE_BASE=<state>/data`, and the service appends
 /// `NeonHearth` on Windows (`platform_paths`).
 pub fn portable_token_file(state: &Path) -> PathBuf {
-    state
-        .join("data")
-        .join("NeonHearth")
-        .join(OWNER_TOKEN_FILE)
+    state.join("data").join("NeonHearth").join(OWNER_TOKEN_FILE)
 }
 
 /// What a token-file read found. Carries the value only when it is usable.
@@ -159,9 +156,15 @@ mod tests {
     fn a_rotation_is_seen_on_the_next_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(OWNER_TOKEN_FILE);
-        assert_eq!(resolve(&path), (FAKE_FALLBACK.to_owned(), TokenSource::Fallback));
+        assert_eq!(
+            resolve(&path),
+            (FAKE_FALLBACK.to_owned(), TokenSource::Fallback)
+        );
         fs::write(&path, FAKE_FILE_TOKEN).unwrap();
-        assert_eq!(resolve(&path), (FAKE_FILE_TOKEN.to_owned(), TokenSource::File));
+        assert_eq!(
+            resolve(&path),
+            (FAKE_FILE_TOKEN.to_owned(), TokenSource::File)
+        );
         let rotated = "fake-second-rotation-zyxwvutsrqponm-9876";
         fs::write(&path, rotated).unwrap();
         assert_eq!(resolve(&path).0, rotated);
@@ -230,7 +233,10 @@ mod tests {
         ];
         for content in bad {
             fs::write(&path, content).unwrap();
-            assert!(matches!(read_token_file(&path), TokenFile::Invalid), "{content:?}");
+            assert!(
+                matches!(read_token_file(&path), TokenFile::Invalid),
+                "{content:?}"
+            );
             let error = resolve_owner_token(&path, unreachable_fallback)
                 .unwrap_err()
                 .to_string();

@@ -544,10 +544,10 @@ pub(super) fn run(arguments: Vec<OsString>) -> Result<()> {
     // (the service applies the same precedence to the token it is given), so
     // a rotation survives a restart. Read at every launch: the launcher is a
     // one-shot process, so there is no long-lived session to refresh.
-    let (owner, owner_source) = owner_token::resolve_owner_token(
-        &owner_token::portable_token_file(&state),
-        || load_owner(&state),
-    )?;
+    let (owner, owner_source) =
+        owner_token::resolve_owner_token(&owner_token::portable_token_file(&state), || {
+            load_owner(&state)
+        })?;
     if owner_source == owner_token::TokenSource::FallbackUnreadable {
         eprintln!(
             "The collector's owner-token file exists but cannot be read by this account; using the saved launcher credential. If sign-in fails after a token rotation, check the data folder permissions."

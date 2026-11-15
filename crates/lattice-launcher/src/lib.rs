@@ -1,6 +1,6 @@
-pub mod owner_token;
 #[cfg(windows)]
 mod mqtt;
+pub mod owner_token;
 #[cfg(windows)]
 mod platform;
 #[cfg(windows)]
