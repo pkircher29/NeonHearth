@@ -323,6 +323,10 @@ struct CleanupResources {
     proxy: Option<LoopbackRtspProxy>,
     output_dir: Option<PathBuf>,
     permit: Option<OwnedSemaphorePermit>,
+    /// Set on the copy handed to a detached cleanup task. Dropping such a copy
+    /// must never spawn again: when the runtime is shutting down the spawned
+    /// future is dropped immediately, which would re-enter `Drop` forever.
+    detached: bool,
 }
 
 impl CleanupResources {
@@ -333,6 +337,7 @@ impl CleanupResources {
             proxy: Some(value.proxy),
             output_dir: Some(value.output_dir),
             permit: Some(value._permit),
+            detached: false,
         }
     }
 
@@ -347,6 +352,7 @@ impl CleanupResources {
             proxy,
             output_dir: Some(output_dir),
             permit: Some(permit),
+            detached: false,
         }
     }
 
@@ -381,6 +387,7 @@ impl CleanupResources {
                 proxy,
                 output_dir,
                 permit,
+                detached: false,
             })),
         }
     }
@@ -395,6 +402,14 @@ impl Drop for CleanupResources {
         if self.is_empty() {
             return;
         }
+        if self.detached {
+            // The cleanup task never ran to completion (runtime shutting
+            // down). Do not spawn again; at least remove the camera video.
+            if let Some(directory) = self.output_dir.take() {
+                let _ = std::fs::remove_dir_all(directory);
+            }
+            return;
+        }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -403,6 +418,7 @@ impl Drop for CleanupResources {
             proxy: self.proxy.take(),
             output_dir: self.output_dir.take(),
             permit: self.permit.take(),
+            detached: true,
         };
         runtime.spawn(async move {
             let mut attempts = 0_u32;
@@ -650,9 +666,8 @@ impl CameraSessionManager {
                 .map_err(|_| CameraSessionError::Invalid)?;
         let contract = HlsSession::new(session.clone(), camera, stream, created_at, expires_at)
             .map_err(|_| CameraSessionError::Invalid)?;
-        let resources = self
-            .launch(&session, source, binding, LaunchKind::Hls)
-            .await?;
+        // Boxed: keeps the launch state machine off the caller's (test) stack.
+        let resources = Box::pin(self.launch(&session, source, binding, LaunchKind::Hls)).await?;
         let mut sessions = self.sessions.lock().await;
         if !self.accepting.load(Ordering::Acquire) {
             drop(sessions);
@@ -891,9 +906,8 @@ impl CameraSessionManager {
             return Err(CameraSessionError::Unavailable);
         }
         let owner = HlsSessionId::new();
-        let mut resources = self
-            .launch(&owner, source, binding, LaunchKind::Snapshot)
-            .await?;
+        let mut resources =
+            Box::pin(self.launch(&owner, source, binding, LaunchKind::Snapshot)).await?;
         let Some(output_dir) = resources.output_dir.clone() else {
             return Err(CameraSessionError::Unavailable);
         };

@@ -82,9 +82,10 @@ pub struct DraftCorrupt {
     pub corrupt: bool,
 }
 
-/// Problem body for a JSON body the extractor refused. Syntax and data errors
-/// stay 400 (the documented contract), a missing content type is 415 and a
-/// body over the limit is 413.
+/// Problem body for a JSON body the extractor refused. The home API's
+/// documented contract keeps syntax and data errors at 400 (existing clients
+/// and tests rely on it); a missing content type is 415 and a body the
+/// framework refused to buffer keeps its own status (413 over the limit).
 fn body_problem(rejection: &axum::extract::rejection::JsonRejection) -> Response {
     use axum::extract::rejection::JsonRejection;
     let status = match rejection {

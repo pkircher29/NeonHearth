@@ -605,13 +605,8 @@ pub(crate) async fn snapshot_route(_: LocalOwner, State(state): State<AppState>)
 /// Problem body for a request body the extractor refused (bad JSON, wrong
 /// content type, oversize): the rejection's own status with a stable shape.
 pub(crate) fn body_rejection(rejection: &JsonRejection) -> Response {
-    let status = match rejection {
-        JsonRejection::BytesRejection(inner) => inner.status(),
-        JsonRejection::MissingJsonContentType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        _ => StatusCode::BAD_REQUEST,
-    };
     (
-        status,
+        rejection.status(),
         Json(json!({"error": "the request body was rejected"})),
     )
         .into_response()
