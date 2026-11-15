@@ -94,3 +94,24 @@ describe('SettingsView', () => {
     expect(document.documentElement.dataset.motion).toBeUndefined();
   });
 });
+
+describe('SettingsView preferences', () => {
+  const values = new Map<string, string>();
+  beforeEach(() => { values.clear(); vi.stubGlobal('localStorage', { getItem: (k: string) => values.get(k) ?? null, setItem: (k: string, v: string) => values.set(k, v), removeItem: (k: string) => values.delete(k) }); });
+  afterEach(() => vi.unstubAllGlobals());
+  it('turns the single-letter editor shortcuts off and back on, persisting the choice', async () => {
+    const { getByRole } = render(SettingsView, { client: client(), auth: owner, onsignout: vi.fn() });
+    const group = getByRole('group', { name: 'Single-letter shortcuts' });
+    const off = group.querySelectorAll('button')[1] as HTMLButtonElement;
+    await fireEvent.click(off);
+    expect(values.get('neonhearth.home.letterShortcuts') ?? null).toBe('off');
+    expect(off.getAttribute('aria-pressed')).toBe('true');
+    await fireEvent.click(group.querySelectorAll('button')[0] as HTMLButtonElement);
+    expect(values.get('neonhearth.home.letterShortcuts') ?? null).toBeNull();
+  });
+
+  it('says where a remembered credential lives', () => {
+    const { getByText } = render(SettingsView, { client: client(), auth: { ...owner, remembered: true }, onsignout: vi.fn() });
+    expect(getByText(/session storage .* until the tab closes or you sign out/)).toBeTruthy();
+  });
+});

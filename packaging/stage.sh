@@ -29,14 +29,14 @@ DESKTOP="$REPO_ROOT/apps/desktop"
 
 if [ "$SKIP_RUST" -eq 0 ]; then
     echo "== cargo build --release -p lattice-service =="
-    (cd "$REPO_ROOT" && cargo build --release -p lattice-service)
+    (cd "$REPO_ROOT" && cargo build --locked --release -p lattice-service)
 fi
 
 if [ "$SKIP_UI" -eq 0 ]; then
     echo "== npm build apps/desktop =="
-    if [ ! -d "$DESKTOP/node_modules" ]; then
-        npm --prefix "$DESKTOP" ci
-    fi
+    # Always a clean, lockfile-exact install: a pre-existing node_modules may
+    # not match package-lock.json.
+    npm --prefix "$DESKTOP" ci
     npm --prefix "$DESKTOP" run build
 fi
 

@@ -30,7 +30,7 @@
 <style>
   .floor-bar{display:grid;gap:10px}
   .storeys{display:grid;gap:3px}
-  .floor-tab{display:grid;grid-template-columns:26px minmax(0,1fr);gap:10px;align-items:center;min-height:44px;padding:5px 10px 5px 6px;border:1px solid transparent;border-left:3px solid var(--line-strong);border-radius:0 6px 6px 0;background:transparent;color:var(--ink);text-align:left;cursor:pointer}
+  .floor-tab{display:grid;grid-template-columns:26px minmax(0,1fr);gap:10px;align-items:center;min-height:44px;padding:5px 10px 5px 6px;border:1px solid transparent;border-left:3px solid var(--line-strong);border-radius:0;background:transparent;color:var(--ink);text-align:left;cursor:pointer}
   .floor-tab:hover{background:var(--surface-raised)}
   .floor-tab.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,transparent)}
   /* The ground line: level 0 sits on a heavier rule, as it would in a section drawing. */
@@ -42,7 +42,7 @@
   .floor-text small{color:var(--muted);font:11px var(--font-display)}
   .floor-area{color:var(--accent);font-family:var(--font-mono)}
   .floor-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-  .floor-add{min-height:36px;padding:5px 8px;border:1px dashed var(--line-strong);border-radius:6px;background:transparent;color:var(--muted-strong);font:600 12px var(--font-display);cursor:pointer}
+  .floor-add{min-height:36px;padding:5px 8px;border:1px dashed var(--line-strong);border-radius:var(--radius-sm);background:transparent;color:var(--muted-strong);font:600 12px var(--font-display);cursor:pointer}
   .floor-add:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
   .floor-add:disabled{opacity:.4;cursor:not-allowed}
 </style>

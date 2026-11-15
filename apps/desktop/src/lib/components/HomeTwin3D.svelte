@@ -94,6 +94,11 @@
   let rebuildCount = $state(0);
   let resetCount = $state(0);
   let loopRunning = $state(false);
+  /** True while the GPU context is lost: the picture is frozen, and the card says so instead of showing a stale scene as live. */
+  let contextLost = $state(false);
+  let contextTimer: ReturnType<typeof setTimeout> | undefined;
+  let hoverFrame = 0;
+  let pendingHover: PointerEvent | null = null;
 
   const sceneDesc = $derived<SceneDescription>(
     plan ? buildSceneDescription(plan, placements, devices) : { floors: [], bounds: null }
@@ -130,6 +135,12 @@
   const occlusionRay = new THREE.Raycaster();
   const scratch = new THREE.Vector3();
   const scratchWorld = new THREE.Vector3();
+  const scratchDir = new THREE.Vector3();
+  const blockerBuffer: THREE.Mesh[] = [];
+  const visibleExtents: { level: number; mesh: THREE.Mesh }[] = [];
+  // Pickable meshes of the visible floors, rebuilt only when visibility or the scene changes (never per pointer move).
+  let pickPins: THREE.Mesh[] = [];
+  let pickRooms: THREE.Mesh[] = [];
   let roomNodes = new Map<string, { mesh: THREE.Mesh; material: THREE.MeshBasicMaterial; anchor: Vec2; floor_id: string; name: string; area_m2: number | undefined; polygon: Vec2[]; elevation: number }>();
   // Walls grouped per wall so every segment of one wall cuts down together.
   let wallNodes: { floor_id: string; mid: Vec2; cut: boolean; parts: { mesh: THREE.Mesh; base: number; height: number }[] }[] = [];
@@ -148,7 +159,8 @@
   let tween: { from: CameraPose; to: CameraPose; start: number } | null = null;
   let rafHandle = 0;
   let dirty = true;
-  let lastPlan: HomePlan | null | undefined;
+  // The camera starts from the bounds only for a different home (or the first plan); an edit snapshot of the same home keeps the view.
+  let lastHomeId: string | null | undefined;
   let resizeObserver: ResizeObserver | null = null;
   let dragging: 'orbit' | 'pan' | null = null;
   let dragMoved = 0;
@@ -219,6 +231,8 @@
       const width = stage.clientWidth || 640;
       const height = stage.clientHeight || 420;
       camera.updateMatrixWorld();
+      visibleExtents.length = 0;
+      for (const entry of extentMeshes) if (floorVisible(entry.floor_id)) visibleExtents.push({ level: floorLevel(entry.floor_id), mesh: entry.mesh });
       const candidates: LabelCandidate[] = [];
       for (const [id, node] of roomNodes) {
         if (!floorVisible(node.floor_id)) continue;
@@ -228,11 +242,12 @@
         if (scratch.z < -1 || scratch.z > 1) continue;
         // A floor above this label's room hides it: test the ray against those slabs.
         const level = floorLevel(node.floor_id);
-        const blockers = extentMeshes.filter((entry) => floorLevel(entry.floor_id) > level && floorVisible(entry.floor_id)).map((entry) => entry.mesh);
-        if (blockers.length > 0) {
-          occlusionRay.set(camera.position, scratchWorld.clone().sub(camera.position).normalize());
+        blockerBuffer.length = 0;
+        for (const entry of visibleExtents) if (entry.level > level) blockerBuffer.push(entry.mesh);
+        if (blockerBuffer.length > 0) {
+          occlusionRay.set(camera.position, scratchDir.copy(scratchWorld).sub(camera.position).normalize());
           occlusionRay.far = Math.max(0, distance - 0.05);
-          if (occlusionRay.intersectObjects(blockers, false).length > 0) continue;
+          if (occlusionRay.intersectObjects(blockerBuffer, false).length > 0) continue;
         }
         const size = estimateLabelSize(node.name, node.area_m2 !== undefined);
         candidates.push({
@@ -277,6 +292,7 @@
   }
 
   function renderFrame() {
+    if (contextLost) return;
     if (renderer && scene && camera) renderer.render(scene, camera);
   }
 
@@ -284,7 +300,7 @@
     // Without a loop (reduced motion, hidden panel) changes render exactly
     // once; with a loop they mark the next frame dirty.
     dirty = true;
-    if (!rafHandle && mode === '3d') {
+    if (!rafHandle && mode === '3d' && !contextLost) {
       applyCamera();
       renderFrame();
       dirty = false;
@@ -411,8 +427,12 @@
   }
 
   function onPointerMove(event: PointerEvent) {
+    // A drag whose button is no longer down (cancelled touch, release outside the window) must not keep steering the camera.
+    if (dragging && event.buttons === 0 && event.pointerType !== 'touch') dragging = null;
     if (!dragging) {
-      hoverAt(event);
+      // Raycasting every pointer event is wasted work: coalesce to one hover test per frame.
+      pendingHover = event;
+      if (!hoverFrame) hoverFrame = requestAnimationFrame(() => { hoverFrame = 0; const next = pendingHover; pendingHover = null; if (next) hoverAt(next); });
       return;
     }
     const dx = event.clientX - lastPointer.x;
@@ -445,8 +465,15 @@
   }
 
   function onPointerLeave() {
+    pendingHover = null;
     if (hoverRoom) hoverRoom = null;
     if (hoverPin) hoverPin = null;
+  }
+
+  /** The browser took the pointer away (touch cancel, capture lost): end the drag exactly as a release would, without picking. */
+  function endDrag() {
+    dragging = null;
+    dragMoved = 0;
   }
 
   function onWheel(event: WheelEvent) {
@@ -499,19 +526,13 @@
   }
 
   function pickPin(): string | null {
-    const hits = raycaster.intersectObjects(
-      [...pinNodes.values()].filter((node) => floorVisible(node.floor_id)).map((node) => node.hit),
-      false
-    );
+    const hits = raycaster.intersectObjects(pickPins, false);
     const hit = hits.find((candidate) => typeof candidate.object.userData.device_id === 'string');
     return hit ? (hit.object.userData.device_id as string) : null;
   }
 
   function pickRoom(): string | null {
-    const hits = raycaster.intersectObjects(
-      [...roomNodes.values()].filter((node) => floorVisible(node.floor_id)).map((node) => node.mesh),
-      false
-    );
+    const hits = raycaster.intersectObjects(pickRooms, false);
     const hit = hits.find((candidate) => typeof candidate.object.userData.room_id === 'string');
     return hit ? (hit.object.userData.room_id as string) : null;
   }
@@ -828,6 +849,10 @@
       node.group.visible = floorVisible(floor_id);
       node.walls.visible = !wallsHidden;
     }
+    pickPins = [];
+    for (const node of pinNodes.values()) if (floorVisible(node.floor_id)) pickPins.push(node.hit);
+    pickRooms = [];
+    for (const node of roomNodes.values()) if (floorVisible(node.floor_id)) pickRooms.push(node.mesh);
   }
 
   /** Dimming multiplies base colours, so it stays opaque and pixel-deterministic. */
@@ -915,6 +940,24 @@
     scene.add(fill);
     camera = new THREE.PerspectiveCamera(50, 4 / 3, 0.1, 500);
     mode = '3d';
+    const onContextLost = (event: Event) => {
+      // preventDefault asks the browser to restore the context; three.js re-initialises itself when it does.
+      event.preventDefault();
+      contextLost = true;
+      stopLoop();
+      clearTimeout(contextTimer);
+      // Not restored in time: stop pretending and hand over to the honest 2D fallback.
+      contextTimer = setTimeout(() => { if (contextLost) { mode = 'fallback'; onfallback?.(); } }, 5000);
+    };
+    const onContextRestored = () => {
+      clearTimeout(contextTimer);
+      contextLost = false;
+      dirty = true;
+      if (visible && !reduced) startLoop();
+      requestRender();
+    };
+    targetCanvas?.addEventListener('webglcontextlost', onContextLost);
+    targetCanvas?.addEventListener('webglcontextrestored', onContextRestored);
     window.addEventListener('resize', resize);
     // The stage can change size while its panel is hidden (a window resize
     // fires, but the hidden stage measures 0); observe the element itself.
@@ -925,6 +968,11 @@
     resize();
     return () => {
       stopLoop();
+      clearTimeout(contextTimer);
+      if (hoverFrame) cancelAnimationFrame(hoverFrame);
+      hoverFrame = 0;
+      targetCanvas?.removeEventListener('webglcontextlost', onContextLost);
+      targetCanvas?.removeEventListener('webglcontextrestored', onContextRestored);
       window.removeEventListener('resize', resize);
       resizeObserver?.disconnect();
       resizeObserver = null;
@@ -949,9 +997,9 @@
     const currentPlan = plan;
     untrack(() => {
       rebuildStatic(desc);
-      if (currentPlan !== lastPlan) {
-        // A new plan is a new home: start the camera from its bounds.
-        lastPlan = currentPlan;
+      if ((currentPlan?.home_id ?? null) !== lastHomeId) {
+        // A different home: start the camera from its bounds.
+        lastHomeId = currentPlan?.home_id ?? null;
         prevPresence.clear();
         resetView(true);
       }
@@ -1065,12 +1113,15 @@
       onpointerdown={onPointerDown}
       onpointermove={onPointerMove}
       onpointerup={onPointerUp}
+      onpointercancel={endDrag}
+      onlostpointercapture={endDrag}
       onpointerleave={onPointerLeave}
       onwheel={onWheel}
       onkeydown={onKeyDown}
     >
       <canvas bind:this={canvas}></canvas>
     </div>
+    {#if mode === '3d' && contextLost}<div class="twin-lost" role="status">3D view paused: the graphics context was lost. Restoring it; the 2D plan still shows your devices.</div>{/if}
     {#if mode === '3d'}
       <div class="twin-labels" aria-label="Room labels">
         {#each labels as label (label.id)}
@@ -1178,6 +1229,7 @@
   .twin-card dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
   .twin-card-action { min-height: 38px; border: 1px solid var(--accent); border-radius: 6px; background: transparent; color: var(--accent); font: 600 12px var(--font-display); cursor: pointer; }
   .twin-card-action:hover { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  .twin-lost { position: absolute; inset: auto 12px 12px 12px; z-index: 4; padding: 10px 12px; border: 1px solid var(--gold); border-radius: 8px; background: color-mix(in srgb, var(--bg) 85%, transparent); color: var(--ink); font-size: 12px; }
   .twin-fallback { border: 1px dashed var(--line-strong); border-radius: 7px; padding: 18px; color: var(--muted-strong); display: grid; gap: 6px; justify-items: start; }
   .twin-fallback strong { color: var(--ink); }
   .twin-fallback p { margin: 0; font-size: 12px; line-height: 1.5; }

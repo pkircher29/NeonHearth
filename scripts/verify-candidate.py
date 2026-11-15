@@ -178,13 +178,24 @@ class LauncherFailure(RuntimeError):
         super().__init__('Candidate launcher failed: '+json.dumps(self.diagnostic))
 
 
+def launcher_flags():
+    # Hosted CI runs elevated and extracts into a drive other accounts can write.
+    # The launcher refuses both by default; only the automated harness opts in.
+    if os.environ.get('NEONHEARTH_CI_HARNESS')=='1':
+        return ['--allow-elevated','--allow-shared-package']
+    return []
+
+
 def launcher(root, state, *arguments):
-    result=subprocess.run([str(Path(root)/'NeonHearth.exe'),*arguments,'--state',str(state)],
+    result=subprocess.run([str(Path(root)/'NeonHearth.exe'),*arguments,*launcher_flags(),'--state',str(state)],
                           capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=50,
                           creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     if result.returncode:
         raise LauncherFailure(result.returncode,result.stderr)
     return json.loads(result.stdout)
+
+
+OWNER_ENTROPY=b'NeonHearth Home Hub owner credential, format 2'
 
 
 def unprotect(path):
@@ -197,9 +208,14 @@ def unprotect(path):
     raw=(ctypes.c_ubyte*len(encrypted)).from_buffer_copy(encrypted)
     source=Blob(len(encrypted),raw); target=Blob()
     crypt=ctypes.WinDLL('crypt32',use_last_error=True)
-    crypt.CryptUnprotectData.argtypes=[ctypes.POINTER(Blob),ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(Blob)]
+    crypt.CryptUnprotectData.argtypes=[ctypes.POINTER(Blob),ctypes.c_void_p,ctypes.POINTER(Blob),ctypes.c_void_p,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(Blob)]
     crypt.CryptUnprotectData.restype=wintypes.BOOL
-    if not crypt.CryptUnprotectData(ctypes.byref(source),None,None,None,None,1,ctypes.byref(target)):
+    # Format 2 credentials carry application entropy (crates/lattice-launcher
+    # platform.rs OWNER_ENTROPY); format 1 files from older builds carry none.
+    entropy_bytes=(ctypes.c_ubyte*len(OWNER_ENTROPY)).from_buffer_copy(OWNER_ENTROPY)
+    entropy=Blob(len(OWNER_ENTROPY),entropy_bytes)
+    if not crypt.CryptUnprotectData(ctypes.byref(source),None,ctypes.byref(entropy),None,None,1,ctypes.byref(target)) and \
+       not crypt.CryptUnprotectData(ctypes.byref(source),None,None,None,None,1,ctypes.byref(target)):
         raise RuntimeError('Owner credential cannot be opened by this Windows account')
     kernel=ctypes.WinDLL('kernel32',use_last_error=True)
     kernel.LocalFree.argtypes=[ctypes.c_void_p]; kernel.LocalFree.restype=ctypes.c_void_p

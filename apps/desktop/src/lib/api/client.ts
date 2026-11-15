@@ -2,19 +2,10 @@ import type { Bandwidth, BandwidthFrame, CameraDetail, CameraHealth, CameraInven
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
-/**
- * Where the client gets its credential. `header()` returns the full
- * Authorization value or null when the caller has no credential (the dev
- * proxy injects one upstream; production shows the sign-in screen after the
- * first 401). The client NEVER sends an empty bearer.
- */
-export interface AuthSource {
-  header(): string | null;
-  /** A request was refused with 401: the credential (if any) is invalid. */
-  unauthorized?(): void;
-  /** A phone-session request was refused with 403: PIN step-up is needed. */
-  stepupRequired?(): void;
-}
+import { createHttp, type AuthSource } from './http';
+// Where the client gets its credential: `header()` is the full Authorization value or null (the dev
+// proxy injects one upstream; production shows the sign-in screen after the first 401). Never an empty bearer.
+export type { AuthSource } from './http';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -256,7 +247,7 @@ export interface ApiClient {
   health(): Promise<Health>;
   snapshot(options?: SnapshotPageOptions): Promise<Snapshot>;
   snapshotAll(options?: { limit?: number; maxPages?: number; maxRecords?: number; signal?: AbortSignal }): Promise<Snapshot>;
-  issueEventTicket(): Promise<EventTicket>;
+  issueEventTicket(signal?: AbortSignal): Promise<EventTicket>;
   /** Owner-only: mints a phone session and returns its one-time pairing secret. */
   pairPhone(deviceLabel: string, pin: string): Promise<PairPhoneResponse>;
   /** History: newest-first page of the audit chain. */
@@ -278,7 +269,8 @@ export interface ApiClient {
   openEvents(
     afterSequence: number,
     onMessage: (message: ServerMessage) => void,
-    onState: (state: ConnectionState) => void
+    onState: (state: ConnectionState) => void,
+    signal?: AbortSignal
   ): Promise<WebSocket>;
   cameras(options?: { limit?: number; after?: string }): Promise<CameraList>;
   camera(id: string): Promise<CameraDetail>;
@@ -676,31 +668,10 @@ function isDoctorApproval(value: unknown): value is DoctorApproval {
     && isApprovalIdToken(value.approval_id) && isDate(value.expires_at);
 }
 
-export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl = fetch, WebSocketImpl = WebSocket, requestTimeoutMs = 15_000 }: ApiClientOptions): ApiClient {
-  const apiUrl = (path: string) => new URL(path, baseUrl).toString();
-  const credential = (): string | null => auth ? auth.header() : (serviceToken ? `Bearer ${serviceToken}` : null);
-
-  /**
-   * One fetch path: applies the request timeout (combined with any caller
-   * signal) and reports auth refusals to the credential source so the app can
-   * show sign-in (401) or the PIN prompt (403 on a phone session).
-   */
-  async function send(path: string, init: RequestInit = {}, signal?: AbortSignal): Promise<Response> {
-    const controller = new AbortController();
-    const abort = () => controller.abort(signal?.reason ?? new Error('Request aborted'));
-    if (signal?.aborted) abort();
-    else signal?.addEventListener('abort', abort, { once: true });
-    const timer = requestTimeoutMs > 0 ? setTimeout(() => controller.abort(new Error('Request timed out')), requestTimeoutMs) : undefined;
-    try {
-      const response = await fetchImpl(apiUrl(path), { ...init, signal: controller.signal });
-      if (response.status === 401) auth?.unauthorized?.();
-      else if (response.status === 403 && credential()?.startsWith('PhoneSession ')) auth?.stepupRequired?.();
-      return response;
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-      signal?.removeEventListener('abort', abort);
-    }
-  }
+export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSocketImpl = WebSocket, requestTimeoutMs = 15_000 }: ApiClientOptions): ApiClient {
+  const http = createHttp({ baseUrl, auth, serviceToken, fetchImpl, timeoutMs: requestTimeoutMs });
+  const credential = http.credential;
+  const send = (path: string, init: RequestInit = {}, signal?: AbortSignal) => http.send(path, init, { signal });
 
   async function request(path: string, init?: RequestInit, signal?: AbortSignal): Promise<unknown> {
     const response = await send(path, init, signal);
@@ -708,10 +679,7 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl = fetch
     return response.json() as Promise<unknown>;
   }
 
-  function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
-    const header = credential();
-    return header === null ? extra : { Authorization: header, ...extra };
-  }
+  const authHeaders = http.authHeaders;
   function authorized(method: 'GET' | 'POST' | 'PUT' | 'DELETE', body?: unknown): RequestInit {
     return body === undefined
       ? { method, headers: authHeaders() }
@@ -776,15 +744,15 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl = fetch
     }
   }
 
-  async function issueEventTicket(): Promise<EventTicket> {
-    const value = await request('/api/v1/events/ticket', authorized('POST'));
+  async function issueEventTicket(signal?: AbortSignal): Promise<EventTicket> {
+    const value = await request('/api/v1/events/ticket', authorized('POST'), signal);
     if (!isEventTicket(value)) throw new Error('Invalid event ticket response');
     return value;
   }
 
-  async function openEvents(afterSequence: number, onMessage: (message: ServerMessage) => void, onState: (state: ConnectionState) => void): Promise<WebSocket> {
+  async function openEvents(afterSequence: number, onMessage: (message: ServerMessage) => void, onState: (state: ConnectionState) => void, signal?: AbortSignal): Promise<WebSocket> {
       if (!isSequence(afterSequence)) throw new Error('Invalid event sequence');
-      const { ticket } = await issueEventTicket();
+      const { ticket } = await issueEventTicket(signal);
       const url = new URL('/api/v1/events', baseUrl);
       url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
       url.search = new URLSearchParams({ ticket, after_sequence: String(afterSequence) }).toString();

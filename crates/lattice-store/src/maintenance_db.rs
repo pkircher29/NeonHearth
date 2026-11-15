@@ -88,6 +88,10 @@ pub struct RestoreReport {
     /// Where the pre-restore database was kept, when one existed.
     pub previous_database: Option<String>,
     pub verification: BackupVerification,
+    /// Always true: a restore rewinds checkpoint sequences, actuation journals
+    /// and the audit chain, so the caller must reconcile router/appliance
+    /// state and refresh any out-of-band audit head before resuming.
+    pub reconcile_required: bool,
 }
 
 /// Retention configuration for the audit log. At least one bound must be set.
@@ -162,6 +166,11 @@ impl DbMaintenance {
         if let Err(error) = sqlx::query(&sql).execute(&self.pool).await {
             let _ = std::fs::remove_file(&temp);
             return Err(storage(error));
+        }
+        // Never publish a backup that does not pass its own integrity check.
+        if let Err(error) = Self::verify_backup(&temp).await {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
         }
         let size_bytes = sync_file(&temp)?;
         std::fs::rename(&temp, destination)
@@ -241,6 +250,15 @@ impl DbMaintenance {
         create_private_empty(&staged)?;
         std::fs::copy(backup, &staged).map_err(|error| io_error("stage restore copy", error))?;
         sync_file(&staged)?;
+        // The backup was verified before the copy; verify what will actually
+        // become the live database so a changed or truncated copy is refused.
+        if let Err(error) = Self::verify_backup(&staged).await {
+            let _ = std::fs::remove_file(&staged);
+            return Err(match error {
+                MaintenanceError::BackupInvalid(reason) => MaintenanceError::RestoreRefused(reason),
+                other => other,
+            });
+        }
         // The incoming snapshot has no journal; stale sidecar files from the
         // old database must not be replayed into it.
         for suffix in ["-wal", "-shm"] {
@@ -270,6 +288,7 @@ impl DbMaintenance {
             restored_from: backup_text,
             previous_database: previous_kept.then(|| previous.display().to_string()),
             verification,
+            reconcile_required: true,
         })
     }
 

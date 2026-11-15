@@ -229,3 +229,55 @@ fn out_of_range_first_seen_fails_closed_to_owner_attention() {
     let late = PolicyEngine::new(chrono::DateTime::<Utc>::MAX_UTC - chrono::Duration::hours(1));
     assert!(!late.is_baseline_member(late.baseline_started_at()));
 }
+
+/// Finding 15: a danger signal over the threshold with no evidence (or over
+/// 100%) used to read as "no danger" and leave the device visible.
+#[test]
+fn malformed_danger_signals_fail_toward_owner_attention_not_allow() {
+    let engine = PolicyEngine::new(at(0));
+    for (bps, evidence) in [
+        (9_900u16, "   "),
+        (9_900, ""),
+        (10_001, "x"),
+        (u16::MAX, "x"),
+    ] {
+        let mut candidate = device(60);
+        candidate.baseline_exempt = true;
+        candidate.risk = RiskSignal::HighConfidenceDanger {
+            confidence_basis_points: bps,
+            evidence: evidence.into(),
+        };
+        assert_eq!(
+            engine.evaluate(&candidate, at(61)),
+            Evaluation::owner_attention(),
+            "bps={bps} evidence={evidence:?}"
+        );
+    }
+}
+
+/// Finding 4: with an untrusted clock a deadline expiry must not quarantine.
+#[test]
+fn untrusted_clock_downgrades_deadline_quarantine_to_owner_attention() {
+    let engine = PolicyEngine::new(at(0));
+    let candidate = device(60);
+    let far_future = at(60 + 24 * 400);
+    assert_eq!(
+        engine.evaluate(&candidate, far_future),
+        Evaluation::quarantine(PolicyReason::UnknownDeadlineExpired)
+    );
+    assert_eq!(
+        engine.evaluate_guarded(&candidate, far_future, true),
+        Evaluation::quarantine(PolicyReason::UnknownDeadlineExpired)
+    );
+    assert_eq!(
+        engine.evaluate_guarded(&candidate, far_future, false),
+        Evaluation::owner_attention()
+    );
+    // Owner decisions are not deadline-driven and still apply.
+    let mut rejected = device(60);
+    rejected.owner_decision = OwnerDecision::Rejected;
+    assert_eq!(
+        engine.evaluate_guarded(&rejected, far_future, false),
+        Evaluation::ban(PolicyReason::OwnerRejected)
+    );
+}

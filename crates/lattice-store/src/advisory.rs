@@ -210,10 +210,31 @@ impl AdvisoryRepository {
         let now = time(now)?;
         let rows: Vec<SqliteRow> = sqlx::query("SELECT a.advisory_id,a.source,a.source_id,a.provenance_sha256,a.source_url,a.title,a.vendor,a.model,a.firmware_kind,a.firmware_min,a.firmware_max,a.published_at,a.modified_at,a.retrieved_at,a.cache_expires_at,a.provenance_freshness,a.source_trust,a.severity,a.exploitability,a.exposure,a.confidence,a.remediation,m.match_label,m.matched_fields_json,m.explanation,m.match_confidence,m.severity,m.exploitability,m.exposure,m.confidence,m.remediation,a.content_revision_sha256,a.effective_freshness FROM advisory_matches m JOIN advisories a ON a.advisory_id=m.advisory_id WHERE m.device_id=? ORDER BY a.modified_at DESC,a.source,a.source_id,a.advisory_id LIMIT ?")
             .bind(device_id.to_string()).bind(i64::try_from(MAX_ROWS + 1).map_err(|_| AdvisoryStoreError::Capacity)?).fetch_all(&self.pool).await.map_err(map_sqlx)?;
+        // A device can legitimately match more advisories than one page holds.
+        // Return the newest MAX_ROWS (callers can compare with
+        // `count_device_advisories`) instead of reporting corruption.
         if rows.len() > MAX_ROWS {
-            return Err(AdvisoryStoreError::Corrupt);
+            tracing::warn!(%device_id, "device has more advisory matches than one page; truncating");
         }
-        rows.into_iter().map(|r| decode_row(r, &now)).collect()
+        rows.into_iter()
+            .take(MAX_ROWS)
+            .map(|r| decode_row(r, &now))
+            .collect()
+    }
+
+    /// Total advisory matches for a device, to detect truncation of
+    /// [`Self::list_device_advisories`].
+    pub async fn count_device_advisories(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<u64, AdvisoryStoreError> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM advisory_matches WHERE device_id=?")
+                .bind(device_id.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        u64::try_from(count).map_err(|_| AdvisoryStoreError::Corrupt)
     }
     pub async fn expire_sources(&self, now: DateTime<Utc>) -> Result<u64, AdvisoryStoreError> {
         let now = time(now)?;

@@ -509,3 +509,40 @@ async fn schema_has_migration_and_advisory_uniqueness() -> anyhow::Result<()> {
     assert_eq!(count, 1);
     Ok(())
 }
+
+/// Finding 9: a device with more matches than one page is truncated and
+/// reported through `count_device_advisories`, not rejected as corrupt.
+#[tokio::test]
+async fn more_than_a_page_of_matches_truncates() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    enroll(&pool, device_id()).await;
+    let repository = AdvisoryRepository::new(pool.clone());
+    for number in 0..300 {
+        let value = advisory(&format!("CVE-2026-{number:04}"));
+        let id = repository.upsert_advisory(&value).await?;
+        let matched = match_advisory(
+            &lattice_advisory::DeviceIdentity::known("Acme", "Router", "1.2.3").unwrap(),
+            &value,
+        )?;
+        repository
+            .record_match(
+                id,
+                device_id(),
+                &matched,
+                RiskDimensions {
+                    severity: Severity::High,
+                    exploitability: Exploitability::ProofOfConcept,
+                    exposure: Exposure::PotentiallyExposed,
+                    confidence: Confidence::High,
+                    remediation: Remediation::Upgrade,
+                },
+            )
+            .await?;
+    }
+    let rows = repository
+        .list_device_advisories(device_id(), at(199))
+        .await?;
+    assert_eq!(rows.len(), 256);
+    assert_eq!(repository.count_device_advisories(device_id()).await?, 300);
+    Ok(())
+}

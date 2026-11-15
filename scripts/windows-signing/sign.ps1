@@ -1,6 +1,7 @@
-# Signs one file with Azure Artifact Signing. Tauri calls this for the app,
-# its bundled programs and the installer (bundle.windows.signCommand).
-# setup.ps1 must have run first in the same job.
+# Signs one file with Azure Artifact Signing. setup.ps1 must have run first in
+# the same job; its `dlib` and `metadata` step outputs are passed to this script
+# through the signing step's own environment (ARTIFACT_SIGNING_DLIB and
+# ARTIFACT_SIGNING_METADATA), never through GITHUB_ENV.
 param(
     [Parameter(Mandatory, Position = 0)][string]$File
 )

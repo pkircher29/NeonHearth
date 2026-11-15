@@ -89,7 +89,7 @@ export const WALL_THICKNESS_M = DEFAULT_WALL_THICKNESS_M;
 /** Endpoints closer than this (meters) count as one joint when walls meet. */
 export const WALL_JOIN_TOLERANCE_M = 0.05;
 export const SLAB_THICKNESS_M = 0.12;
-/** Visual breathing room between a floor's ceiling and the slab above it. */
+/** Visual clearance between a floor's ceiling and the slab above it. */
 export const FLOOR_GAP_M = 0.4;
 export const DOOR_HEAD_M = 2.0;
 export const WINDOW_SILL_M = 0.9;

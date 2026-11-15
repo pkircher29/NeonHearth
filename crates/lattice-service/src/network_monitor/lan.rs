@@ -1,6 +1,4 @@
 //! Bounded, directly connected IPv4 discovery. Never derives targets from remote input.
-#[cfg(target_os = "linux")]
-use lattice_sensor::InterfaceId;
 use lattice_sensor::{InterfaceInventory, InterfaceOverride, SystemInterfaceManager};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, net::Ipv4Addr};
@@ -102,17 +100,27 @@ pub fn local_target(ip: Ipv4Addr) -> Option<Target> {
     None
 }
 
-pub async fn probe(target: Target) -> Result<Option<Sighting>, ()> {
-    // Revalidate adapter identity and source immediately before the OS operation.
-    let current = SystemInterfaceManager.snapshot().map_err(|_| ())?;
-    if !plan(&current)
-        .targets
-        .iter()
-        .any(|t| t.interface == target.interface && t.source == target.source && t.ip == target.ip)
-    {
-        return Err(());
-    }
-    probe_native(target).await
+/// Targets probed concurrently per batch. A batch shares one neighbor-table snapshot on Linux.
+#[cfg(windows)]
+pub const BATCH: usize = 16;
+#[cfg(not(windows))]
+pub const BATCH: usize = 64;
+
+/// Probes one batch of targets from a plan that was validated once for the whole sweep.
+/// `names` maps interface index to adapter name (used to pin sockets on Linux).
+pub async fn probe_batch(
+    batch: &[Target],
+    names: &std::collections::BTreeMap<u32, String>,
+) -> Vec<Result<Option<Sighting>, ()>> {
+    probe_batch_native(batch, names).await
+}
+
+#[cfg(windows)]
+async fn probe_batch_native(
+    batch: &[Target],
+    _names: &std::collections::BTreeMap<u32, String>,
+) -> Vec<Result<Option<Sighting>, ()>> {
+    futures_util::future::join_all(batch.iter().cloned().map(probe_native)).await
 }
 
 #[cfg(windows)]
@@ -157,63 +165,79 @@ async fn probe_native(target: Target) -> Result<Option<Sighting>, ()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn probe_native(target: Target) -> Result<Option<Sighting>, ()> {
-    use lattice_sensor::neighbor::{
-        NeighborReachability, NeighborSnapshotConfig, NeighborSnapshotSource,
-        SystemNeighborSnapshotSource,
+async fn probe_batch_native(
+    batch: &[Target],
+    names: &std::collections::BTreeMap<u32, String>,
+) -> Vec<Result<Option<Sighting>, ()>> {
+    use lattice_sensor::{
+        InterfaceId,
+        active::pin_socket_to_interface,
+        neighbor::{
+            NeighborReachability, NeighborSnapshotConfig, NeighborSnapshotSource,
+            SystemNeighborSnapshotSource,
+        },
     };
-    let inventory = SystemInterfaceManager.snapshot().map_err(|_| ())?;
-    let interface = inventory
-        .interfaces()
-        .find(|i| i.id.get() == target.interface)
-        .ok_or(())?;
-    let executable = ["/usr/bin/ping", "/bin/ping"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).is_file())
-        .ok_or(())?;
-    // OS ping binds the named adapter, has a one-second deadline and never invokes a shell.
-    let status = tokio::process::Command::new(executable)
-        .args([
-            "-n",
-            "-c",
-            "1",
-            "-W",
-            "1",
-            "-w",
-            "1",
-            "-I",
-            &interface.name,
-            &target.ip.to_string(),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .status()
-        .await
-        .map_err(|_| ())?;
-    if !matches!(status.code(), Some(0 | 1)) {
-        return Err(());
+    // A datagram to the discard port makes the kernel resolve the neighbor (ARP) without
+    // spawning a process per target. Nothing is expected back; only the neighbor entry matters.
+    let mut triggered = vec![false; batch.len()];
+    for (slot, target) in triggered.iter_mut().zip(batch) {
+        if !names.contains_key(&target.interface) {
+            continue;
+        }
+        let Ok(socket) = tokio::net::UdpSocket::bind((target.source, 0)).await else {
+            continue;
+        };
+        let binding = lattice_sensor::AuthorizedBinding {
+            source: target.source.into(),
+            interface_index: target.interface,
+            target: target.ip.into(),
+        };
+        if pin_socket_to_interface(&socket, binding).is_err() {
+            continue;
+        }
+        let _ = socket.send_to(&[0], (target.ip, 9)).await;
+        *slot = true;
     }
-    let config =
-        NeighborSnapshotConfig::new(4096, [InterfaceId::new(target.interface)]).map_err(|_| ())?;
-    let rows = SystemNeighborSnapshotSource::new(config)
-        .snapshot()
-        .await
-        .map_err(|_| ())?;
-    Ok(rows
-        .into_iter()
-        .find(|r| {
-            r.ip() == target.ip
-                && (status.success() || r.reachability() == NeighborReachability::Reachable)
+    // One neighbor snapshot for the whole batch, after the kernel had time to resolve.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let interfaces: std::collections::BTreeSet<_> = batch
+        .iter()
+        .map(|t| InterfaceId::new(t.interface))
+        .collect();
+    let rows = match NeighborSnapshotConfig::new(4096, interfaces) {
+        Ok(config) => SystemNeighborSnapshotSource::new(config).snapshot().await,
+        Err(_) => Err(lattice_sensor::neighbor::NeighborError::InvalidConfig),
+    };
+    let Ok(rows) = rows else {
+        return batch.iter().map(|_| Err(())).collect();
+    };
+    batch
+        .iter()
+        .zip(triggered)
+        .map(|(target, triggered)| {
+            if !triggered {
+                return Err(());
+            }
+            Ok(rows
+                .iter()
+                .find(|r| {
+                    r.interface().get() == target.interface
+                        && r.ip() == std::net::IpAddr::V4(target.ip)
+                        && r.reachability() == NeighborReachability::Reachable
+                })
+                .map(|r| Sighting {
+                    interface: target.interface,
+                    ip: target.ip.to_string(),
+                    mac: r.link_address().to_string().to_ascii_uppercase(),
+                }))
         })
-        .map(|r| Sighting {
-            interface: target.interface,
-            ip: target.ip.to_string(),
-            mac: r.link_address().to_string().to_ascii_uppercase(),
-        }))
+        .collect()
 }
+
 #[cfg(not(any(windows, target_os = "linux")))]
-async fn probe_native(_: Target) -> Result<Option<Sighting>, ()> {
-    Err(())
+async fn probe_batch_native(
+    batch: &[Target],
+    _: &std::collections::BTreeMap<u32, String>,
+) -> Vec<Result<Option<Sighting>, ()>> {
+    batch.iter().map(|_| Err(())).collect()
 }

@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result};
 use std::ffi::OsString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -31,6 +32,11 @@ pub const SERVICE_NAME: &str = "NeonHearth";
 /// Exit code reported to the SCM when startup or serving fails. Surfaces as
 /// Win32 error 1066 (ERROR_SERVICE_SPECIFIC_ERROR) with this code attached.
 const EXIT_CODE_RUNTIME_FAILURE: u32 = 1;
+
+/// Wait hint reported while stopping; the checkpoint is advanced every half hint.
+const STOP_WAIT_HINT: Duration = Duration::from_secs(10);
+/// Longest the runtime may take to drop outstanding blocking work after `serve` returns.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 define_windows_service!(ffi_service_main, service_main);
 
@@ -59,15 +65,37 @@ fn run_service() -> Result<()> {
     let handle_slot: Arc<OnceLock<ServiceStatusHandle>> = Arc::new(OnceLock::new());
     let handler_slot = Arc::clone(&handle_slot);
     let handler_shutdown = shutdown_tx.clone();
+    // Set once the runtime has fully stopped; ends the StopPending checkpoint heartbeat.
+    let stopped = Arc::new(AtomicBool::new(false));
+    let handler_stopped = Arc::clone(&stopped);
     let event_handler = move |control| match control {
-        ServiceControl::Stop | ServiceControl::Shutdown => {
-            if let Some(handle) = handler_slot.get() {
+        ServiceControl::Stop | ServiceControl::Shutdown | ServiceControl::Preshutdown => {
+            if let Some(handle) = handler_slot.get().copied() {
                 let _ = handle.set_service_status(status(
                     ServiceState::StopPending,
                     ServiceExitCode::Win32(0),
-                    Duration::from_secs(10),
+                    STOP_WAIT_HINT,
                     1,
                 ));
+                // Draining in-flight probes can outlast one wait hint. Keep advancing the
+                // checkpoint so the SCM sees progress instead of declaring a hung stop.
+                let stopped = Arc::clone(&handler_stopped);
+                std::thread::spawn(move || {
+                    let mut checkpoint = 2;
+                    while !stopped.load(Ordering::Acquire) {
+                        std::thread::sleep(STOP_WAIT_HINT / 2);
+                        if stopped.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let _ = handle.set_service_status(status(
+                            ServiceState::StopPending,
+                            ServiceExitCode::Win32(0),
+                            STOP_WAIT_HINT,
+                            checkpoint,
+                        ));
+                        checkpoint += 1;
+                    }
+                });
             }
             let _ = handler_shutdown.send(true);
             ServiceControlHandlerResult::NoError
@@ -89,6 +117,7 @@ fn run_service() -> Result<()> {
         .context("report StartPending to the SCM")?;
 
     let result = run_shared_startup(shutdown_tx, shutdown_rx, status_handle);
+    stopped.store(true, Ordering::Release);
 
     if let Err(error) = &result {
         tracing::error!(
@@ -123,14 +152,18 @@ fn run_shared_startup(
         .enable_all()
         .build()
         .context("build tokio runtime")?;
-    runtime.block_on(crate::serve(shutdown_tx, shutdown_rx, move || {
+    let result = runtime.block_on(crate::serve(shutdown_tx, shutdown_rx, move || {
         let _ = status_handle.set_service_status(status(
             ServiceState::Running,
             ServiceExitCode::Win32(0),
             Duration::ZERO,
             0,
         ));
-    }))
+    }));
+    // Dropping a runtime waits for every spawn_blocking task (ICMP echoes, neighbor and
+    // socket-table reads) with no limit; bound it so Stopped is always reported promptly.
+    runtime.shutdown_timeout(SHUTDOWN_DRAIN);
+    result
 }
 
 fn status(
@@ -143,7 +176,9 @@ fn status(
         service_type: ServiceType::OWN_PROCESS,
         current_state: state,
         controls_accepted: if state == ServiceState::Running {
-            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+            ServiceControlAccept::STOP
+                | ServiceControlAccept::SHUTDOWN
+                | ServiceControlAccept::PRESHUTDOWN
         } else {
             ServiceControlAccept::empty()
         },
