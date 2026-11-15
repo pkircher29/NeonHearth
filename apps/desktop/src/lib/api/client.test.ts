@@ -811,3 +811,20 @@ describe('createApiClient', () => {
     }
   });
 });
+
+describe('createApiClient camera media status', () => {
+  const make = (response: () => Response) => createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => response()) });
+  const body = { enabled: false, reason: 'ffmpeg_not_found', detail: 'Install ffmpeg.', setup_available: false, setup_detail: 'No camera can be added yet.' };
+
+  it('parses the status and ignores keys a newer service adds', async () => {
+    const client = make(() => new Response(JSON.stringify({ ...body, future_key: 1 }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    await expect(client.cameraMedia()).resolves.toEqual(body);
+  });
+
+  it('fills the optional fields and answers null for an old service or an unreadable reply', async () => {
+    const minimal = make(() => new Response(JSON.stringify({ enabled: true, reason: 'ready' }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    await expect(minimal.cameraMedia()).resolves.toEqual({ enabled: true, reason: 'ready', detail: '', setup_available: true, setup_detail: '' });
+    await expect(make(() => new Response(null, { status: 404 })).cameraMedia()).resolves.toBeNull();
+    await expect(make(() => new Response(JSON.stringify({ enabled: 'yes' }), { status: 200, headers: { 'content-type': 'application/json' } })).cameraMedia()).resolves.toBeNull();
+  });
+});
