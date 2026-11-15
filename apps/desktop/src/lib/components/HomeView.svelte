@@ -2,7 +2,7 @@
   // Home tab: 2D plan editor + 3D twin over one shared HomeApi and live state (M5 integration · H8).
   import { onMount } from 'svelte';
   import { createHomeApi, type HomeApi, type HomeSnapshot } from '../stores/home';
-  import type { LiveState } from '../stores/live';
+  import { liveStatus, type LiveState } from '../stores/live';
   import type { AutomationSnapshot, NetworkDetails } from '../api/automation';
   import type { TwinDevice } from '../twin/geometry';
   import { motionReduced } from '../stores/preferences';
@@ -40,10 +40,12 @@
     if (!sameTwinDevices(twinCache, next)) twinCache = next;
     return twinCache;
   });
-  const presence = $derived(toPresenceMap(liveState.devices));
+  // Pins only claim a presence or a heat colour while the collector is live; otherwise they show as unknown.
+  const live = $derived(liveStatus(liveState) === 'live');
+  const presence = $derived(live ? toPresenceMap(liveState.devices) : {});
   // Evidence and last-seen change with live frames; they feed the twin's detail card only, never its scene.
   const deviceInfo = $derived(toTwinDeviceInfo(liveState.devices));
-  const bandwidth = $derived(toBandwidthMap(liveState.devices));
+  const bandwidth = $derived(live ? toBandwidthMap(liveState.devices) : {});
   const selectedName = $derived(
     selectedDeviceId === null
       ? null
@@ -103,6 +105,10 @@
     {/if}
   </div>
 
+  {#if !live && liveState.deviceOrder.length > 0}
+    <div class="home-banner" role="status">Collector offline. Device presence and heat are not shown live; pins appear as unknown until the connection returns.</div>
+  {/if}
+
   {#if fallbackNotice}
     <div class="home-banner" role="status">
       3D unavailable on this device. The plan editor shows the same devices and placements.
@@ -121,7 +127,7 @@
       <p class="home-banner">{automation.devices.length} Home Assistant devices are available in the placement tray. Reported rooms: {automation.areas.join(', ') || 'none'}. Draw the rooms to match your home, then place each device. Room names do not establish physical coordinates.</p>
     {/if}
     <div id="home-panel-editor" role="tabpanel" aria-labelledby="home-tab-editor" hidden={tab !== 'editor'}>
-      <HomeEditorView api={homeApi} devices={deviceRefs} {snapshot} onsnapshot={onSnapshot} />
+      <HomeEditorView api={homeApi} devices={deviceRefs} {snapshot} onsnapshot={onSnapshot} active={tab === 'editor'} />
     </div>
     {#if twinVisited}
       <div id="home-panel-twin" role="tabpanel" aria-labelledby="home-tab-twin" hidden={tab !== 'twin'}>

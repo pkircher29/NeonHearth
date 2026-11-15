@@ -121,6 +121,30 @@ describe('HomeView', () => {
     expect(within(tray).queryByText(/Front Door Cam/)).toBeNull();
   });
 
+  it('shows pins as unknown and says so while the collector is offline', async () => {
+    webgl.enabled = true;
+    render(HomeView, { liveState: { ...liveFixture(), connected: false }, api: apiStub() });
+    await screen.findByRole('heading', { name: 'Draw the home you protect.' });
+    expect(screen.getByText(/Collector offline\. Device presence and heat are not shown live/)).toBeTruthy();
+    await fireEvent.click(screen.getByRole('tab', { name: '3D view' }));
+    const pin = await screen.findByRole('button', { name: /Front Door Cam — unknown/ });
+    expect(pin).toBeTruthy();
+  });
+
+  it('keeps the plan editor shortcuts and undo away while the 3D tab is showing', async () => {
+    webgl.enabled = true;
+    render(HomeView, { liveState: liveFixture(), api: apiStub() });
+    await screen.findByRole('heading', { name: 'Draw the home you protect.' });
+    await fireEvent.click(screen.getByRole('tab', { name: '3D view' }));
+    await fireEvent.keyDown(document.body, { key: 'w' });
+    await fireEvent.keyDown(document.body, { key: 'z', ctrlKey: true });
+    const wall = screen.getByRole('button', { name: 'Wall', hidden: true });
+    expect(wall.getAttribute('aria-pressed')).toBe('false');
+    await fireEvent.click(screen.getByRole('tab', { name: 'Plan editor' }));
+    await fireEvent.keyDown(document.body, { key: 'w' });
+    expect(screen.getByRole('button', { name: 'Wall' }).getAttribute('aria-pressed')).toBe('true');
+  });
+
   it('degrades a missing home route (404) to the empty-plan editor state', async () => {
     const api = apiStub({ fetchHome: vi.fn(async () => { throw new Error('Request failed with status 404'); }) });
     render(HomeView, { liveState: liveFixture(), api });
@@ -225,10 +249,10 @@ describe('homeViewData', () => {
     expect(toBandwidthMap(devices)).toEqual({ [cameraId]: 3000 });
   });
 
-  it('sums partial bandwidth values when only one direction is known', () => {
+  it('omits a device whose reading is one-sided: an unreported direction is unknown, not zero', () => {
     const id = '018f47a0-9b5c-7a22-8a33-112233445503';
     const devices = { [id]: makeDevice(id, { available: true, upload: null, download: 500 }) };
-    expect(toBandwidthMap(devices)).toEqual({ [id]: 500 });
+    expect(toBandwidthMap(devices)).toEqual({});
   });
 
   it('withEmptyPlanOn404 returns an empty snapshot only for 404 and rethrows other failures', async () => {

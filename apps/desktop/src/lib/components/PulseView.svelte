@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { ServerMessage } from '../api/types';
   import type { NetworkSnapshot } from '../api/networkMonitor';
-  import { topDevices, type LiveState } from '../stores/live';
+  import { liveStatus, topDevices, type LiveState } from '../stores/live';
   import type { HostApi } from '../api/hostMonitor';
   import type { AutomationApi } from '../api/automation';
   import { deviceMetaFrom, hostFlowFrom, type DeviceMeta, type HostFlow, type HostSample } from './flowMap';
@@ -12,6 +12,7 @@
   interface Props { state?: LiveState | null; network?: NetworkSnapshot | null; onselectdevice?: (deviceId: string) => void; onopentraffic?: () => void; hostApi?: HostApi | null; automationApi?: AutomationApi | null; }
   let { state: liveState = null, network = null, onselectdevice, onopentraffic, hostApi = null, automationApi = null }: Props = $props();
   let animationPaused = $state(false);
+  const CURVE_BREAK_MS = 5_000;
   const HERO_KEY = 'neonhearth.pulse.hero';
   type Hero = 'flow' | 'hearth';
   function readHero(): Hero { try { return globalThis.localStorage?.getItem(HERO_KEY) === 'hearth' ? 'hearth' : 'flow'; } catch { return 'flow'; } }
@@ -21,11 +22,16 @@
   let meta = $state<ReadonlyMap<string, DeviceMeta> | undefined>(undefined);
   // This computer's live traffic: the honest fallback when per-device counters need the router feed.
   let hostFlow = $state<HostFlow | null>(null);
-  const hasThroughput = $derived(Boolean(liveState?.connected && liveState.throughput.length));
+  // A reading is only real while the stream is live and some fresh device reports it.
+  const status = $derived(liveStatus(liveState));
+  const hasThroughput = $derived(Boolean(liveState && status === 'live' && (liveState.aggregate.upload !== null || liveState.aggregate.download !== null)));
   const hostSource = $derived(!hasThroughput && Boolean(liveState?.connected) && hostFlow !== null);
   const flowUpload = $derived(hasThroughput && liveState ? liveState.aggregate.upload : hostSource && hostFlow ? hostFlow.up : null);
   const flowDownload = $derived(hasThroughput && liveState ? liveState.aggregate.download : hostSource && hostFlow ? hostFlow.down : null);
-  const currentBps = $derived(hasThroughput && liveState ? liveState.aggregate.upload + liveState.aggregate.download : null);
+  // A one-sided reading is not a total: say which side is missing instead of adding a fake zero.
+  const currentBps = $derived(hasThroughput && liveState && liveState.aggregate.upload !== null && liveState.aggregate.download !== null ? liveState.aggregate.upload + liveState.aggregate.download : null);
+  const oneSided = $derived(hasThroughput && liveState && currentBps === null ? (liveState.aggregate.upload === null ? 'Only download is reported' : 'Only upload is reported') : null);
+  const routerName = $derived(network?.router.source?.trim() || 'The router');
   const allDevices = $derived(liveState ? liveState.deviceOrder.map((id) => liveState.devices[id]).filter((device): device is NonNullable<typeof device> => Boolean(device)) : []);
   const devices = $derived(liveState ? topDevices(liveState, 4) : []);
   const presenceCounts = $derived(allDevices.reduce((acc, device) => { const key = device.presence.state === 'online' ? 'online' : device.presence.state === 'quiet' ? 'quiet' : device.presence.state === 'blocked' ? 'blocked' : 'other'; acc[key] += 1; return acc; }, { online: 0, quiet: 0, blocked: 0, other: 0 }));
@@ -71,17 +77,22 @@
 
   const makerGrouped = $derived(Boolean(meta) && allDevices.some((device) => !device.owner_type && !device.identity.classification));
 
+  /** Time-scaled path; a gap longer than the break threshold lifts the pen instead of drawing across missing data. */
   function pathFor(points: LiveState['throughput']): string {
-    const bounded = points.slice(-60); if (bounded.length < 2) return '';
+    const bounded = points.slice(-60);
+    if (bounded.length < 2) return '';
+    const times = bounded.map((point) => Date.parse(point.at));
+    if (times.some((time) => !Number.isFinite(time))) return '';
+    const span = Math.max(1, times[times.length - 1]! - times[0]!);
     const max = Math.max(...bounded.map((point) => point.upload + point.download), 1);
-    return bounded.map((point, index) => `${index ? 'L' : 'M'} ${(index / (bounded.length - 1)) * 600} ${118 - ((point.upload + point.download) / max) * 98}`).join(' ');
+    return bounded.map((point, index) => {
+      const move = index === 0 || times[index]! - times[index - 1]! > CURVE_BREAK_MS;
+      return `${move ? 'M' : 'L'} ${((times[index]! - times[0]!) / span) * 600} ${118 - ((point.upload + point.download) / max) * 98}`;
+    }).join(' ');
   }
+  const deviceTotal = (device: LiveState['devices'][string]): number | null => (device.bandwidth.upload === null && device.bandwidth.download === null ? null : (device.bandwidth.upload ?? 0) + (device.bandwidth.download ?? 0));
   function widthFor(device: LiveState['devices'][string]): number {
-    return Math.min(100, (((device.bandwidth.upload ?? 0) + (device.bandwidth.download ?? 0)) / Math.max(currentBps ?? 1, 1)) * 100);
-  }
-  function protocolShare(value: number): number {
-    const total = liveState?.protocolMix ? Object.values(liveState.protocolMix).reduce((sum, amount) => sum + amount, 0) : 0;
-    return total ? (value / total) * 100 : 0;
+    return Math.min(100, ((deviceTotal(device) ?? 0) / Math.max(currentBps ?? 1, 1)) * 100);
   }
   function eventCopy(event: ServerMessage): { title: string; detail: string; cue: string } {
     if (event.type === 'resync_required') return { title: 'Live stream needs a refresh', detail: 'Waiting for a safe resync', cue: 'watch' };
@@ -101,10 +112,10 @@
         {#if householdReady}
           <h2>Household traffic is available</h2>
           <p class="household-rates"><span>Download <strong>{formatThroughput(network?.router.download)}</strong></span><span>Upload <strong>{formatThroughput(network?.router.upload)}</strong></span></p>
-          <p>Predator Connect W6 · router-reported internet totals. These readings do not measure individual devices or traffic between LAN devices.</p>
+          <p>{routerName} · router-reported internet totals. These readings do not measure individual devices or traffic between LAN devices.</p>
         {:else}
           <h2>No fresh router readings</h2>
-          <p>Household internet totals require the supported Predator Connect W6 feed. Open Traffic, then Network preferences to connect it. Device discovery and this computer's monitoring do not require that feed.</p>
+          <p>Household internet totals require a supported router feed. Open Traffic, then Network preferences to connect it. Device discovery and this computer's monitoring do not require that feed.</p>
         {/if}
       </div>
       <button class="pause-button" type="button" onclick={onopentraffic}>Open Traffic</button>
@@ -157,9 +168,9 @@
     {/if}
     <div class="hearth-caption"><span class="status-cue watch">△</span><strong>{liveState?.connected ? 'Live readings connected' : 'Collector connection unavailable'}</strong><span class="muted">{liveState?.connected ? 'Data updates continue when motion is paused.' : 'Check the local collector and sign in if requested. Existing measurements may be stale.'}</span></div>
   </div>
-  <div class="metrics"><article><span class="metric-label">THROUGHPUT</span><strong>{formatThroughput(currentBps)}</strong><span class="metric-note">{hasThroughput ? 'Measured devices · upload + download now' : liveState?.connected ? 'No per-device counter source' : 'Collector connection unavailable'}</span></article><article><span class="metric-label">PROTOCOL MIX</span>{#if liveState?.protocolMix}<strong>{Object.keys(liveState.protocolMix).length} <small>observed</small></strong><span class="metric-note">Traffic categories from collector</span>{:else}<strong>Unavailable</strong><span class="metric-note">No protocol data received</span>{/if}</article><article><span class="metric-label">COVERAGE</span><strong class="coverage-badge {liveState?.coverage ?? 'unavailable'}"><span aria-hidden="true">{liveState?.coverage === 'complete' ? '✓' : liveState?.coverage === 'mixed' ? '△' : '○'}</span> {liveState?.coverage ?? 'UNAVAILABLE'}</strong><span class="metric-note">Evidence quality, not a heat score</span></article></div>
-  <div class="pulse-lower"><div><div class="section-title"><h2>Throughput curve</h2><span class="muted">{hasThroughput ? 'last 60 readings' : 'waiting for readings'}</span></div><div class="curve-panel">{#if hasThroughput}<svg viewBox="0 0 600 130" role="img" aria-label="Bounded throughput curve"><path class="curve-grid" d="M0 20h600M0 69h600M0 118h600"/><path class="curve-path" d={curvePath}/></svg>{:else}<p class="unavailable-copy">{liveState?.connected ? onopentraffic ? 'The collector is connected. This chart needs per-device bandwidth measurements; household router readings appear separately above.' : 'The collector is connected. This chart needs per-device bandwidth measurements. The owner can configure household router readings in Traffic.' : 'Waiting for the collector connection. No current per-device throughput can be verified.'}</p>{/if}</div></div><div><div class="section-title"><h2>Protocol availability</h2></div>{#if liveState?.protocolMix}<div class="protocol-bars">{#each Object.entries(liveState.protocolMix) as pair}<div><span>{pair[0]}</span><progress max="100" value={protocolShare(pair[1])}></progress><b>{Math.round(protocolShare(pair[1]))}%</b></div>{/each}</div>{:else}<p class="unavailable-copy">Unavailable — no protocol mix has arrived.</p>{/if}</div></div>
-  <div class="section-title"><h2>Devices using the most</h2><span class="muted">{devices.length ? `${devices.length} observed` : 'no usage data'}</span></div>{#if devices.length}<div class="top-devices">{#each devices as device}<div class="top-device"><span class="device-symbol">◌</span><span class="device-label"><strong>{device.owner_name ?? `Device ${device.device_id.slice(0, 6)}`}</strong><small>{device.presence.state}</small></span><span class="device-bar"><i style={'width: ' + widthFor(device) + '%'}></i></span><b>{formatThroughput((device.bandwidth.upload ?? 0) + (device.bandwidth.download ?? 0))}</b></div>{/each}</div>{:else}<div class="empty-state"><span class="empty-icon">⌁</span><div><strong>No usage data yet</strong><p class="muted">Usage bars appear only after the collector reports available bandwidth.</p></div></div>{/if}
+  <div class="metrics"><article><span class="metric-label">THROUGHPUT</span><strong>{formatThroughput(currentBps)}</strong><span class="metric-note">{oneSided ?? (hasThroughput ? 'Measured devices · upload + download now' : liveState?.connected ? 'No per-device counter source' : 'Collector connection unavailable')}</span></article><article><span class="metric-label">COVERAGE</span><strong class="coverage-badge {liveState?.coverage ?? 'unavailable'}"><span aria-hidden="true">{liveState?.coverage === 'complete' ? '✓' : liveState?.coverage === 'mixed' ? '△' : '○'}</span> {liveState?.coverage ?? 'UNAVAILABLE'}</strong><span class="metric-note">Evidence quality, not a heat score</span></article></div>
+  <div class="pulse-lower"><div><div class="section-title"><h2>Throughput curve</h2><span class="muted">{hasThroughput ? 'last 60 readings' : 'waiting for readings'}</span></div><div class="curve-panel">{#if hasThroughput}<svg viewBox="0 0 600 130" role="img" aria-label="Bounded throughput curve"><path class="curve-grid" d="M0 20h600M0 69h600M0 118h600"/><path class="curve-path" d={curvePath}/></svg>{:else}<p class="unavailable-copy">{liveState?.connected ? onopentraffic ? 'The collector is connected. This chart needs per-device bandwidth measurements; household router readings appear separately above.' : 'The collector is connected. This chart needs per-device bandwidth measurements. The owner can configure household router readings in Traffic.' : 'Waiting for the collector connection. No current per-device throughput can be verified.'}</p>{/if}</div></div></div>
+  <div class="section-title"><h2>Devices using the most</h2><span class="muted">{devices.length ? `${devices.length} observed` : 'no usage data'}</span></div>{#if devices.length}<div class="top-devices">{#each devices as device}<div class="top-device"><span class="device-symbol">◌</span><span class="device-label"><strong>{device.owner_name ?? `Device ${device.device_id.slice(0, 6)}`}</strong><small>{device.presence.state}</small></span><span class="device-bar"><i style={'width: ' + widthFor(device) + '%'}></i></span><b>{formatThroughput(deviceTotal(device))}</b></div>{/each}</div>{:else}<div class="empty-state"><span class="empty-icon">⌁</span><div><strong>No usage data yet</strong><p class="muted">Usage bars appear only after the collector reports available bandwidth.</p></div></div>{/if}
   <div class="section-title event-heading"><h2>Recent events</h2><span class="muted">bounded to 8</span></div>{#if recentEvents.length}<div class="event-list" aria-label="Recent network events">{#each recentEvents as event}<div class="event-row"><span class="event-kind {eventCopy(event).cue}" aria-label={`${eventCopy(event).cue} status`}>{eventCopy(event).cue === 'risk' ? '!' : eventCopy(event).cue === 'watch' ? '△' : eventCopy(event).cue === 'secure' ? '✓' : '·'}</span><span><strong>{eventCopy(event).title}</strong><small>{eventCopy(event).detail}</small></span><time>{event.type === 'event' ? new Date(event.data.occurred_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'now'}</time></div>{/each}</div>{:else}<p class="unavailable-copy">{liveState?.connected ? 'No recent events. The collector is connected.' : 'Recent events are unavailable while the collector reconnects.'}</p>{/if}
 </section>
 <style>
@@ -170,6 +181,6 @@
   .status-cue { display: inline-grid; place-items: center; width: 21px; height: 21px; border: 1px solid currentColor; border-radius: 50%; }
   .status-cue.watch, .coverage-badge.mixed, .coverage-badge.estimated { color: var(--gold); }
   .coverage-badge.complete { color: var(--accent); }.coverage-badge.unavailable,.coverage-badge.local-only { color: var(--pink); }
-  .pulse-lower { display: grid; grid-template-columns: 1.5fr 1fr; gap: 23px; }.curve-panel { margin-top: 13px; min-height: 151px; border: 1px solid var(--line); border-radius: 7px; padding: 10px; background: var(--surface); }.curve-panel svg { width: 100%; height: 130px; }.curve-grid { fill: none; stroke: var(--line); stroke-dasharray: 3 6; }.curve-path { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }.unavailable-copy { color: var(--muted); font-size: 12px; line-height: 1.5; padding: 18px 0; }.protocol-bars { display: grid; gap: 11px; margin-top: 14px; }.protocol-bars div { display: grid; grid-template-columns: 75px 1fr 33px; gap: 8px; align-items: center; font: 11px var(--font-mono); }.protocol-bars progress { width: 100%; height: 7px; accent-color: var(--blue); }.protocol-bars b { color: var(--ink); font-size: 10px; }.top-devices { border-top: 1px solid var(--line); }.top-device { min-height: 57px; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 25px 1fr minmax(80px, 1fr) auto; align-items: center; gap: 11px; }.device-label strong,.device-label small { display: block; }.device-label small { color: var(--muted); margin-top: 3px; font-size: 11px; }.device-bar { height: 7px; border: 1px solid var(--line-strong); background: var(--surface); }.device-bar i { display: block; height: 100%; background: var(--blue); }.top-device>b { font: 11px var(--font-mono); color: var(--muted-strong); }.event-heading { margin-top: 32px; }.event-list { border-top: 1px solid var(--line); }.event-row { min-height: 57px; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 25px 1fr auto; align-items: center; gap: 10px; }.event-row strong,.event-row small { display: block; }.event-row small { margin-top: 4px; color: var(--muted); font-size: 11px; }.event-row time { color: var(--faint); font: 10px var(--font-mono); }.event-kind { display: inline-grid; place-items: center; width: 21px; height: 21px; border: 1px solid currentColor; border-radius: 4px; font: 11px var(--font-mono); }.event-kind.info { color: var(--blue); }.event-kind.secure { color: var(--accent); }.event-kind.watch { color: var(--gold); border-style: dashed; }.event-kind.risk { color: var(--pink); border-width: 2px; }
+  .pulse-lower { display: grid; grid-template-columns: 1fr; gap: 23px; }.curve-panel { margin-top: 13px; min-height: 151px; border: 1px solid var(--line); border-radius: 7px; padding: 10px; background: var(--surface); }.curve-panel svg { width: 100%; height: 130px; }.curve-grid { fill: none; stroke: var(--line); stroke-dasharray: 3 6; }.curve-path { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }.unavailable-copy { color: var(--muted); font-size: 12px; line-height: 1.5; padding: 18px 0; }.top-devices { border-top: 1px solid var(--line); }.top-device { min-height: 57px; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 25px 1fr minmax(80px, 1fr) auto; align-items: center; gap: 11px; }.device-label strong,.device-label small { display: block; }.device-label small { color: var(--muted); margin-top: 3px; font-size: 11px; }.device-bar { height: 7px; border: 1px solid var(--line-strong); background: var(--surface); }.device-bar i { display: block; height: 100%; background: var(--blue); }.top-device>b { font: 11px var(--font-mono); color: var(--muted-strong); }.event-heading { margin-top: 32px; }.event-list { border-top: 1px solid var(--line); }.event-row { min-height: 57px; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 25px 1fr auto; align-items: center; gap: 10px; }.event-row strong,.event-row small { display: block; }.event-row small { margin-top: 4px; color: var(--muted); font-size: 11px; }.event-row time { color: var(--faint); font: 10px var(--font-mono); }.event-kind { display: inline-grid; place-items: center; width: 21px; height: 21px; border: 1px solid currentColor; border-radius: 4px; font: 11px var(--font-mono); }.event-kind.info { color: var(--blue); }.event-kind.secure { color: var(--accent); }.event-kind.watch { color: var(--gold); border-style: dashed; }.event-kind.risk { color: var(--pink); border-width: 2px; }
   @media (max-width: 850px) { .view-heading { flex-wrap: wrap; }.pause-button { width: 100%; }.pulse-lower { grid-template-columns: 1fr; }.top-device { grid-template-columns: 25px 1fr auto; }.device-bar { grid-column: 2 / -1; }.top-device>b { grid-column: 3; grid-row: 1; } }
 </style>
