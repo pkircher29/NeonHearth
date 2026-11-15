@@ -711,6 +711,14 @@ describe('createApiClient', () => {
     expect(noFetch).not.toHaveBeenCalled();
   });
 
+  it('accepts the audit verify response with or without the saved-head anchor and rejects an unknown anchor', async () => {
+    const base = { report: { checked: 1, start_id: 1, end_id: 1, anchored: true, first_break: null }, head: { id: 1, entry_hash: 'a'.repeat(64) }, valid: true };
+    const make = (body: unknown) => createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })) });
+    await expect(make(base).auditVerify()).resolves.toEqual(base);
+    await expect(make({ ...base, anchor: 'matches' }).auditVerify()).resolves.toEqual({ ...base, anchor: 'matches' });
+    await expect(make({ ...base, anchor: 'surprise' }).auditVerify()).rejects.toThrow('Invalid audit verify response');
+  });
+
   it('binds the owner choice into the approval and repair bodies and rejects a malformed address', async () => {
     const approval = { approval_id: 'appr-0001', expires_at: '2026-08-24T00:10:00Z' };
     const duplicateKind: DiagnosisKind = { kind: 'duplicate_ip', address: '10.0.0.5', macs: ['aa:aa:aa:aa:aa:01', 'ba:bb:bb:bb:bb:02'] };

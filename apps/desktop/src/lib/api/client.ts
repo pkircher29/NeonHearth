@@ -164,7 +164,9 @@ export interface ChainHead { id: number; entry_hash: string }
 export interface AuditPage { entries: AuditEntry[]; head: ChainHead | null; next_before: number | null }
 export type ChainBreakKind = 'id_gap' | 'prev_hash_mismatch' | 'entry_hash_mismatch' | 'invalid_row' | 'head_mismatch';
 export interface ChainReport { checked: number; start_id: number | null; end_id: number | null; anchored: boolean; first_break: { id: number; kind: ChainBreakKind } | null }
-export interface AuditVerify { report: ChainReport; head: ChainHead | null; valid: boolean }
+/** Whether the log still agrees with the newest entry the service recorded separately. Older services omit it. */
+export type AuditAnchor = 'matches' | 'unanchored' | 'mismatch';
+export interface AuditVerify { report: ChainReport; head: ChainHead | null; valid: boolean; anchor?: AuditAnchor }
 
 /** Remote access (Settings). */
 export interface RemoteStatus { daemon: { running: boolean; backend_state: string; dns_name: string | null } | null; daemon_error: string | null; serve_configured: boolean; funnel_conflict: boolean; loopback_port: number }
@@ -213,7 +215,9 @@ function isChainReport(value: unknown): value is ChainReport {
   return isRecord(value.first_break) && exact(value.first_break, ['id', 'kind']) && isId(value.first_break.id) && typeof value.first_break.kind === 'string' && CHAIN_BREAKS.includes(value.first_break.kind);
 }
 function isAuditVerify(value: unknown): value is AuditVerify {
-  return isRecord(value) && exact(value, ['report', 'head', 'valid']) && isChainReport(value.report) && (value.head === null || isChainHead(value.head)) && typeof value.valid === 'boolean';
+  if (!isRecord(value)) return false;
+  const anchorOk = !('anchor' in value) || value.anchor === 'matches' || value.anchor === 'unanchored' || value.anchor === 'mismatch';
+  return exact(value, 'anchor' in value ? ['report', 'head', 'valid', 'anchor'] : ['report', 'head', 'valid']) && anchorOk && isChainReport(value.report) && (value.head === null || isChainHead(value.head)) && typeof value.valid === 'boolean';
 }
 function isRemoteStatus(value: unknown): value is RemoteStatus {
   if (!isRecord(value) || !exact(value, ['daemon', 'daemon_error', 'serve_configured', 'funnel_conflict', 'loopback_port'])) return false;

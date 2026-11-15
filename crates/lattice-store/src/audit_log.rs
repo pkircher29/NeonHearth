@@ -194,6 +194,29 @@ pub struct ChainHead {
     pub entry_hash: String,
 }
 
+/// How the live chain relates to the head recorded outside the audit table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadAnchor {
+    /// The recorded head is still in the chain with the recorded hash.
+    Matches,
+    /// No head has been recorded yet, so nothing can vouch for the chain
+    /// beyond its own self-consistency.
+    Unanchored,
+    /// The recorded head is missing from the chain, carries a different
+    /// hash, or an earlier append found the chain had already diverged.
+    Mismatch,
+}
+
+/// A [`ChainReport`] together with the result of the recorded-head check.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnchoredChainReport {
+    /// A `Mismatch` also appears here as a [`ChainBreakKind::HeadMismatch`]
+    /// break (unless an earlier break already explains the failure).
+    pub report: ChainReport,
+    pub anchor: HeadAnchor,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 pub struct ChainBreak {
     /// Id of the first entry at which the chain fails to verify.
@@ -375,6 +398,21 @@ impl AuditLog {
         report
     }
 
+    /// [`Self::verify_chain`] checked against the head recorded in
+    /// `audit_head_anchor`, which lives outside the audit table and is
+    /// advanced by every append. The walk and the head comparison read one
+    /// snapshot. A chain rewritten or truncated consistently inside the audit
+    /// table verifies on its own, but not against the recorded head.
+    pub async fn verify_chain_anchored(
+        &self,
+        scope: ChainScope,
+    ) -> Result<AnchoredChainReport, AuditLogError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = verify_anchored_in(&mut tx, scope).await;
+        tx.rollback().await.map_err(storage)?;
+        result
+    }
+
     /// Lists entries oldest-first with keyset paging.
     pub async fn list(
         &self,
@@ -540,6 +578,86 @@ async fn head_on(conn: &mut sqlx::SqliteConnection) -> Result<ChainHead, AuditLo
         None => trusted_root_on(conn).await?,
     };
     Ok(ChainHead { id, entry_hash })
+}
+
+async fn verify_anchored_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    scope: ChainScope,
+) -> Result<AnchoredChainReport, AuditLogError> {
+    let stored: Option<(i64, String, i64)> = sqlx::query_as(
+        "SELECT head_id, head_hash, diverged FROM audit_head_anchor WHERE singleton = 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?;
+    let mut report = verify_in(tx, scope, None).await?;
+    let Some((head_id, head_hash, diverged)) = stored else {
+        return Ok(AnchoredChainReport {
+            report,
+            anchor: HeadAnchor::Unanchored,
+        });
+    };
+    let (root_id, root_hash) = trusted_root_on(tx).await?;
+    let live_hash: Option<String> = if head_id == root_id {
+        Some(root_hash)
+    } else if head_id < root_id {
+        None
+    } else {
+        sqlx::query_scalar("SELECT entry_hash FROM audit_log WHERE id = ?")
+            .bind(head_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(storage)?
+    };
+    let matches = diverged == 0 && live_hash.as_deref() == Some(head_hash.as_str());
+    if !matches && report.first_break.is_none() {
+        report.first_break = Some(ChainBreak {
+            id: head_id,
+            kind: ChainBreakKind::HeadMismatch,
+        });
+    }
+    Ok(AnchoredChainReport {
+        report,
+        anchor: if matches {
+            HeadAnchor::Matches
+        } else {
+            HeadAnchor::Mismatch
+        },
+    })
+}
+
+/// Advances the recorded head inside the append transaction. `previous` is
+/// the `(id, hash)` the new entry extends; when the recorded head is not that
+/// pair the chain was changed behind the service's back, and the sticky
+/// `diverged` flag keeps that visible after later appends move the head on.
+async fn record_head(
+    tx: &mut Transaction<'_, Sqlite>,
+    previous: (i64, &str),
+    new_id: i64,
+    new_hash: &str,
+    recorded_at: &str,
+) -> Result<(), AuditLogError> {
+    let stored: Option<(i64, String)> =
+        sqlx::query_as("SELECT head_id, head_hash FROM audit_head_anchor WHERE singleton = 1")
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(storage)?;
+    let diverged = match stored {
+        Some((id, hash)) => id != previous.0 || hash != previous.1,
+        // Nothing recorded yet is only normal for a log that has never had an entry.
+        None => previous.0 > 0,
+    };
+    sqlx::query(
+        "INSERT INTO audit_head_anchor(singleton, head_id, head_hash, diverged, recorded_at)          VALUES(1, ?, ?, ?, ?)          ON CONFLICT(singleton) DO UPDATE SET head_id=excluded.head_id,          head_hash=excluded.head_hash,          diverged=MAX(audit_head_anchor.diverged, excluded.diverged),          recorded_at=excluded.recorded_at",
+    )
+    .bind(new_id)
+    .bind(new_hash)
+    .bind(i64::from(diverged))
+    .bind(recorded_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    Ok(())
 }
 
 async fn verify_in(
@@ -766,6 +884,7 @@ async fn append_locked(
     .execute(&mut **tx)
     .await
     .map_err(storage)?;
+    record_head(tx, (head_id, &prev_hash), id, &entry_hash, occurred_at).await?;
     let detail: serde_json::Value = serde_json::from_str(detail)
         .map_err(|error| AuditLogError::Corrupt(format!("stored detail is not JSON: {error}")))?;
     let occurred_at = decode_time(occurred_at)?;
