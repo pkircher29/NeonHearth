@@ -4,7 +4,8 @@ import {
   FIRE, HISTORY_MAX_SAMPLES, HISTORY_WINDOW_MS, MAX_PARTICLES, STREAM_FLOOR_BPS, TOP, TAU,
   buildRamp, capParticles, curvePoint, curveTangent, describeFlow, easeToward, flowCanvasSize, flowGeometry, flowStateCopy, groupOf,
   historyAngle, historyPoints, historyRadius, laneWidth, layoutFlow, mixHex, nodeAt, particlePhase, particleSpec, placeLabels, planRings,
-  pushHistory, rateFraction, statusOf, streamCurve, topTalkers, type FlowNode
+  pushHistory, rateFraction, statusOf, streamCurve, topTalkers, type FlowNode,
+  deviceLabel, deviceMetaFrom, firstIpv4, groupOfWithSource, hostAppRates, hostFlowFrom, layoutApps, vendorGroup, vendorName, type DeviceMeta, type HostSample
 } from './flowMap';
 import { formatThroughput } from './networkFormat';
 
@@ -101,12 +102,13 @@ describe('grouping', () => {
   it('maps presence and counters to a status without faking activity', () => {
     expect(statusOf(device('a', { rate: [100_000, 0] }))).toBe('active');
     expect(statusOf(device('a', { rate: [0, 0] }))).toBe('idle');
-    expect(statusOf(device('a', { rate: null }))).toBe('unavailable');
+    expect(statusOf(device('a', { rate: null }))).toBe('present'); // online without counters stays visibly online
     expect(statusOf(device('a', { state: 'quiet', rate: [0, 0] }))).toBe('quiet');
     expect(statusOf(device('a', { state: 'offline', rate: [9e6, 0] }))).toBe('offline');
     expect(statusOf(device('a', { state: 'blocked', rate: [9e6, 0] }))).toBe('blocked');
     expect(statusOf(device('a', { state: 'unknown', rate: null }))).toBe('unknown');
-    expect(statusOf(device('a', { rate: [NaN, 0] }))).toBe('unavailable');
+    expect(statusOf(device('a', { rate: [NaN, 0] }))).toBe('present');
+    expect(statusOf(device('a', { state: 'quiet', rate: null }))).toBe('quiet'); // presence survives missing counters
   });
 });
 
@@ -196,7 +198,7 @@ describe('layoutFlow', () => {
     expect(get('x-1').hasStream).toBe(false); // unavailable counters: neutral, no stream
     expect(get('x-1').rate).toBeNull();
     expect(get('x-1').share).toBe(0);
-    expect(get('x-1').status).toBe('unavailable');
+    expect(get('x-1').status).toBe('present');
   });
   it('computes shares over every device the service aggregate covers, so they sum to one', () => {
     const layout = layoutFlow(fleet(), SIZE);
@@ -246,7 +248,7 @@ describe('layoutFlow', () => {
     const layout = layoutFlow([device('solo', { rate: [Infinity, -5] })], SIZE);
     const n = layout.nodes[0]!;
     expect(Number.isFinite(n.x) && Number.isFinite(n.y)).toBe(true);
-    expect(n.status).toBe('unavailable');
+    expect(n.status).toBe('present');
   });
   it('plans rings from the core outward and clamps overflow to the rim', () => {
     const plan = planRings(10, 1, 100, 200, 20, 20);
@@ -329,12 +331,12 @@ describe('history ring', () => {
 });
 
 function node(id: string, x: number, y: number, rate: number, extra: Partial<FlowNode> = {}): FlowNode {
-  return { deviceId: id, label: id, group: 'computers', presence: 'online', status: 'active', rate, down: rate, up: 0, share: 0, rank: 0, x, y, angle: Math.atan2(y - 280, x - 380), radius: 6, hasStream: true, downLane: 1, upLane: 0, downParticles: 1, upParticles: 0, downSpeed: 0.2, upSpeed: 0, seed: 0, ...extra };
+  return { deviceId: id, kind: 'device', vendor: null, groupSource: 'none', label: id, group: 'computers', presence: 'online', status: 'active', rate, down: rate, up: 0, share: 0, rank: 0, x, y, angle: Math.atan2(y - 280, x - 380), radius: 6, hasStream: true, downLane: 1, upLane: 0, downParticles: 1, upParticles: 0, downSpeed: 0.2, upSpeed: 0, seed: 0, ...extra };
 }
 
 describe('top talkers and labels', () => {
   it('picks the busiest few and ignores insignificant or non-live devices', () => {
-    const nodes = [node('a', 100, 100, 5e6), node('b', 200, 100, 4e6), node('c', 300, 100, 3e6), node('d', 400, 100, 2e6), node('e', 500, 100, 1e6), node('tiny', 600, 100, 10_000), node('blocked', 50, 50, 9e9, { status: 'blocked' }), node('nocount', 60, 60, 0, { status: 'unavailable', rate: null })];
+    const nodes = [node('a', 100, 100, 5e6), node('b', 200, 100, 4e6), node('c', 300, 100, 3e6), node('d', 400, 100, 2e6), node('e', 500, 100, 1e6), node('tiny', 600, 100, 10_000), node('blocked', 50, 50, 9e9, { status: 'blocked' }), node('nocount', 60, 60, 0, { status: 'present', rate: null })];
     expect(topTalkers(nodes).map((n) => n.deviceId)).toEqual(['a', 'b', 'c', 'd']);
     expect(topTalkers(nodes, 2).map((n) => n.deviceId)).toEqual(['a', 'b']);
     expect(topTalkers([node('tiny', 1, 1, 10_000)])).toEqual([]);
@@ -403,5 +405,157 @@ describe('describeFlow', () => {
     expect(text).toContain('unavailable total');
     expect(text).toContain('Per-device counters unavailable.');
     expect(text).not.toContain('Top talkers');
+  });
+});
+
+
+const ORG = (organization: string | null, status = 'assigned') => ({ organization, status });
+
+describe('vendor grouping (inferred from the MAC maker)', () => {
+  it.each([
+    ['Espressif Inc.', 'iot'], ['Tuya Smart Inc.', 'iot'], ['WiZ', 'iot'], ['Lumi United Technology Co., Ltd', 'iot'], ['GD Midea Air-Conditioning Equipment Co.,Ltd.', 'iot'], ['Sichuan AI-Link Technology Co., Ltd.', 'iot'],
+    ['FLIR Systems', 'cameras'], ['Wyze Labs Inc', 'cameras'], ['Blink by Amazon', 'cameras'], ['Hangzhou Hikvision Digital Technology Co.,Ltd.', 'cameras'],
+    ['Amazon Technologies Inc.', 'media'], ['Google, Inc.', 'media'], ['Sony Home Entertainment&Sound Products Inc', 'media'],
+    ['Proxmox Server Solutions GmbH', 'computers'], ['Raspberry Pi (Trading) Ltd', 'computers'], ['NVIDIA', 'computers'], ['GIGA-BYTE TECHNOLOGY CO.,LTD.', 'computers'], ['Hewlett Packard', 'computers'], ['Dell Inc.', 'computers'],
+    ['TP-Link Systems Inc.', 'network'], ['Ubiquiti Inc', 'network'], ['Acer Inc.', 'network'],
+    ['Apple, Inc.', 'phones']
+  ])('%s -> %s', (org, group) => { expect(vendorGroup(org, 'assigned')).toBe(group); });
+  it('puts a randomised (locally administered) address in its own honest sector', () => {
+    expect(vendorGroup(null, 'locally_administered')).toBe('private');
+    expect(vendorGroup('Apple, Inc.', 'locally_administered')).toBe('private');
+  });
+  it('leaves unknown makers and missing data ungrouped', () => {
+    expect(vendorGroup(null, 'unknown')).toBeNull();
+    expect(vendorGroup('Shenzhen Jixian Technology Co., Ltd.', 'assigned')).toBeNull();
+    expect(vendorGroup('', 'assigned')).toBeNull();
+    expect(vendorGroup(undefined, undefined)).toBeNull();
+  });
+  it('names makers briefly for labels', () => {
+    expect(vendorName('Espressif Inc.')).toBe('Espressif');
+    expect(vendorName('Proxmox Server Solutions GmbH')).toBe('Proxmox');
+    expect(vendorName('Raspberry Pi (Trading) Ltd')).toBe('Raspberry Pi');
+    expect(vendorName('Shenzhen Jixian Technology Co., Ltd.')).toBe('Shenzhen Jixian');
+    expect(vendorName(null)).toBeNull();
+  });
+  it('reads maker and IPv4 from an inventory row', () => {
+    expect(deviceMetaFrom({ ip_addresses: ['fe80::1', '192.168.1.142'], mac_assignments: [ORG(null, 'unknown'), ORG('Espressif Inc.')] })).toEqual({ vendor: 'Espressif Inc.', vendorStatus: 'assigned', ip: '192.168.1.142' });
+    expect(deviceMetaFrom({})).toEqual({ vendor: null, vendorStatus: null, ip: null });
+    expect(deviceMetaFrom({ mac_assignments: [ORG(null, 'locally_administered')] }).vendorStatus).toBe('locally_administered');
+    expect(firstIpv4(['::1'])).toBeNull();
+  });
+  it('uses type first, the maker only as a labelled fallback, never overriding a stated type', () => {
+    const meta: DeviceMeta = { vendor: 'Espressif Inc.', vendorStatus: 'assigned', ip: '192.168.1.142' };
+    expect(groupOfWithSource(device('a'), meta)).toEqual({ group: 'iot', source: 'vendor' });
+    expect(groupOfWithSource(device('a', { type: 'laptop' }), meta)).toEqual({ group: 'computers', source: 'type' });
+    expect(groupOfWithSource(device('a', { cls: 'camera' }), meta)).toEqual({ group: 'cameras', source: 'type' });
+    expect(groupOfWithSource(device('a'), null)).toEqual({ group: 'unclassified', source: 'none' });
+    expect(groupOfWithSource(device('a'), { vendor: null, vendorStatus: 'unknown', ip: null })).toEqual({ group: 'unclassified', source: 'none' });
+  });
+  it('names unnamed devices by maker and last octet instead of an id', () => {
+    expect(deviceLabel(device('018f47aa'), { vendor: 'Espressif Inc.', vendorStatus: 'assigned', ip: '192.168.1.142' })).toBe('Espressif ·.142');
+    expect(deviceLabel(device('018f47aa'), { vendor: null, vendorStatus: 'locally_administered', ip: '192.168.1.7' })).toBe('Private address ·.7');
+    expect(deviceLabel(device('018f47aa'), { vendor: null, vendorStatus: 'unknown', ip: '192.168.1.9' })).toBe('Device ·.9');
+    expect(deviceLabel(device('018f47aa'), { vendor: 'Espressif Inc.', vendorStatus: 'assigned', ip: null })).toBe('Espressif');
+    expect(deviceLabel(device('018f47aa'))).toBe('Device 018f47');
+    expect(deviceLabel(device('018f47aa', { owner_name: 'Kitchen speaker' }), { vendor: 'Google', vendorStatus: 'assigned', ip: '1.2.3.4' })).toBe('Kitchen speaker');
+  });
+  it('lays a real-shaped network out in meaningful sectors with visible presence', () => {
+    const makers = [['Espressif Inc.', 25], ['WiZ', 6], ['Proxmox Server Solutions GmbH', 6], ['Amazon Technologies Inc.', 5], ['FLIR Systems', 3], ['TP-Link Systems Inc.', 2], ['Apple, Inc.', 3]] as const;
+    const devices: DeviceSnapshot[] = []; const meta = new Map<string, DeviceMeta>();
+    let n = 0;
+    for (const [org, count] of makers) for (let i = 0; i < count; i += 1) {
+      const id = `real-${String(n).padStart(3, '0')}`; n += 1;
+      devices.push(device(id, { rate: null, state: n === 3 ? 'offline' : 'quiet' }));
+      meta.set(id, { vendor: org, vendorStatus: 'assigned', ip: `192.168.1.${n}` });
+    }
+    const layout = layoutFlow(devices, SIZE, true, { meta });
+    expect(layout.state).toBe('no-counters');
+    expect(layout.groups.map((g) => [g.id, g.count])).toEqual([['computers', 6], ['phones', 3], ['media', 5], ['cameras', 3], ['iot', 31], ['network', 2]]);
+    expect(layout.groups.every((g) => g.inferred === g.count)).toBe(true);
+    expect(layout.nodes.filter((x) => x.status === 'quiet')).toHaveLength(49);
+    expect(layout.nodes.filter((x) => x.status === 'offline')).toHaveLength(1);
+    expect(layout.nodes.every((x) => x.groupSource === 'vendor' && !x.hasStream)).toBe(true);
+    expect(layout.nodes[0]!.label).toMatch(/·\.\d+$/);
+  });
+});
+
+function sample(at: string, conns: Array<[string, string, number | null, number | null]>, extra: Partial<HostSample> = {}): HostSample {
+  return {
+    observed_at: at, status: 'ready', upload_bytes_per_second: 1000, download_bytes_per_second: 2000,
+    applications: [{ app_id: 'a1', name: 'chrome.exe' }, { app_id: 'a2', name: 'node.exe' }, { app_id: 'a3', name: 'idle.exe' }],
+    connections: conns.map(([connection_id, app_id, sent_bytes, received_bytes]) => ({ connection_id, app_id, sent_bytes, received_bytes })),
+    ...extra
+  };
+}
+
+describe('host traffic fallback', () => {
+  const t0 = '2026-11-15T10:00:00Z';
+  const t1 = '2026-11-15T10:00:05Z';
+  it('turns cumulative connection bytes into per-app rates, summing connections and ignoring nulls', () => {
+    const prev = sample(t0, [['c1', 'a1', 1_000, 10_000], ['c2', 'a1', 500, 500], ['c3', 'a2', 0, 0], ['c4', 'a3', null, null]]);
+    const cur = sample(t1, [['c1', 'a1', 51_000, 60_000], ['c2', 'a1', 1_500, 1_500], ['c3', 'a2', 500_000, 0], ['c4', 'a3', null, null], ['c5', 'a3', 9_999_999, 9_999_999]]);
+    const rates = hostAppRates(prev, cur);
+    expect(rates.map((r) => r.appId)).toEqual(['a2', 'a1']); // c5 is new (no baseline) and c4 is null: both ignored
+    expect(rates[0]).toMatchObject({ appId: 'a2', name: 'node.exe', up: 100_000, down: 0 });
+    expect(rates[1]!.up).toBeCloseTo(10_200, 0);
+    expect(rates[1]!.down).toBeCloseTo(51_000 / 5, 0);
+  });
+  it('ignores counter resets, tiny rates, missing baselines and zero intervals', () => {
+    expect(hostAppRates(null, sample(t1, []))).toEqual([]);
+    const prev = sample(t0, [['c1', 'a1', 1_000_000, 1_000_000], ['c2', 'a2', 0, 0]]);
+    expect(hostAppRates(prev, sample(t1, [['c1', 'a1', 5, 5], ['c2', 'a2', 10, 10]]))).toEqual([]); // reset and < 10 kbit/s
+    expect(hostAppRates(prev, sample(t0, [['c1', 'a1', 9_000_000, 9_000_000]]))).toEqual([]); // no elapsed time
+    expect(hostAppRates(prev, sample('garbage', [['c1', 'a1', 9_000_000, 9_000_000]], { last_interval_ms: 2000 }))[0]!.appId).toBe('a1'); // falls back to the reported interval
+  });
+  it('keeps at most six apps, busiest first', () => {
+    const prev = sample(t0, Array.from({ length: 10 }, (_, i) => [`c${i}`, `app${i}`, 0, 0] as [string, string, number, number]));
+    const cur = sample(t1, Array.from({ length: 10 }, (_, i) => [`c${i}`, `app${i}`, (i + 1) * 100_000, 0] as [string, string, number, number]));
+    const rates = hostAppRates(prev, cur);
+    expect(rates).toHaveLength(6);
+    expect(rates[0]!.appId).toBe('app9');
+  });
+  it('reports the host core rate only when the collector is ready with real numbers', () => {
+    const ready = sample(t1, []);
+    expect(hostFlowFrom(null, ready)).toEqual({ up: 1000, down: 2000, apps: [] });
+    expect(hostFlowFrom(null, sample(t1, [], { status: 'unavailable' }))).toBeNull();
+    expect(hostFlowFrom(null, sample(t1, [], { upload_bytes_per_second: null }))).toBeNull();
+    expect(hostFlowFrom(null, sample(t1, [], { download_bytes_per_second: -1 }))).toBeNull();
+  });
+  it('places up to six app nodes on an inner ring with real streams, and none without a rate', () => {
+    const geo = flowGeometry(SIZE);
+    expect(layoutApps([], geo)).toEqual([]);
+    expect(layoutApps([{ appId: 'a', name: 'tiny', up: 10, down: 10 }], geo)).toEqual([]);
+    const apps = layoutApps([{ appId: 'a1', name: 'chrome.exe', up: 300_000, down: 100_000 }, { appId: 'a2', name: 'node.exe', up: 0, down: 2_000_000 }], geo);
+    expect(apps).toHaveLength(2);
+    for (const a of apps) {
+      expect(a.kind).toBe('app'); expect(a.deviceId.startsWith('app:')).toBe(true);
+      expect(Math.hypot(a.x - geo.cx, a.y - geo.cy)).toBeLessThan(geo.nodeMin);
+      expect(Math.hypot(a.x - geo.cx, a.y - geo.cy)).toBeGreaterThan(geo.histBase + geo.histOut);
+      expect(a.hasStream).toBe(true);
+    }
+    const node = apps.find((a) => a.label === 'node.exe')!;
+    expect(node.downLane).toBeGreaterThan(0); expect(node.upLane).toBe(0);
+    expect(node.downParticles).toBeGreaterThan(0); expect(node.upParticles).toBe(0);
+    expect(apps.reduce((sum, a) => sum + a.share, 0)).toBeCloseTo(1);
+  });
+  it('adds the apps to the layout without changing per-device behaviour', () => {
+    const plain = layoutFlow(fleet(), SIZE);
+    const withApps = layoutFlow(fleet(), SIZE, true, { apps: [{ appId: 'a1', name: 'chrome.exe', up: 1e5, down: 1e5 }] });
+    expect(withApps.nodes.map((n) => [n.deviceId, n.x, n.y])).toEqual(plain.nodes.map((n) => [n.deviceId, n.x, n.y]));
+    expect(withApps.apps).toHaveLength(1);
+    expect(withApps.all).toHaveLength(plain.nodes.length + 1);
+    expect(plain.apps).toEqual([]);
+  });
+  it('drops apps when the collector is offline', () => {
+    expect(layoutFlow(fleet(), SIZE, false, { apps: [{ appId: 'a1', name: 'x', up: 1e5, down: 1e5 }] }).apps).toEqual([]);
+  });
+  it('says plainly that the core is this computer only', () => {
+    expect(flowStateCopy('no-counters', true)!.title).toBe("Showing this computer's traffic");
+    expect(flowStateCopy('no-counters', true)!.detail).toContain('router feed');
+    expect(flowStateCopy('no-counters', false)!.title).toBe('No per-device counters');
+    const apps = layoutApps([{ appId: 'a1', name: 'chrome.exe', up: 300_000, down: 100_000 }], flowGeometry(SIZE));
+    const text = describeFlow({ connected: true, upload: 1000, download: 2000, nodes: [], apps, coreLabel: 'This computer', format: formatThroughput });
+    expect(text).toContain('showing this computer only');
+    expect(text).toContain('Top applications: chrome.exe');
   });
 });

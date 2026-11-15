@@ -54,7 +54,9 @@
 .hearth-legend .tiers i.node.offline { border: 1.5px solid rgba(233, 251, 252, .45); }
 .hearth-legend .tiers i.node.blocked { border: 2px solid #ff4757; background: rgba(255, 71, 87, .14); }
 .hearth-legend .tiers i.node.unknown { border: 1.5px dashed rgba(233, 251, 252, .6); }
-.hearth-legend .tiers i.node.unavailable { background: #68808a; }
+.hearth-legend .tiers i.node.present { background: #ff6d3b; opacity: .7; }
+.hearth-legend .swatch.maker { width: 16px; height: 6px; border-radius: 3px; background: repeating-linear-gradient(90deg, rgba(233,251,252,.6) 0 3px, transparent 3px 5px); }
+.hearth-legend .swatch.computer { width: 10px; height: 10px; border-radius: 1px; transform: rotate(45deg); background: #0e101a; border: 2px solid #ff9d3b; margin-inline: 3px; }
 
 .metrics { display:grid; grid-template-columns:repeat(3,1fr); border-block:1px solid var(--line)}
 .metrics article { padding:17px 15px; border-right:1px solid var(--line); display:grid; gap:7px}

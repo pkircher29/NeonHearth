@@ -4,7 +4,7 @@
   import {
     FIRE, DOWN_RAMP, UP_RAMP, TAU, TOP, HISTORY_BREAK_MS, HISTORY_WINDOW_MS, buildRamp, curvePoint, curveTangent, describeFlow, easeToward, flowCanvasSize,
     flowStateCopy, groupLabel, groupLabelRect, historyAngle, historyRadius, layoutFlow, nodeAt, particlePhase, placeLabels, pushHistory, rateFraction,
-    streamCurve, topTalkers, type FlowLayout, type HistorySample, type PlacedLabel, type Rect
+    streamCurve, topTalkers, type AppRate, type DeviceMeta, type FlowLayout, type HistorySample, type PlacedLabel, type Rect
   } from './flowMap';
   import { formatThroughput } from './networkFormat';
   import { MOTION_KEY, motionReduced } from '../stores/preferences';
@@ -16,8 +16,14 @@
     connected?: boolean;
     paused?: boolean;
     onselect?: (deviceId: string) => void;
+    /** Inventory details (MAC maker, IP) by device id; used to group and name devices that have no stated type. */
+    meta?: ReadonlyMap<string, DeviceMeta>;
+    /** Fallback source: this computer's busiest applications. Only meaningful with `coreLabel`. */
+    hostApps?: readonly AppRate[];
+    /** Names what the core total measures when it is not the whole network (for example "This computer"). */
+    coreLabel?: string | null;
   }
-  let { devices = [], upload = null, download = null, connected = false, paused = false, onselect }: Props = $props();
+  let { devices = [], upload = null, download = null, connected = false, paused = false, onselect, meta = undefined, hostApps = [], coreLabel = null }: Props = $props();
 
   const FONT_UI = '"Instrument Sans Variable", "Instrument Sans", "Segoe UI", Helvetica, Arial, sans-serif';
   const FONT_MONO = '"IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace';
@@ -32,16 +38,16 @@
   let fontTick = $state(0);
 
   const animate = $derived(!paused && !prefersReduced && !pageHidden);
-  const layout = $derived(layoutFlow(devices, size, connected));
+  const layout = $derived(layoutFlow(devices, size, connected, { meta, apps: coreLabel ? hostApps : [] }));
   const total = $derived(connected && (upload !== null || download !== null) ? (upload ?? 0) + (download ?? 0) : null);
-  const description = $derived(describeFlow({ connected, upload, download, nodes: layout.nodes, format: formatThroughput }));
-  const stateCopy = $derived(flowStateCopy(layout.state));
-  const hovered = $derived(hoveredId ? layout.nodes.find((node) => node.deviceId === hoveredId) ?? null : null);
+  const description = $derived(describeFlow({ connected, upload, download, nodes: layout.nodes, apps: layout.apps, coreLabel, format: formatThroughput }));
+  const stateCopy = $derived(flowStateCopy(layout.state, coreLabel !== null));
+  const hovered = $derived(hoveredId ? layout.all.find((node) => node.deviceId === hoveredId) ?? null : null);
 
   // ---- Non-reactive draw state (kept out of $state so the frame loop never allocates reactive proxies) ----
   let ctx: CanvasRenderingContext2D | null = null;
   let history: readonly HistorySample[] = [];
-  let scene: { layout: FlowLayout; connected: boolean; total: number | null; upload: number | null; download: number | null; labels: PlacedLabel[]; labelText: Map<string, { name: string; rate: string; w: number }>; groupRects: Rect[]; hoverId: string | null } | null = null;
+  let scene: { layout: FlowLayout; coreLabel: string | null; connected: boolean; total: number | null; upload: number | null; download: number | null; labels: PlacedLabel[]; labelText: Map<string, { name: string; rate: string; w: number }>; groupRects: Rect[]; hoverId: string | null } | null = null;
   const current = new Map<string, { x: number; y: number }>();
   let drawn: Array<{ deviceId: string; x: number; y: number; radius: number }> = [];
   let snap = true;
@@ -88,7 +94,7 @@
     const u = l.geo.unit;
     const nameFont = `600 ${Math.max(10.5, 11.5 * u)}px ${FONT_UI}`;
     const rateFont = `500 ${Math.max(9.5, 10 * u)}px ${FONT_MONO}`;
-    const talkers = topTalkers(l.nodes);
+    const talkers = [...l.apps.slice().sort((a, b) => (b.rate ?? 0) - (a.rate ?? 0)).slice(0, 3), ...topTalkers(l.nodes)];
     const labelText = new Map<string, { name: string; rate: string; w: number }>();
     for (const node of talkers) {
       const name = truncate(node.label, 20);
@@ -96,12 +102,14 @@
       labelText.set(node.deviceId, { name, rate, w: Math.max(measure(name, nameFont), measure(rate, rateFont)) + 12 });
     }
     const groupFont = `500 ${Math.max(9.5, 10 * u)}px ${FONT_MONO}`;
-    const groupRects = l.groups.map((group) => groupLabelRect(group, measure(`${group.label.toUpperCase()} ${group.count}`, groupFont) + 4));
+    const groupRects = l.groups.map((group) => groupLabelRect(group, measure(`${(l.geo.compact ? group.short : group.label).toUpperCase()} ${group.count}`, groupFont) + 4));
+    // Keep always-on labels off the ring's NOW / 60 s captions.
+    groupRects.push({ x: l.geo.cx - 36, y: l.geo.cy - l.geo.histBase - l.geo.histOut - 24 * u, w: 72, h: 18 });
     const widths = new Map<string, number>([...labelText].map(([id, value]) => [id, value.w]));
-    const labels = placeLabels(talkers, l.nodes, widths, l.geo, groupRects, Math.max(25, 26 * u));
-    scene = { layout: l, connected, total, upload, download, labels, labelText, groupRects, hoverId: hoveredId };
-    drawn = l.nodes.map((node) => ({ deviceId: node.deviceId, x: node.x, y: node.y, radius: node.radius }));
-    const known = new Set(l.nodes.map((node) => node.deviceId));
+    const labels = placeLabels(talkers, l.all, widths, l.geo, groupRects, Math.max(25, 26 * u));
+    scene = { layout: l, coreLabel, connected, total, upload, download, labels, labelText, groupRects, hoverId: hoveredId };
+    drawn = l.all.map((node) => ({ deviceId: node.deviceId, x: node.x, y: node.y, radius: node.radius }));
+    const known = new Set(l.all.map((node) => node.deviceId));
     for (const id of [...current.keys()]) if (!known.has(id)) current.delete(id);
     const geoKey = `${l.geo.width}x${l.geo.height}`;
     if (geoKey !== lastGeoKey) { snap = true; lastGeoKey = geoKey; }
@@ -151,7 +159,7 @@
       c.strokeStyle = f > 0 && live ? rgba(down[Math.round(f * (LUT - 1))]!, 0.75) : 'rgba(233,251,252,0.16)';
       c.arc(g.cx, g.cy, g.rimR, group.start + 0.012, group.end - 0.012);
       c.stroke();
-      const caption = `${group.label.toUpperCase()} ${group.count}`;
+      const caption = `${(g.compact ? group.short : group.label).toUpperCase()} ${group.count}`;
       c.globalAlpha = live ? 1 : 0.6;
       c.textAlign = group.align;
       if (g.compact) { const w = c.measureText(caption).width + 10; c.fillStyle = 'rgba(10,12,20,0.88)'; c.fillRect(group.labelX - w / 2, group.labelY - 8, w, 16); }
@@ -231,8 +239,8 @@
     c.stroke();
     // Ease drawn positions toward the layout targets (snap when resting, resized or first seen).
     const easing = moving && !snap && dt > 0;
-    for (let i = 0; i < L.nodes.length; i += 1) {
-      const node = L.nodes[i]!;
+    for (let i = 0; i < L.all.length; i += 1) {
+      const node = L.all[i]!;
       let pos = current.get(node.deviceId);
       if (!pos) { pos = { x: node.x, y: node.y }; current.set(node.deviceId, pos); }
       if (easing) { pos.x = easeToward(pos.x, node.x, dt); pos.y = easeToward(pos.y, node.y, dt); } else { pos.x = node.x; pos.y = node.y; }
@@ -244,9 +252,9 @@
     // Streams.
     c.lineCap = 'round';
     c.globalAlpha = dim;
-    for (let i = 0; i < L.nodes.length; i += 1) {
-      const node = L.nodes[i]!;
-      if (node.hasStream || !live) continue;
+    for (let i = 0; i < L.all.length; i += 1) {
+      const node = L.all[i]!;
+      if (node.hasStream || !live || node.rate === null) continue; // no counters, no line: a hairline would claim a measured zero
       if (node.status !== 'idle' && node.status !== 'quiet') continue;
       const p = current.get(node.deviceId)!;
       const curve = streamCurve(g, p.x, p.y, node.radius);
@@ -254,8 +262,8 @@
       c.lineWidth = 0.8; c.strokeStyle = 'rgba(233,251,252,0.11)'; c.stroke();
     }
     if (live) {
-      for (let i = L.nodes.length - 1; i >= 0; i -= 1) {
-        const node = L.nodes[i]!;
+      for (let i = L.all.length - 1; i >= 0; i -= 1) {
+        const node = L.all[i]!;
         if (!node.hasStream) continue;
         const p = current.get(node.deviceId)!;
         const curve = streamCurve(g, p.x, p.y, node.radius);
@@ -346,11 +354,19 @@
 
     // Nodes.
     c.setLineDash([]);
-    for (let i = 0; i < L.nodes.length; i += 1) {
-      const node = L.nodes[i]!;
+    for (let i = 0; i < L.all.length; i += 1) {
+      const node = L.all[i]!;
       const p = current.get(node.deviceId)!;
       const r = node.radius;
       c.globalAlpha = dim;
+      if (node.kind === 'app') {
+        const color = down[Math.round(rateFraction(node.rate) * (LUT - 1))]!;
+        c.beginPath(); c.fillStyle = rgba(color, 0.2); c.arc(p.x, p.y, r * 1.9, 0, TAU); c.fill();
+        c.beginPath(); c.moveTo(p.x, p.y - r * 1.25); c.lineTo(p.x + r * 1.25, p.y); c.lineTo(p.x, p.y + r * 1.25); c.lineTo(p.x - r * 1.25, p.y); c.closePath();
+        c.fillStyle = 'rgba(14,16,26,0.95)'; c.fill(); c.lineWidth = 1.6; c.strokeStyle = color; c.stroke();
+        if (s.hoverId === node.deviceId) { c.beginPath(); c.lineWidth = 1.5; c.strokeStyle = 'rgba(233,251,252,0.95)'; c.arc(p.x, p.y, r * 1.25 + 5, 0, TAU); c.stroke(); }
+        continue;
+      }
       switch (node.status) {
         case 'offline':
           c.beginPath(); c.lineWidth = 1.3; c.strokeStyle = rgba(ink, 0.38); c.arc(p.x, p.y, r, 0, TAU); c.stroke();
@@ -362,9 +378,6 @@
         case 'unknown':
           c.beginPath(); c.lineWidth = 1.3; c.strokeStyle = rgba(ink, 0.5); c.setLineDash([2.4, 2.6]); c.arc(p.x, p.y, r, 0, TAU); c.stroke(); c.setLineDash([]);
           break;
-        case 'unavailable':
-          c.beginPath(); c.fillStyle = rgba(FIRE.neutral, 0.85); c.arc(p.x, p.y, r, 0, TAU); c.fill();
-          break;
         case 'quiet': {
           c.beginPath(); c.fillStyle = rgba(quiet, 0.16); c.arc(p.x, p.y, r * 2, 0, TAU); c.fill();
           c.beginPath(); c.fillStyle = rgba(quiet, 0.8); c.arc(p.x, p.y, r, 0, TAU); c.fill();
@@ -374,7 +387,7 @@
           const f = node.status === 'active' ? rateFraction(node.rate) : 0;
           const color = down[Math.round(f * (LUT - 1))]!;
           if (live && f > 0) { c.beginPath(); c.fillStyle = rgba(color, 0.12 + 0.2 * f); c.arc(p.x, p.y, r * (1.9 + f), 0, TAU); c.fill(); }
-          c.beginPath(); c.fillStyle = color; c.globalAlpha = (node.status === 'idle' ? 0.78 : 1) * dim; c.arc(p.x, p.y, r, 0, TAU); c.fill();
+          c.beginPath(); c.fillStyle = color; c.globalAlpha = (node.status === 'idle' || node.status === 'present' ? 0.78 : 1) * dim; c.arc(p.x, p.y, r, 0, TAU); c.fill();
           if (node.status === 'active') { c.beginPath(); c.fillStyle = 'rgba(255,255,255,0.55)'; c.arc(p.x - r * 0.28, p.y - r * 0.3, r * 0.34, 0, TAU); c.fill(); }
         }
       }
@@ -417,15 +430,22 @@
     c.textBaseline = 'middle';
     if (live && s.total !== null) {
       const lh = Math.max(11, 12.5 * u);
+      const textY = s.coreLabel ? -0.85 : -0.62;
+      const rowY = s.coreLabel ? 0.7 : 0.62;
+      if (s.coreLabel) {
+        c.font = `500 ${Math.max(9, 9.5 * u)}px ${FONT_UI}`;
+        c.fillStyle = muted;
+        c.fillText(s.coreLabel, g.cx, g.cy - lh * (g.coreR < 40 ? 1.85 : 2.0));
+      }
       c.font = `700 ${Math.max(13, 19 * u)}px ${FONT_UI}`;
       c.fillStyle = ink;
-      c.fillText(formatThroughput(s.total), g.cx, g.cy - lh * 0.62);
+      c.fillText(formatThroughput(s.total), g.cx, g.cy + lh * textY);
       c.font = `500 ${Math.max(9, 10.5 * u)}px ${FONT_MONO}`;
       const rows: Array<[number | null, string, number]> = [[s.download, down[LUT - 1]!, 1], [s.upload, up[LUT - 1]!, -1]];
       rows.forEach(([value, color, dir], index) => {
         const text = formatThroughput(value);
         const w = c.measureText(text).width;
-        const y = g.cy + lh * (0.62 + index * 1.0);
+        const y = g.cy + lh * (rowY + index);
         const a = 3.4 * Math.max(0.8, u);
         const x0 = g.cx - (w + a * 2 + 4) / 2 + a;
         c.fillStyle = color;
@@ -527,7 +547,7 @@
   function onClick(event: MouseEvent) {
     const p = point(event);
     const hit = p ? nodeAt(drawn, p.x, p.y) : null;
-    if (hit && onselect) onselect(hit.deviceId);
+    if (hit && onselect && !hit.deviceId.startsWith('app:')) onselect(hit.deviceId);
   }
 
   onMount(() => {
@@ -575,7 +595,12 @@
   {#if hovered}
     <div class="tip" role="tooltip" style={`left:${Math.min(Math.max(hovered.x, 90), size.width - 90)}px; top:${hovered.y}px`}>
       <strong>{hovered.label}</strong>
-      <span>{groupLabel(hovered.group)} · {hovered.presence}</span>
+      {#if hovered.kind === 'app'}
+        <span>Application on this computer</span>
+      {:else}
+        <span>{groupLabel(hovered.group)} · {hovered.presence}</span>
+        {#if hovered.groupSource === 'vendor' && hovered.vendor}<span class="vendor">Vendor: {hovered.vendor} — grouped by maker</span>{:else if hovered.vendor}<span class="vendor">Vendor: {hovered.vendor}</span>{/if}
+      {/if}
       {#if hovered.rate === null}
         <span>counters unavailable</span>
       {:else}
@@ -606,6 +631,7 @@
   .tip { position: absolute; transform: translate(-50%, calc(-100% - 16px)); background: var(--surface-raised, #102a35); border: 1px solid var(--line-strong, #28505a); border-radius: 8px; padding: 7px 10px; display: grid; gap: 2px; pointer-events: none; white-space: nowrap; font-size: 12px; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5); }
   .tip strong { color: var(--ink, #e9fbfc); }
   .tip span { color: var(--muted, #77959d); font: 11px var(--font-mono, monospace); text-transform: capitalize; }
+  .tip .vendor { text-transform: none; }
   .tip .rates { display: flex; gap: 10px; text-transform: none; }
   .tip .rates b { font-weight: 500; }
   .tip .d { color: #ffb347; }

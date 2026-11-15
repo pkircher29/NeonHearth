@@ -137,7 +137,7 @@ export function easeToward(current: number, target: number, dtSeconds: number, t
 
 // --- Grouping --------------------------------------------------------------
 
-export type GroupId = 'computers' | 'phones' | 'media' | 'cameras' | 'iot' | 'network' | 'guests' | 'other' | 'unclassified';
+export type GroupId = 'computers' | 'phones' | 'media' | 'cameras' | 'iot' | 'network' | 'guests' | 'private' | 'other' | 'unclassified';
 
 /** Fixed order: sectors always appear in this order, clockwise from 12 o'clock. */
 export const GROUPS: ReadonlyArray<{ id: GroupId; label: string; patterns: RegExp }> = [
@@ -148,20 +148,137 @@ export const GROUPS: ReadonlyArray<{ id: GroupId; label: string; patterns: RegEx
   { id: 'iot', label: 'Home & IoT', patterns: /iot|sensor|light|bulb|plug|thermostat|lock|hub|appliance|printer|vacuum|switchbot|smart/ },
   { id: 'network', label: 'Network', patterns: /router|gateway|switch|access.?point|\bap\b|mesh|modem|extender/ },
   { id: 'guests', label: 'Guests', patterns: /guest|visitor/ },
+  { id: 'private', label: 'Private address', patterns: /$^/ },
   { id: 'other', label: 'Other', patterns: /$^/ },
   { id: 'unclassified', label: 'Unclassified', patterns: /$^/ }
 ];
 
+// --- Vendor (MAC maker) inference -------------------------------------------
+
+/** What the network inventory knows about a device beyond the live snapshot. */
+export interface DeviceMeta { vendor: string | null; vendorStatus: string | null; ip: string | null }
+
+/** Ordered: the first matching rule wins, so specific makers sit above broad ones (Blink by Amazon before Amazon). */
+export const VENDOR_RULES: ReadonlyArray<{ group: GroupId; name: string; pattern: RegExp }> = [
+  { group: 'cameras', name: 'Blink', pattern: /\bblink\b/ },
+  { group: 'cameras', name: 'FLIR', pattern: /\bflir\b/ },
+  { group: 'cameras', name: 'Lorex', pattern: /lorex/ },
+  { group: 'cameras', name: 'Wyze', pattern: /wyze/ },
+  { group: 'cameras', name: 'Hikvision', pattern: /hikvision/ },
+  { group: 'cameras', name: 'Dahua', pattern: /dahua/ },
+  { group: 'cameras', name: 'Reolink', pattern: /reolink/ },
+  { group: 'cameras', name: 'Ring', pattern: /\bring\b/ },
+  { group: 'cameras', name: 'Arlo', pattern: /\barlo\b/ },
+  { group: 'cameras', name: 'Amcrest', pattern: /amcrest/ },
+  { group: 'iot', name: 'Espressif', pattern: /espressif/ },
+  { group: 'iot', name: 'Tuya', pattern: /tuya/ },
+  { group: 'iot', name: 'WiZ', pattern: /\bwiz\b/ },
+  { group: 'iot', name: 'Lumi', pattern: /\blumi\b/ },
+  { group: 'iot', name: 'Midea', pattern: /midea/ },
+  { group: 'iot', name: 'AI-Link', pattern: /ai-link/ },
+  { group: 'iot', name: 'Shelly', pattern: /shelly|allterco/ },
+  { group: 'iot', name: 'Sonoff', pattern: /sonoff|itead/ },
+  { group: 'iot', name: 'Signify', pattern: /signify|philips lighting/ },
+  { group: 'iot', name: 'SmartThings', pattern: /smartthings/ },
+  { group: 'iot', name: 'QinHeng', pattern: /qinheng/ },
+  { group: 'network', name: 'TP-Link', pattern: /tp-link|tplink/ },
+  { group: 'network', name: 'Netgear', pattern: /netgear/ },
+  { group: 'network', name: 'Ubiquiti', pattern: /ubiquiti/ },
+  { group: 'network', name: 'Acer', pattern: /\bacer\b/ },
+  { group: 'network', name: 'Cisco', pattern: /cisco/ },
+  { group: 'network', name: 'MikroTik', pattern: /mikrotik|routerboard/ },
+  { group: 'network', name: 'Zyxel', pattern: /zyxel/ },
+  { group: 'network', name: 'D-Link', pattern: /d-link/ },
+  { group: 'network', name: 'Linksys', pattern: /linksys/ },
+  { group: 'media', name: 'Amazon', pattern: /amazon/ },
+  { group: 'media', name: 'Google', pattern: /google/ },
+  { group: 'media', name: 'Sony', pattern: /\bsony\b/ },
+  { group: 'media', name: 'Roku', pattern: /\broku\b/ },
+  { group: 'media', name: 'Samsung', pattern: /samsung/ },
+  { group: 'media', name: 'LG', pattern: /\blg\b|lg elec/ },
+  { group: 'media', name: 'Sonos', pattern: /sonos/ },
+  { group: 'media', name: 'Vizio', pattern: /vizio/ },
+  { group: 'media', name: 'Nintendo', pattern: /nintendo/ },
+  { group: 'computers', name: 'Proxmox', pattern: /proxmox/ },
+  { group: 'computers', name: 'Raspberry Pi', pattern: /raspberry/ },
+  { group: 'computers', name: 'NVIDIA', pattern: /nvidia/ },
+  { group: 'computers', name: 'GIGABYTE', pattern: /giga-?byte/ },
+  { group: 'computers', name: 'HP', pattern: /hewlett|\bhp\b/ },
+  { group: 'computers', name: 'Dell', pattern: /\bdell\b/ },
+  { group: 'computers', name: 'Intel', pattern: /\bintel\b/ },
+  { group: 'computers', name: 'ASUS', pattern: /asus/ },
+  { group: 'computers', name: 'MSI', pattern: /micro-?star|\bmsi\b/ },
+  { group: 'computers', name: 'Lenovo', pattern: /lenovo/ },
+  { group: 'computers', name: 'Microsoft', pattern: /microsoft/ },
+  { group: 'computers', name: 'VMware', pattern: /vmware/ },
+  { group: 'phones', name: 'Apple', pattern: /\bapple\b/ },
+  { group: 'phones', name: 'OnePlus', pattern: /oneplus/ },
+  { group: 'phones', name: 'Oppo', pattern: /\boppo\b/ },
+  { group: 'phones', name: 'Motorola', pattern: /motorola/ }
+];
+
+const LEGAL_SUFFIX = /^(inc\.?|co\.?,?|ltd\.?|llc|gmbh|corp\.?|corporation|technology|technologies|\(trading\))$/i;
+
+/** Short maker name for labels: the rule's name when known, else the first two meaningful words. */
+export function vendorName(organization: string | null | undefined): string | null {
+  const org = organization?.trim();
+  if (!org) return null;
+  const lower = org.toLowerCase();
+  const rule = VENDOR_RULES.find((r) => r.pattern.test(lower));
+  if (rule) return rule.name;
+  const words = org.split(/\s+/).map((w) => w.replace(/[,.]+$/, '')).filter((w) => w && !LEGAL_SUFFIX.test(w));
+  return words.slice(0, 2).join(' ') || org;
+}
+
+/**
+ * Group inferred from the MAC maker, or null when there is nothing to go on.
+ * A locally administered (randomised) address is usually a phone, but that is a
+ * guess, so it gets its own honest "Private address" sector.
+ */
+export function vendorGroup(organization: string | null | undefined, status: string | null | undefined): GroupId | null {
+  if (status === 'locally_administered') return 'private';
+  const lower = organization?.trim().toLowerCase();
+  if (!lower) return null;
+  return VENDOR_RULES.find((r) => r.pattern.test(lower))?.group ?? null;
+}
+
+/** First IPv4 address from the inventory, if any. */
+export function firstIpv4(addresses: readonly string[] | undefined): string | null {
+  return addresses?.find((a) => /^\d{1,3}(\.\d{1,3}){3}$/.test(a)) ?? null;
+}
+
+export function deviceMetaFrom(device: { ip_addresses?: string[]; mac_assignments?: Array<{ organization: string | null; status: string }> }): DeviceMeta {
+  const assignments = device.mac_assignments ?? [];
+  const best = assignments.find((a) => a.organization) ?? assignments.find((a) => a.status === 'locally_administered') ?? assignments[0] ?? null;
+  return { vendor: best?.organization ?? null, vendorStatus: best?.status ?? null, ip: firstIpv4(device.ip_addresses) };
+}
+
+export type GroupSource = 'type' | 'vendor' | 'none';
+
 /**
  * Stable category for a device from fields that exist on DeviceSnapshot: the
- * owner-confirmed `owner_type` wins, then the inferred `identity.classification`.
- * The snapshot has no room or location, so none is invented.
+ * owner-confirmed `owner_type` wins, then the inferred `identity.classification`,
+ * then the MAC maker from the network inventory (inferred, reported as such),
+ * else Unclassified. The snapshot has no room or location, so none is invented.
  */
-export function groupOf(device: DeviceSnapshot): GroupId {
+export function groupOfWithSource(device: DeviceSnapshot, meta?: DeviceMeta | null): { group: GroupId; source: GroupSource } {
   const raw = (device.owner_type?.trim() || device.identity?.classification?.trim() || '').toLowerCase();
-  if (!raw) return 'unclassified';
-  for (const group of GROUPS) if (group.id !== 'other' && group.id !== 'unclassified' && group.patterns.test(raw)) return group.id;
-  return 'other';
+  if (raw) {
+    for (const group of GROUPS) if (group.id !== 'other' && group.id !== 'unclassified' && group.id !== 'private' && group.patterns.test(raw)) return { group: group.id, source: 'type' };
+    return { group: 'other', source: 'type' };
+  }
+  const inferred = meta ? vendorGroup(meta.vendor, meta.vendorStatus) : null;
+  if (inferred) return { group: inferred, source: 'vendor' };
+  return { group: 'unclassified', source: 'none' };
+}
+
+export function groupOf(device: DeviceSnapshot, meta?: DeviceMeta | null): GroupId {
+  return groupOfWithSource(device, meta).group;
+}
+
+/** Compact captions for narrow canvases, where the long names would run off the edge. */
+export function groupShortLabel(id: GroupId): string {
+  return id === 'private' ? 'Private' : id === 'iot' ? 'IoT' : id === 'unclassified' ? 'Unsorted' : id === 'computers' ? 'Computers' : groupLabel(id);
 }
 
 export function groupLabel(id: GroupId): string {
@@ -170,10 +287,17 @@ export function groupLabel(id: GroupId): string {
 
 // --- Device status ---------------------------------------------------------
 
-export type NodeStatus = 'active' | 'idle' | 'quiet' | 'offline' | 'blocked' | 'unknown' | 'unavailable';
+/** `present`: online but no counters; presence stays visible, only the stream is missing. */
+export type NodeStatus = 'active' | 'idle' | 'quiet' | 'offline' | 'blocked' | 'unknown' | 'present';
 
-export function deviceLabel(device: DeviceSnapshot): string {
-  return device.owner_name ?? `Device ${device.device_id.slice(0, 6)}`;
+/** Owner name, else "Vendor ·.142" from the inventory, else the short id. */
+export function deviceLabel(device: DeviceSnapshot, meta?: DeviceMeta | null): string {
+  if (device.owner_name) return device.owner_name;
+  const octet = meta?.ip ? `·.${meta.ip.split('.')[3]}` : '';
+  const maker = meta?.vendorStatus === 'locally_administered' ? 'Private address' : vendorName(meta?.vendor);
+  if (maker) return octet ? `${maker} ${octet}` : maker;
+  if (octet) return `Device ${octet}`;
+  return `Device ${device.device_id.slice(0, 6)}`;
 }
 
 /** Directional rates, or null when counters are unavailable (never a fake zero). */
@@ -191,9 +315,9 @@ export function statusOf(device: DeviceSnapshot): NodeStatus {
   if (state === 'blocked') return 'blocked';
   if (state === 'offline') return 'offline';
   if (state === 'unknown') return 'unknown';
-  const rates = deviceRates(device);
-  if (rates === null) return 'unavailable';
   if (state === 'quiet') return 'quiet';
+  const rates = deviceRates(device);
+  if (rates === null) return 'present';
   return rates.total >= STREAM_FLOOR_BPS ? 'active' : 'idle';
 }
 
@@ -203,7 +327,7 @@ function activityScore(status: NodeStatus, total: number | null): number {
     case 'active': return 100 + bucket;
     case 'quiet': return total !== null && total >= STREAM_FLOOR_BPS ? 70 + bucket : 30;
     case 'idle': return 50;
-    case 'unavailable': return 40;
+    case 'present': return 40;
     case 'blocked': return 25;
     case 'unknown': return 20;
     default: return 10;
@@ -234,12 +358,12 @@ export function flowGeometry(size: FlowSize): FlowGeometry {
   const width = Math.max(200, size.width);
   const height = Math.max(200, size.height);
   const unit = clamp(Math.min(width, height) / 560, 0.5, 1.2);
-  const coreR = Math.max(32, 46 * unit);
+  const coreR = Math.max(36, 46 * unit);
   const histBase = coreR + 22 * unit;
   const histOut = 17 * unit;
   const histIn = 13 * unit;
   const compact = width < 520;
-  const labelReserve = compact ? 44 : clamp(width * 0.14, 54, 100);
+  const labelReserve = compact ? 44 : clamp(width * 0.19, 60, 128) + 26; // + rail and label offset
   const nodeMax = Math.max(histBase + histOut + 40, Math.min(height / 2 - 40, width / 2 - labelReserve));
   const nodeMin = histBase + histOut + 36 * unit;
   return { width, height, cx: width / 2, cy: height / 2, unit, coreR, histBase, histOut, histIn, nodeMin, nodeMax: Math.max(nodeMax, nodeMin + 20), rimR: Math.max(nodeMax, nodeMin + 20) + 14, compact };
@@ -248,8 +372,14 @@ export function flowGeometry(size: FlowSize): FlowGeometry {
 // --- Layout ----------------------------------------------------------------
 
 export interface FlowNode {
+  /** Device id, or `app:<id>` for an application on this computer. */
   deviceId: string;
+  kind: 'device' | 'app';
   label: string;
+  /** MAC maker from the network inventory, when known. */
+  vendor: string | null;
+  /** How the group was chosen: confirmed type, inferred from the maker, or not at all. */
+  groupSource: GroupSource;
   group: GroupId;
   presence: PresenceState;
   status: NodeStatus;
@@ -278,12 +408,16 @@ export interface FlowNode {
 export interface FlowGroup {
   id: GroupId;
   label: string;
+  /** Shorter caption used on narrow canvases. */
+  short: string;
   count: number;
   active: number;
   rate: number;
   start: number;
   end: number;
   mid: number;
+  /** Members placed here because of their maker rather than a stated type. */
+  inferred: number;
   labelX: number;
   labelY: number;
   align: 'left' | 'right' | 'center';
@@ -295,9 +429,20 @@ export interface FlowLayout {
   geo: FlowGeometry;
   state: FlowState;
   nodes: FlowNode[];
+  /** Applications on this computer (host fallback only). */
+  apps: FlowNode[];
+  /** Devices then apps, for drawing and hit testing. */
+  all: FlowNode[];
   groups: FlowGroup[];
   /** Sum of measured device rates (null counters excluded). */
   measuredTotal: number;
+}
+
+export interface LayoutOptions {
+  /** Inventory details by device id (maker, IP). */
+  meta?: ReadonlyMap<string, DeviceMeta>;
+  /** This computer's busiest applications, from {@link hostAppRates}. */
+  apps?: readonly AppRate[];
 }
 
 const GROUP_GAP = 0.075;
@@ -337,7 +482,7 @@ export function planRings(count: number, sectorWidth: number, rMin: number, rMax
 }
 
 export function emptyFlowLayout(size: FlowSize, state: FlowState = 'empty'): FlowLayout {
-  return { geo: flowGeometry(size), state, nodes: [], groups: [], measuredTotal: 0 };
+  return { geo: flowGeometry(size), state, nodes: [], apps: [], all: [], groups: [], measuredTotal: 0 };
 }
 
 /**
@@ -346,10 +491,10 @@ export function emptyFlowLayout(size: FlowSize, state: FlowState = 'empty'): Flo
  * the device id as tie-break, so it only changes when activity changes by about
  * a third of a decade and never jitters between frames.
  */
-export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, connected = true): FlowLayout {
+export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, connected = true, options: LayoutOptions = {}): FlowLayout {
   const geo = flowGeometry(size);
   if (!connected) {
-    const base = layoutFlow(devices, size, true);
+    const base = layoutFlow(devices, size, true, { meta: options.meta });
     // Offline: keep the ghosts of known devices, but never any stream.
     for (const node of base.nodes) { node.hasStream = false; node.downParticles = 0; node.upParticles = 0; }
     return { ...base, state: 'offline' };
@@ -359,7 +504,9 @@ export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, c
   const rows = devices.map((device) => {
     const rates = deviceRates(device);
     const status = statusOf(device);
-    return { device, rates, status, group: groupOf(device), score: activityScore(status, rates?.total ?? null) };
+    const meta = options.meta?.get(device.device_id) ?? null;
+    const grouped = groupOfWithSource(device, meta);
+    return { device, meta, rates, status, group: grouped.group, source: grouped.source, score: activityScore(status, rates?.total ?? null) };
   });
   // The same set the service aggregate covers: every device that reports counters, whatever its presence.
   // Blocked and offline devices still get a share (and appear in tooltips) but never a stream.
@@ -412,7 +559,10 @@ export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, c
         const uSpec = streaming ? particleSpec(up) : { count: 0, speed: 0 };
         nodes.push({
           deviceId: row.device.device_id,
-          label: deviceLabel(row.device),
+          kind: 'device' as const,
+          label: deviceLabel(row.device, row.meta),
+          vendor: row.meta?.vendor ?? null,
+          groupSource: row.source,
           group: group.id,
           presence: row.device.presence.state,
           status: row.status,
@@ -437,9 +587,11 @@ export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, c
     groups.push({
       id: group.id,
       label: group.label,
+      short: groupShortLabel(group.id),
       count: list.length,
       active: list.filter((row) => row.status === 'active').length,
       rate: list.reduce((sum, row) => sum + (row.rates ? row.rates.total : 0), 0),
+      inferred: list.filter((row) => row.source === 'vendor').length,
       start, end, mid,
       labelX: geo.cx + cos * (geo.compact ? geo.rimR : geo.rimR + 12),
       labelY: geo.cy + Math.sin(mid) * (geo.compact ? geo.rimR : geo.rimR + 12),
@@ -450,10 +602,95 @@ export function layoutFlow(devices: readonly DeviceSnapshot[], size: FlowSize, c
   // Particle budget: busiest streams keep theirs first.
   const order = nodes.map((_, index) => index).filter((index) => nodes[index]!.hasStream).sort((a, b) => (nodes[b]!.rate ?? 0) - (nodes[a]!.rate ?? 0));
   const flat = order.flatMap((index) => [nodes[index]!.downParticles, nodes[index]!.upParticles]);
-  const capped = capParticles(flat);
+  const capped = capParticles(flat, MAX_PARTICLES - (options.apps?.length ? 60 : 0));
   order.forEach((index, i) => { nodes[index]!.downParticles = capped[i * 2]!; nodes[index]!.upParticles = capped[i * 2 + 1]!; });
 
-  return { geo, state: anyCounters ? 'live' : 'no-counters', nodes, groups, measuredTotal };
+  const apps = layoutApps(options.apps ?? [], geo);
+  return { geo, state: anyCounters ? 'live' : 'no-counters', nodes, apps, all: nodes.concat(apps), groups, measuredTotal };
+}
+
+// --- This computer's applications (host fallback) ------------------------------
+
+export interface AppRate { appId: string; name: string; down: number; up: number }
+export const MAX_APPS = 6;
+
+/** Inner ring of the busiest applications on this computer, evenly spaced and ordered by id so they stay put. */
+export function layoutApps(apps: readonly AppRate[], geo: FlowGeometry): FlowNode[] {
+  const usable = apps.filter((a) => a.down + a.up >= STREAM_FLOOR_BPS).sort((a, b) => (b.down + b.up) - (a.down + a.up)).slice(0, MAX_APPS);
+  if (usable.length === 0) return [];
+  const total = usable.reduce((sum, a) => sum + a.down + a.up, 0);
+  const ordered = usable.slice().sort((a, b) => (a.appId < b.appId ? -1 : 1));
+  const r = geo.histBase + geo.histOut + 17 * geo.unit;
+  return ordered.map((app, index) => {
+    const rate = app.down + app.up;
+    const angle = TOP + ((index + 0.5) / ordered.length) * TAU;
+    const dSpec = particleSpec(app.down);
+    const uSpec = particleSpec(app.up);
+    return {
+      deviceId: `app:${app.appId}`, kind: 'app' as const, label: app.name, vendor: null, groupSource: 'none' as const, group: 'other' as const,
+      presence: 'online' as const, status: 'active' as const, rate, down: app.down, up: app.up, share: rate / total,
+      rank: usable.indexOf(app), x: geo.cx + Math.cos(angle) * r, y: geo.cy + Math.sin(angle) * r, angle,
+      radius: geo.unit * (3.6 + 4 * rateFraction(rate)), hasStream: true,
+      downLane: app.down >= STREAM_FLOOR_BPS ? laneWidth(app.down / total, geo.unit) * 0.85 : 0,
+      upLane: app.up >= STREAM_FLOOR_BPS ? laneWidth(app.up / total, geo.unit) * 0.85 : 0,
+      downParticles: Math.min(dSpec.count, 5), upParticles: Math.min(uSpec.count, 5), downSpeed: dSpec.speed, upSpeed: uSpec.speed,
+      seed: (hashId(app.appId) & 0xffff) / 0x10000
+    };
+  });
+}
+
+export interface HostSample {
+  observed_at: string;
+  status: string;
+  upload_bytes_per_second: number | null;
+  download_bytes_per_second: number | null;
+  last_interval_ms?: number | null;
+  applications: ReadonlyArray<{ app_id: string; name: string }>;
+  connections: ReadonlyArray<{ connection_id: string; app_id: string; sent_bytes: number | null; received_bytes: number | null }>;
+}
+
+export interface HostFlow { up: number; down: number; apps: AppRate[] }
+
+/**
+ * Per-application byte rate from two host snapshots: the growth of the summed
+ * connection counters, counting only connections present in both snapshots with
+ * non-null counters on both sides (a new connection's cumulative bytes would
+ * otherwise read as a burst). Counter resets and missing intervals are ignored.
+ */
+export function hostAppRates(prev: HostSample | null, cur: HostSample, limit = MAX_APPS): AppRate[] {
+  if (!prev) return [];
+  const before = new Map(prev.connections.map((c) => [c.connection_id, c]));
+  const t1 = Date.parse(cur.observed_at);
+  const t0 = Date.parse(prev.observed_at);
+  let seconds = Number.isFinite(t1) && Number.isFinite(t0) ? (t1 - t0) / 1000 : NaN;
+  if (!(seconds > 0.2) && typeof cur.last_interval_ms === 'number' && cur.last_interval_ms > 0) seconds = cur.last_interval_ms / 1000;
+  if (!(seconds > 0.2)) return [];
+  const sums = new Map<string, { up: number; down: number }>();
+  for (const c of cur.connections) {
+    const old = before.get(c.connection_id);
+    if (!old || c.sent_bytes === null || c.received_bytes === null || old.sent_bytes === null || old.received_bytes === null) continue;
+    const up = c.sent_bytes - old.sent_bytes;
+    const down = c.received_bytes - old.received_bytes;
+    if (up < 0 || down < 0) continue;
+    const entry = sums.get(c.app_id) ?? { up: 0, down: 0 };
+    entry.up += up; entry.down += down;
+    sums.set(c.app_id, entry);
+  }
+  const names = new Map(cur.applications.map((a) => [a.app_id, a.name]));
+  return [...sums.entries()]
+    .map(([appId, v]) => ({ appId, name: names.get(appId) ?? appId, up: v.up / seconds, down: v.down / seconds }))
+    .filter((a) => a.up + a.down >= STREAM_FLOOR_BPS)
+    .sort((a, b) => (b.up + b.down) - (a.up + a.down) || (a.appId < b.appId ? -1 : 1))
+    .slice(0, limit);
+}
+
+/** This computer's live rate plus its busiest applications; null unless the collector says it is ready with real numbers. */
+export function hostFlowFrom(prev: HostSample | null, cur: HostSample): HostFlow | null {
+  if (cur.status !== 'ready') return null;
+  const up = cur.upload_bytes_per_second;
+  const down = cur.download_bytes_per_second;
+  if (typeof up !== 'number' || typeof down !== 'number' || !Number.isFinite(up) || !Number.isFinite(down) || up < 0 || down < 0) return null;
+  return { up, down, apps: hostAppRates(prev, cur) };
 }
 
 // --- Streams ---------------------------------------------------------------
@@ -608,7 +845,8 @@ export function nodeAt<T extends { x: number; y: number; radius: number }>(nodes
 
 // --- Copy ------------------------------------------------------------------
 
-export function flowStateCopy(state: FlowState): { title: string; detail: string } | null {
+export function flowStateCopy(state: FlowState, hostSource = false): { title: string; detail: string } | null {
+  if (hostSource && state === 'no-counters') return { title: "Showing this computer's traffic", detail: 'Per-device traffic needs the router feed. This is not whole-home traffic.' };
   switch (state) {
     case 'offline': return { title: 'Collector offline', detail: 'Waiting to reconnect. Last known devices are dimmed; no live flow is shown.' };
     case 'empty': return { title: 'No devices yet', detail: 'Devices appear here once the collector has seen them.' };
@@ -617,13 +855,13 @@ export function flowStateCopy(state: FlowState): { title: string; detail: string
   }
 }
 
-export function describeFlow(input: { connected: boolean; upload: number | null; download: number | null; nodes: readonly FlowNode[]; format: (bytesPerSecond: number | null) => string }): string {
+export function describeFlow(input: { connected: boolean; upload: number | null; download: number | null; nodes: readonly FlowNode[]; apps?: readonly FlowNode[]; coreLabel?: string | null; format: (bytesPerSecond: number | null) => string }): string {
   if (!input.connected) return 'Network flow map: collector connection unavailable; reconnect or sign in if requested.';
   const online = input.nodes.filter((node) => node.presence === 'online').length;
   const blocked = input.nodes.filter((node) => node.presence === 'blocked').length;
   const total = input.upload === null && input.download === null ? null : (input.upload ?? 0) + (input.download ?? 0);
   const parts = [
-    `Network flow map: ${input.format(total)} total`,
+    input.coreLabel ? `Network flow map, showing ${input.coreLabel.toLowerCase()} only: ${input.format(total)} total` : `Network flow map: ${input.format(total)} total`,
     `${input.format(input.download)} down`,
     `${input.format(input.upload)} up`,
     `${online} of ${input.nodes.length} devices online`
@@ -631,6 +869,7 @@ export function describeFlow(input: { connected: boolean; upload: number | null;
   if (blocked) parts.push(`${blocked} blocked`);
   let text = parts.join(', ') + '.';
   if (input.nodes.length && input.nodes.every((node) => node.rate === null)) text += ' Per-device counters unavailable.';
+  if (input.apps?.length) text += ` Top applications: ${input.apps.slice().sort((a, b) => (b.rate ?? 0) - (a.rate ?? 0)).slice(0, 3).map((node) => `${node.label} ${input.format(node.rate)}`).join(', ')}.`;
   const talkers = topTalkers(input.nodes);
   if (talkers.length) text += ` Top talkers: ${talkers.map((node) => `${node.label} ${input.format(node.rate)}`).join(', ')}.`;
   return text;

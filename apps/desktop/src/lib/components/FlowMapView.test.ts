@@ -136,4 +136,41 @@ describe('FlowMap', () => {
     unmount();
     expect(globalThis.cancelAnimationFrame).toHaveBeenCalled();
   });
+
+  it('labels the core as this computer and offers its apps when per-device counters are missing', () => {
+    const noCounters = { available: false, upload: null, download: null, coverage: null, observed_at: null } as const;
+    const { getByRole, getByText } = render(FlowMap, {
+      devices: [device('a', { bandwidth: noCounters })], upload: 1_641_975, download: 45_994, connected: true, paused: true,
+      coreLabel: 'This computer', hostApps: [{ appId: 'a1', name: 'chrome.exe', up: 300_000, down: 100_000 }]
+    });
+    expect(getByText("Showing this computer's traffic")).toBeTruthy();
+    const label = getByRole('img').getAttribute('aria-label') ?? '';
+    expect(label).toContain('showing this computer only');
+    expect(label).toContain('Top applications: chrome.exe');
+    const texts = stub.fns.fillText!.mock.calls.map((call) => String(call[0]));
+    expect(texts).toContain('This computer');
+    expect(texts).toContain('chrome.exe');
+    expect(stub.fns.quadraticCurveTo).toHaveBeenCalled(); // app stream drawn
+  });
+
+  it('keeps presence visible and names unnamed devices from the inventory', async () => {
+    const meta = new Map([['dev-1', { vendor: 'Espressif Inc.', vendorStatus: 'assigned', ip: '192.168.1.142' }]]);
+    const noCounters = { available: false, upload: null, download: null, coverage: null, observed_at: null } as const;
+    const quiet = { state: 'quiet', observed_at: null, source: null, kind: null } as const;
+    const { getByRole, findByRole } = render(FlowMap, { devices: [device('dev-1', { bandwidth: noCounters, presence: quiet })], upload: null, download: null, connected: true, paused: true, onselect: vi.fn(), meta });
+    const button = getByRole('button', { name: /Espressif ·\.142, Home & IoT, quiet/ });
+    await fireEvent.focus(button);
+    const tip = await findByRole('tooltip');
+    expect(tip.textContent).toContain('Vendor: Espressif Inc. — grouped by maker');
+    // a quiet device is drawn as an ember (filled), not flattened to the neutral grey
+    const fills = stub.fns.arc!.mock.calls.length;
+    expect(fills).toBeGreaterThan(0);
+  });
+
+  it('does not select an application node and shows no host copy without a core label', async () => {
+    const { queryByText } = render(FlowMap, { devices: [device('a')], upload: 1, download: 1, connected: true, paused: true, hostApps: [{ appId: 'a1', name: 'chrome.exe', up: 3e5, down: 1e5 }] });
+    expect(queryByText("Showing this computer's traffic")).toBeNull();
+    const texts = stub.fns.fillText!.mock.calls.map((call) => String(call[0]));
+    expect(texts).not.toContain('chrome.exe');
+  });
 });

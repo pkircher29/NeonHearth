@@ -66,6 +66,67 @@ function bigSpecs(): Spec[] {
   return out;
 }
 
+/**
+ * A "real-shaped" home as a stock install sees it without the router feed: 89 devices, no owner names, no types,
+ * no counters, presence quiet, MAC makers as in the live inventory; plus a host snapshot whose connection bytes grow.
+ */
+const MAKERS: Array<[string | null, string, number]> = [
+  ['Espressif Inc.', 'assigned', 25], ['WiZ', 'assigned', 6], ['Proxmox Server Solutions GmbH', 'assigned', 6], ['Amazon Technologies Inc.', 'assigned', 5],
+  ['Tuya Smart Inc.', 'assigned', 4], ['FLIR Systems', 'assigned', 3], ['Shenzhen Jixian Technology Co., Ltd.', 'assigned', 3], [null, 'unknown', 3],
+  ['Wyze Labs Inc', 'assigned', 2], ['Raspberry Pi (Trading) Ltd', 'assigned', 2], ['Google, Inc.', 'assigned', 2], ['Sichuan AI-Link Technology Co., Ltd.', 'assigned', 2],
+  ['Lumi United Technology Co., Ltd', 'assigned', 2], [null, 'locally_administered', 2], ['NVIDIA', 'assigned', 1], ['GIGA-BYTE TECHNOLOGY CO.,LTD.', 'assigned', 1],
+  ['GD Midea Air-Conditioning Equipment Co.,Ltd.', 'assigned', 1], ['Blink by Amazon', 'assigned', 1], ['TP-Link Systems Inc.', 'assigned', 2], ['Hewlett Packard', 'assigned', 1],
+  ['Sony Home Entertainment&Sound Products Inc', 'assigned', 1], ['Hangzhou Hikvision Digital Technology Co.,Ltd.', 'assigned', 1], ['Acer Inc.', 'assigned', 1],
+  ['Microsoft Corporation', 'assigned', 1], ['Dell Inc.', 'assigned', 1], ['Ubiquiti Inc', 'assigned', 1], ['Liteon Technology Corporation', 'assigned', 1], ['Camille Bauer', 'assigned', 1]
+];
+function realShape() {
+  const rows: Array<{ id: string; org: string | null; status: string; ip: string }> = [];
+  for (const [org, status, count] of MAKERS) for (let i = 0; i < count; i += 1) {
+    const n = rows.length;
+    rows.push({ id: `01a1dfa1-02d7-7a11-9f34-${String(n + 1).padStart(12, '0')}`, org, status, ip: `192.168.1.${100 + n}` });
+  }
+  return rows;
+}
+async function installRealShaped(page: Page) {
+  const rows = realShape();
+  const devices = rows.map((r, i) => ({
+    device_id: r.id, first_seen_at: AT, last_seen_at: AT, owner_name: null, owner_type: null, owner_confirmed: false,
+    presence: { state: i === 40 ? 'offline' : 'quiet', observed_at: AT, source: 'neighbor-interface-21', kind: 'neighbor_cache' }, evidence: null,
+    identity: { available: false, classification: null, confidence: null }, bandwidth: { available: false, upload: null, download: null, coverage: null, observed_at: null }, policy: null
+  }));
+  await page.route('**/api/v1/**', (route) => route.fulfill({ status: 503, json: { error: 'fixture unavailable' } }));
+  await page.route('**/api/v1/health', (route) => route.fulfill({ json: { status: 'ok', api_version: 'fixture' } }));
+  await page.route('**/api/v1/state**', (route) => route.fulfill({ json: { sequence: 1, devices, next_after: null, service_status: 'ready' } }));
+  await page.route('**/api/v1/events/ticket', (route) => route.fulfill({ json: { ticket: 'fixture-ticket', expires_in_seconds: 30 } }));
+  await page.route('**/api/v1/network/monitor?*', (route) => route.fulfill({ status: 503, json: { error: 'fixture' } }));
+  await page.route('**/api/v1/automation/network', (route) => route.fulfill({ json: {
+    status: 'ready', observed_at: AT,
+    devices: rows.map((r) => ({ device_id: r.id, mac_addresses: ['00:00:00:00:00:01'], ip_addresses: [r.ip], home_assistant: null, mac_assignments: [{ mac_address: '00:00:00:00:00:01', organization: r.org, registry: r.org ? 'MA-L' : null, status: r.status }] }))
+  } }));
+  let calls = 0;
+  const apps = [['chrome.exe', 420_000, 60_000], ['node.exe', 90_000, 1_800_000], ['Teams.exe', 260_000, 190_000], ['svchost.exe', 5_000, 25_000], ['OneDrive.exe', 700_000, 12_000], ['code.exe', 22_000, 8_000], ['steam.exe', 3_000, 520_000]] as const;
+  await page.route('**/api/v1/host/snapshot', (route) => {
+    calls += 1;
+    const now = Date.now();
+    const wob = 1 + 0.3 * Math.sin(calls * 0.9);
+    route.fulfill({ json: {
+      observed_at: new Date(now).toISOString(), status: 'ready', detail: 'This computer only. Physical-interface bytes include all protocols.', interfaces: [],
+      applications: apps.map((a, i) => ({ app_id: `app-${i}`, name: a[0], executable: null, pid: 100 + i, started: AT, cpu_time_ms: null, memory_bytes: null })),
+      connections: apps.flatMap((a, i) => [0, 1].map((k) => ({ connection_id: `c-${i}-${k}`, app_id: `app-${i}`, pid: 100 + i, protocol: 'tcp', local_address: '192.168.1.2', local_port: 50000 + i * 2 + k, remote_address: '203.0.113.9', remote_port: 443, state: 'established', sent_bytes: k === 1 && i === 3 ? null : Math.round(a[1] * wob * calls * 2.5 / 2), received_bytes: k === 1 && i === 3 ? null : Math.round(a[2] * wob * calls * 2.5 / 2) }))),
+      upload_bytes_per_second: 1_641_975 * wob, download_bytes_per_second: 2_100_000 * wob + 45_994, last_interval_ms: 2000, app_counters: 'sampled_tcp', firewall_available: false, memory_total_bytes: null, memory_available_bytes: null
+    } });
+  });
+  await page.addInitScript(() => {
+    class FixtureSocket {
+      onopen?: () => void; onclose?: () => void; onerror?: () => void; onmessage?: (e: { data: string }) => void;
+      constructor() { setTimeout(() => this.onopen?.(), 0); }
+      close() { this.onclose?.(); }
+      send() {}
+    }
+    (window as unknown as { WebSocket: unknown }).WebSocket = FixtureSocket;
+  });
+}
+
 async function install(page: Page, opts: { devices?: boolean; socket?: 'live' | 'never' | 'noframes'; specs?: Spec[] } = {}) {
   const SPECS_ = opts.specs ?? SPECS;
   const devices = opts.devices === false ? [] : SPECS_.map(snapshotDevice);
@@ -204,6 +265,19 @@ test.describe('flow map visual review', () => {
     console.log('FRAME_STATS_150', JSON.stringify(stats));
     await shoot(page, '08-150-devices');
     expect(stats.frames).toBeGreaterThan(100);
+    await context.close();
+  });
+
+  test('real-shaped: 89 unnamed devices, no counters, host traffic fallback', async ({ browser }) => {
+    const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'no-preference', deviceScaleFactor: 1 });
+    const page = await context.newPage();
+    const errors: string[] = []; page.on('pageerror', (e) => errors.push(e.message));
+    await installRealShaped(page);
+    await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
+    await expect(page.getByRole('img', { name: /showing this computer only/ })).toHaveAttribute('aria-label', /Top applications/, { timeout: 30000 });
+    await page.waitForTimeout(12000);
+    await shoot(page, '09-real-shaped-live');
+    expect(errors).toEqual([]);
     await context.close();
   });
 
