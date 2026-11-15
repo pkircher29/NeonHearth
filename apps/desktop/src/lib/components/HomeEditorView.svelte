@@ -1224,6 +1224,6 @@
   .scale-bar{pointer-events:none}
   .scale-bar path{fill:none;stroke:var(--muted-strong);stroke-width:1.5}
   .scale-bar text{fill:var(--muted-strong);font:10px var(--font-mono)}
-  .side-panel{display:grid;gap:14px;align-content:start}
+  .side-panel{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;align-content:start;min-width:0}
   @media(max-width:1000px){.editor-body{grid-template-columns:1fr}.side-panel{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}}
 </style>
