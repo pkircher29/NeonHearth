@@ -92,7 +92,9 @@ async fn snapshot_requires_exact_bearer_token() {
         response.headers().get("www-authenticate").unwrap(),
         "Bearer"
     );
-    let response = app(test_state().await)
+    let state = test_state().await;
+    let events_epoch = state.events().epoch().to_string();
+    let response = app(state)
         .oneshot(
             Request::get("/api/v1/state")
                 .header("authorization", format!("Bearer {TOKEN}"))
@@ -104,7 +106,7 @@ async fn snapshot_requires_exact_bearer_token() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         body(response).await,
-        serde_json::json!({"sequence":0,"devices":[],"next_after":null,"service_status":"ready"})
+        serde_json::json!({"sequence":0,"events_epoch":events_epoch,"devices":[],"next_after":null,"service_status":"ready"})
     );
 }
 

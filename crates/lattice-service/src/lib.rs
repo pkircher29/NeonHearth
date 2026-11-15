@@ -215,6 +215,10 @@ pub fn app_with_parts(
 struct EventQuery {
     ticket: String,
     after_sequence: u64,
+    /// The `events_epoch` the client's sequence belongs to (from `/api/v1/state`).
+    /// Absent for older clients, which keep the epoch-less resume.
+    #[serde(default)]
+    epoch: Option<u64>,
 }
 
 async fn events_socket(
@@ -247,5 +251,5 @@ async fn events_socket(
     upgrade
         .max_message_size(ws::MAX_CLIENT_MESSAGE_BYTES)
         .max_frame_size(ws::MAX_CLIENT_MESSAGE_BYTES)
-        .on_upgrade(move |socket| ws::serve_socket(socket, events, query.after_sequence, guard))
+        .on_upgrade(move |socket| ws::serve_socket(socket, events, query.after_sequence, query.epoch, guard))
 }

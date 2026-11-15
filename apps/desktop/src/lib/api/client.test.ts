@@ -393,6 +393,31 @@ describe('createApiClient', () => {
     expect(sockets[0]).not.toContain('secret-service-token');
   });
 
+  it('presents the snapshot events epoch when opening the event stream', async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => String(input).includes('/api/v1/state')
+      ? new Response(JSON.stringify({ sequence: 7, events_epoch: '1800000000123456789', devices: [], next_after: null, service_status: 'ready' }), { status: 200 })
+      : new Response(JSON.stringify({ ticket: 'single-use ticket', expires_in_seconds: 60 }), { status: 200 }));
+    const sockets: string[] = [];
+    class FakeWebSocket {
+      onopen: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onmessage: ((event: MessageEvent<string>) => void) | null = null;
+      constructor(url: string) { sockets.push(url); queueMicrotask(() => this.onopen?.()); }
+    }
+    const client = createApiClient({
+      baseUrl: 'https://collector.example',
+      serviceToken: 'secret-service-token',
+      fetchImpl,
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    });
+
+    await client.snapshot();
+    await client.openEvents(7, vi.fn(), vi.fn());
+
+    expect(sockets).toEqual(['wss://collector.example/api/v1/events?ticket=single-use+ticket&after_sequence=7&epoch=1800000000123456789']);
+  });
+
   it('rejects an invalid cursor before issuing a ticket or opening a socket', async () => {
     const fetchImpl = vi.fn();
     const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });

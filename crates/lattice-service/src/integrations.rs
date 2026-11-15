@@ -559,16 +559,24 @@ pub struct IntegrationEventsQuery {
     pub after_sequence: u64,
     /// Long-poll wait when no scoped events are pending (capped at 25s).
     pub wait_ms: Option<u64>,
+    /// The `epoch` of the response the cursor came from. A cursor from an
+    /// earlier run of the service (sequences restart) is answered with a
+    /// resync. Omit it only for a first call.
+    pub epoch: Option<u64>,
 }
 
 #[derive(Serialize, ToSchema)]
 pub struct IntegrationEvents {
-    /// True when the cursor predates the replay window; the client must
-    /// refetch snapshots and resume from `next_after`.
+    /// True when the cursor predates the replay window or belongs to an
+    /// earlier run of the service; the client must refetch snapshots and
+    /// resume from `next_after`.
     pub resync: bool,
     #[schema(value_type = Vec<Object>)]
     pub events: Vec<EventEnvelope>,
     pub next_after: u64,
+    /// Identifies this run of the service's event stream; echo it as `epoch`
+    /// on the next call. Decimal string because it exceeds 2^53.
+    pub epoch: String,
 }
 
 fn scope_allows(scopes: &[IntegrationScope], payload: &EventPayload) -> bool {
@@ -581,7 +589,7 @@ fn scope_allows(scopes: &[IntegrationScope], payload: &EventPayload) -> bool {
     }
 }
 
-#[utoipa::path(get, path = "/api/v1/integrations/v1/events", params(("after_sequence" = u64, Query), ("wait_ms" = Option<u64>, Query, maximum = 25000)), responses((status = 200, body = IntegrationEvents), (status = 400), (status = 401), (status = 429, description = "this token already holds its maximum number of open long-polls"), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/integrations/v1/events", params(("after_sequence" = u64, Query), ("wait_ms" = Option<u64>, Query, maximum = 25000), ("epoch" = Option<u64>, Query)), responses((status = 200, body = IntegrationEvents), (status = 400), (status = 401), (status = 429, description = "this token already holds its maximum number of open long-polls"), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn events_route(
     principal: IntegrationPrincipal,
     State(state): State<AppState>,
@@ -607,14 +615,19 @@ pub(crate) async fn events_route(
     };
     let scopes = principal.0.scopes.clone();
     let bus = state.events().clone();
-    // Subscribe before replay so no event is lost between the two reads.
-    let mut receiver = bus.subscribe();
-    let (mut visible, mut next_after) = match bus.resume_after(query.after_sequence).await {
+    let epoch = bus.epoch().to_string();
+    // Subscribe and replay under the bus lock so no event is lost between the two reads; a
+    // cursor from an earlier run of the bus gets a resync.
+    let (mut receiver, resume) = bus
+        .subscribe_and_resume(query.epoch, query.after_sequence)
+        .await;
+    let (mut visible, mut next_after) = match resume {
         Resume::SnapshotRequired => {
             return Json(IntegrationEvents {
                 resync: true,
                 events: Vec::new(),
                 next_after: bus.current_sequence().await,
+                epoch,
             })
             .into_response();
         }
@@ -640,6 +653,7 @@ pub(crate) async fn events_route(
                         resync: true,
                         events: Vec::new(),
                         next_after: bus.current_sequence().await,
+                        epoch,
                     })
                     .into_response();
                 }
@@ -660,6 +674,7 @@ pub(crate) async fn events_route(
         resync: false,
         events: visible,
         next_after,
+        epoch,
     })
     .into_response()
 }
