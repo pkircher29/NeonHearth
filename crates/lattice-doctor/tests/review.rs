@@ -22,7 +22,7 @@ use lattice_doctor::repair::{
     ApprovalAction, ApprovalId, ApprovedRepair, ExecutableRepair, RepairClass, RepairContext,
     StateKey, plan_repair,
 };
-use lattice_doctor::types::{InterfaceName, IpVersion, MacAddr};
+use lattice_doctor::types::{IpVersion, MacAddr};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -456,7 +456,6 @@ fn symptom_deserialisation_enforces_the_constructor_rules() {
     assert!(serde_json::from_str::<Symptom>(&json("0.0")).is_err());
     assert!(serde_json::from_str::<Symptom>(&json("-1.0")).is_err());
     assert!(serde_json::from_str::<Symptom>(&json("1.0")).is_ok());
-    let _ = InterfaceName::parse("eth0").unwrap();
 }
 
 #[tokio::test]

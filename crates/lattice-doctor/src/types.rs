@@ -186,8 +186,19 @@ impl IpVersion {
 
 /// A link MTU in bytes (IP packet size), never an ICMP payload size.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(transparent)]
+#[serde(try_from = "u16")]
 pub struct Mtu(u16);
+
+impl TryFrom<u16> for Mtu {
+    type Error = DoctorError;
+
+    fn try_from(value: u16) -> Result<Self, DoctorError> {
+        if value < Self::MIN {
+            return Err(DoctorError::InvalidValue("mtu"));
+        }
+        Ok(Self(value))
+    }
+}
 
 impl Mtu {
     pub const MIN: u16 = 576;
@@ -271,6 +282,12 @@ mod tests {
         );
         assert_eq!(Mtu::from_icmp_payload(10, IpVersion::V4), None);
         assert_eq!(Mtu::from_icmp_payload(u16::MAX, IpVersion::V4), None);
+    }
+
+    #[test]
+    fn mtu_deserialisation_enforces_the_floor() {
+        assert!(Mtu::try_from(575).is_err());
+        assert_eq!(Mtu::try_from(1500).unwrap().get(), 1500);
     }
 
     #[test]

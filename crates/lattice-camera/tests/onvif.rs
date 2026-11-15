@@ -864,6 +864,19 @@ fn public_output_constructors_preserve_bounds() {
     assert!(BoundedMetadata::new("x".repeat(129)).is_err());
     assert!(BoundedMetadata::new("rtsp://metadata-secret.invalid/live").is_err());
     assert!(BoundedMetadata::new("authorization: bearer value").is_err());
+    for secret in [
+        "Bearer abc123",
+        "Basic dXNlcjpwYXNz",
+        "password=hunter2",
+        "passwd: hunter2",
+        "api_key = abc",
+        "user:pass@192.168.1.5",
+    ] {
+        assert!(BoundedMetadata::new(secret).is_err(), "{secret}");
+    }
+    for product in ["Password Cam @ Home", "Acme Token Reader", "A&B <C>"] {
+        assert!(BoundedMetadata::new(product).is_ok(), "{product}");
+    }
     assert!(BoundedSerial::new("serial with spaces").is_err());
     assert!(StreamSourceRef::new("x".repeat(129)).is_err());
     let profile = CameraProfile::new(
@@ -946,4 +959,28 @@ fn onvif_targets_must_not_be_loopback_or_unspecified() {
         );
     }
     assert!(TargetAddress::new("192.168.1.9".parse().unwrap(), 80, false, "/onvif").is_ok());
+}
+
+#[tokio::test]
+async fn escaped_field_length_bound_is_on_decoded_bytes_at_the_boundary() {
+    // `A&amp;B&amp;C` decodes to 5 bytes: 5 is accepted, 4 is rejected.
+    let run = |max_field_bytes| async move {
+        inventory(
+            &FixtureTransport::mutated(Mutation::EscapedFieldTooLong),
+            &Sink::default(),
+            target(),
+            None,
+            InventoryLimits {
+                max_field_bytes,
+                ..InventoryLimits::default()
+            },
+        )
+        .await
+    };
+    let accepted = run(5).await.unwrap();
+    assert_eq!(
+        accepted.manufacturer.as_ref().map(BoundedMetadata::as_str),
+        Some("A&B&C")
+    );
+    assert_eq!(run(4).await.unwrap_err(), OnvifError::InvalidResponse);
 }

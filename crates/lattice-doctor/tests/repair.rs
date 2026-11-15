@@ -184,7 +184,13 @@ fn deserialising_an_approval_runs_its_validation() {
     assert!(serde_json::from_str::<ApprovalId>("\"ok-1\"").is_ok());
     assert!(serde_json::from_str::<InterfaceName>("\"-h\"").is_err());
     assert!(serde_json::from_str::<MacAddr>("\"01:00:5e:00:00:01\"").is_err());
-    let _ = IpVersion::V4;
+    assert_eq!(
+        serde_json::from_str::<lattice_doctor::types::Mtu>("1400")
+            .unwrap()
+            .get(),
+        1400
+    );
+    assert!(serde_json::from_str::<lattice_doctor::types::Mtu>("100").is_err());
 }
 
 #[test]

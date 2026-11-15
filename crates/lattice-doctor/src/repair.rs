@@ -211,7 +211,7 @@ pub fn plan_repair(diagnosis: &DiagnosisKind, context: &RepairContext) -> Repair
                     claimants: macs.clone(),
                     chosen: None,
                 },
-                rationale: "several devices answer for one address; the owner must choose                             which device keeps it before a reservation can be applied"
+                rationale: "several devices answer for one address; the owner must choose which device keeps it before a reservation can be applied"
                     .into(),
             },
             _ => RepairPlan::ObservationOnly {

@@ -464,10 +464,8 @@ fn validate_complexity(wasm: &[u8]) -> Result<(), AuditError> {
             Payload::FunctionSection(section) => {
                 functions = functions.saturating_add(section.count());
             }
-            Payload::CodeSectionEntry(body) => {
-                if body.range().len() > MAX_FUNCTION_BODY_BYTES {
-                    return Err(AuditError::InvalidModule);
-                }
+            Payload::CodeSectionEntry(body) if body.range().len() > MAX_FUNCTION_BODY_BYTES => {
+                return Err(AuditError::InvalidModule);
             }
             _ => {}
         }

@@ -464,6 +464,19 @@ impl<'de> Deserialize<'de> for StreamSourceRef {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BoundedMetadata(String);
 
+/// True for `password=x`, `passwd: x`, `token = x` style text.
+fn looks_like_credential_assignment(normalized: &str) -> bool {
+    ["password", "passwd", "pwd", "token", "secret", "apikey", "api_key"]
+        .iter()
+        .any(|word| {
+            normalized.match_indices(word).any(|(at, _)| {
+                normalized[at + word.len()..]
+                    .trim_start()
+                    .starts_with([':', '='])
+            })
+        })
+}
+
 impl BoundedMetadata {
     pub fn new(value: impl AsRef<str>) -> Result<Self, OnvifError> {
         let value = value.as_ref().trim();
@@ -471,10 +484,15 @@ impl BoundedMetadata {
         if value.is_empty()
             || value.len() > MAX_PUBLIC_TEXT_BYTES
             || value.chars().any(char::is_control)
-            // A URL (and so any embedded user:password@host credential) is the
-            // only dangerous shape: product names legitimately contain words
-            // such as "password" or "@".
+            // Reject only secret-shaped text: URLs (embedded user:password@host),
+            // auth header shapes, and credential assignments. Product names
+            // may legitimately contain "password" or "@" on their own.
             || normalized.contains("://")
+            || normalized.contains("authorization")
+            || normalized.contains("bearer ")
+            || normalized.starts_with("basic ")
+            || (value.contains('@') && value.contains(':'))
+            || looks_like_credential_assignment(&normalized)
         {
             return Err(OnvifError::InvalidMetadata);
         }
