@@ -16,6 +16,7 @@ pub mod network_monitor;
 pub mod network_scan;
 pub mod platform;
 pub mod policy;
+pub mod restore;
 pub mod runtime;
 mod security;
 mod state;

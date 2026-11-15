@@ -58,6 +58,37 @@ Nothing, by default. The only designed exceptions are:
 - Owner-confirmed values never expire; only your explicit clearing removes
   them.
 
+## Restoring a backup
+
+Restoring replaces the whole database with a backup file, so it is done
+offline:
+
+1. Stop the NeonHearth service.
+2. Run `lattice-service restore --from <backup-file>` with the same
+   environment the service uses (`LATTICE_STATE_BASE`, and `LATTICE_BIND` if
+   you changed it). The command refuses to run while the service is
+   listening, checks the backup (integrity, foreign keys, migration history)
+   and refuses one written by a newer NeonHearth than the one you are
+   running. If anything fails it exits with an error and your current
+   database is left as it was.
+3. On success your previous database is kept next to the restored one as
+   `lattice.db.pre-restore` until the next restore replaces it. Start the
+   service.
+
+On that first start the service reconciles before it trusts anything. A
+restore rewinds more than your device list: the record of what NeonHearth had
+already blocked at the router, pending decisions, and the audit log all go
+back to the moment of the backup. So the service treats its enforcement state
+as unknown, re-evaluates every device from the restored data, and writes a
+`restore.reconciled` entry to the audit log (entries made after the backup
+was taken are gone from the log; this entry says so). Controls that cannot be
+proven stay pending and ask for your attention instead of being repeated
+blindly. Until that finishes, a small marker file
+(`restore-reconcile.pending` in the state directory) stays in place; if
+reconciliation fails the service reports itself degraded and tries again on
+the next start. Check your router for blocks NeonHearth applied after the
+backup was taken: the restored database no longer knows about them.
+
 ## Removing NeonHearth and its data
 
 1. Stop the service (and disable whatever mechanism you used to start it).
@@ -72,8 +103,10 @@ Nothing, by default. The only designed exceptions are:
 
 ## Not yet available
 
-- Backup and restore. The service reserves a `backups` directory but no
-  backup is written yet; do not rely on one existing.
+- Scheduled backups. The service reserves a `backups` directory but no
+  backup is written yet; do not rely on one existing. Restoring a SQLite
+  backup file (for example one made with `VACUUM INTO`) is supported; see
+  "Restoring a backup".
 - A guided uninstaller (removal is the manual procedure above).
 - Retention and destination-metadata settings in the app (the underlying
   policies exist in the service; the Settings view is not built).
