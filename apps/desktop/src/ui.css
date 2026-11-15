@@ -58,7 +58,7 @@
 .hearth-legend .swatch.maker { width: 16px; height: 6px; border-radius: 3px; background: repeating-linear-gradient(90deg, rgba(233,251,252,.6) 0 3px, transparent 3px 5px); }
 .hearth-legend .swatch.computer { width: 10px; height: 10px; border-radius: 1px; transform: rotate(45deg); background: #0e101a; border: 2px solid #ff9d3b; margin-inline: 3px; }
 
-.metrics { display:grid; grid-template-columns:repeat(3,1fr); border-block:1px solid var(--line)}
+.metrics { display:grid; grid-template-columns:repeat(2,1fr); border-block:1px solid var(--line)}
 .metrics article { padding:17px 15px; border-right:1px solid var(--line); display:grid; gap:7px}
 .metrics strong { font:600 22px var(--font-display)}
 .metrics small,.metric-note { color:var(--muted); font:11px var(--font-mono)}

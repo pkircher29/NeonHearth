@@ -1,6 +1,7 @@
 <script lang="ts">
   // PIN step-up for phone sessions: a high-impact route answered 403, so the
   // service wants the six-digit PIN before the five-minute grace window opens.
+  import { modal } from '../a11y';
   interface Props {
     onsubmit: (pin: string) => Promise<void>;
     oncancel: () => void;
@@ -25,13 +26,13 @@
   }
 </script>
 
-<div class="stepup-backdrop" role="dialog" aria-modal="true" aria-labelledby="stepup-heading">
+<div class="stepup-backdrop" role="dialog" aria-modal="true" aria-labelledby="stepup-heading" use:modal={{ onescape: () => { if (!busy) oncancel(); } }}>
   <form class="stepup" onsubmit={submit}>
     <p class="kicker">PHONE / STEP-UP</p>
     <h2 id="stepup-heading">Confirm with your PIN</h2>
     <p class="muted">This action changes your network. Enter the PIN you chose when pairing; the unlock lasts five minutes.</p>
     <label class="search"><span>Six-digit PIN</span>
-      <input type="password" inputmode="numeric" autocomplete="one-time-code" maxlength="6" bind:value={pin} aria-invalid={error !== null} />
+      <input data-autofocus type="password" inputmode="numeric" autocomplete="one-time-code" maxlength="6" bind:value={pin} aria-invalid={error !== null} />
     </label>
     {#if error}<p class="stepup-error" role="alert">{error}</p>{/if}
     <div class="stepup-actions">
@@ -42,7 +43,7 @@
 </div>
 
 <style>
-  .stepup-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: var(--bg)99; backdrop-filter: blur(3px); }
+  .stepup-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: color-mix(in srgb, var(--bg) 60%, transparent); backdrop-filter: blur(3px); }
   .stepup { width: min(420px, 92vw); padding: 22px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); display: grid; gap: 10px; }
   .stepup h2 { margin: 0; font: 700 22px var(--font-display); }
   .stepup .search { margin: 8px 0 0; }

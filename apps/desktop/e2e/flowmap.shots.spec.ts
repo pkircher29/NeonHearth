@@ -5,6 +5,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { settled } from './fixtures/isolation';
 
 const OUT = resolve(process.cwd(), '../../output/flow-map');
 const AT = '2026-01-01T00:00:00Z';
@@ -182,12 +183,12 @@ test.describe('flow map visual review', () => {
     await install(page);
     await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
     await expect(page.getByRole('img', { name: /Network flow map:/ })).toHaveAttribute('aria-label', /Top talkers/, { timeout: 15000 });
-    await page.waitForTimeout(9000);
+    await settled(page);
     await shoot(page, '01-live', true);
-    await page.waitForTimeout(700);
+    await settled(page);
     await shoot(page, '01-live-b');
     await page.getByRole('button', { name: 'Hearth' }).click();
-    await page.waitForTimeout(1200);
+    await settled(page);
     await shoot(page, '07-hearth-comparison');
     expect(errors).toEqual([]);
     await context.close();
@@ -199,7 +200,7 @@ test.describe('flow map visual review', () => {
     await install(page);
     await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
     await expect(page.getByRole('img', { name: /Network flow map:/ })).toHaveAttribute('aria-label', /Top talkers/, { timeout: 15000 });
-    await page.waitForTimeout(6000);
+    await settled(page);
     await shoot(page, '02-paused-reduced');
     await context.close();
   });
@@ -210,7 +211,7 @@ test.describe('flow map visual review', () => {
     await install(page, { socket: 'never' });
     await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
     await expect(page.getByText('Collector offline', { exact: true })).toBeVisible({ timeout: 15000 });
-    await page.waitForTimeout(1500);
+    await settled(page);
     await shoot(page, '03-disconnected');
     await context.close();
   });
@@ -221,7 +222,7 @@ test.describe('flow map visual review', () => {
     await install(page, { devices: false, socket: 'noframes' });
     await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
     await expect(page.getByText('No devices yet', { exact: true })).toBeVisible({ timeout: 15000 });
-    await page.waitForTimeout(1200);
+    await settled(page);
     await shoot(page, '04-empty');
     await context.close();
   });
@@ -232,7 +233,7 @@ test.describe('flow map visual review', () => {
     await install(page, { socket: 'noframes' });
     await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
     await expect(page.getByText('No per-device counters', { exact: true })).toBeVisible({ timeout: 15000 });
-    await page.waitForTimeout(1200);
+    await settled(page);
     await shoot(page, '05-no-counters');
     await context.close();
   });
@@ -250,7 +251,7 @@ test.describe('flow map visual review', () => {
     });
     await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
     await expect(page.getByRole('img', { name: /Network flow map:/ })).toHaveAttribute('aria-label', /Top talkers/, { timeout: 15000 });
-    await page.waitForTimeout(4000);
+    await settled(page);
     await page.evaluate(() => { (window as unknown as { __on: boolean }).__on = true; });
     const stats = await page.evaluate(() => new Promise<{ frames: number; avg: number; worst: number; p95: number; paintAvg: number; paintMax: number }>((resolveStats) => {
       const deltas: number[] = []; let last = 0; const start = performance.now();
@@ -275,7 +276,7 @@ test.describe('flow map visual review', () => {
     await installRealShaped(page);
     await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
     await expect(page.getByRole('img', { name: /showing this computer only/ })).toHaveAttribute('aria-label', /Top applications/, { timeout: 30000 });
-    await page.waitForTimeout(12000);
+    await settled(page);
     await shoot(page, '09-real-shaped-live');
     expect(errors).toEqual([]);
     await context.close();
@@ -287,7 +288,7 @@ test.describe('flow map visual review', () => {
     await install(page);
     await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
     await expect(page.getByRole('img', { name: /Network flow map:/ })).toHaveAttribute('aria-label', /Top talkers/, { timeout: 15000 });
-    await page.waitForTimeout(7000);
+    await settled(page);
     await shoot(page, '06-mobile', true);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await context.close();

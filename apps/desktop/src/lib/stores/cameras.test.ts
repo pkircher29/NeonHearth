@@ -93,4 +93,33 @@ describe('createCameraStore', () => {
     await store.closeSession(); await store.closeSession(); await store.dispose();
     expect(store.state.session).toBeNull(); expect(client.closeCameraSession).toHaveBeenCalledTimes(1);
   });
+
+  it('a snapshot or live-view request does not strand the camera list in the loading state', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const client = clientStub({ cameras: vi.fn(async () => { await gate; return { items: [item], next_after: null }; }) });
+    const store = createCameraStore(client);
+    const loading = store.load();
+    expect(store.state.loading).toBe(true);
+    void store.snapshot(cameraId);
+    void store.startSession(cameraId, streamId);
+    release();
+    await loading;
+    expect(store.state.loading).toBe(false);
+    expect(store.state.items).toEqual([item]);
+  });
+
+  it('selecting another camera drops a snapshot still in flight for the previous one', async () => {
+    let finish!: (blob: Blob) => void;
+    const client = clientStub({ cameraSnapshot: vi.fn(() => new Promise<Blob>((resolve) => { finish = resolve; })) as never });
+    const urls = { createObjectURL: vi.fn(() => 'blob:x'), revokeObjectURL: vi.fn() };
+    const store = createCameraStore(client, urls);
+    await store.load();
+    const pending = store.snapshot(cameraId);
+    await store.select(null);
+    finish(new Blob(['x']));
+    await pending;
+    expect(urls.createObjectURL).not.toHaveBeenCalled();
+    expect(store.state.snapshotUrl).toBeNull();
+  });
 });
