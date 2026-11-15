@@ -164,7 +164,7 @@ class ReleaseWiringTests(unittest.TestCase):
             condition = self.jobs[name].get('if', '')
             signing_only = condition.startswith("needs.plan.outputs.sign == 'true'")
             self.assertTrue('!cancelled()' in condition or signing_only,
-                            f'{name} would be skipped together with an unsigned candidate's signing jobs')
+                            f'{name} would be skipped together with an unsigned candidate signing jobs')
 
     def test_signing_check_workflow_is_gone(self):
         self.assertFalse((WORKFLOWS / 'signing-check.yml').exists())
