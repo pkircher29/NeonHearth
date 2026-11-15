@@ -350,7 +350,7 @@ removes program files; the state directory survives with a note.
 Linux: deb/rpm install the binary to `/usr/libexec/neonhearth/`, the
 hardened unit, the sysusers fragment, and UI assets;
 `postinstall.sh` creates the user, generates
-`/etc/neonhearth/service.env` (root:neonhearth 0640) on first install,
+`/etc/neonhearth/service.env` (root:root 0600) on first install,
 and enables/starts the unit. `StateDirectory=neonhearth` owns
 `/var/lib/neonhearth`; package removal never deletes it (note file written
 at install).
