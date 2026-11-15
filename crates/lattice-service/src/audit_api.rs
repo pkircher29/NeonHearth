@@ -32,6 +32,9 @@ use crate::{auth::Authorized, state::AppState};
 const DEFAULT_PAGE: u32 = 50;
 /// Largest tail window the verify route accepts in one call.
 const MAX_VERIFY_TAIL: u64 = 10_000;
+/// Window verified when the caller names none: a full-chain walk is a long
+/// read inside a request, so it is opt-in (`?tail=all`).
+const DEFAULT_VERIFY_TAIL: u64 = 1_000;
 
 #[derive(Clone)]
 pub struct AuditApiState {
@@ -74,8 +77,9 @@ pub struct AuditPageResponse {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct AuditVerifyQuery {
-    /// Verify only the newest `tail` entries; omit to walk the whole chain.
-    pub tail: Option<u64>,
+    /// Verify only the newest `tail` entries (1..=10000, default 1000), or
+    /// pass `all` to walk the whole chain.
+    pub tail: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -167,7 +171,7 @@ pub(crate) async fn page_route(
     .into_response()
 }
 
-#[utoipa::path(get, path = "/api/v1/audit/verify", params(("tail" = Option<u64>, Query)), responses((status = 200, body = AuditVerifyResponse), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(get, path = "/api/v1/audit/verify", params(("tail" = Option<String>, Query)), responses((status = 200, body = AuditVerifyResponse), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn verify_route(
     _: Authorized,
     Extension(audit): Extension<AuditApiState>,
@@ -176,11 +180,14 @@ pub(crate) async fn verify_route(
     let Ok(Query(query)) = query else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let scope = match query.tail {
-        None => ChainScope::All,
-        Some(0) => return StatusCode::BAD_REQUEST.into_response(),
-        Some(tail) if tail > MAX_VERIFY_TAIL => return StatusCode::BAD_REQUEST.into_response(),
-        Some(tail) => ChainScope::Tail(tail),
+    let scope = match query.tail.as_deref() {
+        None => ChainScope::Tail(DEFAULT_VERIFY_TAIL),
+        Some("all") => ChainScope::All,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(0) | Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            Ok(tail) if tail > MAX_VERIFY_TAIL => return StatusCode::BAD_REQUEST.into_response(),
+            Ok(tail) => ChainScope::Tail(tail),
+        },
     };
     let report = match audit.log.verify_chain(scope).await {
         Ok(report) => report,

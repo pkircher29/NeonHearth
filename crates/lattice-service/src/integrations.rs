@@ -12,11 +12,14 @@
 //! is out of scope for this release and recorded as pending in the contract.
 
 use crate::tailscale::{RemoteAccessState, sha256_hex};
-use crate::{AppState, auth::Authorized};
+use crate::{
+    AppState,
+    auth::{Principal, bearer_token},
+};
 use axum::{
     Json,
     extract::{FromRequestParts, Path as AxumPath, Query, Request, State},
-    http::{StatusCode, header, request::Parts},
+    http::{StatusCode, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -24,7 +27,7 @@ use chrono::{DateTime, Utc};
 use lattice_domain::{Coverage, DeviceId, EventEnvelope, EventPayload, PresenceState};
 use lattice_event_bus::Resume;
 use lattice_store::{
-    AuditActor, AuditCategory, AuditLog, NewAuditEntry, NewIntegrationToken, PolicyRepository,
+    AuditCategory, AuditLog, NewAuditEntry, NewIntegrationToken, PolicyRepository,
     RemoteAccessRepository,
 };
 use serde::{Deserialize, Serialize};
@@ -119,21 +122,7 @@ pub(crate) async fn authorize_integration(
 ) -> Response {
     let unauthorized =
         || (StatusCode::UNAUTHORIZED, [("WWW-Authenticate", "Bearer")]).into_response();
-    let values: Vec<_> = request
-        .headers()
-        .get_all(header::AUTHORIZATION)
-        .iter()
-        .collect();
-    let token = if values.len() == 1 {
-        values[0]
-            .to_str()
-            .ok()
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    } else {
-        None
-    };
+    let token = bearer_token(request.headers()).map(str::to_owned);
     let Some(token) = token else {
         return unauthorized();
     };
@@ -141,7 +130,10 @@ pub(crate) async fn authorize_integration(
     let row = match repository.find_integration_token(&sha256_hex(&token)).await {
         Ok(Some(row)) => row,
         Ok(None) => return unauthorized(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "integration token lookup failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     if row.revoked {
         return unauthorized();
@@ -214,6 +206,7 @@ fn random_token_hex() -> Result<String, ()> {
 
 async fn append_token_audit(
     remote: &RemoteAccessState,
+    principal: Principal,
     action: &str,
     subject: String,
     detail: serde_json::Value,
@@ -221,12 +214,12 @@ async fn append_token_audit(
     let audit = AuditLog::new(remote.pool().clone());
     match audit
         .append(NewAuditEntry {
-            occurred_at: Utc::now(),
-            actor: AuditActor::Owner,
+            occurred_at: remote.now(),
+            actor: principal.audit_actor(),
             category: AuditCategory::Approval,
             action: action.to_owned(),
             subject: Some(subject),
-            detail,
+            detail: principal.annotate(detail),
         })
         .await
     {
@@ -240,7 +233,7 @@ async fn append_token_audit(
 
 #[utoipa::path(post, path = "/api/v1/integrations/tokens", request_body = MintTokenRequest, responses((status = 200, body = MintTokenResponse), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn mint_token_route(
-    _: Authorized,
+    principal: Principal,
     axum::Extension(remote): axum::Extension<RemoteAccessState>,
     body: Result<Json<MintTokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -273,11 +266,13 @@ pub(crate) async fn mint_token_route(
         created_at: Utc::now(),
     };
     let repository = RemoteAccessRepository::new(remote.pool().clone());
-    if repository.insert_integration_token(&record).await.is_err() {
+    if let Err(error) = repository.insert_integration_token(&record).await {
+        tracing::error!(%error, "integration token insert failed");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let audited = append_token_audit(
         &remote,
+        principal,
         "integration_token_minted",
         record.id.to_string(),
         serde_json::json!({ "name": record.name, "scopes": record.scopes }),
@@ -300,7 +295,7 @@ pub(crate) async fn mint_token_route(
 
 #[utoipa::path(get, path = "/api/v1/integrations/tokens", responses((status = 200, body = IntegrationTokenList), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn list_tokens_route(
-    _: Authorized,
+    _: crate::auth::Authorized,
     axum::Extension(remote): axum::Extension<RemoteAccessState>,
 ) -> Response {
     let repository = RemoteAccessRepository::new(remote.pool().clone());
@@ -318,13 +313,16 @@ pub(crate) async fn list_tokens_route(
                 .collect(),
         })
         .into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "integration token storage failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 
 #[utoipa::path(delete, path = "/api/v1/integrations/tokens/{id}", params(("id" = String, Path, format = Uuid)), responses((status = 204), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn revoke_token_route(
-    _: Authorized,
+    principal: Principal,
     axum::Extension(remote): axum::Extension<RemoteAccessState>,
     path: Result<AxumPath<String>, axum::extract::rejection::PathRejection>,
 ) -> Response {
@@ -341,6 +339,7 @@ pub(crate) async fn revoke_token_route(
             // append fails, surfaced as 503.
             let audited = append_token_audit(
                 &remote,
+                principal,
                 "integration_token_revoked",
                 id.to_string(),
                 serde_json::json!({}),
@@ -352,7 +351,10 @@ pub(crate) async fn revoke_token_route(
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "integration token storage failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 

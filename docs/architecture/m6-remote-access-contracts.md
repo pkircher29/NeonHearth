@@ -23,13 +23,15 @@ Locked 2026-08-24 for the Tailscale (T1–T4) and integrations (I1–I2) lanes.
   limited and audited.
 - **No replay (T4)**: command-carrying requests over a phone session include
   a client-generated `command_id` (uuid); the service keeps a bounded
-  per-session response window and returns the original result for a replayed
-  id instead of re-executing. SQLite reservations bind each id to the method,
-  URI and body and survive restart. Concurrent in-flight duplicates wait for the original result when its handler
-  is already admitted. Changed payloads and reservations whose response is not
-  retained (including interrupted requests) return 409;
-  clients must refresh state before deciding whether to issue a new command.
-  Reservations remain for the session lifetime, even after response eviction. WebSocket reconnects resume the event stream
+  durable per-session record (SQLite, `phone_command_replays`) and returns the
+  original result for a replayed id instead of re-executing. The record is
+  claimed before the handler runs, bound to the method, URI and body, and
+  survives restart. Concurrent in-flight duplicates wait for the original
+  result. A changed payload, or a claim whose handler never finished
+  (crash, timeout, disconnect), returns 409; clients must refresh state before
+  deciding whether to issue a new command. Reservations remain for the session
+  lifetime: only the stored response bodies of the oldest settled commands are
+  evicted, never the id. WebSocket reconnects resume the event stream
   by sequence (existing snapshot/resume protocol) and never re-deliver
   commands.
 
@@ -52,7 +54,38 @@ Locked 2026-08-24 for the Tailscale (T1–T4) and integrations (I1–I2) lanes.
 Every minting/revocation and step-up failure is appended to the audit log
 (category `approval` for pairings/tokens).
 
-PIN hashing runs on blocking workers with one admitted operation per service.
-Busy requests return 429 before verification. Attempts are durably debited
-before hashing; successful verification clears the debit. Interrupted attempts
-remain counted, so cancellation cannot bypass the attempt budget.
+## Hardening amendments (security review)
+
+- **PIN budget is reserved, not charged after the fact.** A step-up attempt
+  reserves one of the five per-window attempts in a single atomic statement
+  *before* the PIN is evaluated; a request that cannot reserve is refused
+  (429) unevaluated, and a correct PIN never overrides a lock. PIN hashing and
+  verification run on the blocking pool behind a two-permit gate.
+- **Commands run at most once.** A mutating phone request writes a durable
+  claim keyed `(session, command_id)` and bound to `(method, target, body)`
+  before the handler runs, and completes it with the response afterwards. The
+  claim survives a restart; a duplicate gets the stored response (any status,
+  including 5xx), an id reused for a different request gets 409, and a claim
+  whose handler never finished (crash, timeout, disconnect) gets 409 "outcome
+  unknown" instead of a second execution.
+- **Sessions are bounded.** Sliding expiry never passes an absolute 180-day
+  age; revoked or expired sessions are never touched back to life, and the
+  store exposes `purge_dead_phone_sessions` for the maintenance task.
+- **Sockets follow their principal.** An event ticket records the principal it
+  was issued to (64 outstanding overall; a phone session holds at most 8, and phones together never take the last 8 slots, which stay reserved for the owner). A phone
+  socket closes immediately when its session is revoked (broadcast) and
+  re-validates against storage every 30 s as a backstop. Sockets are capped
+  (32), pinged, closed when idle (60 s), limited in lifetime (1 h, clients
+  resume by sequence), bounded in write time (10 s) and in client message size
+  (1 KiB).
+- **Host allowlist.** `Host` must be a loopback name on the bound port (plus
+  the Vite dev/preview ports), or the daemon-reported tailnet name; anything
+  else is 403 even with a matching `Origin` (DNS rebinding). Requests bearing
+  the `Tailscale-Funnel-Request` header are refused (header name unverified
+  against live Funnel traffic).
+- **Audit attribution.** Remote-access audit rows record `actor = phone` with
+  the session id for phone-initiated actions.
+- **Owner token.** `POST /api/v1/service/token/rotate` (owner only) replaces
+  the token; the new value is persisted to `<state>/owner-token`, which wins
+  over `LATTICE_SERVICE_TOKEN` at the next start. The environment variable is
+  removed from the process at startup so children never inherit it.

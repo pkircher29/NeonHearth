@@ -40,7 +40,7 @@ async fn fixture() -> Fixture {
         M2StateRepository::new(connect_memory().await.unwrap()),
     )
     .unwrap();
-    let router = with_ui_assets(app(state), &ui_dir);
+    let router = with_ui_assets(app(state.clone()), &ui_dir, &state);
     Fixture {
         _base: base,
         router,

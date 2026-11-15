@@ -143,7 +143,12 @@ async fn verify_reports_a_healthy_tail_and_rejects_bad_windows() {
     assert_eq!(verify["report"]["anchored"], json!(false));
     assert_eq!(verify["head"]["id"], json!(5));
 
+    // No window named: a bounded default tail, not a whole-chain walk.
     let (status, verify) = get_json(&app, "/api/v1/audit/verify").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(verify["report"]["checked"], json!(5));
+    // The full walk is explicit.
+    let (status, verify) = get_json(&app, "/api/v1/audit/verify?tail=all").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(verify["report"]["anchored"], json!(true));
     assert_eq!(verify["report"]["checked"], json!(5));
@@ -151,6 +156,7 @@ async fn verify_reports_a_healthy_tail_and_rejects_bad_windows() {
     for uri in [
         "/api/v1/audit/verify?tail=0",
         "/api/v1/audit/verify?tail=10001",
+        "/api/v1/audit/verify?tail=bogus",
     ] {
         let (status, _) = get_json(&app, uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
