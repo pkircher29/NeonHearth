@@ -504,6 +504,7 @@ test('3D twin v2: the close button dismisses the detail card; hovering a room na
   await expect(tip).toContainText(/6\.\d m²/);
   await page.mouse.move(box.x + 4, box.y + 4); // off the room: the tip goes away
   await expect(tip).toHaveCount(0);
+});
 
 // Real multi-touch: CDP Input.dispatchTouchEvent makes Chromium emit genuine pointer events with
 // pointerType "touch" (and the browser's own touch-action handling), unlike the jsdom synthetic events.
