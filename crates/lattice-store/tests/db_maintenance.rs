@@ -155,6 +155,46 @@ async fn restore_refuses_an_unverifiable_file() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn restore_refuses_a_backup_from_a_newer_schema() -> anyhow::Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("state.db");
+    let pool = seeded_db(&path, 3).await?;
+    let maintenance = DbMaintenance::new(pool, &path);
+    let backup_path = directory.path().join("newer.db");
+    maintenance.backup_to(&backup_path).await?;
+
+    // Pretend a newer build wrote this backup: bump its newest migration.
+    let newer = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&backup_path)
+            .create_if_missing(false),
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE _sqlx_migrations SET version = version + 1000 \
+         WHERE version = (SELECT MAX(version) FROM _sqlx_migrations)",
+    )
+    .execute(&newer)
+    .await?;
+    newer.close().await;
+
+    let error = maintenance.restore_from(&backup_path).await.unwrap_err();
+    assert!(
+        matches!(&error, MaintenanceError::RestoreRefused(reason) if reason.contains("newer")),
+        "unexpected: {error:?}"
+    );
+
+    // The live database was never touched and nothing was set aside.
+    assert!(!PathBuf::from(format!("{}.pre-restore", path.display())).exists());
+    let pool = connect_path(&path).await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn retention_prune_keeps_the_chain_verifiable_from_the_anchor() -> anyhow::Result<()> {
     let directory = tempdir()?;
     let path = directory.path().join("state.db");

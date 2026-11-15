@@ -42,7 +42,17 @@ where
 }
 
 fn main() -> Result<()> {
-    match parse_mode(std::env::args_os().skip(1)).map_err(|message| anyhow::anyhow!(message))? {
+    let mut args = std::env::args_os().skip(1).peekable();
+    if args
+        .peek()
+        .is_some_and(|first| first.as_os_str() == "restore")
+    {
+        args.next();
+        let backup = lattice_service::restore::parse_restore_args(args)
+            .map_err(|message| anyhow::anyhow!(message))?;
+        return run_restore(backup);
+    }
+    match parse_mode(args).map_err(|message| anyhow::anyhow!(message))? {
         RunMode::Console => run_console(),
         RunMode::Service => run_service_mode(),
     }
@@ -73,6 +83,38 @@ async fn run_console() -> Result<()> {
     let terminate = ();
     tokio::spawn(console_shutdown_signals(terminate, shutdown_tx.clone()));
     serve(shutdown_tx, shutdown_rx, || {}).await
+}
+
+/// `lattice-service restore --from <backup-file>`: the offline restore. The
+/// service must be stopped. "Stopped" is checked the only way this service
+/// enforces single-instance: the exclusive loopback bind. Holding that port for
+/// the whole restore also stops a service from starting underneath it. Run it
+/// with the same `LATTICE_BIND` / `LATTICE_STATE_BASE` as the service.
+#[tokio::main]
+async fn run_restore(backup: PathBuf) -> Result<()> {
+    let paths = resolve_state_paths()?;
+    let bind_var = std::env::var("LATTICE_BIND").ok();
+    let bind = parse_bind(bind_var.as_deref()).map_err(|message| anyhow::anyhow!(message))?;
+    let _port_guard = bind_exclusive(bind).with_context(|| {
+        format!("cannot take {bind}: the NeonHearth service appears to be running; stop it first")
+    })?;
+    let report = lattice_service::restore::restore_database(&paths, &backup).await?;
+    println!("Restored {}", report.restored_from);
+    println!(
+        "Database: {} (schema version {}, {} bytes)",
+        paths.database.display(),
+        report.verification.migration_version,
+        report.verification.size_bytes
+    );
+    match &report.previous_database {
+        Some(previous) => println!("Previous database kept at: {previous}"),
+        None => println!("There was no previous database."),
+    }
+    println!(
+        "Start the service now. It will reconcile enforcement state before trusting it, \
+         and record that in the audit log."
+    );
+    Ok(())
 }
 
 /// Resolve the service-owned state paths (docs/architecture/privilege-boundary.md):
@@ -253,6 +295,10 @@ pub(crate) async fn serve(
         .context("initialize install state")?;
     let state =
         AppState::new(token, M2StateRepository::new(pool.clone()))?.with_token_file(token_file);
+    // After an offline restore, enforcement state is re-derived before any
+    // worker (and so any actuation) starts. On failure the marker stays and the
+    // service is degraded; see lattice_service::restore.
+    lattice_service::restore::reconcile_at_startup(&state, &pool, &paths.state_dir).await;
     // A panic or early exit in a background task must show up in service
     // status, not vanish: each task is watched by `supervise_background`.
     supervise_background(
