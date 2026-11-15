@@ -21,27 +21,31 @@
 //! `X-Forwarded-*` are stripped from every request before routing, so no
 //! handler can ever observe (let alone trust) them.
 
-use crate::{AppState, auth::Authorized};
+use crate::{
+    AppState,
+    auth::{Authorized, Principal},
+};
 use axum::{
     Json,
-    body::{Body, Bytes},
+    body::Body,
     extract::{FromRequestParts, Path as AxumPath, Request, State},
-    http::{HeaderValue, Method, StatusCode, header, request::Parts},
+    http::{Method, StatusCode, header, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Duration, Utc};
 use lattice_doctor::{Clock, SystemClock};
 use lattice_store::{
-    AuditActor, AuditCategory, AuditLog, NewAuditEntry, NewPhoneSession, PhoneSessionRow,
-    RemoteAccessRepository,
+    AuditCategory, AuditLog, CommandReplay, NewAuditEntry, NewPhoneSession, PhoneSessionRow,
+    PinReservation, RemoteAccessRepository,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -51,18 +55,30 @@ use uuid::Uuid;
 
 /// Phone session lifetime; every successful authentication slides it forward.
 const PHONE_SESSION_TTL_DAYS: i64 = 30;
+/// Absolute session age: sliding expiry never extends past this, so a stolen
+/// secret cannot live forever and the owner must re-pair periodically.
+const PHONE_SESSION_MAX_LIFETIME_DAYS: i64 = 180;
+/// Concurrent Argon2 computations (PIN verify/hash) the service will run.
+const PIN_WORKERS: usize = 2;
 /// Step-up grace after a correct PIN (contract: 5 minutes).
 const STEPUP_GRACE_MINUTES: i64 = 5;
 /// Failed-PIN budget per window before the session locks.
 const PIN_MAX_FAILURES: u32 = 5;
 /// Failed-PIN accounting window and lock duration.
 const PIN_WINDOW_MINUTES: i64 = 15;
-/// Per-session replay window: the newest ids whose results are retained.
-const COMMAND_DEDUP_WINDOW: usize = 128;
-/// Largest response body the dedup cache will buffer.
-const MAX_CACHED_COMMAND_BODY: usize = 2 * 1024 * 1024;
-/// The loopback port the production service binds (see `main.rs`).
-const DEFAULT_LOOPBACK_PORT: u16 = 58120;
+/// Per-session replay window: the newest settled command records retained.
+const COMMAND_REPLAY_KEEP: u32 = 128;
+/// Largest request body buffered to fingerprint a phone command.
+const MAX_COMMAND_REQUEST_BODY: usize = 2 * 1024 * 1024;
+/// Largest response body persisted for replay; bigger responses replay as
+/// their status alone (flagged with `x-command-body-omitted`).
+const MAX_PERSISTED_COMMAND_BODY: usize = 256 * 1024;
+/// Largest response body the layer will buffer at all.
+const MAX_COMMAND_RESPONSE_BODY: usize = 8 * 1024 * 1024;
+/// Marks a replayed response whose body was too large to retain.
+const BODY_OMITTED_HEADER: &str = "x-command-body-omitted";
+/// Longest a tailscale CLI call may run before it is killed.
+const TAILSCALE_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// The tailnet HTTPS port Serve exposes privately.
 const SERVE_HTTPS_PORT: u16 = 443;
 /// Marks a replayed command response so clients can tell it was not re-run.
@@ -152,14 +168,34 @@ impl SystemTailscaleControl {
 
     async fn run(&self, args: &[&str]) -> Result<String, TailscaleError> {
         let binary = self.binary.as_ref().ok_or(TailscaleError::NotConfigured)?;
-        let output = tokio::process::Command::new(binary)
-            .args(args)
-            .output()
-            .await
-            .map_err(|error| TailscaleError::DaemonUnavailable(error.to_string()))?;
+        let mut command = tokio::process::Command::new(binary);
+        // A hung CLI must not outlive the request that started it.
+        command.args(args).kill_on_drop(true);
+        let output = match tokio::time::timeout(TAILSCALE_CLI_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "tailscale CLI could not be started");
+                return Err(TailscaleError::DaemonUnavailable(
+                    "the tailscale CLI could not be started".into(),
+                ));
+            }
+            Err(_) => {
+                tracing::warn!("tailscale CLI timed out");
+                return Err(TailscaleError::DaemonUnavailable(
+                    "the tailscale CLI timed out".into(),
+                ));
+            }
+        };
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(TailscaleError::Cli(stderr.trim().to_owned()));
+            // Raw stderr can carry paths and account details; log it, never
+            // return it to API callers.
+            tracing::warn!(
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "tailscale CLI failed"
+            );
+            return Err(TailscaleError::Cli(
+                "the tailscale CLI reported an error".into(),
+            ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
@@ -246,10 +282,12 @@ fn parse_host_port(host_port: &str) -> Option<u16> {
 /// Scriptable fake for tests: injected daemon/serve answers plus a record of
 /// every applied mapping. Applying a mapping also updates the fake's serve
 /// state so idempotency is observable through the trait.
+#[cfg(any(test, feature = "test-support"))]
 pub struct FakeTailscaleControl {
     inner: std::sync::Mutex<FakeTailscaleInner>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct FakeTailscaleInner {
     daemon: Result<TailscaleDaemon, TailscaleError>,
     serve: Result<ServeState, TailscaleError>,
@@ -257,12 +295,14 @@ struct FakeTailscaleInner {
     applied: Vec<ServeMapping>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for FakeTailscaleControl {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl FakeTailscaleControl {
     pub fn new() -> Self {
         Self {
@@ -304,6 +344,7 @@ impl FakeTailscaleControl {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
 impl TailscaleControl for FakeTailscaleControl {
     async fn daemon_status(&self) -> Result<TailscaleDaemon, TailscaleError> {
@@ -338,40 +379,33 @@ struct RemoteShared {
     clock: Arc<dyn Clock>,
     loopback_port: u16,
     pool: SqlitePool,
-    /// Per-session replay windows. A `std` mutex: every critical section is
-    /// short and never spans an `.await`, which also lets the in-flight guard
-    /// release a command from `Drop` when a handler future is cancelled.
-    dedup: Mutex<HashMap<Uuid, SessionDedup>>,
+    host_policy: crate::security::HostPolicy,
+    /// In-process single-flight for command ids: a duplicate that arrives
+    /// while the first copy executes parks on the notify instead of racing
+    /// it. The durable record (see `claim_command`) is what guarantees a
+    /// command never runs twice, across restarts and cancellations too. A
+    /// `std` mutex: every critical section is short and never spans an
+    /// `.await`, which also lets the in-flight guard release from `Drop`.
+    pending: Mutex<HashMap<(Uuid, Uuid), Arc<Notify>>>,
     /// Per-integration-token long-poll admission.
     long_polls: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
+    /// Bounds concurrent Argon2 work so PIN traffic cannot starve the runtime.
+    pin_gate: Arc<Semaphore>,
+    pin_verifications: AtomicUsize,
 }
 
 impl RemoteShared {
-    fn lock_dedup(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, SessionDedup>> {
-        // A poisoned window only means a panicking handler; the map itself
-        // is always left consistent by the short critical sections.
-        self.dedup
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, HashMap<(Uuid, Uuid), Arc<Notify>>> {
+        // A poisoned map only means a panicking handler; the map itself is
+        // always left consistent by the short critical sections.
+        self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Drops a session's replay window (revocation, expiry).
-    fn forget_session(&self, session_id: Uuid) {
-        self.lock_dedup().remove(&session_id);
-    }
-
-    /// Completes an in-flight command: stores the settled response (or, when
-    /// `cached` is `None`, releases the id so a waiting duplicate executes)
-    /// and wakes every duplicate parked on it.
-    fn finish_command(&self, session_id: Uuid, command_id: Uuid, cached: Option<CachedCommand>) {
-        let mut dedup = self.lock_dedup();
-        let Some(window) = dedup.get_mut(&session_id) else {
-            return;
-        };
-        let notify = match cached {
-            Some(cached) => window.settle(command_id, cached),
-            None => window.release(command_id),
-        };
+    /// Frees an in-flight command id and wakes every duplicate parked on it.
+    fn release_pending(&self, key: (Uuid, Uuid)) {
+        let notify = self.lock_pending().remove(&key);
         if let Some(notify) = notify {
             notify.notify_waiters();
         }
@@ -379,20 +413,21 @@ impl RemoteShared {
 }
 
 /// Cloneable handle to the remote-access state (tailscale control, clock,
-/// and per-session command dedup windows).
+/// and the in-flight command registry).
 #[derive(Clone)]
 pub struct RemoteAccessState {
     shared: Arc<RemoteShared>,
 }
 
 impl RemoteAccessState {
-    /// Production remote access for this service instance.
+    /// Production remote access for this service instance. The Serve target
+    /// follows the port the listener is actually bound to.
     pub fn for_service(state: &AppState) -> Self {
         Self::with_parts(
             state,
             Arc::new(SystemTailscaleControl::from_env()),
             Arc::new(SystemClock),
-            DEFAULT_LOOPBACK_PORT,
+            state.bound_port(),
         )
     }
 
@@ -410,10 +445,34 @@ impl RemoteAccessState {
                 clock,
                 loopback_port,
                 pool: state.state_repository().pool().clone(),
-                dedup: Mutex::new(HashMap::new()),
+                host_policy: state.host_policy().clone(),
+                pending: Mutex::new(HashMap::new()),
                 long_polls: Mutex::new(HashMap::new()),
+                pin_gate: Arc::new(Semaphore::new(PIN_WORKERS)),
+                pin_verifications: AtomicUsize::new(0),
             }),
         }
+    }
+
+    /// Asks the tailscale daemon for its DNS name and allows it as a `Host`.
+    /// Best effort: without a daemon only loopback names are served.
+    pub async fn prime_host_policy(&self) {
+        if let Ok(Ok(daemon)) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.shared.tailscale.daemon_status(),
+        )
+        .await
+            && let Some(name) = daemon.dns_name
+        {
+            self.shared.host_policy.allow_tailnet_name(&name);
+        }
+    }
+
+    /// Number of PIN verifications (Argon2 runs) performed. Exposed so tests
+    /// can prove the attempt budget bounds the work, not just the outcome.
+    #[doc(hidden)]
+    pub fn pin_verifications(&self) -> usize {
+        self.shared.pin_verifications.load(Ordering::SeqCst)
     }
 
     /// Admits one more concurrent long-poll for `token_id`, or `None` when
@@ -444,8 +503,33 @@ impl RemoteAccessState {
         &self.shared.pool
     }
 
-    fn now(&self) -> DateTime<Utc> {
+    pub(crate) fn now(&self) -> DateTime<Utc> {
         self.shared.clock.now()
+    }
+
+    /// Runs CPU-heavy PIN work on the blocking pool behind a small gate.
+    async fn pin_work<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let permit = Arc::clone(&self.shared.pin_gate).acquire_owned().await.ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+        .ok()
+    }
+
+    async fn verify_pin_blocking(&self, pin: String, hash: String) -> bool {
+        self.shared.pin_verifications.fetch_add(1, Ordering::SeqCst);
+        self.pin_work(move || verify_pin(&pin, &hash))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn hash_pin_blocking(&self, pin: String) -> Option<String> {
+        self.pin_work(move || hash_pin(&pin).ok()).await.flatten()
     }
 }
 
@@ -590,119 +674,184 @@ fn phone_credentials(headers: &axum::http::HeaderMap) -> Result<Option<(Uuid, St
     Ok(Some((id, secret.to_owned())))
 }
 
-#[derive(Clone)]
-struct CachedCommand {
-    status: StatusCode,
-    content_type: Option<HeaderValue>,
-    body: Bytes,
-}
-
-/// One command id's place in a session's replay window.
-enum CommandSlot {
-    /// A request with this id is executing; duplicates wait on the notify.
-    Pending(Arc<Notify>),
-    /// The settled response, replayed verbatim to duplicates.
-    Done(CachedCommand),
-}
-
-#[derive(Default)]
-struct SessionDedup {
-    /// Settled ids, oldest first, for bounded eviction.
-    order: VecDeque<Uuid>,
-    slots: HashMap<Uuid, CommandSlot>,
-}
-
-impl SessionDedup {
-    /// Claims `command_id` for the calling request. The in-flight marker
-    /// closes the check-then-execute window: a duplicate that arrives while
-    /// the first request is still running parks on the returned notify
-    /// instead of executing a second time.
-    fn begin(&mut self, command_id: Uuid) -> Arc<Notify> {
-        let notify = Arc::new(Notify::new());
-        self.slots
-            .insert(command_id, CommandSlot::Pending(Arc::clone(&notify)));
-        notify
-    }
-
-    /// Stores the settled response for `command_id`, evicting the oldest
-    /// settled entries beyond the window.
-    fn settle(&mut self, command_id: Uuid, response: CachedCommand) -> Option<Arc<Notify>> {
-        let previous = self.slots.insert(command_id, CommandSlot::Done(response));
-        if !matches!(previous, Some(CommandSlot::Done(_))) {
-            self.order.push_back(command_id);
-        }
-        while self.order.len() > COMMAND_DEDUP_WINDOW {
-            if let Some(evicted) = self.order.pop_front() {
-                self.slots.remove(&evicted);
-            }
-        }
-        match previous {
-            Some(CommandSlot::Pending(notify)) => Some(notify),
-            _ => None,
-        }
-    }
-
-    /// Forgets an in-flight `command_id` whose request produced nothing worth
-    /// replaying (a 5xx, an oversized body, or a cancelled handler).
-    fn release(&mut self, command_id: Uuid) -> Option<Arc<Notify>> {
-        match self.slots.get(&command_id) {
-            Some(CommandSlot::Pending(_)) => match self.slots.remove(&command_id) {
-                Some(CommandSlot::Pending(notify)) => Some(notify),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    fn settled(&self, command_id: &Uuid) -> bool {
-        matches!(self.slots.get(command_id), Some(CommandSlot::Done(_)))
-    }
-}
-
-/// Releases a claimed command id if the executing request never settles it
-/// (a client disconnect drops the handler future mid-flight). Without this a
-/// parked duplicate would wait forever.
+/// Frees the in-flight marker for a command id however the handler ends,
+/// including being dropped mid-flight by a timeout or a client disconnect.
+/// The durable record is deliberately NOT touched: a command that may have
+/// run stays claimed, so a retry can never execute it a second time.
 struct InFlightCommand<'a> {
     shared: &'a RemoteShared,
-    session_id: Uuid,
-    command_id: Uuid,
-    settled: bool,
-}
-
-impl InFlightCommand<'_> {
-    fn settle(mut self, cached: Option<CachedCommand>) {
-        self.settled = true;
-        self.shared
-            .finish_command(self.session_id, self.command_id, cached);
-    }
+    key: (Uuid, Uuid),
 }
 
 impl Drop for InFlightCommand<'_> {
     fn drop(&mut self) {
-        if !self.settled {
-            self.shared
-                .finish_command(self.session_id, self.command_id, None);
-        }
+        self.shared.release_pending(self.key);
     }
 }
 
-fn replayed_response(cached: &CachedCommand) -> Response {
+fn command_error(status: StatusCode, error: &'static str) -> Response {
+    remote_error(status, error)
+}
+
+fn replayed_response(record: &CommandReplay) -> Response {
     let mut response = Response::builder()
-        .status(cached.status)
+        .status(StatusCode::from_u16(record.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header(REPLAYED_HEADER, "true");
-    if let Some(content_type) = &cached.content_type {
+    if let Some(content_type) = &record.content_type {
         response = response.header(header::CONTENT_TYPE, content_type);
     }
+    if record.body_omitted {
+        response = response.header(BODY_OMITTED_HEADER, "true");
+    }
     response
-        .body(Body::from(cached.body.clone()))
+        .body(Body::from(record.body.clone()))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Binds a command id to exactly one request: method, target and body.
+fn request_fingerprint(method: &Method, target: &str, body: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(method.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(target.as_bytes());
+    digest.update([0]);
+    digest.update(body);
+    hex_encode(&digest.finalize())
+}
+
+/// Runs one mutating phone command at most once (T4).
+///
+/// The durable claim is written BEFORE the handler runs and completed after,
+/// so every way the first attempt can end leaves a record behind:
+/// * finished (any status, including 5xx, because the effect may have
+///   happened): the stored response is replayed;
+/// * service restart, crash, or the handler being cancelled mid-flight: the
+///   record stays in flight and a retry gets 409 "outcome unknown" instead of
+///   a second execution;
+/// * the same id with a different method/path/body: 409, not a replay.
+async fn run_command(
+    remote: &RemoteAccessState,
+    session_id: Uuid,
+    command_id: Uuid,
+    request: Request,
+    next: Next,
+) -> Response {
+    let key = (session_id, command_id);
+    let (parts, body) = request.into_parts();
+    let Ok(request_body) = axum::body::to_bytes(body, MAX_COMMAND_REQUEST_BODY).await else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    let target = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_owned(), |value| value.as_str().to_owned());
+    let fingerprint = request_fingerprint(&parts.method, &target, &request_body);
+    let request = Request::from_parts(parts, Body::from(request_body));
+
+    // Become the single in-process executor of this id, or wait for the one
+    // that is. The claim and the lookup happen under one lock.
+    loop {
+        let notify: Arc<Notify>;
+        let notified = {
+            let mut pending = remote.shared.lock_pending();
+            match pending.get(&key) {
+                Some(existing) => {
+                    notify = Arc::clone(existing);
+                    // Register interest before the lock is released so a
+                    // release that lands in between still wakes this waiter.
+                    // Boxed so the guard stays confined to this block and is
+                    // never held across the await below.
+                    let mut notified = Box::pin(notify.notified());
+                    notified.as_mut().enable();
+                    notified
+                }
+                None => {
+                    pending.insert(key, Arc::new(Notify::new()));
+                    break;
+                }
+            }
+        };
+        notified.await;
+    }
+    let _in_flight = InFlightCommand {
+        shared: &remote.shared,
+        key,
+    };
+
+    let repository = remote.repository();
+    match repository
+        .claim_command(session_id, command_id, &fingerprint, remote.now())
+        .await
+    {
+        Ok(None) => {}
+        Ok(Some(record)) => {
+            if record.fingerprint != fingerprint {
+                return command_error(
+                    StatusCode::CONFLICT,
+                    "command id was already used for a different request",
+                );
+            }
+            if !record.completed {
+                return command_error(
+                    StatusCode::CONFLICT,
+                    "command outcome unknown: it may have run; check state before issuing a new command",
+                );
+            }
+            return replayed_response(&record);
+        }
+        Err(error) => {
+            tracing::error!(%error, "phone command claim failed; command not executed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    let content_type = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_COMMAND_RESPONSE_BODY).await else {
+        // The command ran but its response cannot be held: settle the record
+        // so a retry is refused as already executed, and tell the caller.
+        if let Err(error) = repository
+            .complete_command(
+                session_id,
+                command_id,
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                None,
+                None,
+                COMMAND_REPLAY_KEEP,
+            )
+            .await
+        {
+            tracing::error!(%error, "phone command completion failed");
+        }
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let persisted = (bytes.len() <= MAX_PERSISTED_COMMAND_BODY).then_some(&bytes[..]);
+    if let Err(error) = repository
+        .complete_command(
+            session_id,
+            command_id,
+            parts.status.as_u16(),
+            content_type.as_deref(),
+            persisted,
+            COMMAND_REPLAY_KEEP,
+        )
+        .await
+    {
+        // The record stays in flight: a retry is refused, never re-run.
+        tracing::error!(%error, "phone command completion failed");
+    }
+    Response::from_parts(parts, Body::from(bytes))
 }
 
 /// The remote-access layer around every route: strips forwarded-identity
 /// headers (T2), dispatches the integrations surface to its dedicated
 /// principal (I1/I2), authenticates phone sessions with the step-up gate
-/// (T3), and serves replayed command ids from the dedup window (T4).
+/// (T3), and runs mutating phone commands at most once (T4).
 /// Owner-bearer and anonymous requests pass through untouched.
 pub(crate) async fn remote_access_layer(
     State(remote): State<RemoteAccessState>,
@@ -727,12 +876,16 @@ pub(crate) async fn remote_access_layer(
     let session = match repository.load_phone_session(session_id).await {
         Ok(Some(session)) => session,
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "phone session lookup failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let now = remote.now();
-    if session.revoked || now >= session.expires_at {
-        // A dead session's replay window can never be consulted again.
-        remote.shared.forget_session(session_id);
+    // A session also dies at an absolute age, however recently it was used:
+    // sliding expiry alone would let a stolen secret live forever.
+    let hard_expiry = session.created_at + Duration::days(PHONE_SESSION_MAX_LIFETIME_DAYS);
+    if session.revoked || now >= session.expires_at || now >= hard_expiry {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if !hashes_match(&sha256_hex(&secret), &session.secret_hash) {
@@ -744,22 +897,25 @@ pub(crate) async fn remote_access_layer(
     if access == PhoneAccess::Denied {
         return StatusCode::FORBIDDEN.into_response();
     }
-    // Sliding expiry: successful authentication moves it forward, written
-    // back at most once per SESSION_TOUCH_INTERVAL_SECS.
+    // Sliding expiry: successful authentication moves it forward (never past
+    // the absolute cap), written back at most once per
+    // SESSION_TOUCH_INTERVAL_SECS. The write only lands on a live session.
     let touch_due = session.last_used_at.is_none_or(|last_used_at| {
         now - last_used_at >= Duration::seconds(SESSION_TOUCH_INTERVAL_SECS)
     });
-    if touch_due
-        && repository
-            .touch_phone_session(
-                session_id,
-                now,
-                now + Duration::days(PHONE_SESSION_TTL_DAYS),
-            )
+    if touch_due {
+        let next_expiry = (now + Duration::days(PHONE_SESSION_TTL_DAYS)).min(hard_expiry);
+        match repository
+            .touch_phone_session(session_id, now, next_expiry)
             .await
-            .is_err()
-    {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        {
+            Ok(true) => {}
+            Ok(false) => return StatusCode::UNAUTHORIZED.into_response(),
+            Err(error) => {
+                tracing::error!(%error, "phone session touch failed");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
     }
     if access == PhoneAccess::HighImpact {
         let live = session
@@ -773,7 +929,7 @@ pub(crate) async fn remote_access_layer(
         .extensions_mut()
         .insert(PhoneAuthorized { session_id });
 
-    // T4: command replay dedup for mutating phone requests.
+    // T4: at-most-once execution for mutating phone requests.
     let mutating = !matches!(*request.method(), Method::GET | Method::HEAD);
     let command_id = request
         .headers()
@@ -785,66 +941,16 @@ pub(crate) async fn remote_access_layer(
                 .and_then(|value| Uuid::parse_str(value).ok())
         })
         .filter(|_| mutating);
-    let command_id = match command_id {
+    match command_id {
         // A high-impact command without a replay id cannot be made
         // idempotent; refuse it rather than silently running it unprotected.
         None if mutating && access == PhoneAccess::HighImpact => {
-            return StatusCode::BAD_REQUEST.into_response();
+            StatusCode::BAD_REQUEST.into_response()
         }
-        None => return next.run(request).await,
-        Some(None) => return StatusCode::BAD_REQUEST.into_response(),
-        Some(Some(command_id)) => command_id,
-    };
-    // Claim the id, or replay / wait on whoever holds it. The claim and the
-    // lookup happen under one lock so two concurrent duplicates can never
-    // both miss.
-    loop {
-        let notify: Arc<Notify>;
-        let notified = {
-            let mut dedup = remote.shared.lock_dedup();
-            let window = dedup.entry(session_id).or_default();
-            match window.slots.get(&command_id) {
-                Some(CommandSlot::Done(cached)) => return replayed_response(cached),
-                Some(CommandSlot::Pending(pending)) => {
-                    notify = Arc::clone(pending);
-                    // Register interest before the lock is released so a
-                    // settle that lands in between still wakes this waiter.
-                    // Boxed so the guard stays confined to this block and is
-                    // never held across the await below.
-                    let mut notified = Box::pin(notify.notified());
-                    notified.as_mut().enable();
-                    notified
-                }
-                None => {
-                    window.begin(command_id);
-                    break;
-                }
-            }
-        };
-        notified.await;
+        None => next.run(request).await,
+        Some(None) => StatusCode::BAD_REQUEST.into_response(),
+        Some(Some(command_id)) => run_command(&remote, session_id, command_id, request, next).await,
     }
-    let in_flight = InFlightCommand {
-        shared: &remote.shared,
-        session_id,
-        command_id,
-        settled: false,
-    };
-    let response = next.run(request).await;
-    let (parts, body) = response.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, MAX_CACHED_COMMAND_BODY).await else {
-        in_flight.settle(None);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    // A 5xx is a transient failure, not a settled outcome: caching it would
-    // pin the client's retry to the failure. Release the id instead so the
-    // retry executes for real.
-    let cached = (!parts.status.is_server_error()).then(|| CachedCommand {
-        status: parts.status,
-        content_type: parts.headers.get(header::CONTENT_TYPE).cloned(),
-        body: bytes.clone(),
-    });
-    in_flight.settle(cached);
-    Response::from_parts(parts, Body::from(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +960,7 @@ pub(crate) async fn remote_access_layer(
 async fn append_audit(
     pool: &SqlitePool,
     occurred_at: DateTime<Utc>,
+    principal: Principal,
     action: &str,
     subject: String,
     detail: serde_json::Value,
@@ -862,11 +969,11 @@ async fn append_audit(
     match audit
         .append(NewAuditEntry {
             occurred_at,
-            actor: AuditActor::Owner,
+            actor: principal.audit_actor(),
             category: AuditCategory::Approval,
             action: action.to_owned(),
             subject: Some(subject),
-            detail,
+            detail: principal.annotate(detail),
         })
         .await
     {
@@ -959,6 +1066,39 @@ fn loopback_target(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// True when a Serve proxy target points at our loopback listener, however
+/// the operator spelled it: `http://127.0.0.1:P`, `localhost:P`, `[::1]:P`,
+/// with or without scheme or trailing path. Exact string comparison missed
+/// `localhost`, which would let a Funnel on another port go unnoticed.
+fn targets_our_listener(target: &str, port: u16) -> bool {
+    let target = target.trim();
+    let with_scheme = if target.contains("://") {
+        target.to_owned()
+    } else {
+        format!("http://{target}")
+    };
+    let Ok(url) = url::Url::parse(&with_scheme) else {
+        return false;
+    };
+    let host_is_loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    host_is_loopback && url.port_or_known_default() == Some(port)
+}
+
+/// Funnel exposes our listener when it is on the Serve port itself or on any
+/// port whose mapping proxies to our listener.
+fn funnel_exposes_us(serve: &ServeState, port: u16) -> bool {
+    serve.funnel_ports.contains(&SERVE_HTTPS_PORT)
+        || serve.mappings.iter().any(|mapping| {
+            serve.funnel_ports.contains(&mapping.https_port)
+                && targets_our_listener(&mapping.target, port)
+        })
+}
+
 /// Idempotently configures private tailnet HTTPS → loopback Serve. Refuses
 /// with [`RemoteServeError::FunnelEnabled`] when Funnel is on for our port
 /// or for any port that proxies to our loopback target (T2).
@@ -967,6 +1107,9 @@ pub async fn configure_private_serve(
 ) -> Result<RemoteServeResponse, RemoteServeError> {
     let shared = &remote.shared;
     let daemon = shared.tailscale.daemon_status().await?;
+    if let Some(name) = &daemon.dns_name {
+        shared.host_policy.allow_tailnet_name(name);
+    }
     if !daemon.running {
         return Err(TailscaleError::DaemonUnavailable(format!(
             "backend state is {}",
@@ -976,18 +1119,18 @@ pub async fn configure_private_serve(
     }
     let serve = shared.tailscale.serve_state().await?;
     let target = loopback_target(shared.loopback_port);
-    let funnel_on_our_port = serve.funnel_ports.contains(&SERVE_HTTPS_PORT);
-    let funnel_on_our_target = serve.mappings.iter().any(|mapping| {
-        mapping.target == target && serve.funnel_ports.contains(&mapping.https_port)
-    });
-    if funnel_on_our_port || funnel_on_our_target {
+    if funnel_exposes_us(&serve, shared.loopback_port) {
         return Err(RemoteServeError::FunnelEnabled);
     }
     let desired = ServeMapping {
         https_port: SERVE_HTTPS_PORT,
         target: target.clone(),
     };
-    let changed = if serve.mappings.contains(&desired) {
+    let already = serve.mappings.iter().any(|mapping| {
+        mapping.https_port == SERVE_HTTPS_PORT
+            && targets_our_listener(&mapping.target, shared.loopback_port)
+    });
+    let changed = if already {
         false
     } else {
         shared.tailscale.apply_serve(&desired).await?;
@@ -1020,7 +1163,7 @@ fn remote_error(status: StatusCode, error: impl Into<String>) -> Response {
 
 #[utoipa::path(post, path = "/api/v1/remote/serve", responses((status = 200, body = RemoteServeResponse), (status = 401), (status = 409, body = RemoteError, description = "funnel is enabled for the serve port; refused"), (status = 503, body = RemoteError)), security(("bearer_auth" = [])))]
 pub(crate) async fn serve_route(
-    _: Authorized,
+    principal: Principal,
     axum::Extension(remote): axum::Extension<RemoteAccessState>,
 ) -> Response {
     let now = remote.now();
@@ -1029,6 +1172,7 @@ pub(crate) async fn serve_route(
             let audited = append_audit(
                 remote.pool(),
                 now,
+                principal,
                 "tailscale_serve_configured",
                 loopback_target(remote.shared.loopback_port),
                 serde_json::json!({
@@ -1049,6 +1193,7 @@ pub(crate) async fn serve_route(
             let _ = append_audit(
                 remote.pool(),
                 now,
+                principal,
                 "tailscale_serve_refused_funnel",
                 loopback_target(remote.shared.loopback_port),
                 serde_json::json!({ "reason": "funnel_enabled" }),
@@ -1075,19 +1220,18 @@ pub(crate) async fn status_route(
         Ok(daemon) => (Some(daemon), None),
         Err(error) => (None, Some(error.to_string())),
     };
-    let target = loopback_target(shared.loopback_port);
     let (serve_configured, funnel_conflict) = match shared.tailscale.serve_state().await {
         Ok(serve) => (
-            serve
-                .mappings
-                .iter()
-                .any(|mapping| mapping.https_port == SERVE_HTTPS_PORT && mapping.target == target),
-            serve.funnel_ports.contains(&SERVE_HTTPS_PORT)
-                || serve.mappings.iter().any(|mapping| {
-                    mapping.target == target && serve.funnel_ports.contains(&mapping.https_port)
-                }),
+            serve.mappings.iter().any(|mapping| {
+                mapping.https_port == SERVE_HTTPS_PORT
+                    && targets_our_listener(&mapping.target, shared.loopback_port)
+            }),
+            funnel_exposes_us(&serve, shared.loopback_port),
         ),
-        Err(_) => (false, false),
+        Err(error) => {
+            tracing::warn!(%error, "tailscale serve state unavailable");
+            (false, false)
+        }
     };
     Json(RemoteStatusResponse {
         daemon,
@@ -1125,7 +1269,7 @@ pub struct PairResponse {
 
 #[utoipa::path(post, path = "/api/v1/remote/pair", request_body = PairRequest, responses((status = 200, body = PairResponse), (status = 400), (status = 401), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn pair_route(
-    _: Authorized,
+    principal: Principal,
     axum::Extension(remote): axum::Extension<RemoteAccessState>,
     body: Result<Json<PairRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -1141,7 +1285,7 @@ pub(crate) async fn pair_route(
     let Ok(secret) = random_secret_hex() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let Ok(pin_hash) = hash_pin(&request.pin) else {
+    let Some(pin_hash) = remote.hash_pin_blocking(request.pin.clone()).await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let now = remote.now();
@@ -1154,12 +1298,14 @@ pub(crate) async fn pair_route(
         expires_at: now + Duration::days(PHONE_SESSION_TTL_DAYS),
     };
     let repository = remote.repository();
-    if repository.insert_phone_session(&session).await.is_err() {
+    if let Err(error) = repository.insert_phone_session(&session).await {
+        tracing::error!(%error, "phone session insert failed");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let audited = append_audit(
         remote.pool(),
         now,
+        principal,
         "phone_session_paired",
         session.id.to_string(),
         serde_json::json!({
@@ -1218,13 +1364,17 @@ pub(crate) async fn sessions_route(
                 .collect(),
         })
         .into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "phone session list failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 
 #[utoipa::path(delete, path = "/api/v1/remote/sessions/{id}", params(("id" = String, Path, format = Uuid)), responses((status = 204), (status = 400), (status = 401), (status = 404), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn revoke_session_route(
-    _: Authorized,
+    principal: Principal,
+    State(state): State<AppState>,
     axum::Extension(remote): axum::Extension<RemoteAccessState>,
     path: Result<AxumPath<String>, axum::extract::rejection::PathRejection>,
 ) -> Response {
@@ -1236,13 +1386,16 @@ pub(crate) async fn revoke_session_route(
     };
     match remote.repository().revoke_phone_session(id).await {
         Ok(true) => {
-            remote.shared.forget_session(id);
+            // Close any live event socket this session holds right now; the
+            // sockets also re-check storage periodically as a backstop.
+            state.announce_session_revoked(id);
             // Revocation only removes privileges, so it stands even when the
             // audit append fails; the failure is surfaced as 503 instead of
             // silently succeeding.
             let audited = append_audit(
                 remote.pool(),
                 remote.now(),
+                principal,
                 "phone_session_revoked",
                 id.to_string(),
                 serde_json::json!({}),
@@ -1254,7 +1407,10 @@ pub(crate) async fn revoke_session_route(
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "phone session revoke failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 
@@ -1275,18 +1431,20 @@ pub struct StepupResponse {
     pub expires_at: DateTime<Utc>,
 }
 
-/// Charges one failed PIN attempt. The window/count/lock accounting is a
-/// single atomic store update, so N concurrent wrong guesses are charged as
-/// N failures — a stolen session cannot widen its guess budget by racing.
+/// Completes a failed, already-reserved PIN attempt: locks the session when
+/// the reservation spent the last of the budget, and audits the failure.
 async fn handle_pin_failure(
     remote: &RemoteAccessState,
+    principal: Principal,
     session: &PhoneSessionRow,
+    attempt: u32,
     now: DateTime<Utc>,
 ) -> Response {
     let outcome = match remote
         .repository()
-        .record_pin_failure(
+        .finish_pin_failure(
             session.id,
+            attempt,
             now,
             Duration::minutes(PIN_WINDOW_MINUTES),
             PIN_MAX_FAILURES,
@@ -1295,11 +1453,15 @@ async fn handle_pin_failure(
     {
         Ok(Some(outcome)) => outcome,
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "pin failure accounting failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let audited = append_audit(
         remote.pool(),
         now,
+        principal,
         "stepup_failed",
         session.id.to_string(),
         serde_json::json!({
@@ -1328,33 +1490,59 @@ pub(crate) async fn stepup_route(
     let Ok(Json(request)) = body else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let actor = Principal::Phone(principal.0);
     let repository = remote.repository();
     let session = match repository.load_phone_session(principal.0).await {
         Ok(Some(session)) => session,
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "phone session lookup failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let now = remote.now();
-    if session
-        .pin_locked_until
-        .is_some_and(|locked_until| now < locked_until)
+    // Reserve the attempt BEFORE evaluating the PIN. The reservation is one
+    // atomic statement, so however many guesses race, at most the window's
+    // budget is ever verified; the rest are refused unevaluated.
+    let attempt = match repository
+        .reserve_pin_attempt(
+            session.id,
+            now,
+            Duration::minutes(PIN_WINDOW_MINUTES),
+            PIN_MAX_FAILURES,
+        )
+        .await
     {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    }
-    if !valid_pin_format(&request.pin) || !verify_pin(&request.pin, &session.pin_hash) {
-        return handle_pin_failure(&remote, &session, now).await;
+        Ok(PinReservation::Reserved { attempt }) => attempt,
+        Ok(PinReservation::Locked { .. }) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+        Ok(PinReservation::NoSession) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "pin attempt reservation failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let verified = valid_pin_format(&request.pin)
+        && remote
+            .verify_pin_blocking(request.pin.clone(), session.pin_hash.clone())
+            .await;
+    if !verified {
+        return handle_pin_failure(&remote, actor, &session, attempt, now).await;
     }
     let expires_at = now + Duration::minutes(STEPUP_GRACE_MINUTES);
-    if repository
-        .grant_stepup(session.id, expires_at)
-        .await
-        .is_err()
-    {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    match repository.grant_stepup(session.id, now, expires_at).await {
+        Ok(true) => {}
+        // The session locked while this (correct) guess was in flight: the
+        // budget was already spent, so the grant is refused.
+        Ok(false) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "step-up grant failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     }
     let audited = append_audit(
         remote.pool(),
         now,
+        actor,
         "stepup_granted",
         session.id.to_string(),
         serde_json::json!({ "expires_at": expires_at }),
@@ -1362,9 +1550,7 @@ pub(crate) async fn stepup_route(
     .await;
     if audited.is_err() {
         // An unaudited grace must not exist: withdraw it.
-        let _ = repository
-            .grant_stepup(session.id, now - Duration::seconds(1))
-            .await;
+        let _ = repository.revoke_stepup(session.id).await;
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     Json(StepupResponse { expires_at }).into_response()
@@ -1514,53 +1700,44 @@ mod tests {
     }
 
     #[test]
-    fn dedup_window_is_bounded_to_the_newest_entries() {
-        let mut window = SessionDedup::default();
-        let cached = CachedCommand {
-            status: StatusCode::OK,
-            content_type: None,
-            body: Bytes::new(),
-        };
-        let first = Uuid::new_v4();
-        window.begin(first);
-        window.settle(first, cached.clone());
-        for _ in 0..COMMAND_DEDUP_WINDOW {
-            let id = Uuid::new_v4();
-            window.begin(id);
-            window.settle(id, cached.clone());
+    fn serve_targets_are_compared_by_host_and_port_not_by_spelling() {
+        for ours in [
+            "http://127.0.0.1:58120",
+            "http://localhost:58120",
+            "localhost:58120",
+            "127.0.0.1:58120/",
+            "http://[::1]:58120",
+            "HTTP://LocalHost:58120",
+        ] {
+            assert!(targets_our_listener(ours, 58120), "{ours}");
         }
-        assert_eq!(window.slots.len(), COMMAND_DEDUP_WINDOW);
-        assert!(!window.settled(&first));
+        for other in [
+            "http://127.0.0.1:58121",
+            "http://192.168.1.5:58120",
+            "http://example.com:58120",
+            "not a target",
+            "",
+        ] {
+            assert!(!targets_our_listener(other, 58120), "{other}");
+        }
+        // Funnel on another port that proxies to `localhost` is still ours.
+        let serve = ServeState {
+            mappings: vec![ServeMapping {
+                https_port: 8443,
+                target: "http://localhost:58120".to_owned(),
+            }],
+            funnel_ports: vec![8443],
+        };
+        assert!(funnel_exposes_us(&serve, 58120));
+        assert!(!funnel_exposes_us(&serve, 58121));
     }
 
     #[test]
-    fn in_flight_commands_are_released_not_settled_and_survive_eviction() {
-        let mut window = SessionDedup::default();
-        let cached = CachedCommand {
-            status: StatusCode::OK,
-            content_type: None,
-            body: Bytes::new(),
-        };
-        let pending = Uuid::new_v4();
-        let notify = window.begin(pending);
-        // Settled entries evict around a pending one: it is not in `order`.
-        for _ in 0..(COMMAND_DEDUP_WINDOW + 8) {
-            let id = Uuid::new_v4();
-            window.begin(id);
-            window.settle(id, cached.clone());
-        }
-        assert!(matches!(
-            window.slots.get(&pending),
-            Some(CommandSlot::Pending(_))
-        ));
-        // Releasing hands back the same notify so waiters can be woken, and
-        // releasing an already-settled or unknown id is a no-op.
-        let released = window.release(pending).expect("pending id releases");
-        assert!(Arc::ptr_eq(&released, &notify));
-        assert!(window.release(pending).is_none());
-        assert!(!window.slots.contains_key(&pending));
-        let done = *window.order.back().unwrap();
-        assert!(window.release(done).is_none());
-        assert!(window.settled(&done));
+    fn request_fingerprint_binds_method_target_and_body() {
+        let base = request_fingerprint(&Method::POST, "/api/v1/policy/action", b"{}");
+        assert_eq!(base, request_fingerprint(&Method::POST, "/api/v1/policy/action", b"{}"));
+        assert_ne!(base, request_fingerprint(&Method::PUT, "/api/v1/policy/action", b"{}"));
+        assert_ne!(base, request_fingerprint(&Method::POST, "/api/v1/home/plan", b"{}"));
+        assert_ne!(base, request_fingerprint(&Method::POST, "/api/v1/policy/action", b"{ }"));
     }
 }

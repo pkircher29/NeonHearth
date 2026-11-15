@@ -46,3 +46,39 @@ Locked 2026-08-24 for the Tailscale (T1–T4) and integrations (I1–I2) lanes.
 
 Every minting/revocation and step-up failure is appended to the audit log
 (category `approval` for pairings/tokens).
+
+## Hardening amendments (security review)
+
+- **PIN budget is reserved, not charged after the fact.** A step-up attempt
+  reserves one of the five per-window attempts in a single atomic statement
+  *before* the PIN is evaluated; a request that cannot reserve is refused
+  (429) unevaluated, and a correct PIN never overrides a lock. PIN hashing and
+  verification run on the blocking pool behind a two-permit gate.
+- **Commands run at most once.** A mutating phone request writes a durable
+  claim keyed `(session, command_id)` and bound to `(method, target, body)`
+  before the handler runs, and completes it with the response afterwards. The
+  claim survives a restart; a duplicate gets the stored response (any status,
+  including 5xx), an id reused for a different request gets 409, and a claim
+  whose handler never finished (crash, timeout, disconnect) gets 409 "outcome
+  unknown" instead of a second execution.
+- **Sessions are bounded.** Sliding expiry never passes an absolute 180-day
+  age; revoked or expired sessions are never touched back to life, and the
+  store exposes `purge_dead_phone_sessions` for the maintenance task.
+- **Sockets follow their principal.** An event ticket records the principal it
+  was issued to (quota: 8 outstanding per principal, 64 overall). A phone
+  socket closes immediately when its session is revoked (broadcast) and
+  re-validates against storage every 30 s as a backstop. Sockets are capped
+  (32), pinged, closed when idle (60 s), limited in lifetime (1 h, clients
+  resume by sequence), bounded in write time (10 s) and in client message size
+  (1 KiB).
+- **Host allowlist.** `Host` must be a loopback name on the bound port (plus
+  the Vite dev/preview ports), or the daemon-reported tailnet name; anything
+  else is 403 even with a matching `Origin` (DNS rebinding). Requests bearing
+  the `Tailscale-Funnel-Request` header are refused (header name unverified
+  against live Funnel traffic).
+- **Audit attribution.** Remote-access audit rows record `actor = phone` with
+  the session id for phone-initiated actions.
+- **Owner token.** `POST /api/v1/service/token/rotate` (owner only) replaces
+  the token; the new value is persisted to `<state>/owner-token`, which wins
+  over `LATTICE_SERVICE_TOKEN` at the next start. The environment variable is
+  removed from the process at startup so children never inherit it.

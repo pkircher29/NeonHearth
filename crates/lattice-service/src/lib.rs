@@ -30,11 +30,15 @@ use axum::{
 };
 pub use platform::{Platform, PlatformPaths, platform_paths};
 use serde::Deserialize;
-pub use state::{AppState, InvalidServiceToken, ServiceRuntimeStatus};
+pub use auth::Principal;
+pub use security::HostPolicy;
+pub use state::{AppState, InvalidServiceToken, ServiceRuntimeStatus, SocketLimits};
 use tower_http::timeout::TimeoutLayer;
+#[cfg(any(test, feature = "test-support"))]
+pub use vault::FakeVault;
 pub use vault::{
-    CredentialRef, FakeVault, FileVault, KeyringVault, Vault, VaultBackend, VaultCapability,
-    VaultError, platform_vault,
+    CredentialRef, FileVault, KeyringVault, Vault, VaultBackend, VaultCapability, VaultError,
+    platform_vault,
 };
 
 /// Upper bound on any single request. Comfortably above the 25s integration
@@ -63,11 +67,14 @@ pub fn app(state: AppState) -> Router {
 /// Only called when `LATTICE_UI_DIR` is configured (main.rs); without it the
 /// service keeps its historical API-only surface and the Vite dev proxy flow
 /// is unchanged.
-pub fn with_ui_assets(router: Router, ui_dir: &std::path::Path) -> Router {
+pub fn with_ui_assets(router: Router, ui_dir: &std::path::Path, state: &AppState) -> Router {
     let index = tower_http::services::ServeFile::new(ui_dir.join("index.html"));
     router
         .fallback_service(tower_http::services::ServeDir::new(ui_dir).fallback(index))
-        .layer(axum::middleware::from_fn(security::browser_boundary))
+        .layer(axum::middleware::from_fn_with_state(
+            state.host_policy().clone(),
+            security::browser_boundary,
+        ))
 }
 
 /// Like [`app`], but with an explicitly assembled Doctor state — the seam
@@ -91,6 +98,7 @@ pub fn app_with_parts(
     remote: tailscale::RemoteAccessState,
 ) -> Router {
     let audit = audit_api::AuditApiState::for_service(&state);
+    let host_policy = state.host_policy().clone();
     Router::new()
         .merge(device_labels::routes())
         .merge(host_monitor::api::routes())
@@ -141,6 +149,7 @@ pub fn app_with_parts(
             delete(cameras::close_session_route),
         )
         .route("/api/v1/openapi.json", get(api::openapi))
+        .route("/api/v1/service/token/rotate", post(api::rotate_owner_token))
         .route("/api/v1/remote/serve", post(tailscale::serve_route))
         .route("/api/v1/remote/status", get(tailscale::status_route))
         .route("/api/v1/remote/pair", post(tailscale::pair_route))
@@ -192,7 +201,10 @@ pub fn app_with_parts(
             std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ))
         .with_state(state)
-        .layer(axum::middleware::from_fn(security::browser_boundary))
+        .layer(axum::middleware::from_fn_with_state(
+            host_policy,
+            security::browser_boundary,
+        ))
 }
 
 #[derive(Deserialize)]
@@ -209,12 +221,27 @@ async fn events_socket(
     let Ok(Query(query)) = query else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if !state
+    // The cap is checked before the ticket is spent so a refused client can
+    // retry with the same ticket.
+    let Some(permit) = state.try_acquire_socket() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    let Some(principal) = state
         .consume_event_ticket(&query.ticket, tokio::time::Instant::now())
         .await
-    {
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     let events = state.events().clone();
-    upgrade.on_upgrade(move |socket| ws::serve_socket(socket, events, query.after_sequence))
+    let guard = ws::SocketGuard {
+        principal,
+        pool: state.state_repository().pool().clone(),
+        revocations: state.subscribe_revocations(),
+        limits: state.socket_limits(),
+        permit,
+    };
+    upgrade
+        .max_message_size(ws::MAX_CLIENT_MESSAGE_BYTES)
+        .max_frame_size(ws::MAX_CLIENT_MESSAGE_BYTES)
+        .on_upgrade(move |socket| ws::serve_socket(socket, events, query.after_sequence, guard))
 }

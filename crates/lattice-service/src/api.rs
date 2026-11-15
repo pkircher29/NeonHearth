@@ -1,4 +1,8 @@
-use crate::{AppState, auth::Authorized, state::EVENT_TICKET_TTL};
+use crate::{
+    AppState,
+    auth::{Authorized, Principal},
+    state::EVENT_TICKET_TTL,
+};
 use axum::{
     Json,
     extract::{Query, State},
@@ -921,11 +925,11 @@ fn policy_action_error(error: anyhow::Error) -> Response {
 }
 #[utoipa::path(post, path = "/api/v1/events/ticket", security(("bearer_auth" = [])), responses((status = 200, body = EventTicket), (status = 401), (status = 429)))]
 pub async fn event_ticket(
-    _: Authorized,
+    principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<EventTicket>, StatusCode> {
     let ticket = state
-        .issue_event_ticket(Instant::now())
+        .issue_event_ticket(Instant::now(), principal)
         .await
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     Ok(Json(EventTicket {
@@ -934,7 +938,7 @@ pub async fn event_ticket(
     }))
 }
 #[derive(OpenApi)]
-#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory, device_advisories, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route, crate::home::home_snapshot, crate::home::save_plan_route, crate::home::upsert_placement_route, crate::home::delete_placement_route, crate::home::get_draft_route, crate::home::put_draft_route, crate::home::delete_draft_route, crate::doctor::run_route, crate::doctor::report_route, crate::doctor::approvals_route, crate::doctor::repair_route, crate::doctor::settings_route, crate::doctor::update_settings_route, crate::tailscale::serve_route, crate::tailscale::status_route, crate::tailscale::pair_route, crate::tailscale::sessions_route, crate::tailscale::revoke_session_route, crate::tailscale::stepup_route, crate::integrations::mint_token_route, crate::integrations::list_tokens_route, crate::integrations::revoke_token_route, crate::integrations::devices_route, crate::integrations::presence_route, crate::integrations::bandwidth_route, crate::integrations::policy_route, crate::integrations::events_route), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, PolicyActionRequest, PolicyActionResponse, PolicyActionRejected, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraStreamProjection, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse, BinaryMedia, AdvisoryList, AdvisoryProjection, AdvisoryRisk, crate::home::HomeSnapshot, crate::home::SavePlanRequest, crate::home::SavePlanResponse, crate::home::PlanVersionConflict, crate::home::PlanRejected, crate::home::PlacementRequest, crate::home::DraftCorrupt, lattice_domain::HomePlan, lattice_domain::Floor, lattice_domain::Wall, lattice_domain::Room, lattice_domain::Opening, lattice_domain::Point, lattice_domain::OpeningKind, lattice_domain::Mounting, lattice_domain::OwnerPlacement, lattice_domain::LocationEstimate, lattice_domain::HomeId, lattice_domain::FloorId, lattice_domain::RoomId, lattice_domain::WallId, lattice_domain::OpeningId, lattice_domain::PlacementId, crate::doctor::DoctorRun, crate::doctor::DoctorFinding, crate::doctor::DoctorApproval, crate::doctor::DoctorApprovalRequest, crate::doctor::DoctorRepairRequest, crate::doctor::DoctorRepairResponse, crate::doctor::DoctorSettings, crate::doctor::DoctorSettingsUpdate, crate::doctor::DoctorSettingsRejected, crate::doctor::TargetSource, lattice_doctor::check::CheckKind, lattice_doctor::check::CheckStatus, lattice_doctor::check::SkipReason, lattice_doctor::check::CheckDetail, lattice_doctor::check::CheckResult, lattice_doctor::check::Confidence, lattice_doctor::check::Metric, lattice_doctor::check::Unit, lattice_doctor::check::Measurement, lattice_doctor::check::ResolverEvidence, lattice_doctor::check::ResolverOutcome, lattice_doctor::check::DiagnosticBudget, lattice_doctor::check::DiagnosticReport, lattice_doctor::probe::LeaseState, lattice_doctor::probe::DnsFailureReason, lattice_doctor::probe::RouteEntry, lattice_doctor::diagnosis::Diagnosis, lattice_doctor::diagnosis::DiagnosisKind, lattice_doctor::repair::RepairClass, lattice_doctor::repair::SafeAction, lattice_doctor::repair::ApprovalAction, lattice_doctor::repair::GuidedAction, lattice_doctor::repair::RepairPlan, lattice_doctor::repair::StateKey, lattice_doctor::executor::Verdict, lattice_doctor::executor::Verification, lattice_doctor::executor::RollbackSkipReason, lattice_doctor::executor::RollbackOutcome, lattice_doctor::executor::RepairEventKind, lattice_doctor::executor::RepairEvent, lattice_doctor::executor::RepairOutcome, lattice_doctor::executor::RepairReport, crate::tailscale::TailscaleDaemon, crate::tailscale::ServeMapping, crate::tailscale::RemoteServeResponse, crate::tailscale::RemoteStatusResponse, crate::tailscale::RemoteError, crate::tailscale::PairRequest, crate::tailscale::PairResponse, crate::tailscale::PhoneSessionProjection, crate::tailscale::PhoneSessionList, crate::tailscale::StepupRequest, crate::tailscale::StepupResponse, crate::integrations::MintTokenRequest, crate::integrations::MintTokenResponse, crate::integrations::IntegrationTokenProjection, crate::integrations::IntegrationTokenList, crate::integrations::IntegrationDevice, crate::integrations::IntegrationDeviceList, crate::integrations::IntegrationPresence, crate::integrations::IntegrationPresenceList, crate::integrations::IntegrationBandwidth, crate::integrations::IntegrationBandwidthList, crate::integrations::IntegrationPolicy, crate::integrations::IntegrationPolicyList, crate::integrations::IntegrationEvents)), modifiers(&SecurityAddon))]
+#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory, device_advisories, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route, crate::home::home_snapshot, crate::home::save_plan_route, crate::home::upsert_placement_route, crate::home::delete_placement_route, crate::home::get_draft_route, crate::home::put_draft_route, crate::home::delete_draft_route, crate::doctor::run_route, crate::doctor::report_route, crate::doctor::approvals_route, crate::doctor::repair_route, crate::doctor::settings_route, crate::doctor::update_settings_route, crate::tailscale::serve_route, rotate_owner_token, crate::tailscale::status_route, crate::tailscale::pair_route, crate::tailscale::sessions_route, crate::tailscale::revoke_session_route, crate::tailscale::stepup_route, crate::integrations::mint_token_route, crate::integrations::list_tokens_route, crate::integrations::revoke_token_route, crate::integrations::devices_route, crate::integrations::presence_route, crate::integrations::bandwidth_route, crate::integrations::policy_route, crate::integrations::events_route), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, RotatedToken, PolicyActionRequest, PolicyActionResponse, PolicyActionRejected, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraStreamProjection, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse, BinaryMedia, AdvisoryList, AdvisoryProjection, AdvisoryRisk, crate::home::HomeSnapshot, crate::home::SavePlanRequest, crate::home::SavePlanResponse, crate::home::PlanVersionConflict, crate::home::PlanRejected, crate::home::PlacementRequest, crate::home::DraftCorrupt, lattice_domain::HomePlan, lattice_domain::Floor, lattice_domain::Wall, lattice_domain::Room, lattice_domain::Opening, lattice_domain::Point, lattice_domain::OpeningKind, lattice_domain::Mounting, lattice_domain::OwnerPlacement, lattice_domain::LocationEstimate, lattice_domain::HomeId, lattice_domain::FloorId, lattice_domain::RoomId, lattice_domain::WallId, lattice_domain::OpeningId, lattice_domain::PlacementId, crate::doctor::DoctorRun, crate::doctor::DoctorFinding, crate::doctor::DoctorApproval, crate::doctor::DoctorApprovalRequest, crate::doctor::DoctorRepairRequest, crate::doctor::DoctorRepairResponse, crate::doctor::DoctorSettings, crate::doctor::DoctorSettingsUpdate, crate::doctor::DoctorSettingsRejected, crate::doctor::TargetSource, lattice_doctor::check::CheckKind, lattice_doctor::check::CheckStatus, lattice_doctor::check::SkipReason, lattice_doctor::check::CheckDetail, lattice_doctor::check::CheckResult, lattice_doctor::check::Confidence, lattice_doctor::check::Metric, lattice_doctor::check::Unit, lattice_doctor::check::Measurement, lattice_doctor::check::ResolverEvidence, lattice_doctor::check::ResolverOutcome, lattice_doctor::check::DiagnosticBudget, lattice_doctor::check::DiagnosticReport, lattice_doctor::probe::LeaseState, lattice_doctor::probe::DnsFailureReason, lattice_doctor::probe::RouteEntry, lattice_doctor::diagnosis::Diagnosis, lattice_doctor::diagnosis::DiagnosisKind, lattice_doctor::repair::RepairClass, lattice_doctor::repair::SafeAction, lattice_doctor::repair::ApprovalAction, lattice_doctor::repair::GuidedAction, lattice_doctor::repair::RepairPlan, lattice_doctor::repair::StateKey, lattice_doctor::executor::Verdict, lattice_doctor::executor::Verification, lattice_doctor::executor::RollbackSkipReason, lattice_doctor::executor::RollbackOutcome, lattice_doctor::executor::RepairEventKind, lattice_doctor::executor::RepairEvent, lattice_doctor::executor::RepairOutcome, lattice_doctor::executor::RepairReport, crate::tailscale::TailscaleDaemon, crate::tailscale::ServeMapping, crate::tailscale::RemoteServeResponse, crate::tailscale::RemoteStatusResponse, crate::tailscale::RemoteError, crate::tailscale::PairRequest, crate::tailscale::PairResponse, crate::tailscale::PhoneSessionProjection, crate::tailscale::PhoneSessionList, crate::tailscale::StepupRequest, crate::tailscale::StepupResponse, crate::integrations::MintTokenRequest, crate::integrations::MintTokenResponse, crate::integrations::IntegrationTokenProjection, crate::integrations::IntegrationTokenList, crate::integrations::IntegrationDevice, crate::integrations::IntegrationDeviceList, crate::integrations::IntegrationPresence, crate::integrations::IntegrationPresenceList, crate::integrations::IntegrationBandwidth, crate::integrations::IntegrationBandwidthList, crate::integrations::IntegrationPolicy, crate::integrations::IntegrationPolicyList, crate::integrations::IntegrationEvents)), modifiers(&SecurityAddon))]
 pub struct ApiDoc;
 struct SecurityAddon;
 impl Modify for SecurityAddon {
@@ -952,6 +956,48 @@ impl Modify for SecurityAddon {
             );
     }
 }
+#[derive(Serialize, ToSchema)]
+pub struct RotatedToken {
+    /// The new owner token. Shown exactly once; the previous token stops working immediately.
+    #[schema(min_length = 64, max_length = 64)]
+    pub token: String,
+}
+
+/// Rotates the owner bearer token. Owner-only: a phone session is refused
+/// both by the phone allowlist and by the principal check here.
+#[utoipa::path(post, path = "/api/v1/service/token/rotate", security(("bearer_auth" = [])), responses((status = 200, body = RotatedToken), (status = 401), (status = 403), (status = 503)))]
+pub async fn rotate_owner_token(principal: Principal, State(state): State<AppState>) -> Response {
+    if principal != Principal::Owner {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut bytes = [0u8; 32];
+    if getrandom::fill(&mut bytes).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    if state.rotate_token(token.clone()).is_err() {
+        tracing::error!("owner token rotation could not be persisted");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let audit = lattice_store::AuditLog::new(state.state_repository().pool().clone());
+    if let Err(error) = audit
+        .append(lattice_store::NewAuditEntry {
+            occurred_at: Utc::now(),
+            actor: principal.audit_actor(),
+            category: lattice_store::AuditCategory::Approval,
+            action: "owner_token_rotated".to_owned(),
+            subject: None,
+            detail: principal.annotate(serde_json::json!({})),
+        })
+        .await
+    {
+        // The rotation already took effect; losing the audit row is reported
+        // but must not strand the caller without the new token.
+        tracing::error!(%error, "owner token rotation audit append failed");
+    }
+    Json(RotatedToken { token }).into_response()
+}
+
 pub async fn openapi(_: Authorized) -> Json<utoipa::openapi::OpenApi> {
     let mut document = ApiDoc::openapi();
     document.merge(crate::automation::AutomationApiDoc::openapi());
