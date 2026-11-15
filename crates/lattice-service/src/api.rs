@@ -1002,10 +1002,7 @@ pub struct ClockProjection {
     pub detail: Option<String>,
 }
 
-async fn clock_projection(
-    state: &AppState,
-    now: DateTime<Utc>,
-) -> anyhow::Result<ClockProjection> {
+async fn clock_projection(state: &AppState, now: DateTime<Utc>) -> anyhow::Result<ClockProjection> {
     let repo = PolicyRepository::new(state.state_repository().pool().clone());
     Ok(match repo.clock_status(now).await? {
         lattice_store::ClockStatus::Trusted => ClockProjection {
