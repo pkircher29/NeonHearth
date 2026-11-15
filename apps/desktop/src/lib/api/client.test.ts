@@ -645,6 +645,24 @@ describe('createApiClient', () => {
     await expect(client.doctorRun()).resolves.toEqual({ status: 'already_running' });
   });
 
+  it('accepts the unavailable states and still rejects malformed ones', async () => {
+    const unavailable = { kind: 'adapter_link', status: { state: 'skipped', because: { reason: 'probe_unsupported' } }, evidence: [], confidence: { basis_points: 9500 }, detail: null };
+    const downstream = { kind: 'address_dhcp', status: { state: 'skipped', because: { reason: 'dependency_unavailable', dependency: 'adapter_link' } }, evidence: [], confidence: { basis_points: 9500 }, detail: null };
+    const envelope = { ...runEnvelope, report: { ...runEnvelope.report, checks: [passedCheck, unavailable, downstream] }, findings: [] };
+    const okClient = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(envelope), { status: 200 })) });
+    await expect(okClient.doctorRun()).resolves.toEqual({ status: 'completed', run: envelope });
+
+    for (const badStatus of [
+      { state: 'skipped', because: { reason: 'probe_unsupported', dependency: 'gateway' } },
+      { state: 'skipped', because: { reason: 'dependency_unavailable' } },
+      { state: 'skipped', because: { reason: 'dependency_unavailable', dependency: 'invented' } }
+    ]) {
+      const malformed = { ...envelope, report: { ...envelope.report, checks: [{ ...unavailable, status: badStatus }] } };
+      const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 })) });
+      await expect(client.doctorRun()).rejects.toThrow('Invalid doctor run response');
+    }
+  });
+
   it('rejects malformed diagnostic run envelopes', async () => {
     for (const malformed of [
       { ...runEnvelope, extra: true },

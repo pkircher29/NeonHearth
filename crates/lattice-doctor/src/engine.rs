@@ -303,7 +303,7 @@ impl DiagnosticEngine {
                 )
             }
             Ok(_) => self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
-            Err(error) => self.failed_probe(kind, error.to_string()),
+            Err(error) => self.probe_error(kind, error),
         }
     }
 
@@ -332,7 +332,7 @@ impl DiagnosticEngine {
                 )
             }
             Ok(_) => self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
-            Err(error) => self.failed_probe(kind, error.to_string()),
+            Err(error) => self.probe_error(kind, error),
         }
     }
 
@@ -362,7 +362,7 @@ impl DiagnosticEngine {
                 )
             }
             Ok(_) => self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
-            Err(error) => self.failed_probe(kind, error.to_string()),
+            Err(error) => self.probe_error(kind, error),
         }
     }
 
@@ -406,7 +406,7 @@ impl DiagnosticEngine {
                 )
             }
             Ok(_) => self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
-            Err(error) => self.failed_probe(kind, error.to_string()),
+            Err(error) => self.probe_error(kind, error),
         }
     }
 
@@ -456,7 +456,7 @@ impl DiagnosticEngine {
                 )
             }
             Ok(_) => self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
-            Err(error) => self.failed_probe(kind, error.to_string()),
+            Err(error) => self.probe_error(kind, error),
         }
     }
 
@@ -482,10 +482,25 @@ impl DiagnosticEngine {
                 }
                 Ok(ProbeResponse::PingTimeout) | Err(ProbeError::Timeout) => sample.measured += 1,
                 Ok(_) => sample.error = Some(UNEXPECTED_RESPONSE.to_owned()),
+                Err(ProbeError::Unsupported) => sample.unsupported = true,
                 Err(error) => sample.error = Some(error.to_string()),
             }
         }
         sample
+    }
+
+    /// Conclusion for a ping series that measured nothing: unavailable when
+    /// the only obstacle was an unsupported probe, otherwise a failed probe.
+    fn unmeasured_ping(&self, kind: CheckKind, sample: PingSample) -> CheckResult {
+        if sample.unsupported && sample.error.is_none() {
+            return unavailable(kind);
+        }
+        self.failed_probe(
+            kind,
+            sample
+                .error
+                .unwrap_or_else(|| "no ping was measured".into()),
+        )
     }
 
     async fn check_gateway<T: ProbeTransport>(&self, t: &T, used: &mut u32) -> CheckResult {
@@ -493,12 +508,7 @@ impl DiagnosticEngine {
         let gateway = self.config.gateway.clone();
         let sample = self.ping_sample(t, used, &gateway).await;
         if sample.measured == 0 {
-            return self.failed_probe(
-                kind,
-                sample
-                    .error
-                    .unwrap_or_else(|| "no ping was measured".into()),
-            );
+            return self.unmeasured_ping(kind, sample);
         }
         let (sent, rtts) = (sample.measured, sample.rtts);
         let received = rtts.len() as u32;
@@ -534,7 +544,7 @@ impl DiagnosticEngine {
                 )
             }
             Ok(_) => self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
-            Err(error) => self.failed_probe(kind, error.to_string()),
+            Err(error) => self.probe_error(kind, error),
         }
     }
 
@@ -543,12 +553,7 @@ impl DiagnosticEngine {
         let gateway = self.config.gateway.clone();
         let sample = self.ping_sample(t, used, &gateway).await;
         if sample.measured == 0 {
-            return self.failed_probe(
-                kind,
-                sample
-                    .error
-                    .unwrap_or_else(|| "no ping was measured".into()),
-            );
+            return self.unmeasured_ping(kind, sample);
         }
         let (sent, mut rtts) = (sample.measured, sample.rtts);
         let received = rtts.len() as u32;
@@ -601,7 +606,7 @@ impl DiagnosticEngine {
                     // The path signaled its MTU properly: not a blackhole.
                     Ok(ProbeResponse::FragmentationNeeded { .. }) => signalled = true,
                     Ok(_) => return self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
-                    Err(error) => return self.failed_probe(kind, error.to_string()),
+                    Err(error) => return self.probe_error(kind, error),
                 }
             }
             if replied {
@@ -638,12 +643,14 @@ impl DiagnosticEngine {
         used: &mut u32,
         resolver: &str,
         independent: bool,
-    ) -> ResolverEvidence {
+    ) -> (ResolverEvidence, bool) {
         let request = ProbeRequest::DnsQuery {
             resolver: resolver.into(),
             name: self.config.dns_probe_name.clone(),
         };
-        let outcome = match self.send(t, used, request).await {
+        let result = self.send(t, used, request).await;
+        let unsupported = matches!(result, Err(ProbeError::Unsupported));
+        let outcome = match result {
             Ok(ProbeResponse::DnsAnswer { latency_ms, .. }) => {
                 ResolverOutcome::Answered { latency_ms }
             }
@@ -655,22 +662,31 @@ impl DiagnosticEngine {
                 error: error.to_string(),
             },
         };
-        ResolverEvidence {
+        let evidence = ResolverEvidence {
             resolver: resolver.into(),
             independent,
             outcome,
-        }
+        };
+        (evidence, unsupported)
     }
 
     async fn check_dns<T: ProbeTransport>(&self, t: &T, used: &mut u32) -> CheckResult {
         let kind = CheckKind::Dns;
         let mut resolvers = Vec::new();
         let configured = self.config.configured_resolvers.clone();
+        let mut all_unsupported = true;
         for resolver in &configured {
-            resolvers.push(self.query_resolver(t, used, resolver, false).await);
+            let (evidence, unsupported) = self.query_resolver(t, used, resolver, false).await;
+            all_unsupported &= unsupported;
+            resolvers.push(evidence);
         }
         let independent = self.config.independent_resolver.clone();
-        resolvers.push(self.query_resolver(t, used, &independent, true).await);
+        let (evidence, unsupported) = self.query_resolver(t, used, &independent, true).await;
+        all_unsupported &= unsupported;
+        resolvers.push(evidence);
+        if all_unsupported {
+            return unavailable(kind);
+        }
 
         let configured_total = configured.len();
         let configured_failures = resolvers
@@ -727,7 +743,7 @@ impl DiagnosticEngine {
                 )
             }
             Ok(_) => self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
-            Err(error) => self.failed_probe(kind, error.to_string()),
+            Err(error) => self.probe_error(kind, error),
         }
     }
 
@@ -776,7 +792,7 @@ impl DiagnosticEngine {
                 )
             }
             Ok(_) => self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
-            Err(error) => self.failed_probe(kind, error.to_string()),
+            Err(error) => self.probe_error(kind, error),
         }
     }
 
@@ -810,6 +826,15 @@ impl DiagnosticEngine {
         }
     }
 
+    /// A transport error ends a check: an unsupported probe leaves it
+    /// unavailable, anything else is a genuine failed probe.
+    fn probe_error(&self, kind: CheckKind, error: ProbeError) -> CheckResult {
+        match error {
+            ProbeError::Unsupported => unavailable(kind),
+            other => self.failed_probe(kind, other.to_string()),
+        }
+    }
+
     fn failed_probe(&self, kind: CheckKind, error: String) -> CheckResult {
         CheckResult {
             kind,
@@ -827,6 +852,8 @@ struct PingSample {
     measured: u32,
     rtts: Vec<f64>,
     error: Option<String>,
+    /// At least one echo was refused as unsupported by the transport.
+    unsupported: bool,
 }
 
 fn dependency_skip(kind: CheckKind, checks: &[CheckResult]) -> Option<SkipReason> {
@@ -835,6 +862,11 @@ fn dependency_skip(kind: CheckKind, checks: &[CheckResult]) -> Option<SkipReason
             Some(CheckStatus::Passed) => {}
             Some(CheckStatus::Failed) => {
                 return Some(SkipReason::DependencyFailed {
+                    dependency: *dependency,
+                });
+            }
+            Some(CheckStatus::Skipped { because }) if because.is_unavailable() => {
+                return Some(SkipReason::DependencyUnavailable {
                     dependency: *dependency,
                 });
             }
@@ -856,6 +888,12 @@ fn skipped(kind: CheckKind, because: SkipReason) -> CheckResult {
         confidence: Confidence::HIGH,
         detail: None,
     }
+}
+
+/// A check whose probe this transport cannot perform. Not a failure and not a
+/// diagnosis: the check is labeled so the report says it was never assessed.
+fn unavailable(kind: CheckKind) -> CheckResult {
+    skipped(kind, SkipReason::ProbeUnsupported)
 }
 
 fn find(checks: &[CheckResult], kind: CheckKind) -> Option<&CheckResult> {

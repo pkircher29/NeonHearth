@@ -123,6 +123,40 @@ impl Feed {
         Ok(())
     }
 }
+/// The router feed's HTTP client: no proxy, no redirects, bound to the LAN source address.
+/// `idle_timeout` bounds how long the stream may stay silent; it is not a total timeout.
+pub(super) fn feed_client_builder(
+    source: Ipv4Addr,
+    idle_timeout: Duration,
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .local_address(std::net::IpAddr::V4(source))
+        .connect_timeout(Duration::from_secs(3))
+        // The feed is a long-lived stream: bound idle time, not total time. A total
+        // timeout cut the stream every 20 s and forced a reconnect gap each time.
+        .read_timeout(idle_timeout)
+}
+/// Opens the event stream. `None` unless the router answers 200 with `text/event-stream`.
+pub(super) async fn open_feed(client: &reqwest::Client, url: &str) -> Option<reqwest::Response> {
+    let response = client
+        .get(url)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .ok()?;
+    if response.status() != reqwest::StatusCode::OK
+        || response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_none_or(|v| v.split(';').next() != Some("text/event-stream"))
+    {
+        return None;
+    }
+    Some(response)
+}
 impl NetworkMonitor {
     pub(super) async fn collect_router(&self) {
         let Ok(settings) = self.settings().await else {
@@ -138,14 +172,7 @@ impl NetworkMonitor {
         let Some(target) = lan::local_target(ip) else {
             return;
         };
-        let builder = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .local_address(std::net::IpAddr::V4(target.source))
-            .connect_timeout(Duration::from_secs(3))
-            // The feed is a long-lived stream: bound idle time, not total time. A total
-            // timeout cut the stream every 20 s and forced a reconnect gap each time.
-            .read_timeout(IDLE_TIMEOUT);
+        let builder = feed_client_builder(target.source, IDLE_TIMEOUT);
         #[cfg(target_os = "linux")]
         let builder = {
             let Ok(inventory) = lattice_sensor::SystemInterfaceManager.snapshot() else {
@@ -162,26 +189,14 @@ impl NetworkMonitor {
         let Ok(client) = builder.build() else { return };
         // Exact vendor read endpoint; no login, cookies, token forwarding, redirects,
         // appliance commands, arbitrary paths, or proxy-environment inheritance.
-        let Ok(response) = client
-            .get(format!(
-                "http://{ip}:{}/cgi-bin/sse_cgi",
-                settings.router_port
-            ))
-            .header("Accept", "text/event-stream")
-            .send()
-            .await
+        let Some(response) = open_feed(
+            &client,
+            &format!("http://{ip}:{}/cgi-bin/sse_cgi", settings.router_port),
+        )
+        .await
         else {
             return;
         };
-        if response.status() != reqwest::StatusCode::OK
-            || response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .is_none_or(|v| v.split(';').next() != Some("text/event-stream"))
-        {
-            return;
-        }
         let mut stream = response.bytes_stream();
         let mut feed = Feed::default();
         let mut received = 0;

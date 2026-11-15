@@ -419,3 +419,62 @@ async fn router_settings_are_cached_between_rechecks_and_a_change_is_picked_up_a
             .await
     );
 }
+
+#[tokio::test]
+async fn a_stalled_router_feed_is_abandoned_after_the_idle_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // A router that answers with valid event-stream headers and one event, then
+    // goes silent without ever closing the connection.
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                return;
+            }
+            head.extend_from_slice(&buffer[..read]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\ndata: {\"Message\":\"keepalive\"}\n\n",
+            )
+            .await
+            .unwrap();
+        socket.flush().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+
+    // Real time: reqwest's timeout is not driven by paused tokio time. The idle
+    // timeout is 200 ms; the outer bound only keeps a regression from hanging.
+    let client = router::feed_client_builder(Ipv4Addr::LOCALHOST, Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}/cgi-bin/sse_cgi");
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let response = router::open_feed(&client, &url)
+            .await
+            .expect("the feed opens on a 200 event stream");
+        let mut stream = response.bytes_stream();
+        let mut chunks = 0;
+        loop {
+            match stream.next().await {
+                Some(Ok(_)) => chunks += 1,
+                Some(Err(error)) => break (chunks, Some(error)),
+                None => break (chunks, None),
+            }
+        }
+    })
+    .await;
+    server.abort();
+
+    let (chunks, error) = outcome.expect("the idle timeout, not the outer bound, ended the read");
+    assert!(chunks >= 1, "the event sent before the stall is delivered");
+    let error = error.expect("a stalled stream ends with an error, not a clean close");
+    assert!(error.is_timeout(), "{error}");
+}
