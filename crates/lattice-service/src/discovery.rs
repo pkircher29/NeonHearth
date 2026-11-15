@@ -241,6 +241,36 @@ impl<
             config,
         })
     }
+    async fn flush_and_publish(
+        &mut self,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), NeighborCoordinatorError> {
+        let transitions = match self.pipeline.flush_refreshed(observed_at).await {
+            Ok(transitions) => transitions,
+            Err(error) => {
+                self.state
+                    .transition_service_status(ServiceRuntimeStatus::Degraded, observed_at)
+                    .await;
+                return Err(error.into());
+            }
+        };
+        for transition in transitions {
+            if !matches!(
+                self.policy.control_blocks(transition.device_id).await,
+                Ok(false)
+            ) {
+                continue;
+            }
+            self.state
+                .events()
+                .publish(
+                    transition.occurred_at,
+                    EventPayload::PresenceChanged(transition),
+                )
+                .await;
+        }
+        Ok(())
+    }
     pub fn poll_interval(&self) -> chrono::Duration {
         self.config.poll_interval
     }
@@ -254,6 +284,9 @@ impl<
     }
     pub fn commit_sequence(&self) -> i64 {
         self.pipeline.commit_sequence()
+    }
+    pub fn pipeline(&self) -> &PersistentDiscoveryPipeline {
+        &self.pipeline
     }
     pub async fn cycle(
         &mut self,
@@ -337,6 +370,36 @@ impl<
         }
         let mut outcomes = Vec::new();
         for observation in out {
+            // Steady-state refreshes of an already-Online device are applied to the live
+            // engine in memory. Only state changes reach the store (see
+            // `refresh_link_presence`), so a quiet network costs no SQLite writes.
+            // Unknown MACs are admitted at a bounded rate per interface and a miss for a
+            // never-admitted device is ignored (it used to abort the whole cycle).
+            match self.pipeline.admit_link_presence(&observation).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    self.state
+                        .transition_service_status(ServiceRuntimeStatus::Degraded, observed_at)
+                        .await;
+                    return Err(error.into());
+                }
+            }
+            match self.pipeline.refresh_link_presence(&observation).await {
+                Ok(RefreshOutcome::Refreshed) => continue,
+                Ok(RefreshOutcome::NeedsCommit) => {}
+                Err(error) => {
+                    self.state
+                        .transition_service_status(ServiceRuntimeStatus::Degraded, observed_at)
+                        .await;
+                    return Err(error.into());
+                }
+            }
+            // Transitions produced by earlier refreshes must reach the store before a
+            // commit that checkpoints the engine they already changed.
+            if self.pipeline.has_pending_transitions() {
+                self.flush_and_publish(observed_at).await?;
+            }
             let outcome = match self
                 .pipeline
                 .observe_link_presence_with_flow(observation, &[], 0, observation.observed_at)
@@ -422,6 +485,7 @@ impl<
             }
             outcomes.push(outcome);
         }
+        self.flush_and_publish(observed_at).await?;
         self.tracker = staged_tracker;
         if !policy_degraded {
             self.state
@@ -619,7 +683,36 @@ pub struct PersistentDiscoveryPipeline {
     state: M2StateRepository,
     flow: FlowRepository,
     sequence: i64,
+    /// (source id, link address) -> device, valid until the next commit.
+    bound: std::collections::HashMap<(u64, lattice_sensor::neighbor::LinkAddress), DeviceId>,
+    /// Transitions produced by in-memory refreshes that still need persisting.
+    pending_transitions: Vec<PresenceTransition>,
+    refreshed_since_persist: bool,
+    last_persist_at: Option<DateTime<Utc>>,
+    serializations: u64,
+    /// Admission times of recently created identities, per source.
+    new_identities: BTreeMap<u64, std::collections::VecDeque<DateTime<Utc>>>,
 }
+
+/// New device identities allowed per interface source per [`IDENTITY_WINDOW`]. A neighbor
+/// flood (spoofed or randomized MACs) is cut off here instead of growing the device table
+/// without bound.
+const MAX_NEW_IDENTITIES_PER_WINDOW: usize = 256;
+const IDENTITY_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Outcome of [`PersistentDiscoveryPipeline::refresh_link_presence`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshOutcome {
+    /// Applied to the live engine; nothing durable changed.
+    Refreshed,
+    /// Not a steady-state refresh; the caller must use the full commit path.
+    NeedsCommit,
+}
+
+/// Longest an in-memory presence refresh may stay unpersisted. After a crash the engine
+/// resumes from the last checkpoint; every device then re-`Appeared`s in the fresh tracker and
+/// is recommitted, so this only bounds how stale the restored evidence TTLs are.
+const REFRESH_CHECKPOINT_INTERVAL: chrono::Duration = chrono::Duration::minutes(5);
 
 #[derive(Clone, Debug)]
 pub struct CommittedDiscovery {
@@ -648,8 +741,9 @@ impl PersistentDiscoveryPipeline {
         max_live_rows: usize,
     ) -> Result<Self, DiscoveryError> {
         let fingerprint = sources.fingerprint();
-        let (pipeline, sequence) = match state.load(&fingerprint).await? {
-            Some(stored) => {
+        let mut migrated = false;
+        let (pipeline, sequence) = match state.load(&fingerprint).await {
+            Ok(Some(stored)) => {
                 let checkpoint: DiscoveryPipelineCheckpoint = serde_json::from_slice(&stored.bytes)
                     .map_err(|_| DiscoveryError::InvalidCheckpoint)?;
                 (
@@ -657,7 +751,15 @@ impl PersistentDiscoveryPipeline {
                     stored.commit_sequence,
                 )
             }
-            None => (DiscoveryPipeline::with_sources(remaining_ids, sources)?, 0),
+            Ok(None) => (DiscoveryPipeline::with_sources(remaining_ids, sources)?, 0),
+            // The set of observed interfaces changed since the checkpoint was written. That is
+            // normal (cable unplugged, Wi-Fi toggled), so carry the state forward instead of
+            // refusing to start.
+            Err(error) if error.to_string().contains("source fingerprint mismatch") => {
+                migrated = true;
+                migrate_checkpoint(&state, sources).await?
+            }
+            Err(error) => return Err(error.into()),
         };
         let flow = state.flow_repository(flow_max_batch)?;
         Ok(Self {
@@ -666,7 +768,221 @@ impl PersistentDiscoveryPipeline {
             state,
             flow,
             sequence,
+            bound: Default::default(),
+            pending_transitions: Vec::new(),
+            // A migrated checkpoint is rewritten under the new source set by the first flush.
+            refreshed_since_persist: migrated,
+            last_persist_at: None,
+            serializations: 0,
+            new_identities: BTreeMap::new(),
         })
+    }
+    /// Decides whether an observation may reach the commit path. Known devices always pass.
+    /// New MACs are rate limited per source; a `Missed` event for a device that was never
+    /// admitted is dropped.
+    pub async fn admit_link_presence(
+        &mut self,
+        observation: &LinkPresenceObservation,
+    ) -> Result<bool, DiscoveryError> {
+        let Some(source_name) = self
+            .pipeline
+            .sources
+            .0
+            .get(&observation.source_id)
+            .map(|s| s.name.clone())
+        else {
+            // Unregistered source: the full path reports the error.
+            return Ok(true);
+        };
+        let key = (observation.source_id, observation.link_address);
+        let bound = match self.bound.get(&key) {
+            Some(id) => Some(*id),
+            None => {
+                let found = self
+                    .state
+                    .lookup_link_layer_device(observation.link_address, &source_name)
+                    .await?;
+                if let Some(id) = found {
+                    self.bound.insert(key, id);
+                }
+                found
+            }
+        };
+        if bound.is_some() {
+            return Ok(true);
+        }
+        if matches!(observation.kind, LinkPresenceKind::Missed) {
+            return Ok(false);
+        }
+        let log = self
+            .new_identities
+            .entry(observation.source_id)
+            .or_default();
+        while log
+            .front()
+            .is_some_and(|at| observation.observed_at - *at >= IDENTITY_WINDOW)
+        {
+            log.pop_front();
+        }
+        if log.len() >= MAX_NEW_IDENTITIES_PER_WINDOW {
+            return Ok(false);
+        }
+        log.push_back(observation.observed_at);
+        Ok(true)
+    }
+    /// Evaluates devices whose only evidence came from sources that are no longer observed
+    /// (an interface that went away between runs), so they do not stay Online forever. The
+    /// resulting transitions are persisted by the next [`Self::flush_refreshed`].
+    pub fn reconcile_orphans(&mut self, now: DateTime<Utc>) {
+        let current: std::collections::BTreeSet<&str> = self
+            .pipeline
+            .sources
+            .0
+            .values()
+            .map(|s| s.name.as_str())
+            .collect();
+        let orphans: Vec<DeviceId> = self
+            .pipeline
+            .presence
+            .checkpoint()
+            .devices
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    d.state,
+                    lattice_domain::PresenceState::Online | lattice_domain::PresenceState::Quiet
+                ) && !d.evidence.is_empty()
+                    && d.evidence
+                        .iter()
+                        .all(|e| !current.contains(e.source.as_str()))
+            })
+            .map(|d| d.device_id)
+            .collect();
+        for id in orphans {
+            if let Ok(Some(transition)) = self.pipeline.presence.evaluate(id, now) {
+                self.pending_transitions.push(transition);
+            }
+        }
+    }
+    /// Number of full checkpoint serializations performed since the pipeline opened.
+    pub fn checkpoint_serializations(&self) -> u64 {
+        self.serializations
+    }
+    pub fn has_pending_transitions(&self) -> bool {
+        !self.pending_transitions.is_empty()
+    }
+    /// Applies a steady-state `Present` refresh for a device that is already `Online` to the
+    /// live presence engine without touching the store. Anything else (unknown MAC, device not
+    /// yet Online, validation problems) is left to the full commit path.
+    pub async fn refresh_link_presence(
+        &mut self,
+        observation: &LinkPresenceObservation,
+    ) -> Result<RefreshOutcome, DiscoveryError> {
+        let LinkPresenceKind::Present { valid_until } = observation.kind else {
+            return Ok(RefreshOutcome::NeedsCommit);
+        };
+        if observation.observed_at.timestamp_subsec_nanos() != 0
+            || valid_until <= observation.observed_at
+            || valid_until.timestamp_subsec_nanos() != 0
+        {
+            return Ok(RefreshOutcome::NeedsCommit);
+        }
+        let Some(source_name) = self
+            .pipeline
+            .sources
+            .0
+            .get(&observation.source_id)
+            .filter(|s| {
+                s.presence
+                    && s.families
+                        .contains(&lattice_domain::EvidenceFamily::LinkLayer)
+            })
+            .map(|s| s.name.clone())
+        else {
+            return Ok(RefreshOutcome::NeedsCommit);
+        };
+        let key = (observation.source_id, observation.link_address);
+        let id = match self.bound.get(&key) {
+            Some(id) => *id,
+            None => match self
+                .state
+                .lookup_link_layer_device(observation.link_address, &source_name)
+                .await?
+            {
+                Some(id) => {
+                    self.bound.insert(key, id);
+                    id
+                }
+                None => return Ok(RefreshOutcome::NeedsCommit),
+            },
+        };
+        if self.pipeline.presence.state(id) != Some(lattice_domain::PresenceState::Online) {
+            return Ok(RefreshOutcome::NeedsCommit);
+        }
+        match self.pipeline.presence.ingest_events(
+            PresenceEvidence {
+                device_id: id,
+                source: source_name,
+                kind: PresenceEvidenceKind::NeighborCache,
+                observed_at: observation.observed_at,
+                valid_until: Some(valid_until),
+            },
+            observation.observed_at,
+        ) {
+            Ok(transitions) => {
+                self.refreshed_since_persist = true;
+                self.pending_transitions.extend(transitions);
+                Ok(RefreshOutcome::Refreshed)
+            }
+            Err(_) => Ok(RefreshOutcome::NeedsCommit),
+        }
+    }
+    /// Persists in-memory refreshes: immediately when they produced transitions, otherwise at
+    /// most once per [`REFRESH_CHECKPOINT_INTERVAL`]. One commit covers the whole cycle.
+    pub async fn flush_refreshed(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<PresenceChanged>, DiscoveryError> {
+        let due = self.refreshed_since_persist
+            && self
+                .last_persist_at
+                .is_none_or(|at| now - at >= REFRESH_CHECKPOINT_INTERVAL);
+        if self.pending_transitions.is_empty() && !due {
+            return Ok(Vec::new());
+        }
+        let next_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(DiscoveryError::InvalidCheckpoint)?;
+        let checkpoint = self.pipeline.checkpoint();
+        let checkpoint_bytes = serde_json::to_vec(&checkpoint)?;
+        self.serializations += 1;
+        let transitions: Vec<_> = self
+            .pending_transitions
+            .iter()
+            .map(PresenceChanged::from)
+            .collect();
+        let commit = CommitInput {
+            checkpoint: CheckpointInput {
+                format_version: 1,
+                bytes: checkpoint_bytes,
+                source_fingerprint: checkpoint.source_fingerprint,
+                commit_sequence: next_sequence,
+                written_at: now,
+            },
+            devices: Vec::new(),
+            evidence: Vec::new(),
+            transitions: transitions.clone(),
+            discovery: None,
+        };
+        self.state
+            .commit_with_flow(commit, &[], now, &self.flow)
+            .await?;
+        self.sequence = next_sequence;
+        self.pending_transitions.clear();
+        self.refreshed_since_persist = false;
+        self.last_persist_at = Some(now);
+        Ok(transitions)
     }
     pub fn source_fingerprint(&self) -> String {
         self.pipeline.sources.fingerprint()
@@ -817,6 +1133,7 @@ impl PersistentDiscoveryPipeline {
             .ok_or(DiscoveryError::InvalidCheckpoint)?;
         let checkpoint = staged_pipeline.checkpoint();
         let checkpoint_bytes = serde_json::to_vec(&checkpoint)?;
+        self.serializations += 1;
         let transitions: Vec<_> = result.presence.iter().map(PresenceChanged::from).collect();
         let summary = serde_json::to_vec(&serde_json::json!({
             "version": 1, "device_id": result.device_id.to_string(), "commit_sequence": next_sequence,
@@ -871,6 +1188,11 @@ impl PersistentDiscoveryPipeline {
         self.pipeline = staged_pipeline;
         self.live = staged_live;
         self.sequence = next_sequence;
+        // The staged engines were cloned from the live ones, so this checkpoint already
+        // contains every in-memory refresh.
+        self.bound.clear();
+        self.refreshed_since_persist = false;
+        self.last_persist_at = Some(arrival);
         Ok(DiscoveryPipelineOutcome::Committed(Box::new(
             CommittedDiscovery {
                 result,
@@ -879,6 +1201,46 @@ impl PersistentDiscoveryPipeline {
             },
         )))
     }
+}
+
+/// Loads the stored checkpoint whatever source set it was written under, keeps a copy of its
+/// bytes in `state_checkpoint_backups`, and rebuilds the engines for `sources`. Presence
+/// evidence recorded under sources that are no longer observed stays trusted so the engine
+/// accepts it; device identities and presence history carry over unchanged.
+async fn migrate_checkpoint(
+    state: &M2StateRepository,
+    sources: DiscoverySources,
+) -> Result<(DiscoveryPipeline, i64), DiscoveryError> {
+    let stored_fingerprint: String =
+        sqlx::query_scalar("SELECT source_fingerprint FROM state_checkpoints WHERE singleton=1")
+            .fetch_one(state.pool())
+            .await
+            .map_err(|_| DiscoveryError::InvalidCheckpoint)?;
+    let stored = state
+        .load(&stored_fingerprint)
+        .await?
+        .ok_or(DiscoveryError::InvalidCheckpoint)?;
+    let mut checkpoint: DiscoveryPipelineCheckpoint =
+        serde_json::from_slice(&stored.bytes).map_err(|_| DiscoveryError::InvalidCheckpoint)?;
+    sqlx::query("INSERT INTO state_checkpoint_backups(saved_at,source_fingerprint,commit_sequence,checkpoint_bytes) VALUES(?,?,?,?)")
+        .bind(Utc::now().to_rfc3339())
+        .bind(&stored_fingerprint)
+        .bind(stored.commit_sequence)
+        .bind(&stored.bytes)
+        .execute(state.pool())
+        .await
+        .map_err(|_| DiscoveryError::InvalidCheckpoint)?;
+    // Keep only the newest few copies.
+    let _ = sqlx::query("DELETE FROM state_checkpoint_backups WHERE id NOT IN (SELECT id FROM state_checkpoint_backups ORDER BY id DESC LIMIT 8)")
+        .execute(state.pool())
+        .await;
+    tracing::warn!(
+        commit_sequence = stored.commit_sequence,
+        "discovery interface set changed; checkpoint backed up and migrated"
+    );
+    checkpoint.source_fingerprint = sources.fingerprint();
+    let pipeline = DiscoveryPipeline::from_checkpoint(sources, checkpoint)?;
+    Ok((pipeline, stored.commit_sequence))
 }
 
 fn semantic_input_hash(
@@ -973,15 +1335,38 @@ impl DiscoveryPipeline {
         sources: DiscoverySources,
         c: DiscoveryPipelineCheckpoint,
     ) -> Result<Self, DiscoveryError> {
+        // Evidence recorded under an interface that is not observed this run must still load.
+        let mut extra: Vec<String> = Vec::new();
+        for device in &c.presence.devices {
+            extra.extend(device.evidence.iter().map(|e| e.source.clone()));
+            extra.extend(device.history.iter().map(|t| t.trigger.source.clone()));
+        }
+        extra.sort();
+        extra.dedup();
+        Self::from_checkpoint_with_extra_sources(sources, c, extra)
+    }
+
+    /// As [`Self::from_checkpoint`], additionally trusting `extra` source names that appear in
+    /// the checkpoint's recorded evidence (sources from a previous interface set).
+    pub fn from_checkpoint_with_extra_sources(
+        sources: DiscoverySources,
+        c: DiscoveryPipelineCheckpoint,
+        extra: Vec<String>,
+    ) -> Result<Self, DiscoveryError> {
         if c.version != 1 || c.source_fingerprint != sources.fingerprint() {
             return Err(DiscoveryError::InvalidCheckpoint);
         }
-        let trusted_sources = sources
+        let mut trusted_sources: Vec<String> = sources
             .0
             .values()
             .filter(|s| s.presence)
             .map(|s| s.name.clone())
             .collect();
+        for name in extra {
+            if !trusted_sources.contains(&name) {
+                trusted_sources.push(name);
+            }
+        }
         let config = PresenceConfig {
             trusted_sources,
             ..PresenceConfig::default()
