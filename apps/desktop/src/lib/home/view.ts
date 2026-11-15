@@ -30,7 +30,9 @@ export const defaultView = (): ViewState => ({ scale: DEFAULT_SCALE, origin: { x
 
 /** The SVG viewBox for a view state over an element of `size` CSS pixels. */
 export function viewBox(view: ViewState, size: Size): string {
-  return `${view.origin.x * view.scale} ${view.origin.y * view.scale} ${Math.max(1, size.width)} ${Math.max(1, size.height)}`;
+  // Rounded to a thousandth of a pixel so float noise from repeated zooms never leaks into the attribute.
+  const round = (value: number) => Number(value.toFixed(3));
+  return `${round(view.origin.x * view.scale)} ${round(view.origin.y * view.scale)} ${Math.max(1, size.width)} ${Math.max(1, size.height)}`;
 }
 
 /** Plan meters → SVG user units (pixels at the current zoom). */

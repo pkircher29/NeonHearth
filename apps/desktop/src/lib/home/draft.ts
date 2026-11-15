@@ -70,7 +70,8 @@ export function planWallBatch(options: BatchOptions): EditAction[] | null {
   }
   const added: WallSpec[] = [];
   for (const wall of options.walls) {
-    const exists = floor.walls.some((candidate) => sameSegment(candidate, wall)) || added.some((candidate) => sameSegment(candidate, wall));
+    // Checked against the working copy so a new wall lying along a freshly split piece counts as existing.
+    const exists = segments.some((candidate) => sameSegment(candidate, wall)) || added.some((candidate) => sameSegment(candidate, wall));
     if (exists && options.skipExisting) continue;
     added.push(wall);
     if (options.moveWallId) {

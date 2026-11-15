@@ -13,8 +13,9 @@
   const minorPx = $derived(minorStep * view.scale);
   // The 0.1 m fade curve, rescaled so an inch grid appears only when an inch is as legible as 0.1 m.
   const minorOpacity = $derived(minorGridOpacity((view.scale * minorStep) / 0.1));
-  const x = $derived(view.origin.x * view.scale);
-  const y = $derived(view.origin.y * view.scale);
+  // Same rounding as the viewBox, so the rects line up with it exactly.
+  const x = $derived(Number((view.origin.x * view.scale).toFixed(3)));
+  const y = $derived(Number((view.origin.y * view.scale).toFixed(3)));
 </script>
 
 <defs>
