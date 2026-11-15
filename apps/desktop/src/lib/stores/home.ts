@@ -49,14 +49,16 @@ export function createEditorState(plan: HomePlan, placements: Placement[]): Edit
   return { doc: { plan, placements }, past: [], future: [] };
 }
 
-export type EditorAction = (
-  | { type: 'add_wall'; floor_id: string; wall_id: string; start: PlanPoint; end: PlanPoint }
-  | { type: 'move_wall'; floor_id: string; wall_id: string; start: PlanPoint; end: PlanPoint }
+/** Edits that change the document (everything except history navigation and batching). */
+export type EditAction =
+  | { type: 'add_wall'; floor_id: string; wall_id: string; start: PlanPoint; end: PlanPoint; thickness_m?: number; /** Take the points as given (already snapped to a real feature) instead of re-snapping to the grid. */ exact?: boolean }
+  | { type: 'move_wall'; floor_id: string; wall_id: string; start: PlanPoint; end: PlanPoint; exact?: boolean }
   | { type: 'delete_wall'; floor_id: string; wall_id: string }
-  | { type: 'split_wall'; floor_id: string; wall_id: string; at: PlanPoint; new_wall_id: string }
+  | { type: 'split_wall'; floor_id: string; wall_id: string; at: PlanPoint; new_wall_id: string; exact?: boolean }
+  | { type: 'set_wall_thickness'; floor_id: string; wall_id: string; thickness_m: number }
   | { type: 'add_opening'; floor_id: string; wall_id: string; opening: Opening }
   | { type: 'delete_opening'; floor_id: string; wall_id: string; opening_id: string }
-  | { type: 'add_room'; floor_id: string; room_id: string; name: string; polygon: PlanPoint[] }
+  | { type: 'add_room'; floor_id: string; room_id: string; name: string; polygon: PlanPoint[]; exact?: boolean }
   | { type: 'rename_room'; floor_id: string; room_id: string; name: string }
   | { type: 'delete_room'; floor_id: string; room_id: string }
   | { type: 'add_floor'; floor_id: string; level: number; name: string; ceiling_height_m: number }
@@ -67,7 +69,14 @@ export type EditorAction = (
   | { type: 'place_device'; placement: Placement }
   | { type: 'move_placement'; device_id: string; x: number; y: number }
   | { type: 'configure_placement'; device_id: string; height_m?: number; mounting?: Mounting }
-  | { type: 'remove_placement'; device_id: string }
+  | { type: 'remove_placement'; device_id: string };
+
+export const BATCH_LIMIT = 64;
+
+export type EditorAction = (
+  | EditAction
+  /** Several edits applied in order as ONE history entry; if any edit is rejected the whole batch is. */
+  | { type: 'batch'; actions: EditAction[] }
   | { type: 'undo' }
   | { type: 'redo' }) & { grid_m?: number };
 
@@ -87,6 +96,10 @@ const validName = (name: string) => name.trim().length > 0 && name.length <= 64;
 const validCoordinate = (value: number) => Number.isFinite(value) && Math.abs(value) <= MAX_COORDINATE_M;
 const validPoint = (point: PlanPoint) => validCoordinate(point.x) && validCoordinate(point.y);
 const validCeiling = (value: number) => Number.isFinite(value) && value >= MIN_CEILING_M && value <= MAX_CEILING_M;
+const validThickness = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= MIN_THICKNESS_M - EPSILON && value <= MAX_THICKNESS_M + EPSILON;
+const round6 = (value: number) => Number(value.toFixed(6));
+const sameSegment = (a: Pick<Wall, 'start' | 'end'>, start: PlanPoint, end: PlanPoint) =>
+  (samePoint(a.start, start) && samePoint(a.end, end)) || (samePoint(a.start, end) && samePoint(a.end, start));
 
 function withFloor(doc: EditorDoc, floorId: string, edit: (floor: Floor) => Floor | null): EditorDoc | null {
   const floor = doc.plan.floors.find((candidate) => candidate.floor_id === floorId);
@@ -106,23 +119,30 @@ function withWall(doc: EditorDoc, floorId: string, wallId: string, edit: (wall: 
   });
 }
 
-function applyEdit(doc: EditorDoc, action: Exclude<EditorAction, { type: 'undo' } | { type: 'redo' }>): EditorDoc | null {
-  const grid = action.grid_m === 0.0254 ? 0.0254 : GRID_M;
+function applyEdit(doc: EditorDoc, action: EditAction, grid: number): EditorDoc | null {
+  const place = (point: PlanPoint, exact?: boolean): PlanPoint => exact ? { x: round6(point.x), y: round6(point.y) } : snapPoint(point, grid);
   switch (action.type) {
     case 'add_wall': {
       if (!validPoint(action.start) || !validPoint(action.end)) return null;
-      const start = snapPoint(action.start, grid);
-      const end = snapPoint(action.end, grid);
+      const start = place(action.start, action.exact);
+      const end = place(action.end, action.exact);
       if (samePoint(start, end)) return null;
-      return withFloor(doc, action.floor_id, (floor) => ({ ...floor, walls: [...floor.walls, { wall_id: action.wall_id, start, end, openings: [] }] }));
+      const thickness_m = action.thickness_m === undefined ? DEFAULT_THICKNESS_M : round6(action.thickness_m);
+      if (!validThickness(thickness_m)) return null;
+      return withFloor(doc, action.floor_id, (floor) => {
+        // The same two endpoints (either way round) are the same wall; a second copy would double-draw it.
+        if (floor.walls.some((wall) => wall.wall_id === action.wall_id || sameSegment(wall, start, end))) return null;
+        return { ...floor, walls: [...floor.walls, { wall_id: action.wall_id, start, end, thickness_m, openings: [] }] };
+      });
     }
     case 'move_wall': {
       if (!validPoint(action.start) || !validPoint(action.end)) return null;
-      const start = snapPoint(action.start, grid);
-      const end = snapPoint(action.end, grid);
+      const start = place(action.start, action.exact);
+      const end = place(action.end, action.exact);
       if (samePoint(start, end)) return null;
       // Openings that no longer fit the moved wall are removed with the move (undo restores them).
-      return withWall(doc, action.floor_id, action.wall_id, (wall) => {
+      return withWall(doc, action.floor_id, action.wall_id, (wall, floor) => {
+        if (floor.walls.some((other) => other.wall_id !== wall.wall_id && sameSegment(other, start, end))) return null;
         const moved = { ...wall, start, end };
         return [{ ...moved, openings: wall.openings.filter((opening) => openingFits(moved, opening)) }];
       });
@@ -135,18 +155,28 @@ function applyEdit(doc: EditorDoc, action: Exclude<EditorAction, { type: 'undo' 
         const length = wallLength(wall);
         if (length < EPSILON) return null;
         const t = ((action.at.x - wall.start.x) * (wall.end.x - wall.start.x) + (action.at.y - wall.start.y) * (wall.end.y - wall.start.y)) / (length * length);
-        const split = snapPoint({ x: wall.start.x + t * (wall.end.x - wall.start.x), y: wall.start.y + t * (wall.end.y - wall.start.y) }, grid);
+        const projected = { x: wall.start.x + t * (wall.end.x - wall.start.x), y: wall.start.y + t * (wall.end.y - wall.start.y) };
+        // An exact split keeps a point that already lies on the wall (a snapped "on wall" click) where it is.
+        const split = action.exact
+          ? (Math.hypot(projected.x - action.at.x, projected.y - action.at.y) < 1e-4 ? place(action.at, true) : null)
+          : snapPoint(projected, grid);
+        if (!split) return null;
         if (samePoint(split, wall.start) || samePoint(split, wall.end)) return null;
         const distance = Math.hypot(split.x - wall.start.x, split.y - wall.start.y);
         // A split landing inside an opening is rejected rather than truncating it.
         if (wall.openings.some((opening) => opening.offset_m < distance - EPSILON && opening.offset_m + opening.width_m > distance + EPSILON)) return null;
         const first: Wall = { ...wall, end: split, openings: wall.openings.filter((opening) => opening.offset_m + opening.width_m <= distance + EPSILON) };
         const second: Wall = {
-          wall_id: action.new_wall_id, start: split, end: wall.end,
+          wall_id: action.new_wall_id, start: split, end: wall.end, ...(wall.thickness_m === undefined ? {} : { thickness_m: wall.thickness_m }),
           openings: wall.openings.filter((opening) => opening.offset_m >= distance - EPSILON).map((opening) => ({ ...opening, offset_m: Number((opening.offset_m - distance).toFixed(6)) }))
         };
         return [first, second];
       });
+    }
+    case 'set_wall_thickness': {
+      const thickness_m = typeof action.thickness_m === 'number' ? round6(action.thickness_m) : NaN;
+      if (!validThickness(thickness_m)) return null;
+      return withWall(doc, action.floor_id, action.wall_id, (wall) => (wall.thickness_m === thickness_m ? null : [{ ...wall, thickness_m }]));
     }
     case 'add_opening': {
       const opening = { ...action.opening, offset_m: snap(action.opening.offset_m, grid), width_m: snap(action.opening.width_m, grid) };
@@ -159,7 +189,7 @@ function applyEdit(doc: EditorDoc, action: Exclude<EditorAction, { type: 'undo' 
       });
     case 'add_room': {
       if (!validName(action.name) || action.polygon.length < 3 || !action.polygon.every(validPoint)) return null;
-      const polygon = action.polygon.map(point => snapPoint(point, grid));
+      const polygon = action.polygon.map(point => place(point, action.exact));
       return withFloor(doc, action.floor_id, (floor) => ({ ...floor, rooms: [...floor.rooms, { room_id: action.room_id, name: action.name.trim(), polygon }] }));
     }
     case 'rename_room': {
@@ -254,7 +284,15 @@ export function reduceEditor(state: EditorState, action: EditorAction): EditorSt
     if (!next) return state;
     return { doc: next, past: [...state.past, state.doc], future };
   }
-  const doc = applyEdit(state.doc, action);
+  const grid = action.grid_m === 0.0254 ? 0.0254 : GRID_M;
+  let doc: EditorDoc | null = state.doc;
+  if (action.type === 'batch') {
+    if (action.actions.length === 0 || action.actions.length > BATCH_LIMIT) return state;
+    for (const edit of action.actions) {
+      doc = applyEdit(doc, edit, grid);
+      if (!doc) return state; // one rejected edit rejects the whole batch
+    }
+  } else doc = applyEdit(doc, action, grid);
   if (!doc) return state;
   const past = [...state.past, state.doc];
   while (past.length > HISTORY_LIMIT) past.shift();
@@ -292,6 +330,7 @@ function isOpening(value: unknown): value is Opening {
 }
 function isWall(value: unknown): value is Wall {
   return isRecord(value) && isOpaqueId(value.wall_id) && isPoint(value.start) && isPoint(value.end)
+    && (value.thickness_m === undefined || validThickness(value.thickness_m))
     && Array.isArray(value.openings) && value.openings.length <= 64 && value.openings.every(isOpening)
     && value.openings.every((opening) => openingFits({ start: (value as unknown as Wall).start, end: (value as unknown as Wall).end }, opening as Opening));
 }

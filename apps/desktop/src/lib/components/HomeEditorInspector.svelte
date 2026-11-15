@@ -9,8 +9,9 @@
 </script>
 
 <script lang="ts">
-  import { MAX_CEILING_M, MIN_CEILING_M, snap, wallLength, type Mounting } from '../stores/home';
-  import { formatLength, fromDisplayLength, gridStep, toDisplayLength, unitSymbol, type HomeUnits } from '../homeUnits';
+  import { DEFAULT_THICKNESS_M, MAX_CEILING_M, MAX_THICKNESS_M, MIN_CEILING_M, MIN_THICKNESS_M, snap, wallLength, type Mounting } from '../stores/home';
+  import { polygonArea } from '../home/rooms';
+  import { formatArea, formatLength, fromDisplayLength, gridStep, toDisplayLength, unitSymbol, type HomeUnits } from '../homeUnits';
 
   let { target, units = 'metric', onaction, onclose }: { target: InspectorTarget; units?: HomeUnits; onaction: (action: EditorAction) => void; onclose: () => void } = $props();
   const display = (meters: number) => Number(toDisplayLength(meters, units).toFixed(6));
@@ -54,6 +55,10 @@
       <div><dt>From</dt><dd>{length(target.wall.start.x)}, {length(target.wall.start.y)}</dd></div>
       <div><dt>To</dt><dd>{length(target.wall.end.x)}, {length(target.wall.end.y)}</dd></div>
     </dl>
+    <label>Thickness ({unitSymbol(units)})
+      <input type="number" min={display(MIN_THICKNESS_M)} max={display(MAX_THICKNESS_M)} step="any" value={display(target.wall.thickness_m ?? DEFAULT_THICKNESS_M)}
+        onchange={(event) => onaction({ type: 'set_wall_thickness', floor_id: target.floor_id, wall_id: target.wall.wall_id, thickness_m: numberFrom(event) })} />
+    </label>
     {#if target.wall.openings.length > 0}
       <p class="inspector-kicker">Openings</p>
       <ul class="opening-list">
@@ -71,7 +76,7 @@
     <label>Room name
       <input type="text" value={target.room.name} maxlength="64" onchange={(event) => onaction({ type: 'rename_room', floor_id: target.floor_id, room_id: target.room.room_id, name: (event.currentTarget as HTMLInputElement).value })} />
     </label>
-    <dl><div><dt>Corners</dt><dd>{target.room.polygon.length}</dd></div></dl>
+    <dl><div><dt>Corners</dt><dd>{target.room.polygon.length}</dd></div><div><dt>Area</dt><dd>{formatArea(polygonArea(target.room.polygon), units)}</dd></div></dl>
     <button type="button" class="danger" onclick={() => onaction({ type: 'delete_room', floor_id: target.floor_id, room_id: target.room.room_id })}>Delete room</button>
   {:else}
     <h2>{target.device?.name ?? 'Device'}</h2>

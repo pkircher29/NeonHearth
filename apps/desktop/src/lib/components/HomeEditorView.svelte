@@ -1,13 +1,22 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import {
-    copyFloorFootprint, createEditorState, emptyHomePlan, reduceEditor, selectUncertain, selectUnplaced, snap, snapPoint, wallLength,
+    DEFAULT_THICKNESS_M, copyFloorFootprint, createEditorState, emptyHomePlan, reduceEditor, selectUncertain, selectUnplaced, snap, snapPoint, wallLength,
     type EditorAction, type EditorState, type Estimate, type HomeApi, type HomeDeviceRef, type HomeDraft, type HomeSnapshot, type OpeningKind, type Placement, type PlanPoint, type Room, type Wall
   } from '../stores/home';
   import HomeEditorFloorBar from './HomeEditorFloorBar.svelte';
   import HomeEditorInspector, { type InspectorTarget } from './HomeEditorInspector.svelte';
   import HomeEditorTray, { type EstimatedRow } from './HomeEditorTray.svelte';
-  import { formatLength, gridStep, readHomeUnits, saveHomeUnits, type HomeUnits } from '../homeUnits';
+  import HomePlanGrid from './HomePlanGrid.svelte';
+  import HomePlanWall from './HomePlanWall.svelte';
+  import { formatArea, formatLength, fromDisplayLength, gridStep, readHomeUnits, saveHomeUnits, unitSymbol, type HomeUnits } from '../homeUnits';
+  import {
+    DEFAULT_SCALE, boundsOf, defaultView, fitView, panBy, scaleBar, toPlan, viewBox, zoomAt, zoomTo, type Size, type ViewState
+  } from '../home/view';
+  import { SNAP_LABELS, angleDegrees, computeSnap, constrainAngle, pointAtLength, type SnapResult } from '../home/snap';
+  import { newRoomCandidates, polygonArea, polygonCentroid, type RoomCandidate } from '../home/rooms';
+  import { parseLengthEntry, planRectangleBatch, planWallBatch } from '../home/draft';
+  import { DEFAULT_CANVAS_SIZE, floorPoints, initialFloorView, readFloorView, saveFloorView } from '../home/viewStore';
 
   // `snapshot` is the already-loaded home when a parent owns it (HomeView
   // shares one fetch with the 3D twin, audit M-27); without it the editor
@@ -15,14 +24,16 @@
   // (committed plan, placements, reloads) so the parent's twin stays current.
   let { api, devices = [], snapshot = undefined, onsnapshot }: { api: HomeApi; devices?: HomeDeviceRef[]; snapshot?: HomeSnapshot | null; onsnapshot?: (snapshot: HomeSnapshot) => void } = $props();
 
-  const SCALE = 40; // pixels per meter
-  const CANVAS_W_M = 18;
-  const CANVAS_H_M = 12;
   const AUTOSAVE_DELAY_MS = 2000;
   const OPENING_WIDTHS: Record<OpeningKind, number> = { door: 0.9, window: 0.8, stair: 1.0 };
+  const DRAG_THRESHOLD_PX = 4;
 
-  type Tool = 'select' | 'wall' | 'room' | 'opening' | 'place';
+  type Tool = 'select' | 'pan' | 'wall' | 'room' | 'rect' | 'opening' | 'place';
   type Selection = { kind: 'wall' | 'room' | 'placement'; id: string } | { kind: 'floor' } | null;
+  type Drag =
+    | { kind: 'pan'; x: number; y: number; moved: boolean }
+    | { kind: 'handle'; wall_id: string; end: 'start' | 'end'; point: PlanPoint; moved: boolean }
+    | { kind: 'body'; wall_id: string; clientX: number; clientY: number; from: PlanPoint; delta: PlanPoint; moved: boolean };
 
   let editor = $state<EditorState>(createEditorState(emptyHomePlan(), []));
   let estimates = $state<Estimate[]>([]);
@@ -41,22 +52,35 @@
   let activeFloorId = $state<string | null>(null);
   let selection = $state<Selection>(null);
   let pendingWallStart = $state<PlanPoint | null>(null);
+  let chainFirst = $state<PlanPoint | null>(null);
+  let lengthEntry = $state('');
+  let rectStart = $state<PlanPoint | null>(null);
   let pendingRoom = $state<PlanPoint[]>([]);
   let placingDevice = $state<string | null>(null);
   let svgEl = $state<SVGSVGElement | null>(null);
+  let cursor = $state.raw<SnapResult | null>(null);
+  let drag = $state.raw<Drag | null>(null);
+  let spaceHeld = $state(false);
+  let view = $state.raw<ViewState>(defaultView());
+  let viewSize = $state.raw<Size>({ ...DEFAULT_CANVAS_SIZE });
+  let roomOfferOpen = $state(false);
+  let roomNameEdits = $state<Record<string, string>>({});
   let autosaveTimer: ReturnType<typeof setTimeout> | undefined;
+  let suppressClick = false;
+  const viewsByFloor = new Map<string, ViewState>();
 
   const doc = $derived(editor.doc);
   const plan = $derived(doc.plan);
   const grid = $derived(gridStep(units));
-  const majorGrid = $derived(units === 'imperial' ? 0.3048 : 1);
   const copyTargets = $derived(plan.floors.filter(floor => floor.floor_id !== activeFloorId && !floor.walls.length && !floor.rooms.length));
   const activeFloor = $derived(plan.floors.find((floor) => floor.floor_id === activeFloorId) ?? plan.floors[0] ?? null);
+  const activeFloorKey = $derived(activeFloor?.floor_id ?? null);
   const floorPlacements = $derived(activeFloor ? doc.placements.filter((placement) => placement.floor_id === activeFloor.floor_id) : []);
   const unplaced = $derived(selectUnplaced(devices, doc.placements));
   const uncertain = $derived(selectUncertain(devices, doc.placements, estimates));
   const canUndo = $derived(editor.past.length > 0);
   const canRedo = $derived(editor.future.length > 0);
+  const segments = $derived(activeFloor ? activeFloor.walls.map((wall) => ({ wall_id: wall.wall_id, start: wall.start, end: wall.end })) : []);
   const selectedWall = $derived.by(() => {
     const current = selection;
     if (!current || current.kind !== 'wall' || !activeFloor) return null;
@@ -94,6 +118,69 @@
       : autosaveState === 'saved' ? 'Draft saved'
       : autosaveState === 'error' ? 'Draft save failed'
       : 'All changes committed');
+
+  // ---- Viewport ----
+  const scale = $derived(view.scale);
+  const bar = $derived(scaleBar(scale));
+  const originPx = $derived({ x: view.origin.x * scale, y: view.origin.y * scale });
+  const panReady = $derived(tool === 'pan' || spaceHeld);
+  const candidates = $derived<RoomCandidate[]>(roomOfferOpen && activeFloor ? newRoomCandidates(activeFloor.walls, activeFloor.rooms) : []);
+  $effect(() => { if (roomOfferOpen && candidates.length === 0) roomOfferOpen = false; });
+
+  function setView(next: ViewState) {
+    view = next;
+    if (!activeFloorKey) return;
+    viewsByFloor.set(activeFloorKey, next);
+    saveFloorView(activeFloorKey, next);
+  }
+  function measure() {
+    const el = svgEl;
+    if (!el) return;
+    const width = el.clientWidth;
+    const height = el.clientHeight;
+    // jsdom (and a not-yet-laid-out frame) reports 0: keep the fallback size.
+    const next = width > 0 && height > 0 ? { width, height } : { ...DEFAULT_CANVAS_SIZE };
+    if (next.width !== viewSize.width || next.height !== viewSize.height) viewSize = next;
+  }
+  $effect(() => {
+    const el = svgEl;
+    if (!el) return;
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
+  // Opening a floor restores its own view; the first time ever, a drawing that does not fit the
+  // default view is framed instead.
+  $effect(() => {
+    const key = activeFloorKey;
+    const el = svgEl;
+    if (!key || !el) return;
+    untrack(() => {
+      const remembered = viewsByFloor.get(key) ?? readFloorView(key);
+      const next = remembered ?? (activeFloor ? initialFloorView(activeFloor, viewSize) : defaultView());
+      viewsByFloor.set(key, next);
+      view = next;
+    });
+  });
+  $effect(() => {
+    const el = svgEl;
+    if (!el) return;
+    // Non-passive so a wheel over the plan zooms the plan instead of scrolling the page.
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const o = offsetOf(event);
+      const unit = event.deltaMode === 1 ? 0.05 : 0.0015;
+      const factor = Math.min(2, Math.max(0.5, Math.exp(-event.deltaY * unit * (event.ctrlKey ? 3 : 1))));
+      setView(zoomAt(view, factor, o.x, o.y));
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  });
+  const zoomBy = (factor: number) => setView(zoomAt(view, factor, viewSize.width / 2, viewSize.height / 2));
+  const fitPlan = () => setView(activeFloor ? fitView(boundsOf(floorPoints(activeFloor)), viewSize) : defaultView());
+  const actualSize = () => setView(zoomTo(view, DEFAULT_SCALE, viewSize));
 
   $effect(() => {
     if (plan.floors.length > 0 && !plan.floors.some((floor) => floor.floor_id === activeFloorId)) activeFloorId = plan.floors[0].floor_id;
@@ -170,6 +257,7 @@
     const nextPlacements = next.doc.placements;
     const planChanged = next.doc.plan !== previous.doc.plan;
     editor = next;
+    if (action.type === 'undo' || action.type === 'redo') resetDrafting();
     if (planChanged) markDirty();
     if (nextPlacements !== previousPlacements) {
       for (const placement of nextPlacements) {
@@ -224,6 +312,7 @@
     activeFloorId = loaded.plan.floors[0]?.floor_id ?? null;
     selection = null;
     autosaveState = 'idle';
+    resetDrafting();
     rememberConfirmed(loaded.placements);
   }
   async function loadHome() {
@@ -241,6 +330,7 @@
     autosaveState = 'saved';
     draftOffer = null;
     selection = null;
+    resetDrafting();
   }
   function discardDraft() {
     draftOffer = null;
@@ -262,25 +352,265 @@
     return () => clearTimeout(autosaveTimer);
   });
 
-  // ---- Canvas interactions ----
-  function canvasPoint(event: { clientX: number; clientY: number }): PlanPoint {
+  // ---- Canvas geometry ----
+  function offsetOf(event: { clientX: number; clientY: number }): { x: number; y: number } {
     const rect = svgEl?.getBoundingClientRect();
-    return snapPoint({ x: (event.clientX - (rect?.left ?? 0)) / SCALE, y: (event.clientY - (rect?.top ?? 0)) / SCALE }, grid);
+    return { x: event.clientX - (rect?.left ?? 0), y: event.clientY - (rect?.top ?? 0) };
   }
-  function onCanvasClick(event: MouseEvent) {
+  /** The pointer in plan meters, unsnapped. */
+  function rawPoint(event: { clientX: number; clientY: number }): PlanPoint {
+    const o = offsetOf(event);
+    return toPlan(view, o.x, o.y);
+  }
+  /** The pointer snapped to the unit grid only (placement, openings, drops). */
+  const gridPoint = (event: { clientX: number; clientY: number }): PlanPoint => snapPoint(rawPoint(event), grid);
+  const samePoint = (a: PlanPoint, b: PlanPoint) => Math.abs(a.x - b.x) < 1e-6 && Math.abs(a.y - b.y) < 1e-6;
+
+  /** The drafting snap for a raw cursor: the ladder first; Shift constrains to 0/45/90 from `anchor`. */
+  function snapFor(raw: PlanPoint, shift: boolean, options: { anchor?: PlanPoint | null; extra?: PlanPoint[]; exclude?: string[] } = {}): SnapResult {
+    const anchor = options.anchor ?? null;
+    if (shift && anchor) {
+      return { point: constrainAngle(anchor, raw, grid), kind: 'grid', label: SNAP_LABELS.grid, wall_id: null, guides: { x: null, y: null } };
+    }
+    return computeSnap(raw, { walls: segments, scale, excludeWallIds: options.exclude, extraPoints: options.extra, guidePoints: anchor ? [anchor] : [], grid });
+  }
+  function draftingSnap(raw: PlanPoint, shift: boolean): SnapResult | null {
+    if (tool === 'wall') return snapFor(raw, shift, { anchor: pendingWallStart, extra: chainFirst ? [chainFirst] : [] });
+    if (tool === 'rect') return snapFor(raw, false, { anchor: rectStart });
+    if (tool === 'room') return snapFor(raw, shift, { anchor: pendingRoom.at(-1) ?? null, extra: pendingRoom.slice(0, 1) });
+    return null;
+  }
+
+  // ---- Pointer interaction ----
+  function capture(event: PointerEvent) {
+    try { svgEl?.setPointerCapture?.(event.pointerId); } catch { /* Capture is an enhancement; some pointers cannot be captured. */ }
+  }
+  function onPointerDownCapture(event: PointerEvent) {
     if (!activeFloor) return;
-    const point = canvasPoint(event);
-    if (tool === 'wall') {
-      if (!pendingWallStart) { pendingWallStart = point; return; }
-      const wall_id = newId();
-      if (dispatch({ type: 'add_wall', floor_id: activeFloor.floor_id, wall_id, start: pendingWallStart, end: point })) {
-        selection = { kind: 'wall', id: wall_id };
-      } else notice = 'Walls need two different grid points.';
-      pendingWallStart = null;
+    const wantsPan = event.button === 1 || (event.button === 0 && panReady);
+    if (!wantsPan) return;
+    event.preventDefault();
+    event.stopPropagation();
+    capture(event);
+    drag = { kind: 'pan', x: event.clientX, y: event.clientY, moved: false };
+  }
+  function onPointerMove(event: PointerEvent) {
+    const current = drag;
+    if (current?.kind === 'pan') {
+      const dx = event.clientX - current.x;
+      const dy = event.clientY - current.y;
+      if (!current.moved && Math.hypot(dx, dy) < 2) return;
+      drag = { ...current, x: event.clientX, y: event.clientY, moved: true };
+      setView(panBy(view, dx, dy));
       return;
     }
-    if (tool === 'room') { pendingRoom = [...pendingRoom, point]; return; }
-    if (tool === 'place' && placingDevice) { placeAt(placingDevice, point); return; }
+    const raw = rawPoint(event);
+    if (current?.kind === 'handle' && activeFloor) {
+      const wall = activeFloor.walls.find((candidate) => candidate.wall_id === current.wall_id);
+      if (!wall) return;
+      const fixed = current.end === 'start' ? wall.end : wall.start;
+      const snapped = snapFor(raw, event.shiftKey, { anchor: fixed, exclude: [wall.wall_id] });
+      cursor = snapped;
+      drag = { ...current, point: snapped.point, moved: true };
+      return;
+    }
+    if (current?.kind === 'body') {
+      if (!current.moved && Math.hypot(event.clientX - current.clientX, event.clientY - current.clientY) < DRAG_THRESHOLD_PX) return;
+      if (!current.moved) capture(event);
+      drag = { ...current, moved: true, delta: { x: snap(raw.x - current.from.x, grid), y: snap(raw.y - current.from.y, grid) } };
+      return;
+    }
+    cursor = draftingSnap(raw, event.shiftKey);
+  }
+  function onPointerUp(event: PointerEvent) {
+    const current = drag;
+    if (!current) return;
+    drag = null;
+    try { svgEl?.releasePointerCapture?.(event.pointerId); } catch { /* Not captured. */ }
+    if (current.moved) {
+      suppressClick = true;
+      setTimeout(() => { suppressClick = false; }, 0); // the click that follows a drag is swallowed; never let the flag go stale
+    }
+    if (!current.moved || !activeFloor) return;
+    if (current.kind === 'handle') commitHandle(current);
+    else if (current.kind === 'body') commitBody(current);
+  }
+  function onPointerLeave() {
+    if (!drag) cursor = null;
+  }
+  function onClickCapture(event: MouseEvent) {
+    if (!suppressClick) return;
+    suppressClick = false;
+    event.stopPropagation();
+    event.preventDefault();
+  }
+
+  function commitHandle(current: Extract<Drag, { kind: 'handle' }>) {
+    const floor = activeFloor;
+    const wall = floor?.walls.find((candidate) => candidate.wall_id === current.wall_id);
+    if (!floor || !wall) return;
+    const start = current.end === 'start' ? current.point : wall.start;
+    const end = current.end === 'end' ? current.point : wall.end;
+    if (samePoint(start, end)) { notice = 'A wall cannot shrink to a point.'; return; }
+    if (samePoint(current.end === 'start' ? wall.start : wall.end, current.point)) return;
+    const batch = planWallBatch({ floor, walls: [{ start, end }], newId, moveWallId: wall.wall_id, ignoreWallIds: [wall.wall_id] });
+    if (batch && dispatch({ type: 'batch', actions: batch })) return;
+    if (!dispatch({ type: 'move_wall', floor_id: floor.floor_id, wall_id: wall.wall_id, start, end, exact: true })) notice = 'That would overlap another wall.';
+  }
+  function commitBody(current: Extract<Drag, { kind: 'body' }>) {
+    const floor = activeFloor;
+    const wall = floor?.walls.find((candidate) => candidate.wall_id === current.wall_id);
+    if (!floor || !wall || (current.delta.x === 0 && current.delta.y === 0)) return;
+    const shift = (point: PlanPoint) => ({ x: point.x + current.delta.x, y: point.y + current.delta.y });
+    if (!dispatch({ type: 'move_wall', floor_id: floor.floor_id, wall_id: wall.wall_id, start: shift(wall.start), end: shift(wall.end), exact: true })) notice = 'That would overlap another wall.';
+  }
+  function onWallPointerDown(event: PointerEvent, wall: Wall) {
+    if (tool !== 'select' || event.button !== 0 || drag) return;
+    selection = { kind: 'wall', id: wall.wall_id };
+    drag = { kind: 'body', wall_id: wall.wall_id, clientX: event.clientX, clientY: event.clientY, from: rawPoint(event), delta: { x: 0, y: 0 }, moved: false };
+  }
+  function onHandlePointerDown(event: PointerEvent, wall: Wall, end: 'start' | 'end') {
+    if (event.button !== 0) return;
+    event.stopPropagation();
+    event.preventDefault();
+    capture(event);
+    drag = { kind: 'handle', wall_id: wall.wall_id, end, point: end === 'start' ? wall.start : wall.end, moved: false };
+  }
+
+  // ---- Drafting ----
+  function resetDrafting() {
+    pendingWallStart = null;
+    chainFirst = null;
+    lengthEntry = '';
+    rectStart = null;
+    pendingRoom = [];
+    drag = null;
+  }
+  function cancelPending() {
+    resetDrafting();
+    placingDevice = null;
+  }
+  function setTool(next: Tool) {
+    resetDrafting();
+    tool = next;
+    if (next !== 'place') placingDevice = null;
+  }
+  function endChain() {
+    pendingWallStart = null;
+    chainFirst = null;
+    lengthEntry = '';
+  }
+
+  /** Commit one wall, joining it to whatever its endpoints touch. Returns the new wall's id. */
+  function commitWall(start: PlanPoint, end: PlanPoint): string | null {
+    const floor = activeFloor;
+    if (!floor) return null;
+    if (samePoint(start, end)) { notice = 'Walls need two different points.'; return null; }
+    const batch = planWallBatch({ floor, walls: [{ start, end }], newId });
+    const added = batch ? [...batch].reverse().find((action) => action.type === 'add_wall') : undefined;
+    if (batch && added?.type === 'add_wall' && dispatch({ type: 'batch', actions: batch })) return added.wall_id;
+    const duplicate = floor.walls.some((wall) => (samePoint(wall.start, start) && samePoint(wall.end, end)) || (samePoint(wall.start, end) && samePoint(wall.end, start)));
+    if (duplicate) { notice = 'That wall already exists.'; return null; }
+    // Splitting was refused (an opening is in the way): draw the wall without joining it.
+    const wall_id = newId();
+    if (dispatch({ type: 'add_wall', floor_id: floor.floor_id, wall_id, start, end, thickness_m: DEFAULT_THICKNESS_M, exact: true })) {
+      notice = 'The wall was drawn, but it could not be joined to the wall it touches because an opening is in the way.';
+      return wall_id;
+    }
+    notice = 'That wall is not allowed.';
+    return null;
+  }
+  function clickWall(raw: PlanPoint, shift: boolean) {
+    const snapped = snapFor(raw, shift, { anchor: pendingWallStart, extra: chainFirst ? [chainFirst] : [] });
+    cursor = snapped;
+    if (!pendingWallStart) {
+      pendingWallStart = snapped.point;
+      chainFirst = snapped.point;
+      lengthEntry = '';
+      return;
+    }
+    advanceChain(pendingWallStart, snapped.point);
+  }
+  function advanceChain(start: PlanPoint, end: PlanPoint) {
+    const id = commitWall(start, end);
+    if (!id) return;
+    selection = { kind: 'wall', id };
+    lengthEntry = '';
+    if (chainFirst && samePoint(end, chainFirst)) {
+      // Closed the loop: the chain ends and the rooms it made are offered.
+      endChain();
+      offerRooms(false);
+    } else pendingWallStart = end;
+  }
+  function commitTypedLength() {
+    const start = pendingWallStart;
+    const typed = parseLengthEntry(lengthEntry);
+    if (!start || typed === null) { lengthEntry = ''; return; }
+    advanceChain(start, typedEnd(start, typed));
+  }
+  function typedEnd(start: PlanPoint, typed: number): PlanPoint {
+    const towards = cursor?.point ?? { x: start.x + 1, y: start.y };
+    return pointAtLength(start, towards, fromDisplayLength(typed, units), null);
+  }
+  function clickRect(raw: PlanPoint) {
+    const floor = activeFloor;
+    if (!floor) return;
+    const snapped = snapFor(raw, false, { anchor: rectStart });
+    cursor = snapped;
+    if (!rectStart) { rectStart = snapped.point; return; }
+    const batch = planRectangleBatch(floor, rectStart, snapped.point, `Room ${floor.rooms.length + 1}`, newId);
+    if (!batch) { notice = 'Rectangles need two corners at least 0.05 m apart in both directions.'; return; }
+    if (!dispatch({ type: 'batch', actions: batch })) { notice = 'That rectangle collides with existing walls or rooms.'; return; }
+    const room = [...batch].reverse().find((action) => action.type === 'add_room');
+    if (room?.type === 'add_room') selection = { kind: 'room', id: room.room_id };
+    rectStart = null;
+  }
+
+  // ---- Rooms from walls ----
+  const candidateKey = (candidate: RoomCandidate) => candidate.polygon.map((point) => `${Math.round(point.x * 10)}:${Math.round(point.y * 10)}`).sort().join('|');
+  const defaultRoomName = (index: number) => `Room ${(activeFloor?.rooms.length ?? 0) + index + 1}`;
+  const roomNameFor = (candidate: RoomCandidate, index: number) => roomNameEdits[candidateKey(candidate)] ?? defaultRoomName(index);
+  function offerRooms(announceNone: boolean) {
+    if (!activeFloor) return;
+    if (newRoomCandidates(activeFloor.walls, activeFloor.rooms).length === 0) {
+      roomOfferOpen = false;
+      if (announceNone) notice = 'No new closed rooms found. Close a loop of walls first.';
+      return;
+    }
+    roomNameEdits = {};
+    roomOfferOpen = true;
+  }
+  function addCandidate(candidate: RoomCandidate, index: number) {
+    if (!activeFloor) return;
+    const name = roomNameFor(candidate, index).trim() || defaultRoomName(index);
+    if (dispatch({ type: 'add_room', floor_id: activeFloor.floor_id, room_id: newId(), name, polygon: candidate.polygon, exact: true })) {
+      notice = `Added ${name}.`;
+    } else notice = 'That room could not be added.';
+  }
+  function addAllCandidates() {
+    if (!activeFloor) return;
+    const floor = activeFloor;
+    const actions = candidates.map((candidate, index) => ({
+      type: 'add_room' as const, floor_id: floor.floor_id, room_id: newId(),
+      name: roomNameFor(candidate, index).trim() || defaultRoomName(index), polygon: candidate.polygon, exact: true
+    }));
+    if (actions.length > 0 && dispatch({ type: 'batch', actions })) notice = `Added ${actions.length} ${actions.length === 1 ? 'room' : 'rooms'}.`;
+    else notice = 'Those rooms could not be added.';
+  }
+
+  // ---- Clicks ----
+  function onCanvasClick(event: MouseEvent) {
+    if (!activeFloor || tool === 'pan') return;
+    const raw = rawPoint(event);
+    if (tool === 'wall') { clickWall(raw, event.shiftKey); return; }
+    if (tool === 'rect') { clickRect(raw); return; }
+    if (tool === 'room') {
+      const snapped = snapFor(raw, event.shiftKey, { anchor: pendingRoom.at(-1) ?? null, extra: pendingRoom.slice(0, 1) });
+      pendingRoom = [...pendingRoom, snapped.point];
+      cursor = snapped;
+      return;
+    }
+    if (tool === 'place' && placingDevice) { placeAt(placingDevice, snapPoint(raw, grid)); return; }
     if (tool === 'select') selection = null;
   }
   function onWallClick(event: MouseEvent, wall: Wall) {
@@ -288,7 +618,7 @@
     if (tool === 'select') { event.stopPropagation(); selection = { kind: 'wall', id: wall.wall_id }; return; }
     if (tool !== 'opening') return; // wall/room/place clicks fall through to the canvas
     event.stopPropagation();
-    const point = canvasPoint(event);
+    const point = gridPoint(event);
     const length = wallLength(wall);
     const t = length === 0 ? 0 : ((point.x - wall.start.x) * (wall.end.x - wall.start.x) + (point.y - wall.start.y) * (wall.end.y - wall.start.y)) / (length * length);
     const width = units === 'imperial' ? (openingKind === 'window' ? 0.8128 : 0.9144) : OPENING_WIDTHS[openingKind];
@@ -311,13 +641,8 @@
   }
   function finishRoom() {
     if (!activeFloor || pendingRoom.length < 3) return;
-    apply({ type: 'add_room', floor_id: activeFloor.floor_id, room_id: newId(), name: `Room ${activeFloor.rooms.length + 1}`, polygon: pendingRoom });
+    apply({ type: 'add_room', floor_id: activeFloor.floor_id, room_id: newId(), name: `Room ${activeFloor.rooms.length + 1}`, polygon: pendingRoom, exact: true });
     pendingRoom = [];
-  }
-  function cancelPending() {
-    pendingWallStart = null;
-    pendingRoom = [];
-    placingDevice = null;
   }
   function placeAt(deviceId: string, point: PlanPoint) {
     if (!activeFloor) return;
@@ -340,35 +665,83 @@
     event.preventDefault();
     const deviceId = event.dataTransfer?.getData('text/plain');
     if (!deviceId || !devices.some((device) => device.device_id === deviceId)) return;
-    placeAt(deviceId, canvasPoint(event));
+    placeAt(deviceId, gridPoint(event));
   }
-  function onCanvasKeydown(event: KeyboardEvent) {
-    if (event.key === 'Escape') { cancelPending(); return; }
-    if ((event.key === 'Delete' || event.key === 'Backspace') && selection && activeFloor) {
+
+  // ---- Keyboard ----
+  const TOOL_KEYS: Record<string, Tool> = { v: 'select', h: 'pan', w: 'wall', r: 'room', b: 'rect', o: 'opening', p: 'place' };
+  const isTextEntry = (element: EventTarget | null) => {
+    const el = element as HTMLElement | null;
+    return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable === true);
+  };
+  const inCanvas = (element: EventTarget | null) => !!svgEl && (element === svgEl || svgEl.contains(element as Node | null));
+  const onBody = (element: EventTarget | null) => !element || element === document.body || element === document.documentElement;
+
+  function onWindowKeydown(event: KeyboardEvent) {
+    const textEntry = isTextEntry(event.target);
+    if (event.ctrlKey || event.metaKey) {
+      if (textEntry) return;
+      const key = event.key.toLowerCase();
+      if (key === 'z' && !event.shiftKey) { event.preventDefault(); dispatch({ type: 'undo' }); }
+      else if ((key === 'z' && event.shiftKey) || key === 'y') { event.preventDefault(); dispatch({ type: 'redo' }); }
+      return;
+    }
+    // Single-letter shortcuts, digits and Space never fire while typing in a field.
+    if (textEntry || event.altKey || loading) return;
+    const key = event.key;
+    const onPlan = inCanvas(event.target);
+    const drafting = tool === 'wall' && pendingWallStart !== null;
+
+    if (key === 'Escape') { cancelPending(); return; }
+    if (drafting) {
+      if (/^[0-9]$/.test(key) || key === '.') { event.preventDefault(); lengthEntry += key; return; }
+      if (key === 'Backspace') { event.preventDefault(); lengthEntry = lengthEntry.slice(0, -1); return; }
+      if (key === 'Enter' && (onPlan || onBody(event.target))) {
+        event.preventDefault();
+        if (lengthEntry) commitTypedLength(); else endChain();
+        return;
+      }
+    }
+    if (key === 'Enter' && tool === 'room' && pendingRoom.length >= 3 && (onPlan || onBody(event.target))) { event.preventDefault(); finishRoom(); return; }
+    if (key === ' ' && !event.repeat && (onPlan || onBody(event.target)) && !(event.target as Element | null)?.closest?.('button, [role="button"], a, summary')) {
+      event.preventDefault();
+      spaceHeld = true;
+      return;
+    }
+    const nextTool = TOOL_KEYS[key.toLowerCase()];
+    if (nextTool && !event.repeat && !event.shiftKey) { setTool(nextTool); return; }
+
+    if (!onPlan || !activeFloor) return;
+    if ((key === 'Delete' || key === 'Backspace') && selection) {
       event.preventDefault();
       if (selection.kind === 'wall') apply({ type: 'delete_wall', floor_id: activeFloor.floor_id, wall_id: selection.id });
       else if (selection.kind === 'room') apply({ type: 'delete_room', floor_id: activeFloor.floor_id, room_id: selection.id });
       else if (selection.kind === 'placement') apply({ type: 'remove_placement', device_id: selection.id });
       return;
     }
-    const current = selection;
-    if (current?.kind !== 'placement') return;
-    const placement = doc.placements.find((candidate) => candidate.device_id === current.id);
-    if (!placement) return;
     const step: Record<string, [number, number]> = { ArrowLeft: [-grid, 0], ArrowRight: [grid, 0], ArrowUp: [0, -grid], ArrowDown: [0, grid] };
-    const nudge = step[event.key];
-    if (!nudge) return;
-    event.preventDefault();
-    dispatch({ type: 'move_placement', device_id: placement.device_id, x: snap(placement.x + nudge[0], grid), y: snap(placement.y + nudge[1], grid) });
+    const nudge = step[key];
+    const current = selection;
+    if (!nudge || !current) return;
+    if (current.kind === 'placement') {
+      const placement = doc.placements.find((candidate) => candidate.device_id === current.id);
+      if (!placement) return;
+      event.preventDefault();
+      dispatch({ type: 'move_placement', device_id: placement.device_id, x: snap(placement.x + nudge[0], grid), y: snap(placement.y + nudge[1], grid) });
+    } else if (current.kind === 'wall') {
+      const wall = activeFloor.walls.find((candidate) => candidate.wall_id === current.id);
+      if (!wall) return;
+      event.preventDefault();
+      dispatch({
+        type: 'move_wall', floor_id: activeFloor.floor_id, wall_id: wall.wall_id, exact: true,
+        start: { x: wall.start.x + nudge[0], y: wall.start.y + nudge[1] }, end: { x: wall.end.x + nudge[0], y: wall.end.y + nudge[1] }
+      });
+    }
   }
-  function onWindowKeydown(event: KeyboardEvent) {
-    if (!(event.ctrlKey || event.metaKey)) return;
-    const targetTag = (event.target as HTMLElement | null)?.tagName;
-    if (targetTag === 'INPUT' || targetTag === 'TEXTAREA' || targetTag === 'SELECT') return;
-    const key = event.key.toLowerCase();
-    if (key === 'z' && !event.shiftKey) { event.preventDefault(); dispatch({ type: 'undo' }); }
-    else if ((key === 'z' && event.shiftKey) || key === 'y') { event.preventDefault(); dispatch({ type: 'redo' }); }
+  function onWindowKeyup(event: KeyboardEvent) {
+    if (event.key === ' ') spaceHeld = false;
   }
+
   function addFloor() {
     const level = plan.floors.length > 0 ? Math.max(...plan.floors.map((floor) => floor.level)) + 1 : 0;
     const floor_id = newId();
@@ -393,29 +766,65 @@
     } else notice = 'The footprint could not be copied. Choose an empty floor within the plan limits.';
   }
 
-  function openingSegment(wall: Wall, offset: number, width: number) {
-    const length = wallLength(wall);
-    if (length === 0) return { x1: 0, y1: 0, x2: 0, y2: 0 };
-    const ux = (wall.end.x - wall.start.x) / length;
-    const uy = (wall.end.y - wall.start.y) / length;
-    return {
-      x1: (wall.start.x + ux * offset) * SCALE, y1: (wall.start.y + uy * offset) * SCALE,
-      x2: (wall.start.x + ux * (offset + width)) * SCALE, y2: (wall.start.y + uy * (offset + width)) * SCALE
-    };
+  // ---- Rendering helpers ----
+  const px = (meters: number) => meters * scale;
+  const polygonPoints = (points: PlanPoint[]) => points.map((point) => `${px(point.x)},${px(point.y)}`).join(' ');
+  /** Walls as drawn: a wall being dragged shows where it will land. */
+  function shownEnds(wall: Wall): { start: PlanPoint; end: PlanPoint } {
+    const current = drag;
+    if (current?.kind === 'handle' && current.wall_id === wall.wall_id) {
+      return current.end === 'start' ? { start: current.point, end: wall.end } : { start: wall.start, end: current.point };
+    }
+    if (current?.kind === 'body' && current.wall_id === wall.wall_id && current.moved) {
+      const move = (point: PlanPoint) => ({ x: point.x + current.delta.x, y: point.y + current.delta.y });
+      return { start: move(wall.start), end: move(wall.end) };
+    }
+    return { start: wall.start, end: wall.end };
   }
-  const polygonPoints = (points: PlanPoint[]) => points.map((point) => `${point.x * SCALE},${point.y * SCALE}`).join(' ');
-  function centroid(points: PlanPoint[]): PlanPoint {
-    const sum = points.reduce((acc, point) => ({ x: acc.x + point.x, y: acc.y + point.y }), { x: 0, y: 0 });
-    return { x: sum.x / points.length, y: sum.y / points.length };
-  }
+  const shownSelected = $derived(selectedWall ? shownEnds(selectedWall) : null);
+  const typedLength = $derived(parseLengthEntry(lengthEntry));
+  const wallPreviewEnd = $derived.by(() => {
+    if (tool !== 'wall' || !pendingWallStart) return null;
+    if (typedLength !== null) return typedEnd(pendingWallStart, typedLength);
+    return cursor?.point ?? null;
+  });
+  const rectPreviewEnd = $derived(tool === 'rect' && rectStart ? (cursor?.point ?? null) : null);
+  const showMarker = $derived(cursor !== null && !panReady && (tool === 'wall' || tool === 'rect' || tool === 'room' || drag?.kind === 'handle') && typedLength === null);
+  const readout = $derived.by(() => {
+    if (wallPreviewEnd && pendingWallStart) {
+      const length = Math.hypot(wallPreviewEnd.x - pendingWallStart.x, wallPreviewEnd.y - pendingWallStart.y);
+      const lengthText = lengthEntry ? `${lengthEntry} ${unitSymbol(units)}▏` : formatLength(length, units);
+      return { at: wallPreviewEnd, a: lengthText, b: `${angleDegrees(pendingWallStart, wallPreviewEnd)}°` };
+    }
+    if (rectPreviewEnd && rectStart) {
+      const w = Math.abs(rectPreviewEnd.x - rectStart.x);
+      const h = Math.abs(rectPreviewEnd.y - rectStart.y);
+      return { at: rectPreviewEnd, a: `${formatLength(w, units)} × ${formatLength(h, units)}`, b: formatArea(w * h, units) };
+    }
+    return null;
+  });
+  const hint = $derived.by(() => {
+    switch (tool) {
+      case 'select': return 'Click a wall, room or device to select it. Drag a selected wall’s end handles to reshape it, or drag the wall to move it. Delete removes it.';
+      case 'pan': return 'Drag to pan the plan. Scroll to zoom at the cursor. Space or the middle mouse button also pans in any tool.';
+      case 'wall': return pendingWallStart
+        ? 'Click for the next corner, or type a length and press Enter. Click the first point to close the loop. Shift keeps it straight. Esc or Enter finishes.'
+        : 'Click to start a wall. It snaps to endpoints, midpoints and walls. Shift keeps it straight (0/45/90°).';
+      case 'room': return pendingRoom.length > 0 ? 'Click each corner, then Finish room (or Enter). Esc cancels.' : 'Click the corners of an irregular room. For a plain rectangle use Rectangle.';
+      case 'rect': return rectStart ? 'Click the opposite corner. Four walls and the room are added together. Esc cancels.' : 'Click one corner of the room, then the opposite corner. Makes four walls and a room.';
+      case 'opening': return `Click a wall to put a ${openingKind} there. Change the kind with the selector.`;
+      case 'place': return placingDevice ? `Click the plan to confirm where ${deviceName(placingDevice)} is. Esc cancels.` : 'Pick a device from the tray, then click the plan to place it.';
+    }
+  });
 
-  const tools: Array<{ id: Tool; label: string }> = [
-    { id: 'select', label: 'Select' }, { id: 'wall', label: 'Wall' }, { id: 'room', label: 'Room' },
-    { id: 'opening', label: 'Opening' }, { id: 'place', label: 'Place device' }
+  const tools: Array<{ id: Tool; label: string; key: string }> = [
+    { id: 'select', label: 'Select', key: 'V' }, { id: 'pan', label: 'Pan', key: 'H' }, { id: 'wall', label: 'Wall', key: 'W' },
+    { id: 'room', label: 'Room', key: 'R' }, { id: 'rect', label: 'Rectangle', key: 'B' },
+    { id: 'opening', label: 'Opening', key: 'O' }, { id: 'place', label: 'Place device', key: 'P' }
   ];
 </script>
 
-<svelte:window onkeydown={onWindowKeydown} />
+<svelte:window onkeydown={onWindowKeydown} onkeyup={onWindowKeyup} onblur={() => { spaceHeld = false; }} />
 
 <section class="home-editor" aria-labelledby="home-heading">
   <div class="view-heading">
@@ -466,7 +875,7 @@
           </select>
         </label>
         {#each tools as entry (entry.id)}
-          <button type="button" class:active={tool === entry.id} aria-pressed={tool === entry.id} onclick={() => { tool = entry.id; if (entry.id !== 'place') placingDevice = null; }}>{entry.label}</button>
+          <button type="button" class:active={tool === entry.id} aria-pressed={tool === entry.id} aria-keyshortcuts={entry.key} title={`${entry.label} (${entry.key})`} onclick={() => setTool(entry.id)}>{entry.label}</button>
         {/each}
         {#if tool === 'opening'}
           <label class="opening-kind">Kind
@@ -490,8 +899,9 @@
         <button type="button" class="save" disabled={committing} onclick={() => void saveCommitted()}>Save plan</button>
       </div>
     </div>
+    <p class="tool-hint" aria-live="polite">{hint}</p>
 
-    <HomeEditorFloorBar {units} floors={plan.floors} active={activeFloor?.floor_id ?? null} onselect={(floorId) => { activeFloorId = floorId; selection = { kind: 'floor' }; cancelPending(); }} onadd={addFloor} />
+    <HomeEditorFloorBar {units} floors={plan.floors} active={activeFloor?.floor_id ?? null} onselect={(floorId) => { activeFloorId = floorId; selection = { kind: 'floor' }; cancelPending(); roomOfferOpen = false; }} onadd={addFloor} />
 
     {#if activeFloor}
       <div class="footprint-controls tool-palette">
@@ -502,62 +912,130 @@
           </select>
         </label>
         <button type="button" disabled={!activeFloor.walls.length && !activeFloor.rooms.length} onclick={copyFootprint}>Copy footprint</button>
-        <span class="placing-hint">Copies walls, openings, and rooms. Devices keep their locations.</span>
+        <span class="placing-hint">Copies walls (with thickness), openings, and rooms. Devices keep their locations.</span>
+      </div>
+    {/if}
+
+    {#if activeFloor}
+      <div class="view-controls" role="toolbar" aria-label="Plan view">
+        <button type="button" onclick={() => zoomBy(1 / 1.25)}>Zoom out</button>
+        <span class="zoom-readout" aria-label="Current zoom">{Math.round(scale)} px/m</span>
+        <button type="button" onclick={() => zoomBy(1.25)}>Zoom in</button>
+        <button type="button" onclick={fitPlan}>Fit plan</button>
+        <button type="button" onclick={actualSize}>100%</button>
+        <button type="button" class="detect" onclick={() => offerRooms(true)}>Detect rooms</button>
+      </div>
+    {/if}
+
+    {#if roomOfferOpen && candidates.length > 0}
+      <div class="banner offer" role="region" aria-label="Detected rooms">
+        <strong>{candidates.length === 1 ? 'A closed room was found.' : `${candidates.length} closed rooms were found.`}</strong>
+        <ul class="offer-list">
+          {#each candidates as candidate, index (candidateKey(candidate))}
+            <li>
+              <span class="offer-index">{index + 1}</span>
+              <input type="text" maxlength="64" aria-label={`Name for detected room ${index + 1}`} value={roomNameFor(candidate, index)}
+                oninput={(event) => { roomNameEdits[candidateKey(candidate)] = event.currentTarget.value; }} />
+              <span class="offer-area">{formatArea(candidate.area, units)}</span>
+              <button type="button" onclick={() => addCandidate(candidate, index)}>Add</button>
+            </li>
+          {/each}
+        </ul>
+        {#if candidates.length > 1}<button type="button" onclick={addAllCandidates}>Add all</button>{/if}
+        <button type="button" class="quiet" onclick={() => (roomOfferOpen = false)}>Dismiss</button>
       </div>
     {/if}
 
     <div class="editor-body">
       <div class="canvas-frame">
         {#if activeFloor}
-          <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+          <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
           <!-- role=application is the ARIA drawing-canvas role; every tool is also reachable through real buttons. -->
-          <svg class="plan-canvas" bind:this={svgEl} width={CANVAS_W_M * SCALE} height={CANVAS_H_M * SCALE}
-            viewBox={`0 0 ${CANVAS_W_M * SCALE} ${CANVAS_H_M * SCALE}`} role="application" tabindex="0"
-            aria-label={`Floor plan for ${activeFloor.name}. Grid squares are ${units === 'imperial' ? '6 inches' : '0.5 meters'}. Snap ${units === 'imperial' ? '1 inch' : '0.1 meter'}.`}
-            onclick={onCanvasClick} onkeydown={onCanvasKeydown} ondragover={(event) => event.preventDefault()} ondrop={onCanvasDrop}>
-            <defs>
-              <pattern id="home-grid-minor" width={SCALE * majorGrid / 2} height={SCALE * majorGrid / 2} patternUnits="userSpaceOnUse">
-                <path class="grid-minor" d={`M ${SCALE * majorGrid / 2} 0 L 0 0 0 ${SCALE * majorGrid / 2}`} fill="none" stroke-width="1" />
-              </pattern>
-              <pattern id="home-grid-major" width={SCALE * majorGrid} height={SCALE * majorGrid} patternUnits="userSpaceOnUse">
-                <path class="grid-major" d={`M ${SCALE * majorGrid} 0 L 0 0 0 ${SCALE * majorGrid}`} fill="none" stroke-width="1" />
-              </pattern>
-            </defs>
-            <rect class="grid" width="100%" height="100%" fill="url(#home-grid-minor)" />
-            <rect class="grid" width="100%" height="100%" fill="url(#home-grid-major)" />
+          <svg class="plan-canvas" class:pan-ready={panReady} class:panning={drag?.kind === 'pan'} bind:this={svgEl}
+            viewBox={viewBox(view, viewSize)} role="application" tabindex="0"
+            aria-label={`Floor plan for ${activeFloor.name}. Major grid lines are ${units === 'imperial' ? '1 foot' : '1 meter'} apart. Snap ${units === 'imperial' ? '1 inch' : '0.1 meter'}.`}
+            onclick={onCanvasClick} onclickcapture={onClickCapture} onpointerdowncapture={onPointerDownCapture}
+            onpointermove={onPointerMove} onpointerup={onPointerUp} onpointercancel={onPointerUp} onpointerleave={onPointerLeave}
+            ondragover={(event) => event.preventDefault()} ondrop={onCanvasDrop}>
+            <HomePlanGrid {view} size={viewSize} {units} />
             {#each activeFloor.rooms as room (room.room_id)}
+              {@const centre = polygonCentroid(room.polygon)}
               <polygon class="room" class:selected={selection?.kind === 'room' && selection.id === room.room_id} data-room-id={room.room_id}
                 points={polygonPoints(room.polygon)} role="button" tabindex="0" aria-label={`Room ${room.name}`}
                 onclick={(event) => onRoomClick(event, room)} onkeydown={(event) => keyActivate(event, () => (selection = { kind: 'room', id: room.room_id }))} />
-              <text class="room-label" x={centroid(room.polygon).x * SCALE} y={centroid(room.polygon).y * SCALE}>{room.name}</text>
+              <text class="room-label" x={px(centre.x)} y={px(centre.y)}>{room.name}</text>
+              <text class="room-area" x={px(centre.x)} y={px(centre.y) + 14}>{formatArea(polygonArea(room.polygon), units)}</text>
+            {/each}
+            {#each candidates as candidate, index (candidateKey(candidate))}
+              <polygon class="candidate" points={polygonPoints(candidate.polygon)} data-candidate={index + 1} />
+              <text class="candidate-label" x={px(candidate.centroid.x)} y={px(candidate.centroid.y)}>{index + 1}</text>
             {/each}
             {#each activeFloor.walls as wall (wall.wall_id)}
-              <line class="wall" class:selected={selection?.kind === 'wall' && selection.id === wall.wall_id} data-wall-id={wall.wall_id}
-                x1={wall.start.x * SCALE} y1={wall.start.y * SCALE} x2={wall.end.x * SCALE} y2={wall.end.y * SCALE}
-                role="button" tabindex="0" aria-label={`Wall, ${formatLength(wallLength(wall), units)}`}
-                onclick={(event) => onWallClick(event, wall)} onkeydown={(event) => keyActivate(event, () => (selection = { kind: 'wall', id: wall.wall_id }))} />
-              {#each wall.openings as opening (opening.opening_id)}
-                {@const segment = openingSegment(wall, opening.offset_m, opening.width_m)}
-                <line class={`wall-opening ${opening.kind}`} x1={segment.x1} y1={segment.y1} x2={segment.x2} y2={segment.y2} />
-              {/each}
+              {@const ends = shownEnds(wall)}
+              <HomePlanWall {wall} start={ends.start} end={ends.end} {scale} selected={selection?.kind === 'wall' && selection.id === wall.wall_id}
+                label={`Wall, ${formatLength(wallLength(wall), units)}`}
+                onclick={(event) => onWallClick(event, wall)} onkeydown={(event) => keyActivate(event, () => (selection = { kind: 'wall', id: wall.wall_id }))}
+                onpointerdown={(event) => onWallPointerDown(event, wall)} />
             {/each}
-            {#if selectedWall}
-              <text class="dimension" x={((selectedWall.start.x + selectedWall.end.x) / 2) * SCALE} y={((selectedWall.start.y + selectedWall.end.y) / 2) * SCALE - 10}>{formatLength(wallLength(selectedWall), units)}</text>
+            {#if selectedWall && shownSelected}
+              <text class="dimension" x={px((shownSelected.start.x + shownSelected.end.x) / 2)} y={px((shownSelected.start.y + shownSelected.end.y) / 2) - 12}>{formatLength(Math.hypot(shownSelected.end.x - shownSelected.start.x, shownSelected.end.y - shownSelected.start.y), units)}</text>
+              {#if tool === 'select'}
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                <circle class="handle" role="presentation" data-handle="start" cx={px(shownSelected.start.x)} cy={px(shownSelected.start.y)} r="6" onpointerdown={(event) => onHandlePointerDown(event, selectedWall, 'start')} />
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                <circle class="handle" role="presentation" data-handle="end" cx={px(shownSelected.end.x)} cy={px(shownSelected.end.y)} r="6" onpointerdown={(event) => onHandlePointerDown(event, selectedWall, 'end')} />
+              {/if}
             {/if}
             {#each floorPlacements as placement (placement.device_id)}
               <g class="placement" class:selected={selection?.kind === 'placement' && selection.id === placement.device_id} data-device-id={placement.device_id}
                 role="button" tabindex="0" aria-label={`${deviceName(placement.device_id)} — owner-placed`}
                 onclick={(event) => selectPlacement(event, placement)} onkeydown={(event) => keyActivate(event, () => (selection = { kind: 'placement', id: placement.device_id }))}>
-                <circle cx={placement.x * SCALE} cy={placement.y * SCALE} r="9" />
-                <text x={placement.x * SCALE} y={placement.y * SCALE - 14}>{deviceName(placement.device_id)}</text>
+                <circle cx={px(placement.x)} cy={px(placement.y)} r="9" />
+                <text x={px(placement.x)} y={px(placement.y) - 14}>{deviceName(placement.device_id)}</text>
               </g>
             {/each}
-            {#if pendingWallStart}
-              <circle class="pending-start" cx={pendingWallStart.x * SCALE} cy={pendingWallStart.y * SCALE} r="5" />
-            {/if}
             {#if pendingRoom.length > 0}
-              <polyline class="pending-room" points={polygonPoints(pendingRoom)} />
+              <polyline class="pending-room" points={polygonPoints(cursor ? [...pendingRoom, cursor.point] : pendingRoom)} />
             {/if}
+            {#if pendingWallStart}
+              {#if wallPreviewEnd}
+                <line class="preview-wall" x1={px(pendingWallStart.x)} y1={px(pendingWallStart.y)} x2={px(wallPreviewEnd.x)} y2={px(wallPreviewEnd.y)} stroke-width={Math.max(2, DEFAULT_THICKNESS_M * scale)} />
+              {/if}
+              <circle class="pending-start" cx={px(pendingWallStart.x)} cy={px(pendingWallStart.y)} r="5" />
+            {/if}
+            {#if rectStart}
+              {#if rectPreviewEnd}
+                <rect class="preview-rect" x={px(Math.min(rectStart.x, rectPreviewEnd.x))} y={px(Math.min(rectStart.y, rectPreviewEnd.y))}
+                  width={px(Math.abs(rectPreviewEnd.x - rectStart.x))} height={px(Math.abs(rectPreviewEnd.y - rectStart.y))} />
+              {/if}
+              <circle class="pending-start" cx={px(rectStart.x)} cy={px(rectStart.y)} r="5" />
+            {/if}
+            {#if showMarker && cursor}
+              {#if cursor.guides.x !== null}
+                <line class="guide" x1={px(cursor.guides.x)} y1={originPx.y} x2={px(cursor.guides.x)} y2={originPx.y + viewSize.height} />
+              {/if}
+              {#if cursor.guides.y !== null}
+                <line class="guide" x1={originPx.x} y1={px(cursor.guides.y)} x2={originPx.x + viewSize.width} y2={px(cursor.guides.y)} />
+              {/if}
+              <g class={`snap-marker snap-${cursor.kind}`} data-snap-kind={cursor.kind} transform={`translate(${px(cursor.point.x)} ${px(cursor.point.y)})`}>
+                {#if cursor.kind === 'endpoint'}<rect x="-7" y="-7" width="14" height="14" />
+                {:else if cursor.kind === 'midpoint'}<path d="M0 -8 L8 6 L-8 6 Z" />
+                {:else if cursor.kind === 'on-wall'}<path d="M0 -8 L8 0 L0 8 L-8 0 Z" />
+                {:else if cursor.kind === 'guide'}<path d="M-7 -7 L7 7 M7 -7 L-7 7" />
+                {:else}<path d="M-6 0 H6 M0 -6 V6" />{/if}
+                <text class="snap-label" x="11" y="19">{cursor.label}</text>
+              </g>
+            {/if}
+            {#if readout}
+              {@const flip = px(readout.at.x) - originPx.x > viewSize.width - 150}
+              <text class="readout" x={px(readout.at.x) + (flip ? -14 : 14)} y={px(readout.at.y) - 14} text-anchor={flip ? 'end' : 'start'}>
+                <tspan class="readout-length">{readout.a}</tspan><tspan class="readout-angle" dx="8">{readout.b}</tspan>
+              </text>
+            {/if}
+            <g class="scale-bar" transform={`translate(${originPx.x + 16} ${originPx.y + viewSize.height - 22})`} aria-hidden="true">
+              <path d={`M0 -5 V0 H${bar.px} V-5`} />
+              <text x="0" y="-9">{bar.label}</text>
+            </g>
           </svg>
         {:else}
           <div class="editor-state">This home has no floors yet. Add a floor to start drawing.
@@ -577,8 +1055,6 @@
 
 <style>
   .footprint-controls{margin:0 0 14px;gap:10px}
-  .grid-minor{stroke:var(--line)}
-  .grid-major{stroke:var(--line-strong)}
   .editor-state{margin-top:28px;padding:18px;border:1px dashed var(--line-strong);color:var(--muted-strong);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   .editor-state.error{border-color:var(--pink);color:#ffb4cc}
   .editor-state button{min-height:40px;padding:8px 14px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
@@ -594,7 +1070,15 @@
   .banner.uncertain{border-color:var(--gold);border-style:dashed}
   .banner.uncertain strong{color:var(--gold)}
   .banner.uncertain button{border-color:var(--gold);color:var(--gold)}
+  .banner.offer{border-color:var(--accent);margin:0 0 12px}
+  .banner.offer strong{color:var(--accent)}
+  .offer-list{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:8px}
+  .offer-list li{display:flex;gap:8px;align-items:center;padding:4px 6px;border:1px solid var(--line-strong);border-radius:6px}
+  .offer-index{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:var(--accent);color:var(--accent-ink);font:700 11px var(--font-mono)}
+  .offer-list input{min-height:34px;width:130px;padding:4px 8px;border:1px solid var(--line-strong);border-radius:5px;background:#0e2430;color:var(--ink);font:13px var(--font-display)}
+  .offer-area{color:var(--muted-strong);font:11px var(--font-mono)}
   .editor-toolbar{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;margin:22px 0 0}
+  .tool-hint{margin:10px 0 0;padding:8px 12px;border-left:2px solid var(--accent);background:var(--surface);color:var(--muted-strong);font:12px/1.5 var(--font-display)}
   .tool-palette{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
   .tool-palette button{min-height:44px;padding:9px 13px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
   .tool-palette button.active{border-color:var(--accent);color:var(--accent);box-shadow:inset 0 0 14px var(--accent)14}
@@ -609,27 +1093,44 @@
   .history-actions button:disabled{opacity:.4;cursor:not-allowed}
   .history-actions button.save{border-color:var(--accent);background:var(--accent);color:var(--accent-ink)}
   .autosave{color:var(--muted-strong);font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.07em}
+  .view-controls{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:0 0 10px}
+  .view-controls button{min-height:38px;padding:6px 12px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
+  .view-controls button.detect{border-color:var(--accent);color:var(--accent);margin-left:auto}
+  .zoom-readout{min-width:64px;text-align:center;color:var(--muted-strong);font:11px var(--font-mono)}
   .editor-body{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:16px;align-items:start;margin-top:4px}
-  .canvas-frame{overflow:auto;border:1px solid var(--line-mid);border-radius:10px;background:var(--bg)}
-  .plan-canvas{display:block;background:#081722;outline:none}
+  .canvas-frame{position:relative;overflow:hidden;height:max(480px,min(70vh,680px));border:1px solid var(--line-mid);border-radius:10px;background:var(--bg)}
+  .canvas-frame .editor-state{margin:0;height:100%}
+  .plan-canvas{--plan-bg:#081722;display:block;width:100%;height:100%;background:var(--plan-bg);outline:none;touch-action:none;user-select:none}
   .plan-canvas:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
-  .grid{pointer-events:none}
+  .plan-canvas.pan-ready{cursor:grab}
+  .plan-canvas.panning{cursor:grabbing}
   .room{fill:#123641;fill-opacity:.55;stroke:var(--line-strong);stroke-width:1.5;cursor:pointer}
   .room.selected{stroke:var(--accent);stroke-width:2;fill-opacity:.75}
-  .room-label{fill:var(--muted-strong);font:11px var(--font-mono);text-anchor:middle;pointer-events:none}
-  .wall{stroke:var(--ink);stroke-width:6;stroke-linecap:round;cursor:pointer}
-  .wall.selected{stroke:var(--accent)}
-  .wall-opening{stroke-width:6;stroke-linecap:butt;pointer-events:none}
-  .wall-opening.door{stroke:var(--gold)}
-  .wall-opening.window{stroke:var(--blue)}
-  .wall-opening.stair{stroke:var(--pink);stroke-dasharray:4 3}
-  .dimension{fill:var(--accent);font:700 12px var(--font-mono);text-anchor:middle;pointer-events:none}
+  .room-label{fill:var(--ink);font:600 11px var(--font-mono);text-anchor:middle;pointer-events:none}
+  .room-area{fill:var(--muted-strong);font:10px var(--font-mono);text-anchor:middle;pointer-events:none}
+  .candidate{fill:var(--accent);fill-opacity:.12;stroke:var(--accent);stroke-width:2;stroke-dasharray:6 4;pointer-events:none}
+  .candidate-label{fill:var(--accent);font:700 14px var(--font-mono);text-anchor:middle;dominant-baseline:middle;pointer-events:none}
+  .dimension{fill:var(--accent);font:700 12px var(--font-mono);text-anchor:middle;pointer-events:none;paint-order:stroke;stroke:var(--plan-bg);stroke-width:3px}
+  .handle{fill:var(--plan-bg);stroke:var(--accent);stroke-width:2;cursor:grab}
+  .handle:hover{fill:var(--accent)}
   .placement{cursor:pointer}
   .placement circle{fill:#0e2430;stroke:var(--accent);stroke-width:2}
   .placement.selected circle{fill:var(--accent)}
   .placement text{fill:var(--ink);font:10px var(--font-mono);text-anchor:middle;pointer-events:none}
-  .pending-start{fill:var(--accent)}
+  .pending-start{fill:var(--accent);pointer-events:none}
   .pending-room{fill:none;stroke:var(--accent);stroke-dasharray:5 4;stroke-width:1.5;pointer-events:none}
+  .preview-wall{stroke:var(--accent);stroke-opacity:.6;stroke-linecap:square;pointer-events:none}
+  .preview-rect{fill:var(--accent);fill-opacity:.08;stroke:var(--accent);stroke-width:1.5;stroke-dasharray:5 4;pointer-events:none}
+  .guide{stroke:var(--gold);stroke-width:1;stroke-dasharray:4 4;opacity:.8;pointer-events:none}
+  .snap-marker{fill:none;stroke:var(--gold);stroke-width:2;pointer-events:none}
+  .snap-marker.snap-endpoint{stroke:var(--accent)}
+  .snap-marker.snap-grid{stroke:var(--muted-strong);stroke-width:1.5}
+  .snap-label{fill:var(--ink);stroke:var(--plan-bg);stroke-width:3px;paint-order:stroke;font:600 10px var(--font-mono);text-transform:uppercase;letter-spacing:.05em}
+  .readout{fill:var(--ink);font:700 12px var(--font-mono);paint-order:stroke;stroke:var(--plan-bg);stroke-width:4px;pointer-events:none}
+  .readout-angle{fill:var(--gold)}
+  .scale-bar{pointer-events:none}
+  .scale-bar path{fill:none;stroke:var(--muted-strong);stroke-width:1.5}
+  .scale-bar text{fill:var(--muted-strong);font:10px var(--font-mono)}
   .side-panel{display:grid;gap:14px;align-content:start}
   @media(max-width:1000px){.editor-body{grid-template-columns:1fr}.side-panel{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}}
 </style>

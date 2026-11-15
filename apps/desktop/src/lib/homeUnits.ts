@@ -6,6 +6,10 @@ export const toDisplayLength = (meters: number, units: HomeUnits) => meters / (u
 export const fromDisplayLength = (value: number, units: HomeUnits) => value * (units === 'imperial' ? METERS_PER_FOOT : 1);
 export const gridStep = (units: HomeUnits) => units === 'imperial' ? 0.0254 : 0.1;
 export const formatLength = (meters: number, units: HomeUnits) => `${toDisplayLength(meters, units).toFixed(2)} ${unitSymbol(units)}`;
+export const SQUARE_FEET_PER_SQUARE_METER = 1 / (METERS_PER_FOOT * METERS_PER_FOOT);
+/** Area in the display unit: m² or ft². */
+export const formatArea = (squareMeters: number, units: HomeUnits) =>
+  units === 'imperial' ? `${(squareMeters * SQUARE_FEET_PER_SQUARE_METER).toFixed(0)} ft²` : `${squareMeters.toFixed(1)} m²`;
 export function readHomeUnits(): HomeUnits {
   try { return localStorage.getItem('neonhearth.home.units') === 'imperial' ? 'imperial' : 'metric'; }
   catch { return 'metric'; }

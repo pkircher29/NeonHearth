@@ -6,7 +6,7 @@
 // The winner carries a human label so the canvas can tell the owner exactly
 // what the next click will produce ("endpoint", "on wall").
 
-import { snapPoint, type PlanPoint } from '../stores/home';
+import { GRID_M, snapPoint, type PlanPoint } from '../stores/home';
 
 export const SNAP_RADIUS_PX = 12;
 /** Alignment guides latch a little wider than the snap radius so they are easy to catch. */
@@ -25,6 +25,10 @@ export interface SnapOptions {
   excludeWallIds?: readonly string[];
   /** Extra endpoint-tier targets, e.g. the first point of the chain being drawn. */
   extraPoints?: readonly PlanPoint[];
+  /** Extra alignment-guide anchors that are not snap targets, e.g. the start of the wall being drawn. */
+  guidePoints?: readonly PlanPoint[];
+  /** Grid step in meters (0.1 metric, 0.0254 imperial). */
+  grid?: number;
 }
 
 export interface SnapResult {
@@ -46,12 +50,14 @@ export const SNAP_LABELS: Record<SnapKind, string> = {
 };
 
 const distance = (a: PlanPoint, b: PlanPoint) => Math.hypot(a.x - b.x, a.y - b.y);
+const round6 = (value: number) => Number(value.toFixed(6));
+const exactPoint = (point: PlanPoint): PlanPoint => ({ x: round6(point.x), y: round6(point.y) });
 
 /** Every endpoint on the floor — the anchors alignment guides are drawn from. */
-export function guideAnchors(walls: readonly SnapSegment[]): PlanPoint[] {
+export function guideAnchors(walls: readonly SnapSegment[], extra: readonly PlanPoint[] = []): PlanPoint[] {
   const seen = new Set<string>();
   const anchors: PlanPoint[] = [];
-  for (const wall of walls) {
+  for (const wall of [...walls, ...extra.map((point) => ({ wall_id: '', start: point, end: point }))]) {
     for (const point of [wall.start, wall.end]) {
       const key = `${point.x}:${point.y}`;
       if (seen.has(key)) continue;
@@ -80,7 +86,8 @@ export function computeSnap(cursor: PlanPoint, options: SnapOptions): SnapResult
   const walls = options.walls.filter((wall) => !excluded.has(wall.wall_id));
 
   // Guides are computed for every cursor position: they are an overlay, not only a snap tier.
-  const anchors = guideAnchors(walls);
+  const grid = options.grid && options.grid > 0 ? options.grid : GRID_M;
+  const anchors = guideAnchors(walls, [...options.guidePoints ?? [], ...options.extraPoints ?? []]);
   let guideX: number | null = null;
   let guideY: number | null = null;
   let bestGuideX = guideRadius;
@@ -92,8 +99,10 @@ export function computeSnap(cursor: PlanPoint, options: SnapOptions): SnapResult
     if (dy < bestGuideY) { bestGuideY = dy; guideY = anchor.y; }
   }
   const guides = { x: guideX, y: guideY };
+  // Feature snaps return the exact feature coordinates (no re-snapping to the grid), so an
+  // "endpoint" snap lands on the real endpoint and the new wall truly joins it.
   const result = (point: PlanPoint, kind: SnapKind, wall_id: string | null = null): SnapResult =>
-    ({ point: snapPoint(point), kind, label: SNAP_LABELS[kind], wall_id, guides });
+    ({ point: exactPoint(point), kind, label: SNAP_LABELS[kind], wall_id, guides });
 
   // 1 — wall endpoints (and the chain's own origin).
   let best: { point: PlanPoint; d: number } | null = null;
@@ -104,13 +113,13 @@ export function computeSnap(cursor: PlanPoint, options: SnapOptions): SnapResult
   if (best) return result(best.point, 'endpoint');
 
   // 2 — wall midpoints.
-  best = null;
+  let bestMid: { point: PlanPoint; d: number; wall_id: string } | null = null;
   for (const wall of walls) {
     const mid = { x: (wall.start.x + wall.end.x) / 2, y: (wall.start.y + wall.end.y) / 2 };
     const d = distance(cursor, mid);
-    if (d <= radius && (!best || d < best.d)) best = { point: mid, d };
+    if (d <= radius && (!bestMid || d < bestMid.d)) bestMid = { point: mid, d, wall_id: wall.wall_id };
   }
-  if (best) return result(best.point, 'midpoint');
+  if (bestMid) return result(bestMid.point, 'midpoint', bestMid.wall_id);
 
   // 3 — a point on a wall's body; committing here splits that wall.
   let onWall: { point: PlanPoint; d: number; wall_id: string } | null = null;
@@ -120,33 +129,43 @@ export function computeSnap(cursor: PlanPoint, options: SnapOptions): SnapResult
     const d = distance(cursor, projected.point);
     if (d <= radius && (!onWall || d < onWall.d)) onWall = { point: projected.point, d, wall_id: wall.wall_id };
   }
-  if (onWall) return result(onWall.point, 'on-wall', onWall.wall_id);
+  if (onWall) {
+    // Along an axis-aligned wall the point can sit on the grid; along a diagonal it stays exact.
+    const wall = walls.find((candidate) => candidate.wall_id === onWall!.wall_id)!;
+    const gridded = snapPoint(onWall.point, grid);
+    const onLine = projectOnSegment(gridded, wall.start, wall.end);
+    const usable = distance(gridded, onLine.point) < 1e-9 && onLine.t > 0.001 && onLine.t < 0.999;
+    return result(usable ? gridded : onWall.point, 'on-wall', onWall.wall_id);
+  }
 
-  // 4 — the intersection of a horizontal and a vertical alignment guide.
-  if (guideX !== null && guideY !== null) return result({ x: guideX, y: guideY }, 'guide');
-
-  // 5 — the 0.1 m grid.
-  return result(cursor, 'grid');
+  // 4 — alignment guides (an intersection when both axes line up, otherwise the aligned axis
+  // is pinned to the anchor and the other falls to the grid), then 5 — the plain grid.
+  const gridded = snapPoint(cursor, grid);
+  if (guideX !== null || guideY !== null) {
+    return result({ x: guideX ?? gridded.x, y: guideY ?? gridded.y }, 'guide');
+  }
+  return result(gridded, 'grid');
 }
 
 /** Shift constraint: keep the direction on the nearest 45° ray from `from`. */
-export function constrainAngle(from: PlanPoint, to: PlanPoint): PlanPoint {
+export function constrainAngle(from: PlanPoint, to: PlanPoint, grid = GRID_M): PlanPoint {
   const dx = to.x - from.x;
   const dy = to.y - from.y;
   const length = Math.hypot(dx, dy);
   if (length < 1e-9) return { ...to };
   const step = Math.PI / 4;
   const angle = Math.round(Math.atan2(dy, dx) / step) * step;
-  return snapPoint({ x: from.x + Math.cos(angle) * length, y: from.y + Math.sin(angle) * length });
+  return snapPoint({ x: from.x + Math.cos(angle) * length, y: from.y + Math.sin(angle) * length }, grid);
 }
 
 /** The point `length` meters from `from` along the `from → towards` direction. */
-export function pointAtLength(from: PlanPoint, towards: PlanPoint, length: number): PlanPoint {
+export function pointAtLength(from: PlanPoint, towards: PlanPoint, length: number, grid: number | null = null): PlanPoint {
   const dx = towards.x - from.x;
   const dy = towards.y - from.y;
   const current = Math.hypot(dx, dy);
-  if (current < 1e-9) return snapPoint({ x: from.x + length, y: from.y });
-  return snapPoint({ x: from.x + (dx / current) * length, y: from.y + (dy / current) * length });
+  const raw = current < 1e-9 ? { x: from.x + length, y: from.y } : { x: from.x + (dx / current) * length, y: from.y + (dy / current) * length };
+  // A typed length is exact by default; pass a grid step to snap the result instead.
+  return grid === null ? exactPoint(raw) : snapPoint(raw, grid);
 }
 
 /** Compass-style bearing in degrees, 0 = east, measured counter-clockwise on a screen-y-down plan. */
