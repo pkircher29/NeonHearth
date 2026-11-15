@@ -719,6 +719,16 @@ describe('createApiClient', () => {
     await expect(make({ ...base, anchor: 'surprise' }).auditVerify()).rejects.toThrow('Invalid audit verify response');
   });
 
+  it('reads a remote status without a funnel flag as no conflict and rejects a non-boolean flag', async () => {
+    const status = { daemon: null, daemon_error: null, serve_configured: false, funnel_conflict: true, loopback_port: 58120 };
+    const make = (body: unknown) => createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })) });
+    await expect(make(status).remoteStatus()).resolves.toEqual(status);
+    const { funnel_conflict, ...older } = status;
+    expect(funnel_conflict).toBe(true);
+    await expect(make(older).remoteStatus()).resolves.toEqual({ ...older, funnel_conflict: false });
+    await expect(make({ ...status, funnel_conflict: 'yes' }).remoteStatus()).rejects.toThrow('Invalid remote status response');
+  });
+
   it('binds the owner choice into the approval and repair bodies and rejects a malformed address', async () => {
     const approval = { approval_id: 'appr-0001', expires_at: '2026-08-24T00:10:00Z' };
     const duplicateKind: DiagnosisKind = { kind: 'duplicate_ip', address: '10.0.0.5', macs: ['aa:aa:aa:aa:aa:01', 'ba:bb:bb:bb:bb:02'] };

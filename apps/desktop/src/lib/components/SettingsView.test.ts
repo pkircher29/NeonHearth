@@ -43,6 +43,25 @@ describe('SettingsView', () => {
     expect(getByText('Turn on private access')).toBeTruthy();
   });
 
+  it('warns in plain words when Tailscale Funnel exposes the service and blocks private access', async () => {
+    const api = client();
+    api.remoteStatus.mockResolvedValue({ ...status, funnel_conflict: true });
+    const { findByText, getByRole } = render(SettingsView, { client: api, auth: owner, onsignout: vi.fn() });
+    expect(await findByText('Tailscale Funnel is exposing NeonHearth to the public internet.')).toBeTruthy();
+    expect(await findByText(/does not allow that, so remote access is switched off until Funnel is turned off/)).toBeTruthy();
+    expect((getByRole('button', { name: 'Turn on private access' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('shows no Funnel warning when the conflict is absent or the service does not report it', async () => {
+    const api = client();
+    const withoutFlag: Partial<typeof status> = { ...status };
+    delete withoutFlag.funnel_conflict;
+    api.remoteStatus.mockResolvedValue(withoutFlag as typeof status);
+    const { findByText, queryByText } = render(SettingsView, { client: api, auth: owner, onsignout: vi.fn() });
+    expect(await findByText(/Running · Running/)).toBeTruthy();
+    expect(queryByText(/Funnel is exposing/)).toBeNull();
+  });
+
   it('hides owner-only sections for a paired phone', async () => {
     const api = client();
     const { queryByText, getByText } = render(SettingsView, { client: api, auth: phone, onsignout: vi.fn() });

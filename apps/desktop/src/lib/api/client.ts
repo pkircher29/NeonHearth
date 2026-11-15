@@ -220,9 +220,10 @@ function isAuditVerify(value: unknown): value is AuditVerify {
   return exact(value, 'anchor' in value ? ['report', 'head', 'valid', 'anchor'] : ['report', 'head', 'valid']) && anchorOk && isChainReport(value.report) && (value.head === null || isChainHead(value.head)) && typeof value.valid === 'boolean';
 }
 function isRemoteStatus(value: unknown): value is RemoteStatus {
-  if (!isRecord(value) || !exact(value, ['daemon', 'daemon_error', 'serve_configured', 'funnel_conflict', 'loopback_port'])) return false;
+  // `funnel_conflict` is optional on the wire: a service that does not report it is read as no conflict.
+  if (!isRecord(value) || !exact(value, 'funnel_conflict' in value ? ['daemon', 'daemon_error', 'serve_configured', 'funnel_conflict', 'loopback_port'] : ['daemon', 'daemon_error', 'serve_configured', 'loopback_port'])) return false;
   if (value.daemon !== null && !(isRecord(value.daemon) && exact(value.daemon, ['running', 'backend_state', 'dns_name']) && typeof value.daemon.running === 'boolean' && typeof value.daemon.backend_state === 'string' && (value.daemon.dns_name === null || typeof value.daemon.dns_name === 'string'))) return false;
-  return (value.daemon_error === null || typeof value.daemon_error === 'string') && typeof value.serve_configured === 'boolean' && typeof value.funnel_conflict === 'boolean' && typeof value.loopback_port === 'number';
+  return (value.daemon_error === null || typeof value.daemon_error === 'string') && typeof value.serve_configured === 'boolean' && (!('funnel_conflict' in value) || typeof value.funnel_conflict === 'boolean') && typeof value.loopback_port === 'number';
 }
 function isRemoteServe(value: unknown): value is RemoteServe {
   return isRecord(value) && exact(value, ['configured', 'changed', 'https_port', 'target', 'dns_name']) && typeof value.configured === 'boolean' && typeof value.changed === 'boolean' && typeof value.https_port === 'number' && typeof value.target === 'string' && (value.dns_name === null || typeof value.dns_name === 'string');
@@ -892,7 +893,7 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
   async function remoteStatus(): Promise<RemoteStatus> {
     const value = await request('/api/v1/remote/status', authorized('GET'));
     if (!isRemoteStatus(value)) throw new Error('Invalid remote status response');
-    return value;
+    return { ...value, funnel_conflict: value.funnel_conflict === true };
   }
   async function remoteServe(): Promise<RemoteServe> {
     const value = await request('/api/v1/remote/serve', authorized('POST'));
