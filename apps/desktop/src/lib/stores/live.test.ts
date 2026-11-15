@@ -351,3 +351,15 @@ describe('freshness in the live model', () => {
     expect(liveStatus({ ...known, connected: false })).toBe('stale');
   });
 });
+
+it('clears omitted readings from the next interval', () => {
+ const first = reduceLiveMessage(initialLiveState, { type: 'event', data: bandwidth(1) });
+ const empty = bandwidth(2);
+ if (empty.payload.type !== 'bandwidth_frame') throw new Error('fixture');
+ empty.payload.data.samples = [];
+ const next = reduceLiveMessage(first, { type: 'event', data: empty });
+ expect(next.aggregate).toEqual({ upload: null, download: null });
+ expect(topDevices(next)).toEqual([]);
+ expect(next.throughput).toEqual([]);
+ expect(first.aggregate.upload).toBe(2_000_000);
+});

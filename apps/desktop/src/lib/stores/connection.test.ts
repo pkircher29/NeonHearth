@@ -299,3 +299,18 @@ describe('createLiveConnection', () => {
     expect(connection.getState().deviceOrder).toEqual([]);
   });
 });
+
+it('backs off repeated socket handshake failures', async () => {
+ let fail: () => void = () => {};
+ let retry: () => void = () => {};
+ const delays: number[] = [];
+ const timers = { setTimeout: (callback: () => void, delay: number) => { retry = callback; delays.push(delay); return 1; }, clearTimeout: () => {} };
+ const client = clientStub({ openEvents: vi.fn(async (_seq, _msg, onState) => {
+   fail = () => onState('error'); return { close: vi.fn() } as unknown as WebSocket;
+ }) });
+ const connection = createLiveConnection({ client, timers, random: () => 0.5, openTimeoutMs: 0, staleAfterMs: 0 });
+ await connection.start();
+ for (let i = 0; i < 3; i++) { fail(); retry(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); }
+ expect(delays).toEqual([250, 500, 1000]);
+ connection.stop();
+});

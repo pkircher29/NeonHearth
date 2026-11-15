@@ -142,7 +142,7 @@ export function reduceLiveMessage(state: LiveState, message: ServerMessage): Liv
     // One source: the curve point is the aggregate derived from the same readings.
     if (summary.aggregate.upload !== null && summary.aggregate.download !== null) {
       next.throughput = [...next.throughput, { at: event.occurred_at, upload: summary.aggregate.upload, download: summary.aggregate.download }].slice(-240);
-    }
+    } else { next.throughput = []; }
   } else {
     next.devices = expireBandwidth(next.devices, event.occurred_at);
   }

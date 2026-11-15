@@ -62,14 +62,16 @@
   {#if ondiscover}<button class="discovery-launch" type="button" onclick={ondiscover}>Find devices across the LAN</button>{/if}
   <div class="inventory-summary" aria-label="Network overview"><div><strong>{devices.length}</strong><span>devices observed</span></div><div><strong>{discovery?.devices.length ? responses : counts.online}</strong><span>{discovery?.devices.length ? 'responding to discovery' : 'online now'}</span></div><div><strong>{counts.named}</strong><span>reported names</span></div><div><strong>{counts.confirmed}</strong><span>names confirmed</span></div></div>
   {#if scanApi}<NetworkScanPanel api={scanApi} onchange={value => scan = value} devices={scanDevices}/>{/if}
-  <label class="search"><span>Search devices</span><input bind:value={query} placeholder="Name, IP, MAC, room, or web identity" /></label>
+  <label class="search"><span>Search devices</span><input type="search" bind:value={query} placeholder="Name, IP, MAC, room, or web identity" /></label>
+  <p class="device-result-count" role="status">{visible.length} of {devices.length} devices</p>
+  {#if query || tab !== 'all'}<button class="reset-filters" type="button" onclick={() => { query = ''; tab = 'all'; }}>Clear filters</button>{/if}
   <div class="device-controls">
     <div class="tabs" role="group" aria-label="Filter devices">{#each [['all','All'],['confirmed','Confirmed'],['needs-confirm','Needs confirm']] as item}<button class:active={tab === item[0]} onclick={() => tab = item[0] as typeof tab} aria-pressed={tab === item[0]}>{item[1]}</button>{/each}</div>
     <label class="sort-control"><span>Sort by</span><select aria-label="Sort devices" bind:value={sort}><option value="ip-asc">IP address: low to high</option><option value="ip-desc">IP address: high to low</option><option value="discovery">Discovery order</option></select></label>
   </div>
   {#if network?.status === 'unavailable'}<p class="muted" role="status">Current IP addresses are unavailable. Saved hardware addresses remain visible.</p>{/if}
   {#if visible.length === 0}
-    <div class="empty-state device-empty"><span class="empty-icon" aria-hidden="true">⌁</span><div><strong>{liveState?.connected ? 'No devices match' : 'No devices to show'}</strong><p class="muted">{liveState?.connected ? 'Try a different name or address.' : 'Pair NeonHearth to begin building a private device list.'}</p></div></div>
+    <div class="empty-state device-empty"><span class="empty-icon" aria-hidden="true">⌁</span><div><strong>{liveState?.connected ? 'No devices match' : 'Live device list unavailable'}</strong><p class="muted">{liveState?.connected ? 'Try a different name or address.' : 'Check the local collector connection to load your devices.'}</p></div></div>
   {:else}
     <div class="device-table">{#each visible as device (device.device_id)}
       {@const info = details.get(device.device_id)}

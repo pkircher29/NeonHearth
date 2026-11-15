@@ -138,3 +138,8 @@ button, input, select, textarea { font-family: inherit; }
 }
 /* The in-app motion switch (Settings → Appearance) mirrors the OS preference. */
 :root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+
+/* Current angular theme tokens shared by every feature view. */
+:root { --bg:#0c1011; --surface:#161d20; --surface-raised:#222d31; --line:#354348; --line-mid:#526269; --line-strong:#617178; --ink:#f2f5f3; --muted-strong:#d2dcd9; --muted:#a8b8b7; --faint:#a8b8b7; --accent:#ff865f; --accent-ink:#101514; --radius-sm:0px; --radius:0px; --radius-lg:0px; }
+body::before, body::after { display:none; }
+:root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after { transition:none !important; }
