@@ -422,6 +422,9 @@ test('3D twin v2: camera presets switch the view and mark the active preset', as
   const stage = page.locator('.twin-stage');
   const controls = page.getByRole('toolbar', { name: '3D view controls' });
   await expect(twin).toHaveAttribute('data-camera-preset', 'iso');
+  // Every room floats its name and area over the floor, in Isometric.
+  await expect(page.locator('.twin-room-label', { hasText: 'Den' })).toBeVisible();
+  await expect(page.locator('.twin-room-label', { hasText: 'Den' })).toContainText(/\d+\.\d m²/);
   const iso = await stage.screenshot();
 
   await controls.getByRole('button', { name: 'Top' }).click();

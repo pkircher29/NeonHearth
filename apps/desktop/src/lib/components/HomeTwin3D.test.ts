@@ -304,3 +304,35 @@ describe('HomeTwin3D v2: presets and detail card (stub renderer)', () => {
     expect(view.container.querySelector('.twin')?.getAttribute('data-selected')).toBe('');
   });
 });
+
+describe('HomeTwin3D room labels (stub renderer)', () => {
+  beforeEach(() => {
+    mocks.detectWebGL.mockReturnValue(true);
+  });
+
+  it('floats a name and area label over each room, without intercepting pointer events', () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    const label = view.container.querySelector('.twin-room-label[data-room-id="room-1"]');
+    expect(label?.textContent).toContain('Kitchen');
+    expect(label?.textContent).toContain('12.0 m²');
+    expect(view.container.querySelector('.twin-labels')).toBeTruthy();
+  });
+
+  it('keeps labels when walls are hidden', async () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    await fireEvent.click(screen.getByRole('button', { name: 'Hide walls' }));
+    expect(view.container.querySelector('.twin-room-label[data-room-id="room-1"]')).toBeTruthy();
+  });
+
+  it('hides labels in the Front preset, where floors are seen edge-on', async () => {
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    await fireEvent.click(screen.getByRole('button', { name: 'Front' }));
+    expect(view.container.querySelector('.twin-room-label')).toBeNull();
+  });
+
+  it('has no labels in the 2D fallback', () => {
+    mocks.detectWebGL.mockReturnValue(false);
+    const view = render(HomeTwin3D, { plan, placements, devices, reducedMotion: true });
+    expect(view.container.querySelector('.twin-room-label')).toBeNull();
+  });
+});

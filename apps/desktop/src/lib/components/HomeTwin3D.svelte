@@ -38,6 +38,7 @@
   } from '../twin/twinCamera';
   import { buildPinCard, formatArea, type PinCard, type TwinDeviceInfo } from '../twin/twinCard';
   import { readTwinPalette, type TwinPalette } from '../twin/twinPalette';
+  import { cullLabels, estimateLabelSize, labelAnchor, labelsVisibleForPhi, pinScreenScale, type LabelCandidate } from '../twin/twinLabels';
   import { createTwinRenderer, detectWebGL, type TwinRenderer } from '../twin/webgl';
 
   interface Props {
@@ -72,12 +73,16 @@
     fallback
   }: Props = $props();
 
+  interface RoomLabel { id: string; name: string; area: string; x: number; y: number }
   interface RoomHover { id: string; name: string; area: string; x: number; y: number }
 
   let mode = $state<'pending' | '3d' | 'fallback'>('pending');
   let selected = $state<string | null>(null);
   let selectedRoomId = $state<string | null>(null);
   let hoverRoom = $state<RoomHover | null>(null);
+  let labels = $state<RoomLabel[]>([]);
+  let viewportEl = $state<HTMLDivElement | null>(null);
+  let cardEl = $state<HTMLElement | null>(null);
   let hoverPin = $state<{ id: string; name: string; x: number; y: number } | null>(null);
   let activePreset = $state<CameraPresetName | null>('iso');
   let wallsHidden = $state(false);
@@ -120,8 +125,12 @@
   let staticRoot: THREE.Group | null = null;
   let shadowTexture: THREE.DataTexture | null = null;
   let floorNodes = new Map<string, { group: THREE.Group; walls: THREE.Group }>();
-  let pinNodes = new Map<string, { pin: THREE.Mesh; ring: THREE.Mesh; hit: THREE.Mesh; glow: THREE.Sprite; halo: THREE.Sprite; floor_id: string }>();
-  let roomNodes = new Map<string, { mesh: THREE.Mesh; material: THREE.MeshStandardMaterial; floor_id: string; name: string; area_m2: number | undefined; polygon: Vec2[]; elevation: number }>();
+  let pinNodes = new Map<string, { pin: THREE.Mesh; ring: THREE.Mesh; hit: THREE.Mesh; glow: THREE.Sprite; halo: THREE.Sprite; floor_id: string; pulse: number }>();
+  let extentMeshes: { floor_id: string; mesh: THREE.Mesh }[] = [];
+  const occlusionRay = new THREE.Raycaster();
+  const scratch = new THREE.Vector3();
+  const scratchWorld = new THREE.Vector3();
+  let roomNodes = new Map<string, { mesh: THREE.Mesh; material: THREE.MeshBasicMaterial; anchor: Vec2; floor_id: string; name: string; area_m2: number | undefined; polygon: Vec2[]; elevation: number }>();
   // Walls grouped per wall so every segment of one wall cuts down together.
   let wallNodes: { floor_id: string; mid: Vec2; cut: boolean; parts: { mesh: THREE.Mesh; base: number; height: number }[] }[] = [];
   // Floor materials with their base colour, so floors below the focus dim without alpha.
@@ -187,6 +196,73 @@
     }
   }
 
+  /** Pins keep a minimum on-screen size: scale with camera distance, capped up close. */
+  function applyPinScale() {
+    if (!camera) return;
+    const height = stage?.clientHeight || 420;
+    for (const [id, node] of pinNodes) {
+      node.pin.getWorldPosition(scratchWorld);
+      const zoom = pinScreenScale(camera.position.distanceTo(scratchWorld), camera.fov, height);
+      const isSelected = selected === id;
+      node.pin.scale.setScalar(zoom * (isSelected ? 1.3 : 1) * node.pulse);
+      node.hit.scale.setScalar(zoom);
+      node.glow.scale.setScalar(0.6 * zoom);
+      node.halo.scale.setScalar((isSelected ? 0.78 : 0.56) * zoom);
+    }
+  }
+
+  /** Projects each room's anchor to the canvas; DOM labels follow, culled for room on screen. */
+  function updateLabels() {
+    if (!camera || !stage) return;
+    const next: RoomLabel[] = [];
+    if (labelsVisibleForPhi(phi) && roomNodes.size > 0) {
+      const width = stage.clientWidth || 640;
+      const height = stage.clientHeight || 420;
+      camera.updateMatrixWorld();
+      const candidates: LabelCandidate[] = [];
+      for (const [id, node] of roomNodes) {
+        if (!floorVisible(node.floor_id)) continue;
+        scratchWorld.set(node.anchor.x, node.elevation + 0.15, node.anchor.y);
+        const distance = camera.position.distanceTo(scratchWorld);
+        scratch.copy(scratchWorld).project(camera);
+        if (scratch.z < -1 || scratch.z > 1) continue;
+        // A floor above this label's room hides it: test the ray against those slabs.
+        const level = floorLevel(node.floor_id);
+        const blockers = extentMeshes.filter((entry) => floorLevel(entry.floor_id) > level && floorVisible(entry.floor_id)).map((entry) => entry.mesh);
+        if (blockers.length > 0) {
+          occlusionRay.set(camera.position, scratchWorld.clone().sub(camera.position).normalize());
+          occlusionRay.far = Math.max(0, distance - 0.05);
+          if (occlusionRay.intersectObjects(blockers, false).length > 0) continue;
+        }
+        const size = estimateLabelSize(node.name, node.area_m2 !== undefined);
+        candidates.push({
+          id,
+          x: Math.round((scratch.x * 0.5 + 0.5) * width),
+          y: Math.round((-scratch.y * 0.5 + 0.5) * height),
+          ...size,
+          priority: node.area_m2 ?? 0
+        });
+      }
+      const rects = [];
+      if (cardEl && viewportEl) {
+        const card = cardEl.getBoundingClientRect();
+        const view = viewportEl.getBoundingClientRect();
+        if (card.width > 0) rects.push({ x: card.left - view.left, y: card.top - view.top, w: card.width, h: card.height });
+      }
+      const keep = cullLabels(candidates, { w: width, h: height }, rects);
+      for (const candidate of candidates) {
+        if (!keep.has(candidate.id)) continue;
+        const node = roomNodes.get(candidate.id)!;
+        next.push({ id: candidate.id, name: node.name, area: formatArea(node.area_m2), x: candidate.x, y: candidate.y });
+      }
+    }
+    const same = next.length === labels.length && next.every((label, i) => {
+      const old = labels[i]!;
+      return old.id === label.id && old.x === label.x && old.y === label.y;
+    });
+    if (!same) labels = next;
+  }
+
   function applyCamera() {
     if (!camera) return;
     camera.position.set(
@@ -196,6 +272,8 @@
     );
     camera.lookAt(target);
     updateWallCut();
+    applyPinScale();
+    updateLabels();
   }
 
   function renderFrame() {
@@ -246,9 +324,9 @@
       }
       if (k >= 1) {
         pulses.delete(id);
-        node.pin.scale.setScalar(selected === id ? 1.35 : 1);
+        node.pulse = 1;
       } else {
-        node.pin.scale.setScalar((selected === id ? 1.35 : 1) * (1 + 0.35 * Math.sin(Math.PI * k)));
+        node.pulse = 1 + 0.35 * Math.sin(Math.PI * k);
       }
     }
     if (tween) {
@@ -563,6 +641,7 @@
     roomNodes = new Map();
     wallNodes = [];
     dimmables = [];
+    extentMeshes = [];
     hoverRoom = null;
     hoverPin = null;
     staticRoot = new THREE.Group();
@@ -578,24 +657,24 @@
       const walls = new THREE.Group();
       for (const slab of floor.slabs) {
         if (slab.kind === 'extent') {
-          // A real slab: dark glass, a thin box whose top face is the walking surface.
+          // A real slab: dark navy glass, unlit so the warm key never tints it.
           const { minX, minY, maxX, maxY } = slabBounds(slab);
+          const top = tint(new THREE.MeshBasicMaterial({ color: palette.raised, toneMapped: false }));
+          const edge = tint(new THREE.MeshBasicMaterial({ color: new THREE.Color(palette.raised).multiplyScalar(0.55), toneMapped: false }));
           const mesh = new THREE.Mesh(
             new THREE.BoxGeometry(maxX - minX, SLAB_THICKNESS_M, maxY - minY),
-            tint(new THREE.MeshStandardMaterial({ color: new THREE.Color(palette.raised), roughness: 0.6, metalness: 0 }))
+            [edge, edge, top, edge, edge, edge]
           );
           mesh.position.set((minX + maxX) / 2, -SLAB_THICKNESS_M / 2, (minY + maxY) / 2);
+          extentMeshes.push({ floor_id: floor.floor_id, mesh });
           group.add(mesh);
           continue;
         }
         const geometry = polygonGeometry(slab.polygon);
         if (!geometry) continue;
-        const material = new THREE.MeshStandardMaterial({
-          color: new THREE.Color(palette.raised).lerp(new THREE.Color(palette.ink), 0.1),
-          roughness: 0.7,
-          metalness: 0,
-          emissive: palette.highlight,
-          emissiveIntensity: 0,
+        const material = new THREE.MeshBasicMaterial({
+          color: new THREE.Color(palette.raised).lerp(new THREE.Color(palette.ink), 0.03),
+          toneMapped: false,
           side: THREE.DoubleSide
         });
         tint(material);
@@ -612,6 +691,7 @@
           roomNodes.set(slab.room_id, {
             mesh,
             material,
+            anchor: labelAnchor(slab.polygon),
             floor_id: floor.floor_id,
             name: slab.name?.trim() ? slab.name : 'Unnamed room',
             area_m2: slab.area_m2,
@@ -715,7 +795,7 @@
         ring.position.set(pin.position.x, pin.height_m - 0.05, pin.position.y);
         ring.visible = false;
         group.add(glow, mesh, halo, ring, hit);
-        pinNodes.set(pin.device_id, { pin: mesh, ring, hit, glow, halo, floor_id: floor.floor_id });
+        pinNodes.set(pin.device_id, { pin: mesh, ring, hit, glow, halo, floor_id: floor.floor_id, pulse: 1 });
       }
       for (const cone of floor.cones) {
         const coneRadius = Math.tan(cone.half_angle_rad) * cone.length_m;
@@ -757,12 +837,15 @@
       const factor = focusLevel !== null && floorLevel(entry.floor_id) < focusLevel ? 0.32 : 1;
       entry.material.color.copy(entry.base).multiplyScalar(factor);
     }
+    const highlight = new THREE.Color(palette.highlight);
+    for (const [id, node] of roomNodes) {
+      const amount = hoverRoom?.id === id ? 0.5 : selectedRoomId === id ? 0.35 : 0;
+      if (amount > 0) node.material.color.lerp(highlight, amount);
+    }
   }
 
   function applyRoomHighlight() {
-    for (const [id, node] of roomNodes) {
-      node.material.emissiveIntensity = hoverRoom?.id === id ? 0.38 : selectedRoomId === id ? 0.3 : 0;
-    }
+    applyDim();
   }
 
   function updatePins(now: number) {
@@ -781,16 +864,14 @@
       const quiet = state === 'offline' || state === 'unknown';
       const glow = node.glow.material as THREE.SpriteMaterial;
       glow.color.set(color);
-      glow.opacity = quiet ? 0.35 : 0.75;
+      glow.opacity = quiet ? 0.3 : 0.55;
       const isSelected = selected === pin.device_id;
       node.halo.visible = isSelected || unavailable;
       const haloMaterial = node.halo.material as THREE.SpriteMaterial;
       haloMaterial.color.set(isSelected ? palette.highlight : palette.ink);
-      node.halo.scale.setScalar(isSelected ? 0.78 : 0.56);
       const badge = riskBadge(riskFromPresence(state));
       node.ring.visible = badge.ring;
       (node.ring.material as THREE.MeshBasicMaterial).color.set(badge.outline);
-      if (!pulses.has(pin.device_id)) node.pin.scale.setScalar(isSelected ? 1.3 : 1);
     }
   }
 
@@ -900,6 +981,12 @@
 
   $effect(() => {
     if (mode !== '3d') return;
+    void card; // the card hides labels it would cover
+    requestRender();
+  });
+
+  $effect(() => {
+    if (mode !== '3d') return;
     void presence;
     void bandwidth;
     void selected;
@@ -965,7 +1052,7 @@
       {/each}
     </div>
   {/if}
-  <div class="twin-viewport" class:stage-hidden={mode !== '3d'}>
+  <div class="twin-viewport" class:stage-hidden={mode !== '3d'} bind:this={viewportEl}>
     <!-- The stage is a genuine custom widget (role="application" with full
          keyboard support); svelte's static a11y rules cannot see that. -->
     <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
@@ -984,6 +1071,15 @@
     >
       <canvas bind:this={canvas}></canvas>
     </div>
+    {#if mode === '3d'}
+      <div class="twin-labels" aria-label="Room labels">
+        {#each labels as label (label.id)}
+          <div class="twin-room-label" data-room-id={label.id} style:left="{label.x}px" style:top="{label.y}px">
+            <strong>{label.name}</strong><span>{label.area}</span>
+          </div>
+        {/each}
+      </div>
+    {/if}
     {#if mode === '3d' && hoverRoom}
       <div
         class="twin-room-tip"
@@ -1006,7 +1102,7 @@
       </div>
     {/if}
     {#if mode === '3d' && card}
-      <aside class="twin-card" aria-label="Device details" data-device-id={card.device_id}>
+      <aside class="twin-card" bind:this={cardEl} aria-label="Device details" data-device-id={card.device_id}>
         <header>
           <h3>{card.name}</h3>
           <button type="button" class="twin-card-close" aria-label="Close device details" onclick={clearSelection}>&times;</button>
@@ -1064,6 +1160,10 @@
   .twin-stage { height: clamp(340px, 62vh, 640px); border: 1px solid var(--line); border-radius: 7px; background: radial-gradient(ellipse at 50% 30%, var(--surface-raised) 0%, var(--surface) 45%, var(--bg) 100%); overflow: hidden; touch-action: none; }
   .twin-stage:focus-visible { outline: 3px solid var(--gold); outline-offset: 3px; }
   .twin-stage canvas { display: block; width: 100%; height: 100%; }
+  .twin-labels { position: absolute; inset: 0; overflow: hidden; pointer-events: none; border-radius: 7px; }
+  .twin-room-label { position: absolute; transform: translate(-50%, -50%); display: grid; justify-items: center; gap: 1px; padding: 3px 9px; border-radius: 999px; background: color-mix(in srgb, var(--bg) 72%, transparent); border: 1px solid color-mix(in srgb, var(--line-strong) 70%, transparent); color: var(--ink); white-space: nowrap; pointer-events: none; text-shadow: 0 1px 2px rgb(0 0 0 / 0.7); }
+  .twin-room-label strong { font: 600 12px var(--font-display); letter-spacing: 0.01em; }
+  .twin-room-label span { font: 10px var(--font-mono); color: var(--muted-strong); }
   .twin-room-tip { position: absolute; z-index: 2; display: grid; gap: 1px; padding: 6px 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: color-mix(in srgb, var(--surface) 78%, transparent); backdrop-filter: blur(10px); color: var(--ink); font-size: 12px; pointer-events: none; white-space: nowrap; }
   .twin-room-tip span { color: var(--accent); font: 11px var(--font-mono); }
   .twin-card { position: absolute; z-index: 3; top: 12px; right: 12px; width: min(280px, calc(100% - 24px)); display: grid; gap: 10px; padding: 12px 14px 14px; border: 1px solid var(--line-strong); border-radius: var(--radius-lg, 12px); background: color-mix(in srgb, var(--surface) 72%, transparent); backdrop-filter: blur(16px) saturate(1.25); box-shadow: 0 10px 30px rgb(0 0 0 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.06); color: var(--ink); }
