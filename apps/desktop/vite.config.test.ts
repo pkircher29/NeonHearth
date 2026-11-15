@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { createCollectorProxyOptions, isLoopbackAddress, isSameOriginRequest, type IncomingRequest } from './vite.proxy-auth';
+import { createCollectorProxyOptions, isLoopbackAddress, isLoopbackHost, isSameOriginRequest, type IncomingRequest } from './vite.proxy-auth';
+import { allowedHosts } from './vite.config';
 
 type Listener = (request: { setHeader: (name: string, value: string) => void; removeHeader: (name: string) => void }, incoming?: IncomingRequest) => void;
 
-const loopbackRequest = (headers: IncomingRequest['headers'] = {}, localAddress = '127.0.0.1'): IncomingRequest => ({ headers, socket: { localAddress } });
+const loopbackRequest = (headers: IncomingRequest['headers'] = {}, localAddress = '127.0.0.1'): IncomingRequest => ({ headers: { host: '127.0.0.1:5173', ...headers }, socket: { localAddress } });
 
 function configuredProxyRequest(token: string | undefined, incomingAuthorization?: string, incoming: IncomingRequest | null = loopbackRequest()) {
   let listener: Listener | undefined;
@@ -79,5 +80,28 @@ describe('collectorProxy', () => {
     expect(isLoopbackAddress(undefined)).toBe(false);
     expect(isSameOriginRequest({ 'sec-fetch-site': ['cross-site'] })).toBe(false);
     expect(isSameOriginRequest({})).toBe(true);
+  });
+
+  it('refuses DNS rebinding: a foreign Host, or none, never receives the credential even from a loopback socket', () => {
+    for (const host of ['evil.example', 'evil.example:5173', '127.0.0.1.evil.example', 'localhost.evil.example:5173', '[::1]x', '']) {
+      expect(configuredProxyRequest('server-secret', undefined, { headers: { host, 'sec-fetch-site': 'same-origin' }, socket: { localAddress: '127.0.0.1' } }), host).toBeUndefined();
+    }
+    expect(configuredProxyRequest('server-secret', undefined, { headers: { 'sec-fetch-site': 'same-origin' }, socket: { localAddress: '127.0.0.1' } })).toBeUndefined();
+    for (const host of ['localhost:5173', '127.0.0.1:4201', '127.5.6.7', '[::1]:5173', 'LOCALHOST']) {
+      expect(configuredProxyRequest('server-secret', undefined, { headers: { host }, socket: { localAddress: '127.0.0.1' } }), host).toBe('Bearer server-secret');
+    }
+  });
+
+  it('exposes the loopback host predicate', () => {
+    expect(isLoopbackHost({ host: 'localhost:5173' })).toBe(true);
+    expect(isLoopbackHost({ host: ['evil.example'] })).toBe(false);
+    expect(isLoopbackHost({})).toBe(false);
+  });
+
+  it('pins the dev and preview servers to loopback host names', async () => {
+    expect(allowedHosts).toEqual(['localhost', '127.0.0.1', '[::1]']);
+    const config = (await import('./vite.config')).default;
+    expect(config.server?.allowedHosts).toEqual(allowedHosts);
+    expect(config.preview?.allowedHosts).toEqual(allowedHosts);
   });
 });

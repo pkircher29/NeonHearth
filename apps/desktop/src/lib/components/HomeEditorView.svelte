@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import {
-    DEFAULT_THICKNESS_M, copyFloorFootprint, createEditorState, emptyHomePlan, reduceEditor, selectUncertain, selectUnplaced, snap, snapPoint, wallLength,
+    DEFAULT_THICKNESS_M, PlanLimitError, copyFloorFootprint, createEditorState, emptyHomePlan, reduceEditor, rejectionReason, selectUncertain, selectUnplaced, snap, snapPoint, wallLength,
     type EditAction, type EditorAction, type EditorState, type Estimate, type HomeApi, type HomeDeviceRef, type HomeDraft, type HomeSnapshot, type OpeningKind, type Placement, type PlanPoint, type Room, type Wall
   } from '../stores/home';
   import HomeEditorFloorBar from './HomeEditorFloorBar.svelte';
@@ -18,12 +18,15 @@
   import { deviceLabel } from '../home/deviceLabel';
   import { blockedOpening, blockedOpeningNotice, parseLengthEntry, planRectangleBatch, planWallBatch } from '../home/draft';
   import { DEFAULT_CANVAS_SIZE, floorPoints, initialFloorView, readFloorView, saveFloorView } from '../home/viewStore';
+  import { readLetterShortcuts } from '../stores/preferences';
 
   // `snapshot` is the already-loaded home when a parent owns it (HomeView
   // shares one fetch with the 3D twin, audit M-27); without it the editor
   // fetches on mount. `onsnapshot` reports every server-acknowledged change
   // (committed plan, placements, reloads) so the parent's twin stays current.
-  let { api, devices = [], snapshot = undefined, onsnapshot }: { api: HomeApi; devices?: HomeDeviceRef[]; snapshot?: HomeSnapshot | null; onsnapshot?: (snapshot: HomeSnapshot) => void } = $props();
+  // `active` is false while the editor is mounted but hidden (the 3D tab is showing): the window-level keyboard
+  // handler must then leave the keys alone.
+  let { api, devices = [], snapshot = undefined, onsnapshot, active = true }: { api: HomeApi; devices?: HomeDeviceRef[]; snapshot?: HomeSnapshot | null; onsnapshot?: (snapshot: HomeSnapshot) => void; active?: boolean } = $props();
 
   const AUTOSAVE_DELAY_MS = 2000;
   const OPENING_WIDTHS: Record<OpeningKind, number> = { door: 0.9, window: 0.8, stair: 1.0 };
@@ -36,7 +39,9 @@
     | { kind: 'handle'; wall_id: string; end: 'start' | 'end'; point: PlanPoint; moved: boolean }
     | { kind: 'body'; wall_id: string; clientX: number; clientY: number; from: PlanPoint; delta: PlanPoint; moved: boolean };
 
-  let editor = $state<EditorState>(createEditorState(emptyHomePlan(), []));
+  // Immutable documents replaced wholesale by the reducer: raw state avoids deep proxies over up to 200 history entries.
+  let editor = $state.raw<EditorState>(createEditorState(emptyHomePlan(), []));
+  let letterShortcuts = $state(true);
   let estimates = $state<Estimate[]>([]);
   let version = $state(0);
   let loading = $state(true);
@@ -82,6 +87,15 @@
   const floorPlacements = $derived(activeFloor ? doc.placements.filter((placement) => placement.floor_id === activeFloor.floor_id) : []);
   const unplaced = $derived(selectUnplaced(devices, doc.placements));
   const uncertain = $derived(selectUncertain(devices, doc.placements, estimates));
+  // One tab stop for the whole plan: the focused item, else the selected one, else the first. Arrow keys move between items.
+  const rovingKeys = $derived(activeFloor ? [...activeFloor.rooms.map((room) => `room:${room.room_id}`), ...activeFloor.walls.map((wall) => `wall:${wall.wall_id}`), ...floorPlacements.map((placement) => `placement:${placement.device_id}`)] : []);
+  let rovingFocus = $state<string | null>(null);
+  const rovingKey = $derived.by(() => {
+    if (rovingFocus && rovingKeys.includes(rovingFocus)) return rovingFocus;
+    const current = selection;
+    const selectedKey = current && current.kind !== 'floor' ? `${current.kind}:${current.id}` : null;
+    return selectedKey && rovingKeys.includes(selectedKey) ? selectedKey : (rovingKeys[0] ?? null);
+  });
   const canUndo = $derived(editor.past.length > 0);
   const canRedo = $derived(editor.future.length > 0);
   const segments = $derived(activeFloor ? activeFloor.walls.map((wall) => ({ wall_id: wall.wall_id, start: wall.start, end: wall.end })) : []);
@@ -223,7 +237,7 @@
     for (const placement of placements) confirmedPlacements.set(placement.device_id, placement);
   }
   function emitSnapshot() {
-    onsnapshot?.({ plan: $state.snapshot(editor).doc.plan, placements: $state.snapshot(editor).doc.placements.map((placement) => ({ ...placement })), estimates: $state.snapshot(estimates) });
+    onsnapshot?.({ plan: editor.doc.plan, placements: editor.doc.placements.map((placement) => ({ ...placement })), estimates: $state.snapshot(estimates) });
   }
   function rollbackPlacement(deviceId: string) {
     const confirmed = confirmedPlacements.get(deviceId);
@@ -277,11 +291,11 @@
     return true;
   }
   function apply(action: EditorAction) {
-    if (!dispatch(action)) notice = 'That change is not allowed.';
+    if (!dispatch(action)) notice = rejectionReason(editor, { ...action, grid_m: grid }) ?? 'That change is not allowed.';
   }
 
   function planSnapshot() {
-    return { ...$state.snapshot(editor).doc.plan, version };
+    return { ...editor.doc.plan, version };
   }
   async function persistDraft() {
     autosaveState = 'saving';
@@ -302,7 +316,7 @@
       notice = `Plan saved as version ${result.version}.`;
       emitSnapshot();
       void api.deleteDraft().catch(() => { /* A stale draft is harmless; the committed plan wins. */ });
-    } catch { notice = 'The plan could not be saved. Try again shortly.'; }
+    } catch (cause) { notice = cause instanceof PlanLimitError ? cause.message : 'The plan could not be saved. Try again shortly.'; }
     finally { committing = false; }
   }
   async function reloadLatest() {
@@ -344,18 +358,33 @@
 
   onMount(() => {
     units = readHomeUnits();
+    letterShortcuts = readLetterShortcuts();
+    const onShortcuts = () => { letterShortcuts = readLetterShortcuts(); };
+    window.addEventListener('neonhearth:shortcuts', onShortcuts);
     void (async () => {
       if (snapshot) { adopt(snapshot); loading = false; }
       else await loadHome();
       if (loadError) return;
       try {
         const draft = await api.loadDraft();
-        if (draft.status === 'draft') draftOffer = draft.draft;
+        if (draft.status === 'draft') { draftOffer = draft.draft; if (draft.overLimits) notice = 'The saved draft is over the plan size limits. Resume it, remove some items, then save.'; }
         else if (draft.status === 'corrupt') notice = 'A saved draft could not be read and was discarded. The last committed plan is shown.';
       } catch { /* Draft recovery is optional; the committed plan is already loaded. */ }
     })();
-    return () => clearTimeout(autosaveTimer);
+    return () => {
+      window.removeEventListener('neonhearth:shortcuts', onShortcuts);
+      clearTimeout(autosaveTimer);
+      // Unsaved edits inside the autosave window must not vanish with the view: flush the draft now.
+      if (autosaveState === 'dirty') void persistDraft();
+    };
   });
+  // A closing tab with unsaved edits asks first, and still tries to leave a draft behind.
+  function onBeforeUnload(event: BeforeUnloadEvent) {
+    if (autosaveState !== 'dirty' && autosaveState !== 'saving') return;
+    void persistDraft();
+    event.preventDefault();
+    event.returnValue = '';
+  }
 
   // ---- Canvas geometry ----
   function offsetOf(event: { clientX: number; clientY: number }): { x: number; y: number } {
@@ -764,6 +793,7 @@
     }
   }
   function onWindowKeydown(event: KeyboardEvent) {
+    if (!active) return;
     const textEntry = isTextEntry(event.target);
     if (event.ctrlKey || event.metaKey) {
       if (textEntry) return;
@@ -790,12 +820,12 @@
       }
     }
     if (key === 'Enter' && tool === 'room' && pendingRoom.length >= 3 && (onPlan || onBody(event.target))) { event.preventDefault(); finishRoom(); return; }
-    if (key === ' ' && !event.repeat && (onPlan || onBody(event.target)) && !(event.target as Element | null)?.closest?.('button, [role="button"], a, summary')) {
+    if (letterShortcuts && key === ' ' && !event.repeat && (onPlan || onBody(event.target)) && !(event.target as Element | null)?.closest?.('button, [role="button"], a, summary')) {
       event.preventDefault();
       spaceHeld = true;
       return;
     }
-    const nextTool = TOOL_KEYS[key.toLowerCase()];
+    const nextTool = letterShortcuts ? TOOL_KEYS[key.toLowerCase()] : undefined;
     if (nextTool && !event.repeat && !event.shiftKey) { setTool(nextTool); return; }
 
     if (!onPlan || !activeFloor) return;
@@ -805,6 +835,20 @@
       else if (selection.kind === 'room') apply({ type: 'delete_room', floor_id: activeFloor.floor_id, room_id: selection.id });
       else if (selection.kind === 'placement') apply({ type: 'remove_placement', device_id: selection.id });
       return;
+    }
+    // Arrows on a plan item that is not the selection browse between items; on the selection they nudge it.
+    const itemEl = (event.target as Element | null)?.closest?.('[data-roving]') ?? null;
+    const order: Record<string, number> = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+    if (itemEl && order[key] !== undefined && !event.shiftKey) {
+      const here = itemEl.getAttribute('data-roving') ?? '';
+      const sel = selection && selection.kind !== 'floor' ? `${selection.kind}:${selection.id}` : null;
+      if (here !== sel && rovingKeys.length > 1) {
+        event.preventDefault();
+        const nextKey = rovingKeys[(rovingKeys.indexOf(here) + order[key]! + rovingKeys.length) % rovingKeys.length]!;
+        rovingFocus = nextKey;
+        queueMicrotask(() => svgEl?.querySelector<SVGElement>(`[data-roving="${CSS.escape(nextKey)}"]`)?.focus());
+        return;
+      }
     }
     const step: Record<string, [number, number]> = { ArrowLeft: [-grid, 0], ArrowRight: [grid, 0], ArrowUp: [0, -grid], ArrowDown: [0, grid] };
     const nudge = step[key];
@@ -914,7 +958,7 @@
   });
   const hint = $derived.by(() => {
     switch (tool) {
-      case 'select': return 'Click a wall, room or device to select it. Drag a selected wall’s end handles to reshape it, or drag the wall to move it. Delete removes it.';
+      case 'select': return 'Click a wall, room or device to select it, or Tab to the plan and use the arrow keys to move between items; Enter selects, then arrows nudge it. Drag a selected wall’s end handles to reshape it. Delete removes it.';
       case 'pan': return 'Drag to pan the plan. Scroll to zoom at the cursor. Space or the middle mouse button also pans in any tool.';
       case 'wall': return pendingWallStart
         ? 'Click for the next corner, or type a length and press Enter. Click the first point to close the loop. Shift keeps it straight. Esc or Enter finishes.'
@@ -933,7 +977,7 @@
   ];
 </script>
 
-<svelte:window onkeydown={onWindowKeydown} onkeyup={onWindowKeyup} onblur={() => { spaceHeld = false; }} />
+<svelte:window onkeydown={onWindowKeydown} onkeyup={onWindowKeyup} onbeforeunload={onBeforeUnload} onblur={() => { spaceHeld = false; }} />
 
 <section class="home-editor" aria-labelledby="home-heading">
   <div class="view-heading">
@@ -1055,14 +1099,14 @@
           <svg class="plan-canvas" class:pan-ready={panReady} class:panning={drag?.kind === 'pan'} bind:this={svgEl}
             viewBox={viewBox(view, viewSize)} role="application" tabindex="0"
             aria-label={`Floor plan for ${activeFloor.name}. Major grid lines are ${units === 'imperial' ? '1 foot' : '1 meter'} apart. Snap ${units === 'imperial' ? '1 inch' : '0.1 meter'}.`}
-            onclick={onCanvasClick} onclickcapture={onClickCapture} onpointerdowncapture={onPointerDownCapture}
+            onfocusin={(event) => { rovingFocus = (event.target as Element).closest?.('[data-roving]')?.getAttribute('data-roving') ?? rovingFocus; }} onclick={onCanvasClick} onclickcapture={onClickCapture} onpointerdowncapture={onPointerDownCapture}
             onpointermove={onPointerMove} onpointerup={onPointerUp} onpointercancel={onPointerUp} onpointerleave={onPointerLeave}
             ondragover={(event) => event.preventDefault()} ondrop={onCanvasDrop}>
             <HomePlanGrid {view} size={viewSize} {units} />
             {#each activeFloor.rooms as room (room.room_id)}
               {@const centre = polygonCentroid(room.polygon)}
               <polygon class="room" class:selected={selection?.kind === 'room' && selection.id === room.room_id} data-room-id={room.room_id}
-                points={polygonPoints(room.polygon)} role="button" tabindex="0" aria-label={`Room ${room.name}`}
+                points={polygonPoints(room.polygon)} role="button" tabindex={rovingKey === `room:${room.room_id}` ? 0 : -1} data-roving={`room:${room.room_id}`} aria-label={`Room ${room.name}`}
                 onclick={(event) => onRoomClick(event, room)} onkeydown={(event) => keyActivate(event, () => (selection = { kind: 'room', id: room.room_id }))} />
               <text class="room-label" x={px(centre.x)} y={px(centre.y)}>{room.name}</text>
               <text class="room-area" x={px(centre.x)} y={px(centre.y) + 14}>{formatArea(polygonArea(room.polygon), units)}</text>
@@ -1073,7 +1117,7 @@
             {/each}
             {#each activeFloor.walls as wall (wall.wall_id)}
               {@const ends = shownEnds(wall)}
-              <HomePlanWall {wall} start={ends.start} end={ends.end} {scale} selected={selection?.kind === 'wall' && selection.id === wall.wall_id}
+              <HomePlanWall {wall} start={ends.start} end={ends.end} {scale} tabindex={rovingKey === `wall:${wall.wall_id}` ? 0 : -1} selected={selection?.kind === 'wall' && selection.id === wall.wall_id}
                 label={`Wall, ${formatLength(wallLength(wall), units)}`}
                 onclick={(event) => onWallClick(event, wall)} onkeydown={(event) => keyActivate(event, () => (selection = { kind: 'wall', id: wall.wall_id }))}
                 onpointerdown={(event) => onWallPointerDown(event, wall)} />
@@ -1089,7 +1133,7 @@
             {/if}
             {#each floorPlacements as placement (placement.device_id)}
               <g class="placement" class:selected={selection?.kind === 'placement' && selection.id === placement.device_id} data-device-id={placement.device_id}
-                role="button" tabindex="0" aria-label={`${deviceName(placement.device_id)} — owner-placed`}
+                role="button" tabindex={rovingKey === `placement:${placement.device_id}` ? 0 : -1} data-roving={`placement:${placement.device_id}`} aria-label={`${deviceName(placement.device_id)} — owner-placed`}
                 onclick={(event) => selectPlacement(event, placement)} onkeydown={(event) => keyActivate(event, () => (selection = { kind: 'placement', id: placement.device_id }))}>
                 <circle cx={px(placement.x)} cy={px(placement.y)} r="9" />
                 <text x={px(placement.x)} y={px(placement.y) - 14}>{deviceName(placement.device_id)}</text>
@@ -1196,7 +1240,7 @@
   .tool-hint{margin:8px 0 0;padding:8px 12px;border-left:2px solid var(--accent);background:var(--surface);color:var(--muted-strong);font:12px/1.5 var(--font-display)}
   .tool-palette{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
   .tool-palette button{min-height:40px;padding:7px 12px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
-  .tool-palette button.active{border-color:var(--accent);color:var(--accent);box-shadow:inset 0 0 14px var(--accent)14}
+  .tool-palette button.active{border-color:var(--accent);color:var(--accent);box-shadow:inset 0 0 14px color-mix(in srgb, var(--accent) 8%, transparent)}
   .tool-palette button.finish{border-color:var(--accent);color:var(--accent-ink);background:var(--accent)}
   .tool-palette button.quiet{border-color:var(--line-strong);color:var(--muted-strong)}
   .tool-palette button:disabled{opacity:.4;cursor:not-allowed}

@@ -27,6 +27,19 @@ export function isLoopbackAddress(address: string | undefined): boolean {
   return address !== undefined && LOOPBACK.test(address);
 }
 
+const LOOPBACK_HOST = /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d{1,5})?$/i;
+
+/**
+ * DNS rebinding: a hostile page whose name resolves to 127.0.0.1 reaches this server with its own name in the Host
+ * header (and Sec-Fetch-Site: same-origin, since the page and the request share that name). Only a loopback Host
+ * may borrow the credential; a missing Host is refused too.
+ */
+export function isLoopbackHost(headers: IncomingRequest['headers']): boolean {
+  const raw = headers.host;
+  const host = Array.isArray(raw) ? raw[0] : raw;
+  return typeof host === 'string' && LOOPBACK_HOST.test(host.trim());
+}
+
 /**
  * A page from another origin can still reach the proxy through the browser
  * (a bodyless POST is a CORS "simple" request whose side effect lands even
@@ -55,7 +68,7 @@ export function createCollectorProxyOptions(serviceToken: string | undefined): C
         proxyRequest.removeHeader('authorization');
         if (!serviceToken) return;
         // No request context (a synthetic call) is treated as untrusted.
-        if (!request || !isLoopbackAddress(request.socket?.localAddress) || !isSameOriginRequest(request.headers)) return;
+        if (!request || !isLoopbackAddress(request.socket?.localAddress) || !isLoopbackHost(request.headers) || !isSameOriginRequest(request.headers)) return;
         proxyRequest.setHeader('authorization', `Bearer ${serviceToken}`);
       });
     }

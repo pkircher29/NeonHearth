@@ -1,14 +1,34 @@
 name: Release
 
-# Tagged release: native Windows Home Hub, compatibility MSI, and Linux packages
-# from the packaging/ scaffolding and publishes them on a GitHub pre-release.
+# Tagged release: native Windows Home Hub (x64 and ARM64), compatibility MSI and
+# setup EXE, and Linux packages, published as a GitHub pre-release.
 #
-# Version flow: the tag (vX.Y.Z[-pre]) is the single source of truth.
-#   - full version  = tag without the leading "v" (names files, the release)
-#   - MSI version   = numeric X.Y.Z part only (MSI ProductVersion cannot
-#     carry a semver prerelease suffix; WiX gets it via -d MsiVersion)
-#   - nfpm receives the full semver via NEONHEARTH_VERSION and splits the
-#     prerelease itself (deb: 0.1.0~alpha.1, rpm: version/release fields).
+# JOB GRAPH (identity and third-party code never share a job)
+#
+#   plan ─┬─ quality (ci.yml)
+#         │
+#         └─ build-windows ──┬─ sign-programs ──┐   (sign.yml: holds the Azure identity)
+#            (unsigned)      │                  ├─ package-home-hub ── windows-arm64-smoke
+#                            └──────────────────┤
+#                                               └─ build-msi ─ sign-msi ─ build-bundle ─ sign-engine ─
+#                                                  reattach-bundle ─ sign-bundle ─ finalize-installer
+#   linux-packages (unsigned by design)
+#   release: verifies every artifact against its producer's hash list, then publishes.
+#
+#  * BUILD jobs (cargo, npm, pip, WiX) have no `environment` and no `id-token`
+#    permission. They publish unsigned artifacts plus a SHA256SUMS list whose
+#    hash is a JOB OUTPUT (scripts/ci-hashes.py).
+#  * SIGN jobs are .github/workflows/sign.yml: they verify the artifact against
+#    that output, sign only named files, verify the signatures, and run no
+#    build tooling.
+#  * Packaging happens AFTER signing so PACKAGE-MANIFEST.json, BUILD-INFO.json
+#    and the ZIP hash describe the signed programs. The MSI embeds the signed
+#    collector, the Burn bundle embeds the signed MSI, and the Burn engine is
+#    detached, signed and reattached in separate jobs because WiX (third-party
+#    code) must not run next to the signing identity.
+#  * Signing happens only for refs/heads/main and v* tags. A manual candidate
+#    from any other branch builds unsigned and says so. On a tag, missing
+#    signing configuration or a tag commit that is not on main fails `plan`.
 
 on:
   workflow_dispatch:
@@ -28,60 +48,123 @@ permissions:
   contents: read
 
 jobs:
+  plan:
+    name: Plan version and signing
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.plan.outputs.full }}
+      msi: ${{ steps.plan.outputs.msi }}
+      sign: ${{ steps.plan.outputs.sign }}
+      note: ${{ steps.plan.outputs.note }}
+      publisher: ${{ steps.plan.outputs.publisher }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve version, ref policy and signing
+        id: plan
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
+          SIGN_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          SIGN_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          SIGN_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          SIGN_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          SIGN_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          SIGN_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          SIGN_PUBLISHER: ${{ vars.ARTIFACT_SIGNING_PUBLISHER }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then full="${GITHUB_REF_NAME#v}"; else full="$MANUAL_VERSION"; fi
+          if ! [[ "$full" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version '$full'" >&2; exit 1
+          fi
+          base="${full%%-*}"
+          workspace="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$base" != "$workspace" ]; then
+            echo "Version base $base does not match workspace version $workspace" >&2; exit 1
+          fi
+
+          is_tag=false; [ "$GITHUB_REF_TYPE" = tag ] && is_tag=true
+          eligible=false
+          if [ "$is_tag" = true ] || [ "$GITHUB_REF" = refs/heads/main ]; then eligible=true; fi
+
+          if [ "$is_tag" = true ]; then
+            # A release tag must point at a commit that is already on main.
+            git fetch --no-tags origin main:refs/remotes/origin/main || true
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+              echo "Tag $GITHUB_REF_NAME ($GITHUB_SHA) is not an ancestor of origin/main; refusing to build a release." >&2
+              exit 1
+            fi
+          fi
+
+          configured=false
+          if [ -n "$SIGN_CLIENT_ID" ]; then
+            for value in "$SIGN_TENANT_ID" "$SIGN_SUBSCRIPTION_ID" "$SIGN_ENDPOINT" "$SIGN_ACCOUNT" "$SIGN_PROFILE" "$SIGN_PUBLISHER"; do
+              if [ -z "$value" ]; then echo "Signing is partly configured: every AZURE_* and ARTIFACT_SIGNING_* repository variable must be set." >&2; exit 1; fi
+            done
+            configured=true
+          fi
+
+          sign=false
+          if [ "$eligible" = true ] && [ "$configured" = true ]; then sign=true; fi
+          if [ "$is_tag" = true ] && [ "$sign" != true ]; then
+            echo "A release tag requires signing, but it is not configured (repository variables AZURE_CLIENT_ID and ARTIFACT_SIGNING_*)." >&2; exit 1
+          fi
+          if [ "$sign" = true ]; then
+            note="Windows programs and installers are code-signed by ${SIGN_PUBLISHER}."
+          elif [ "$eligible" != true ]; then
+            note="UNSIGNED candidate: signing runs only for main and v* tags, and this ref is $GITHUB_REF."
+          else
+            note="UNSIGNED candidate: signing is not configured for this repository."
+          fi
+          {
+            echo "full=$full"
+            echo "msi=$base"
+            echo "sign=$sign"
+            echo "note=$note"
+            echo "publisher=$SIGN_PUBLISHER"
+          } >> "$GITHUB_OUTPUT"
+          echo "$note"
+
   quality:
     uses: ./.github/workflows/ci.yml
 
-  windows-home-hub:
-    name: Windows native Home Hub ${{ matrix.arch }} (recommended ZIP)
-    # ARM64 is cross-compiled with the x64 runner's MSVC ARM64 tools, then signed
-    # and packaged here; windows-arm64-smoke runs the result on an ARM64 runner.
+  # ------------------------------------------------------------------ build
+  build-windows:
+    name: Build Windows programs and payload (unsigned)
+    needs: [plan, quality]
     runs-on: windows-latest
-    needs: quality
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            target: x86_64-pc-windows-msvc
-          - arch: arm64
-            target: aarch64-pc-windows-msvc
-    # Holds the trust link that lets this job sign with Azure Artifact Signing.
-    environment: release-signing
     permissions:
       contents: read
-      id-token: write
+    outputs:
+      programs: ${{ steps.hashes.outputs.programs }}
+      payload: ${{ steps.hashes.outputs.payload }}
     env:
       # Rust EXEs must load before the launcher can explain the broker's separate prerequisite.
-      CARGO_BUILD_TARGET: ${{ matrix.target }}
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
       CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-09-03
         with:
           toolchain: 1.96.0
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc,aarch64-pc-windows-msvc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: ${{ matrix.target }}
+          key: windows-release
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
-      - name: Resolve candidate version
-        id: version
-        shell: pwsh
-        env:
-          MANUAL_VERSION: ${{ inputs.version }}
-        run: |
-          $full = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME -replace '^v','' } else { $env:MANUAL_VERSION }
-          if ($full -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw 'Invalid release version' }
-          "full=$full" | Add-Content $env:GITHUB_OUTPUT
       - name: Verify packaging boundaries
+        shell: pwsh
         run: |
           python packaging/test_home_hub_package.py
           if ($LASTEXITCODE -ne 0) { throw 'Packaging tests failed' }
@@ -89,37 +172,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Import parser tests failed' }
           python packaging/windows/test_windows_stage.py
           if ($LASTEXITCODE -ne 0) { throw 'Staging target tests failed' }
-      - name: Build locked native launcher and collector
-        run: cargo build --locked --release --target ${{ matrix.target }} -p lattice-service -p lattice-launcher
-      # Code signing with Azure Artifact Signing. The job signs in with GitHub's
-      # OIDC identity (no stored secret). Without the AZURE_CLIENT_ID repository
-      # variable every signing step is skipped and the output stays unsigned.
-      # The signing token lasts about an hour and cannot be renewed in the job,
-      # so the sign-in comes after the long compile.
-      - name: Sign in to Azure for code signing
-        if: vars.AZURE_CLIENT_ID != ''
-        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      - name: Prepare code signing
-        if: vars.AZURE_CLIENT_ID != ''
-        shell: pwsh
-        run: ./scripts/windows-signing/setup.ps1 -Endpoint "${{ vars.ARTIFACT_SIGNING_ENDPOINT }}" -Account "${{ vars.ARTIFACT_SIGNING_ACCOUNT }}" -CertificateProfile "${{ vars.ARTIFACT_SIGNING_PROFILE }}"
-      # Signed before packaging so PACKAGE-MANIFEST.json and the ZIP hash
-      # describe the signed programs.
-      - name: Sign and check the launcher and collector
-        if: vars.AZURE_CLIENT_ID != ''
-        shell: pwsh
-        run: |
-          $release = 'target/${{ matrix.target }}/release'
-          foreach ($name in 'NeonHearth.exe', 'lattice-service.exe') {
-            ./scripts/windows-signing/sign.ps1 "$release/$name"
-            if ($LASTEXITCODE -ne 0) { throw "Signing $name failed" }
-          }
-          ./scripts/windows-signing/verify.ps1 -Publisher "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}" "$release/NeonHearth.exe" "$release/lattice-service.exe"
-          if ($LASTEXITCODE -ne 0) { throw 'Signature check failed' }
+          python -m unittest discover -s scripts/tests -p 'test_*.py'
+          if ($LASTEXITCODE -ne 0) { throw 'Release tooling tests failed' }
+      - name: Build locked native launcher and collector (x64)
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p lattice-service -p lattice-launcher
+      - name: Build locked native launcher and collector (ARM64, cross-compiled)
+        run: cargo build --locked --release --target aarch64-pc-windows-msvc -p lattice-service -p lattice-launcher
       - name: Build dashboard
         shell: pwsh
         run: |
@@ -128,92 +186,223 @@ jobs:
           npm --prefix apps/desktop run build
           if ($LASTEXITCODE -ne 0) { throw 'UI build failed' }
       - name: Prepare checksum-pinned broker without installing it
-        run: python packaging/windows/prepare-mosquitto.py --output "${{ runner.temp }}/neonhearth-mosquitto"
-      - name: Assemble native Home Hub ZIP
+        run: python packaging/windows/prepare-mosquitto.py --output "${{ runner.temp }}/out/payload/broker"
+      - name: Collect third-party notices
+        run: python scripts/package-home-hub.py --emit-notices "${{ runner.temp }}/out/payload/notices"
+      - name: Collect programs and dashboard
         shell: pwsh
         run: |
+          $out = Join-Path $env:RUNNER_TEMP 'out'
+          foreach ($pair in @(@('x64','x86_64-pc-windows-msvc'), @('arm64','aarch64-pc-windows-msvc'))) {
+            $dest = Join-Path $out "programs/$($pair[0])"
+            New-Item -ItemType Directory -Force $dest | Out-Null
+            foreach ($name in 'NeonHearth.exe', 'lattice-service.exe') {
+              Copy-Item "target/$($pair[1])/release/$name" $dest
+            }
+          }
+          Copy-Item -Recurse apps/desktop/dist (Join-Path $out 'payload/ui')
+      - name: Hash the artifacts
+        id: hashes
+        shell: pwsh
+        run: |
+          $programs = python scripts/ci-hashes.py create "$env:RUNNER_TEMP/out/programs"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not hash the programs' }
+          $payload = python scripts/ci-hashes.py create "$env:RUNNER_TEMP/out/payload"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not hash the payload' }
+          "programs=$programs" | Add-Content $env:GITHUB_OUTPUT
+          "payload=$payload" | Add-Content $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: win-programs
+          path: ${{ runner.temp }}/out/programs
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: win-payload
+          path: ${{ runner.temp }}/out/payload
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------- sign
+  sign-programs:
+    name: Sign launcher and collector
+    needs: [plan, build-windows]
+    if: needs.plan.outputs.sign == 'true'
+    uses: ./.github/workflows/sign.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      artifact: win-programs
+      expected: ${{ needs.build-windows.outputs.programs }}
+      signed_artifact: win-programs-signed
+      files: |
+        x64/NeonHearth.exe
+        x64/lattice-service.exe
+        arm64/NeonHearth.exe
+        arm64/lattice-service.exe
+
+  # --------------------------------------------------------- Home Hub ZIPs
+  package-home-hub:
+    name: Package Home Hub ZIPs (x64, ARM64)
+    needs: [plan, build-windows, sign-programs]
+    if: ${{ !cancelled() && needs.build-windows.result == 'success' && (needs.sign-programs.result == 'success' || (needs.sign-programs.result == 'skipped' && needs.plan.outputs.sign != 'true')) }}
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      sums: ${{ steps.dist.outputs.sums }}
+    env:
+      SIGNED: ${{ needs.plan.outputs.sign }}
+      VERSION: ${{ needs.plan.outputs.full }}
+      PUBLISHER: ${{ needs.plan.outputs.publisher }}
+      NEONHEARTH_CI_HARNESS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: win-payload
+          path: ${{ runner.temp }}/in/payload
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ needs.plan.outputs.sign == 'true' && 'win-programs-signed' || 'win-programs' }}
+          path: ${{ runner.temp }}/in/programs
+      - name: Verify inputs against the producing jobs' hash lists
+        shell: pwsh
+        env:
+          PAYLOAD_SUMS: ${{ needs.build-windows.outputs.payload }}
+          PROGRAMS_SUMS: ${{ needs.plan.outputs.sign == 'true' && needs.sign-programs.outputs.signed || needs.build-windows.outputs.programs }}
+        run: |
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/in/payload" --expect $env:PAYLOAD_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'Payload does not match the build job' }
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/in/programs" --expect $env:PROGRAMS_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'Programs do not match the producing job' }
+      - name: Check the programs are signed by the expected publisher
+        if: env.SIGNED == 'true'
+        shell: pwsh
+        run: |
+          $programs = "$env:RUNNER_TEMP/in/programs"
+          ./scripts/windows-signing/verify.ps1 -Publisher $env:PUBLISHER "$programs/x64/NeonHearth.exe" "$programs/x64/lattice-service.exe" "$programs/arm64/NeonHearth.exe" "$programs/arm64/lattice-service.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Signature check failed' }
+      - name: Assemble the Home Hub ZIPs from the (signed) programs
+        shell: pwsh
+        run: |
+          $in = "$env:RUNNER_TEMP/in"
           $signed = @()
-          if ("${{ vars.AZURE_CLIENT_ID }}") { $signed = @('--signed-by', "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}") }
-          python scripts/package-home-hub.py --target target/${{ matrix.target }}/release --platform windows-${{ matrix.arch }} --mosquitto "${{ runner.temp }}/neonhearth-mosquitto" --output "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-${{ matrix.arch }}" --version "${{ steps.version.outputs.full }}" @signed
-          if ($LASTEXITCODE -ne 0) { throw 'Home Hub packaging failed' }
+          if ($env:SIGNED -eq 'true') { $signed = @('--signed-by', $env:PUBLISHER) }
+          foreach ($arch in 'x64', 'arm64') {
+            python scripts/package-home-hub.py --target "$in/programs/$arch" --ui "$in/payload/ui" --notices "$in/payload/notices" --mosquitto "$in/payload/broker" --platform "windows-$arch" --output "packaging/dist/NeonHearth-Home-Hub-$env:VERSION-windows-$arch" --version $env:VERSION @signed
+            if ($LASTEXITCODE -ne 0) { throw "Home Hub packaging failed for $arch" }
+          }
       - name: Check the packaged signatures
-        if: vars.AZURE_CLIENT_ID != ''
+        if: env.SIGNED == 'true'
         shell: pwsh
         run: |
-          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-${{ matrix.arch }}"
-          ./scripts/windows-signing/verify.ps1 -Publisher "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}" "$hub/NeonHearth.exe" "$hub/bin/lattice-service.exe"
-          if ($LASTEXITCODE -ne 0) { throw 'Packaged signature check failed' }
+          foreach ($arch in 'x64', 'arm64') {
+            $hub = "packaging/dist/NeonHearth-Home-Hub-$env:VERSION-windows-$arch"
+            ./scripts/windows-signing/verify.ps1 -Publisher $env:PUBLISHER "$hub/NeonHearth.exe" "$hub/bin/lattice-service.exe"
+            if ($LASTEXITCODE -ne 0) { throw "Packaged signature check failed for $arch" }
+          }
       - name: Validate exact payload and executable loading
         shell: pwsh
         run: |
-          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-${{ matrix.arch }}"
-          python packaging/windows/check-rust-imports.py "$hub/NeonHearth.exe" "$hub/bin/lattice-service.exe"
-          if ($LASTEXITCODE -ne 0) { throw 'Shipped Rust executable requires an external VC runtime' }
-          $manifest = Get-Content -Raw "$hub/PACKAGE-MANIFEST.json" | ConvertFrom-Json
-          foreach ($file in $manifest.files) {
-            $path = Join-Path $hub $file.path
-            if ((Get-Item $path).Length -ne $file.bytes) { throw "Size mismatch: $($file.path)" }
-            if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLower() -ne $file.sha256) { throw "Hash mismatch: $($file.path)" }
+          foreach ($arch in 'x64', 'arm64') {
+            $hub = "packaging/dist/NeonHearth-Home-Hub-$env:VERSION-windows-$arch"
+            python packaging/windows/check-rust-imports.py "$hub/NeonHearth.exe" "$hub/bin/lattice-service.exe"
+            if ($LASTEXITCODE -ne 0) { throw 'Shipped Rust executable requires an external VC runtime' }
+            $manifest = Get-Content -Raw "$hub/PACKAGE-MANIFEST.json" | ConvertFrom-Json
+            foreach ($file in $manifest.files) {
+              $path = Join-Path $hub $file.path
+              if ((Get-Item $path).Length -ne $file.bytes) { throw "Size mismatch: $($file.path)" }
+              if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLower() -ne $file.sha256) { throw "Hash mismatch: $($file.path)" }
+            }
+            $info = Get-Content -Raw "$hub/BUILD-INFO.json" | ConvertFrom-Json
+            if ($info.source_commit -ne $env:GITHUB_SHA -or $info.source_dirty) { throw 'Candidate source does not match the clean checkout' }
+            if ($info.platform -ne "windows-$arch") { throw 'Package platform does not match this build' }
+            if ($env:SIGNED -eq 'true' -and $info.unsigned) { throw 'Signed build produced a package marked unsigned' }
+            if ($env:SIGNED -ne 'true' -and -not $info.unsigned) { throw 'Unsigned build produced a package marked signed' }
           }
-          $info = Get-Content -Raw "$hub/BUILD-INFO.json" | ConvertFrom-Json
-          if ($info.source_commit -ne $env:GITHUB_SHA -or $info.source_dirty) { throw 'Candidate source does not match the clean checkout' }
-          if ($info.platform -ne 'windows-${{ matrix.arch }}') { throw 'Package platform does not match this build' }
-          if ('${{ matrix.arch }}' -eq 'x64') {
-            # An x64 runner cannot start the ARM64 launcher; windows-arm64-smoke does that.
-            $process = Start-Process -FilePath "$PWD/$hub/NeonHearth.exe" -ArgumentList '--help' -WindowStyle Hidden -Wait -PassThru
-            if ($process.ExitCode -ne 0) { throw 'Native launcher could not load' }
-          }
-          $archive = "$hub.zip"
-          "$((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower())  $(Split-Path -Leaf $archive)" | Set-Content "$archive.sha256"
-      - name: Validate candidate and run isolated native smoke
-        if: matrix.arch == 'x64'
+          # An x64 runner cannot start the ARM64 launcher; windows-arm64-smoke does that.
+          $x64 = "packaging/dist/NeonHearth-Home-Hub-$env:VERSION-windows-x64"
+          $process = Start-Process -FilePath "$PWD/$x64/NeonHearth.exe" -ArgumentList '--help' -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Native launcher could not load' }
+      - name: Validate candidate and run isolated native smoke (x64)
         shell: pwsh
         run: |
           python -m pip install psutil==7.2.2
           if ($LASTEXITCODE -ne 0) { throw 'Smoke test dependency install failed' }
-          $hub = "packaging/dist/NeonHearth-Home-Hub-${{ steps.version.outputs.full }}-windows-${{ matrix.arch }}"
+          $hub = "packaging/dist/NeonHearth-Home-Hub-$env:VERSION-windows-x64"
           python scripts/verify-candidate.py --package $hub --output "${{ runner.temp }}/home-hub-verify.json"
           if ($LASTEXITCODE -ne 0) { throw 'Candidate verification failed' }
           # Hosted VMs may have no eligible physical adapter. This checks the
           # authenticated local transport, not physical discovery or a soak.
           python scripts/soak-candidate.py --package $hub --state "${{ runner.temp }}/home-hub-smoke-state" --output "${{ runner.temp }}/home-hub-smoke.json" --port 58131 --mqtt-port 58193 --duration-seconds 15 --interval-seconds 3 --allow-degraded-collector
           if ($LASTEXITCODE -ne 0) { throw 'Isolated native smoke failed' }
+      - name: Collect the ZIPs and their hash list
+        id: dist
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP 'dist'
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          foreach ($arch in 'x64', 'arm64') {
+            $archive = "packaging/dist/NeonHearth-Home-Hub-$env:VERSION-windows-$arch.zip"
+            Copy-Item $archive $dist
+            $name = Split-Path -Leaf $archive
+            "$((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower())  $name" | Set-Content "$dist/$name.sha256"
+          }
+          $sums = python scripts/ci-hashes.py create $dist
+          if ($LASTEXITCODE -ne 0) { throw 'Could not hash the ZIPs' }
+          "sums=$sums" | Add-Content $env:GITHUB_OUTPUT
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: windows-home-hub-verification-${{ matrix.arch }}
+          name: windows-home-hub-verification
           path: |
             ${{ runner.temp }}/home-hub-verify.json
             ${{ runner.temp }}/home-hub-smoke.json
           if-no-files-found: ignore
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-home-hub-${{ matrix.arch }}
-          path: |
-            packaging/dist/NeonHearth-Home-Hub-*.zip
-            packaging/dist/NeonHearth-Home-Hub-*.zip.sha256
+          name: windows-home-hub
+          path: ${{ runner.temp }}/dist
           if-no-files-found: error
 
   windows-arm64-smoke:
     name: Windows ARM64 Home Hub runs on ARM64
     # The only place the ARM64 launcher and collector are actually started.
     runs-on: windows-11-arm
-    needs: windows-home-hub
+    needs: [plan, package-home-hub]
+    # A skipped signing job upstream (unsigned candidate off main) marks every
+    # dependent without an explicit condition as skipped; this job must still
+    # run whenever the packaging job succeeded.
+    if: ${{ !cancelled() && needs.package-home-hub.result == 'success' }}
     permissions:
       contents: read
+    env:
+      NEONHEARTH_CI_HARNESS: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: windows-home-hub-arm64
+          name: windows-home-hub
           path: hub
       - name: Start the ARM64 launcher and run the isolated smoke
         shell: pwsh
+        env:
+          EXPECTED_SUMS: ${{ needs.package-home-hub.outputs.sums }}
         run: |
           if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') { throw "Expected an ARM64 runner, got $env:PROCESSOR_ARCHITECTURE" }
+          python scripts/ci-hashes.py verify hub --expect $env:EXPECTED_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'Home Hub artifact does not match the packaging job' }
           $archive = Get-ChildItem hub -Filter 'NeonHearth-Home-Hub-*-windows-arm64.zip' | Select-Object -First 1
           if (-not $archive) { throw 'ARM64 Home Hub archive not found' }
           Expand-Archive $archive.FullName -DestinationPath extracted
@@ -241,140 +430,99 @@ jobs:
             ${{ runner.temp }}/home-hub-smoke.json
           if-no-files-found: ignore
 
-  windows-installer:
-    name: Windows service compatibility installer (MSI)
-    needs: quality
+  # ------------------------------------------------- MSI and setup EXE chain
+  build-msi:
+    name: Build MSI (from the signed collector)
+    needs: [plan, build-windows, sign-programs]
+    if: ${{ !cancelled() && needs.build-windows.result == 'success' && (needs.sign-programs.result == 'success' || (needs.sign-programs.result == 'skipped' && needs.plan.outputs.sign != 'true')) }}
     runs-on: windows-latest
-    # Holds the trust link that lets this job sign with Azure Artifact Signing.
-    environment: release-signing
     permissions:
       contents: read
-      id-token: write
+    outputs:
+      msi: ${{ steps.hash.outputs.msi }}
     env:
-      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+      VERSION: ${{ needs.plan.outputs.full }}
+      MSI_VERSION: ${{ needs.plan.outputs.msi }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
-
-      - name: Resolve candidate and MSI versions
-        id: version
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: win-payload
+          path: ${{ runner.temp }}/in/payload
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ needs.plan.outputs.sign == 'true' && 'win-programs-signed' || 'win-programs' }}
+          path: ${{ runner.temp }}/in/programs
+      - name: Verify inputs and place them where stage.ps1 expects them
         shell: pwsh
         env:
-          MANUAL_VERSION: ${{ inputs.version }}
+          PAYLOAD_SUMS: ${{ needs.build-windows.outputs.payload }}
+          PROGRAMS_SUMS: ${{ needs.plan.outputs.sign == 'true' && needs.sign-programs.outputs.signed || needs.build-windows.outputs.programs }}
         run: |
-          $full = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME -replace '^v','' } else { $env:MANUAL_VERSION }
-          if ($full -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw 'Invalid release version' }
-          $msi = ($full -split '-', 2)[0]
-          if ($msi -notmatch '^\d+\.\d+\.\d+$') { throw "Tag '$env:GITHUB_REF_NAME' does not start with a numeric x.y.z version" }
-          "full=$full" | Add-Content $env:GITHUB_OUTPUT
-          "msi=$msi" | Add-Content $env:GITHUB_OUTPUT
-          Write-Host "full=$full msi=$msi"
-
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head, 2026-09-03
-        with:
-          toolchain: 1.96.0
-          targets: x86_64-pc-windows-msvc
-
-      - name: Record resolved toolchain versions
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/in/payload" --expect $env:PAYLOAD_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'Payload does not match the build job' }
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/in/programs" --expect $env:PROGRAMS_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'Programs do not match the producing job' }
+          New-Item -ItemType Directory -Force 'target/x86_64-pc-windows-msvc/release' | Out-Null
+          Copy-Item "$env:RUNNER_TEMP/in/programs/x64/lattice-service.exe" 'target/x86_64-pc-windows-msvc/release/'
+          Copy-Item -Recurse "$env:RUNNER_TEMP/in/payload/ui" 'apps/desktop/dist'
+      - name: Check the collector signature
+        if: needs.plan.outputs.sign == 'true'
         shell: pwsh
+        env:
+          PUBLISHER: ${{ needs.plan.outputs.publisher }}
         run: |
-          rustc --version --verbose
-          cargo --version
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: apps/desktop/package-lock.json
-
-      - name: Stage Windows release layout (packaging/stage.ps1)
+          ./scripts/windows-signing/verify.ps1 -Publisher $env:PUBLISHER target/x86_64-pc-windows-msvc/release/lattice-service.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Collector signature check failed' }
+      - name: Stage Windows release layout (packaging/stage.ps1, no build)
         shell: pwsh
+        env:
+          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
         run: |
           python packaging/windows/test_rust_imports.py
           if ($LASTEXITCODE -ne 0) { throw 'Import parser tests failed' }
           python packaging/windows/test_windows_stage.py
           if ($LASTEXITCODE -ne 0) { throw 'Staging target tests failed' }
-          pwsh -File packaging\stage.ps1
-          if ($LASTEXITCODE -ne 0) { throw 'Windows staging failed' }
-
-      # Code signing with Azure Artifact Signing. The job signs in with GitHub's
-      # OIDC identity (no stored secret). Without the AZURE_CLIENT_ID repository
-      # variable every signing step is skipped and the output stays unsigned.
-      # The signing token lasts about an hour and cannot be renewed in the job,
-      # so the sign-in comes after the long compile.
-      - name: Sign in to Azure for code signing
-        if: vars.AZURE_CLIENT_ID != ''
-        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      - name: Prepare code signing
-        if: vars.AZURE_CLIENT_ID != ''
-        shell: pwsh
-        run: ./scripts/windows-signing/setup.ps1 -Endpoint "${{ vars.ARTIFACT_SIGNING_ENDPOINT }}" -Account "${{ vars.ARTIFACT_SIGNING_ACCOUNT }}" -CertificateProfile "${{ vars.ARTIFACT_SIGNING_PROFILE }}"
-
-      # stage.ps1 hashes its inputs into STAGING-MANIFEST.txt, so the collector
-      # is signed in the build folder and the layout is staged again from it.
-      - name: Sign the collector and restage
-        if: vars.AZURE_CLIENT_ID != ''
-        shell: pwsh
-        run: |
-          $exe = 'target/x86_64-pc-windows-msvc/release/lattice-service.exe'
-          ./scripts/windows-signing/sign.ps1 $exe
-          if ($LASTEXITCODE -ne 0) { throw 'Signing the collector failed' }
           pwsh -File packaging\stage.ps1 -SkipRust -SkipUi
-          if ($LASTEXITCODE -ne 0) { throw 'Windows restaging failed' }
-          ./scripts/windows-signing/verify.ps1 -Publisher "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}" packaging/dist/windows/bin/lattice-service.exe
-          if ($LASTEXITCODE -ne 0) { throw 'Staged collector signature check failed' }
-
-      # WiX v5 is required: the <Files> wildcard-harvesting element used for
-      # the UI bundle does not exist in WiX 4.x. Pinned to the version the
-      # .wxs was verified against.
-      - name: Install WiX toolset
-        shell: pwsh
-        run: |
-          dotnet tool install --global wix --version 5.0.2
-          wix extension add -g WixToolset.Util.wixext/5.0.2
-          wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
-          wix --version
-
+          if ($LASTEXITCODE -ne 0) { throw 'Windows staging failed' }
+      # WiX 5 is required: the <Files> wildcard-harvesting element used for the
+      # UI bundle does not exist in WiX 4.x. Installed from SHA-256 pinned
+      # packages; this job holds no signing identity.
+      - name: Install WiX toolset (checksum-pinned)
+        id: wix
+        uses: ./.github/actions/install-wix
       # The bindpath MUST be absolute: the <Files> wildcard harvest resolves a
       # relative bindpath against the .wxs file's own directory (not the
       # working directory), silently harvesting nothing (warning WIX8601).
       # -wx turns that class of warning into a hard build failure.
       - name: Build MSI
         shell: pwsh
+        env:
+          WIX_DIR: ${{ steps.wix.outputs.tool_dir }}
+          UTIL_EXT: ${{ steps.wix.outputs.util_ext }}
         run: |
-          wix build packaging\windows\NeonHearth.wxs `
-            -ext WixToolset.Util.wixext `
-            -bindpath dist=${{ github.workspace }}\packaging\dist\windows `
+          $out = Join-Path $env:RUNNER_TEMP 'msi'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $msi = Join-Path $out "NeonHearth-$env:VERSION-x64.msi"
+          & "$env:WIX_DIR/wix.exe" build packaging\windows\NeonHearth.wxs `
+            -ext $env:UTIL_EXT `
+            -bindpath "dist=$env:GITHUB_WORKSPACE\packaging\dist\windows" `
             -arch x64 `
-            -d MsiVersion=${{ steps.version.outputs.msi }} `
+            -d "MsiVersion=$env:MSI_VERSION" `
             -wx `
-            -o NeonHearth-${{ steps.version.outputs.full }}-x64.msi
-          if (-not (Test-Path "NeonHearth-${{ steps.version.outputs.full }}-x64.msi")) { throw 'MSI was not produced' }
-
-      # Signed before the bundle is built: the bundle embeds this exact file.
-      - name: Sign the MSI
-        if: vars.AZURE_CLIENT_ID != ''
-        shell: pwsh
-        run: |
-          ./scripts/windows-signing/sign.ps1 "NeonHearth-${{ steps.version.outputs.full }}-x64.msi"
-          if ($LASTEXITCODE -ne 0) { throw 'Signing the MSI failed' }
-
+            -o $msi
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $msi)) { throw 'MSI was not produced' }
       # Validation without installing: administrative extract (msiexec /a)
       # unpacks the file table; assert the payload the installer promises.
       - name: Validate MSI payload (administrative extract)
         shell: pwsh
         run: |
-          $msi = (Resolve-Path "NeonHearth-${{ steps.version.outputs.full }}-x64.msi").Path
+          $msi = (Resolve-Path "$env:RUNNER_TEMP/msi/NeonHearth-$env:VERSION-x64.msi").Path
           $target = Join-Path $env:RUNNER_TEMP 'msi-extract'
           $p = Start-Process msiexec.exe -ArgumentList "/a `"$msi`" /qn TARGETDIR=`"$target`"" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "msiexec /a failed with exit code $($p.ExitCode)" }
@@ -394,88 +542,313 @@ jobs:
           $jsCount = @(Get-ChildItem -Recurse (Join-Path $target 'PFiles64\NeonHearth\ui') -Filter '*.js').Count
           if ($jsCount -lt 1) { throw 'MSI payload missing: UI JavaScript bundle' }
           Write-Host "UI bundle JS files: $jsCount"
+      - name: Hash the MSI
+        id: hash
+        shell: pwsh
+        run: |
+          $sums = python scripts/ci-hashes.py create "$env:RUNNER_TEMP/msi"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not hash the MSI' }
+          "msi=$sums" | Add-Content $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msi-unsigned
+          path: ${{ runner.temp }}/msi
+          if-no-files-found: error
 
-      # Burn bundle (.exe) chaining the MSI just built and validated above.
-      # Same absolute-bindpath rule as the MSI build.
+  sign-msi:
+    name: Sign the MSI
+    needs: [plan, build-msi]
+    if: needs.plan.outputs.sign == 'true'
+    uses: ./.github/workflows/sign.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      artifact: msi-unsigned
+      expected: ${{ needs.build-msi.outputs.msi }}
+      signed_artifact: msi-signed
+      files: NeonHearth-${{ needs.plan.outputs.full }}-x64.msi
+
+  build-bundle:
+    name: Build setup EXE (embeds the signed MSI)
+    needs: [plan, build-msi, sign-msi]
+    if: ${{ !cancelled() && needs.build-msi.result == 'success' && (needs.sign-msi.result == 'success' || (needs.sign-msi.result == 'skipped' && needs.plan.outputs.sign != 'true')) }}
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      bundle: ${{ steps.hash.outputs.bundle }}
+      engine: ${{ steps.hash.outputs.engine }}
+    env:
+      VERSION: ${{ needs.plan.outputs.full }}
+      MSI_VERSION: ${{ needs.plan.outputs.msi }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ needs.plan.outputs.sign == 'true' && 'msi-signed' || 'msi-unsigned' }}
+          path: ${{ runner.temp }}/msi
+      - name: Verify the MSI against the producing job
+        shell: pwsh
+        env:
+          MSI_SUMS: ${{ needs.plan.outputs.sign == 'true' && needs.sign-msi.outputs.signed || needs.build-msi.outputs.msi }}
+        run: |
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/msi" --expect $env:MSI_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'MSI does not match the producing job' }
+      - name: Install WiX toolset (checksum-pinned)
+        id: wix
+        uses: ./.github/actions/install-wix
       - name: Build setup bundle (exe)
         shell: pwsh
+        env:
+          WIX_DIR: ${{ steps.wix.outputs.tool_dir }}
+          BAL_EXT: ${{ steps.wix.outputs.bal_ext }}
         run: |
-          wix build packaging\windows\Bundle.wxs `
-            -ext WixToolset.BootstrapperApplications.wixext `
-            -bindpath msi=${{ github.workspace }} `
+          $out = Join-Path $env:RUNNER_TEMP 'bundle'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $bundle = Join-Path $out "NeonHearth-Setup-$env:VERSION-x64.exe"
+          & "$env:WIX_DIR/wix.exe" build packaging\windows\Bundle.wxs `
+            -ext $env:BAL_EXT `
+            -bindpath "msi=$env:RUNNER_TEMP\msi" `
             -arch x64 `
-            -d MsiVersion=${{ steps.version.outputs.msi }} `
-            -d FullVersion=${{ steps.version.outputs.full }} `
+            -d "MsiVersion=$env:MSI_VERSION" `
+            -d "FullVersion=$env:VERSION" `
             -wx `
-            -o NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe
-          if (-not (Test-Path "NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe")) { throw 'Bundle exe was not produced' }
-
-      # A Burn bundle is an engine with the payload attached. Signing the
-      # finished file alone leaves the engine it extracts and runs unsigned,
-      # so: detach the engine, sign it, reattach, then sign the whole bundle.
-      - name: Sign the setup bundle
-        if: vars.AZURE_CLIENT_ID != ''
-        shell: pwsh
-        run: |
-          $bundle = "NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe"
-          $work = Join-Path $env:RUNNER_TEMP 'burn-sign'
-          New-Item -ItemType Directory -Force $work | Out-Null
-          $engine = Join-Path $work 'engine.exe'
-          $signedBundle = Join-Path $work $bundle
-          wix burn detach $bundle -engine $engine
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $engine)) { throw 'Could not detach the bundle engine' }
-          ./scripts/windows-signing/sign.ps1 $engine
-          if ($LASTEXITCODE -ne 0) { throw 'Signing the bundle engine failed' }
-          wix burn reattach $bundle -engine $engine -o $signedBundle
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $signedBundle)) { throw 'Could not reattach the bundle engine' }
-          Move-Item -Force $signedBundle $bundle
-          ./scripts/windows-signing/sign.ps1 $bundle
-          if ($LASTEXITCODE -ne 0) { throw 'Signing the setup bundle failed' }
-          ./scripts/windows-signing/verify.ps1 -Publisher "${{ vars.ARTIFACT_SIGNING_PUBLISHER }}" $bundle "NeonHearth-${{ steps.version.outputs.full }}-x64.msi"
-          if ($LASTEXITCODE -ne 0) { throw 'Installer signature check failed' }
-
-      # Validation without installing: extract the bundle's attached
-      # container and require the embedded payload to be byte-identical to
-      # the MSI. (A compressed bundle's /layout is a no-op copy, so this is
-      # the real check. wix burn extract silently no-ops with WIX8503 unless
-      # the output and intermediate folders already exist.)
+            -o $bundle
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $bundle)) { throw 'Bundle exe was not produced' }
+      # Validation without installing: extract the bundle's attached container
+      # and require the embedded payload to be byte-identical to the MSI.
+      # (wix burn extract silently no-ops with WIX8503 unless the output and
+      # intermediate folders already exist.)
       - name: Validate bundle payload (burn extract)
         shell: pwsh
+        env:
+          WIX_DIR: ${{ steps.wix.outputs.tool_dir }}
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'burn-extract'
           $tmp = Join-Path $env:RUNNER_TEMP 'burn-tmp'
           New-Item -ItemType Directory -Force $out, $tmp | Out-Null
-          wix burn extract "NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe" -o $out -intermediateFolder $tmp
+          & "$env:WIX_DIR/wix.exe" burn extract "$env:RUNNER_TEMP/bundle/NeonHearth-Setup-$env:VERSION-x64.exe" -o $out -intermediateFolder $tmp
           $payloads = @(Get-ChildItem -File $out)
           if ($payloads.Count -lt 1) { throw 'burn extract produced no payloads' }
-          $msiHash = (Get-FileHash "NeonHearth-${{ steps.version.outputs.full }}-x64.msi" -Algorithm SHA256).Hash
+          $msiHash = (Get-FileHash "$env:RUNNER_TEMP/msi/NeonHearth-$env:VERSION-x64.msi" -Algorithm SHA256).Hash
           $match = $payloads | Where-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash -eq $msiHash }
-          if (-not $match) { throw 'no extracted bundle payload matches the built MSI (SHA-256)' }
+          if (-not $match) { throw 'no extracted bundle payload matches the MSI (SHA-256)' }
           Write-Host "embedded MSI verified byte-identical: $($match.Name)"
-
-      - name: Compute SHA-256s
+      # A Burn bundle is an engine with the payload attached. Signing the
+      # finished file alone leaves the engine it extracts and runs unsigned,
+      # so the engine is detached here, signed in its own job (sign-engine),
+      # reattached in reattach-bundle, and the whole bundle is signed last.
+      - name: Detach the Burn engine for signing
+        if: needs.plan.outputs.sign == 'true'
+        shell: pwsh
+        env:
+          WIX_DIR: ${{ steps.wix.outputs.tool_dir }}
+        run: |
+          $engineDir = Join-Path $env:RUNNER_TEMP 'engine'
+          New-Item -ItemType Directory -Force $engineDir | Out-Null
+          & "$env:WIX_DIR/wix.exe" burn detach "$env:RUNNER_TEMP/bundle/NeonHearth-Setup-$env:VERSION-x64.exe" -engine "$engineDir/engine.exe"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$engineDir/engine.exe")) { throw 'Could not detach the bundle engine' }
+      - name: Hash the bundle and engine
+        id: hash
         shell: pwsh
         run: |
-          foreach ($f in @("NeonHearth-${{ steps.version.outputs.full }}-x64.msi",
-                           "NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe")) {
-            $hash = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
-            "$hash  $f" | Set-Content "$f.sha256"
-            Get-Content "$f.sha256"
+          $bundle = python scripts/ci-hashes.py create "$env:RUNNER_TEMP/bundle"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not hash the bundle' }
+          "bundle=$bundle" | Add-Content $env:GITHUB_OUTPUT
+          if (Test-Path "$env:RUNNER_TEMP/engine") {
+            $engine = python scripts/ci-hashes.py create "$env:RUNNER_TEMP/engine"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not hash the engine' }
+            "engine=$engine" | Add-Content $env:GITHUB_OUTPUT
           }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundle-built
+          path: ${{ runner.temp }}/bundle
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: needs.plan.outputs.sign == 'true'
+        with:
+          name: bundle-engine
+          path: ${{ runner.temp }}/engine
+          if-no-files-found: error
 
+  sign-engine:
+    name: Sign the Burn engine
+    needs: [plan, build-bundle]
+    if: needs.plan.outputs.sign == 'true'
+    uses: ./.github/workflows/sign.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      artifact: bundle-engine
+      expected: ${{ needs.build-bundle.outputs.engine }}
+      signed_artifact: bundle-engine-signed
+      files: engine.exe
+
+  reattach-bundle:
+    name: Reattach the signed Burn engine
+    needs: [plan, build-msi, sign-msi, build-bundle, sign-engine]
+    if: needs.plan.outputs.sign == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      bundle: ${{ steps.hash.outputs.bundle }}
+    env:
+      VERSION: ${{ needs.plan.outputs.full }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: bundle-built
+          path: ${{ runner.temp }}/bundle
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: bundle-engine-signed
+          path: ${{ runner.temp }}/engine
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: msi-signed
+          path: ${{ runner.temp }}/msi
+      - name: Verify inputs against the producing jobs
+        shell: pwsh
+        env:
+          BUNDLE_SUMS: ${{ needs.build-bundle.outputs.bundle }}
+          ENGINE_SUMS: ${{ needs.sign-engine.outputs.signed }}
+          MSI_SUMS: ${{ needs.sign-msi.outputs.signed }}
+        run: |
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/bundle" --expect $env:BUNDLE_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'Bundle does not match the build job' }
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/engine" --expect $env:ENGINE_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'Signed engine does not match the signing job' }
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/msi" --expect $env:MSI_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'Signed MSI does not match the signing job' }
+      - name: Install WiX toolset (checksum-pinned)
+        id: wix
+        uses: ./.github/actions/install-wix
+      - name: Reattach and re-validate the payload
+        shell: pwsh
+        env:
+          WIX_DIR: ${{ steps.wix.outputs.tool_dir }}
+        run: |
+          $final = Join-Path $env:RUNNER_TEMP 'bundle-reattached'
+          New-Item -ItemType Directory -Force $final | Out-Null
+          $name = "NeonHearth-Setup-$env:VERSION-x64.exe"
+          & "$env:WIX_DIR/wix.exe" burn reattach "$env:RUNNER_TEMP/bundle/$name" -engine "$env:RUNNER_TEMP/engine/engine.exe" -o "$final/$name"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$final/$name")) { throw 'Could not reattach the bundle engine' }
+          $out = Join-Path $env:RUNNER_TEMP 'burn-extract'
+          $tmp = Join-Path $env:RUNNER_TEMP 'burn-tmp'
+          New-Item -ItemType Directory -Force $out, $tmp | Out-Null
+          & "$env:WIX_DIR/wix.exe" burn extract "$final/$name" -o $out -intermediateFolder $tmp
+          $msiHash = (Get-FileHash "$env:RUNNER_TEMP/msi/NeonHearth-$env:VERSION-x64.msi" -Algorithm SHA256).Hash
+          $match = @(Get-ChildItem -File $out) | Where-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash -eq $msiHash }
+          if (-not $match) { throw 'reattached bundle does not embed the signed MSI' }
+      - name: Hash the reattached bundle
+        id: hash
+        shell: pwsh
+        run: |
+          $sums = python scripts/ci-hashes.py create "$env:RUNNER_TEMP/bundle-reattached"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not hash the bundle' }
+          "bundle=$sums" | Add-Content $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundle-reattached
+          path: ${{ runner.temp }}/bundle-reattached
+          if-no-files-found: error
+
+  sign-bundle:
+    name: Sign the setup EXE
+    needs: [plan, reattach-bundle]
+    if: needs.plan.outputs.sign == 'true'
+    uses: ./.github/workflows/sign.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      artifact: bundle-reattached
+      expected: ${{ needs.reattach-bundle.outputs.bundle }}
+      signed_artifact: bundle-signed
+      files: NeonHearth-Setup-${{ needs.plan.outputs.full }}-x64.exe
+
+  finalize-installer:
+    name: Collect MSI and setup EXE
+    needs: [plan, build-msi, sign-msi, build-bundle, sign-bundle]
+    if: ${{ !cancelled() && needs.build-bundle.result == 'success' && (needs.sign-bundle.result == 'success' || (needs.sign-bundle.result == 'skipped' && needs.plan.outputs.sign != 'true')) }}
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      sums: ${{ steps.dist.outputs.sums }}
+    env:
+      VERSION: ${{ needs.plan.outputs.full }}
+      SIGNED: ${{ needs.plan.outputs.sign }}
+      PUBLISHER: ${{ needs.plan.outputs.publisher }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ needs.plan.outputs.sign == 'true' && 'msi-signed' || 'msi-unsigned' }}
+          path: ${{ runner.temp }}/msi
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ needs.plan.outputs.sign == 'true' && 'bundle-signed' || 'bundle-built' }}
+          path: ${{ runner.temp }}/bundle
+      - name: Verify and finish
+        id: dist
+        shell: pwsh
+        env:
+          MSI_SUMS: ${{ needs.plan.outputs.sign == 'true' && needs.sign-msi.outputs.signed || needs.build-msi.outputs.msi }}
+          BUNDLE_SUMS: ${{ needs.plan.outputs.sign == 'true' && needs.sign-bundle.outputs.signed || needs.build-bundle.outputs.bundle }}
+        run: |
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/msi" --expect $env:MSI_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'MSI does not match the producing job' }
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/bundle" --expect $env:BUNDLE_SUMS
+          if ($LASTEXITCODE -ne 0) { throw 'Setup EXE does not match the producing job' }
+          $msi = "$env:RUNNER_TEMP/msi/NeonHearth-$env:VERSION-x64.msi"
+          $exe = "$env:RUNNER_TEMP/bundle/NeonHearth-Setup-$env:VERSION-x64.exe"
+          if ($env:SIGNED -eq 'true') {
+            ./scripts/windows-signing/verify.ps1 -Publisher $env:PUBLISHER $exe $msi
+            if ($LASTEXITCODE -ne 0) { throw 'Installer signature check failed' }
+          }
+          $dist = Join-Path $env:RUNNER_TEMP 'dist'
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          foreach ($file in $msi, $exe) {
+            Copy-Item $file $dist
+            $name = Split-Path -Leaf $file
+            "$((Get-FileHash $file -Algorithm SHA256).Hash.ToLower())  $name" | Set-Content "$dist/$name.sha256"
+          }
+          $sums = python scripts/ci-hashes.py create $dist
+          if ($LASTEXITCODE -ne 0) { throw 'Could not hash the installers' }
+          Add-Content $env:GITHUB_OUTPUT "sums=$sums"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-msi
-          path: |
-            NeonHearth-${{ steps.version.outputs.full }}-x64.msi
-            NeonHearth-${{ steps.version.outputs.full }}-x64.msi.sha256
-            NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe
-            NeonHearth-Setup-${{ steps.version.outputs.full }}-x64.exe.sha256
+          path: ${{ runner.temp }}/dist
           if-no-files-found: error
 
+  # ------------------------------------------------------------------ Linux
   linux-packages:
     name: Linux packages ${{ matrix.arch }} (deb, rpm)
-    needs: quality
+    needs: [plan, quality]
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -488,29 +861,18 @@ jobs:
           # Linux ships amd64 only (owner decision, 2026-11-15). An arm64 entry built and
           # passed on ubuntu-24.04-arm with rpm_arch aarch64, machine aarch64 and nfpm_sha256
           # 27419eb382695a7942be8ad52259f3ec1854fad001b3ae4baed34ce39a223b97; re-adding it
-          # here (and to the release job's checks) is all it takes.
+          # here (and to the release job's checks) is all it takes. NOTE: with more than one
+          # leg the `sums` output below needs one distinct output per architecture.
     runs-on: ${{ matrix.runner }}
+    outputs:
+      sums: ${{ steps.dist.outputs.sums }}
+    env:
+      NEONHEARTH_VERSION: ${{ needs.plan.outputs.full }}
+      NEONHEARTH_ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Derive version from tag or manual input
-        id: version
-        env:
-          MANUAL_VERSION: ${{ inputs.version }}
-        run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then full="${GITHUB_REF_NAME#v}"; else full="$MANUAL_VERSION"; fi
-          base="${full%%-*}"
-          case "$base" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "Version '$full' does not start with a numeric x.y.z version" >&2; exit 1 ;;
-          esac
-          workspace="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
-          if [ "$base" != "$workspace" ]; then
-            echo "Version base $base does not match workspace version $workspace" >&2
-            exit 1
-          fi
-          echo "full=$full" >> "$GITHUB_OUTPUT"
-          echo "full=$full base=$base workspace=$workspace"
+        with:
+          persist-credentials: false
 
       # Same rationale as ci.yml's rust job: reclaim hosted-image space the
       # release build may need for its link step.
@@ -542,21 +904,20 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
-      - name: Stage Linux release layout (packaging/stage.sh)
+      - name: Stage Linux release layout (packaging/stage.sh, cargo --locked)
         run: packaging/stage.sh
 
       - name: Install nfpm (pinned, checksum-verified)
+        env:
+          NFPM_SHA256: ${{ matrix.nfpm_sha256 }}
         run: |
-          curl -sSLo nfpm.deb https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_${{ matrix.arch }}.deb
-          echo "${{ matrix.nfpm_sha256 }}  nfpm.deb" | sha256sum -c -
+          curl -sSLo nfpm.deb "https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_${NEONHEARTH_ARCH}.deb"
+          echo "${NFPM_SHA256}  nfpm.deb" | sha256sum -c -
           sudo dpkg -i nfpm.deb
           rm nfpm.deb
           nfpm --version
 
       - name: Build deb and rpm packages
-        env:
-          NEONHEARTH_VERSION: ${{ steps.version.outputs.full }}
-          NEONHEARTH_ARCH: ${{ matrix.arch }}
         run: |
           cd packaging/linux
           nfpm package --config nfpm.yaml --packager deb --target ../dist/
@@ -564,58 +925,86 @@ jobs:
           ls -la ../dist/
 
       - name: Validate package payloads
+        env:
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+          MACHINE: ${{ matrix.machine }}
         run: |
           deb="$(ls packaging/dist/*.deb)"
           rpm="$(ls packaging/dist/*.rpm)"
           echo "== $deb =="
-          [ "$(dpkg-deb -f "$deb" Architecture)" = "${{ matrix.arch }}" ] || { echo 'deb architecture mismatch' >&2; exit 1; }
-          case "$rpm" in *.${{ matrix.rpm_arch }}.rpm) ;; *) echo "rpm is not ${{ matrix.rpm_arch }}: $rpm" >&2; exit 1 ;; esac
-          file target/release/lattice-service | grep -q "${{ matrix.machine }}" || { echo 'service binary is not ${{ matrix.machine }}' >&2; file target/release/lattice-service >&2; exit 1; }
+          [ "$(dpkg-deb -f "$deb" Architecture)" = "${NEONHEARTH_ARCH}" ] || { echo 'deb architecture mismatch' >&2; exit 1; }
+          case "$rpm" in *."${RPM_ARCH}".rpm) ;; *) echo "rpm is not ${RPM_ARCH}: $rpm" >&2; exit 1 ;; esac
+          file target/release/lattice-service | grep -q "${MACHINE}" || { echo "service binary is not ${MACHINE}" >&2; file target/release/lattice-service >&2; exit 1; }
           dpkg-deb --contents "$deb"
           dpkg-deb --contents "$deb" | grep -q '/usr/libexec/neonhearth/lattice-service' || { echo 'deb missing service binary' >&2; exit 1; }
           dpkg-deb --contents "$deb" | grep -q '/usr/lib/systemd/system/neonhearth.service' || { echo 'deb missing systemd unit' >&2; exit 1; }
           dpkg-deb --contents "$deb" | grep -q '/usr/share/neonhearth/ui/index.html' || { echo 'deb missing UI bundle' >&2; exit 1; }
+          dpkg-deb --contents "$deb" | grep -q '/usr/share/doc/neonhearth/README-DATA.txt' || { echo 'deb missing data-retention note' >&2; exit 1; }
           echo "== $rpm =="
           sudo apt-get install -y rpm cpio >/dev/null
           rpm2cpio "$rpm" | cpio -t
           rpm2cpio "$rpm" | cpio -t | grep -q 'usr/libexec/neonhearth/lattice-service' || { echo 'rpm missing service binary' >&2; exit 1; }
           rpm2cpio "$rpm" | cpio -t | grep -q 'usr/lib/systemd/system/neonhearth.service' || { echo 'rpm missing systemd unit' >&2; exit 1; }
 
-      - name: Compute SHA-256s
+      - name: Collect packages and their hash list
+        id: dist
         run: |
-          cd packaging/dist
-          for f in *.deb *.rpm; do
-            sha256sum "$f" | tee "$f.sha256"
-          done
+          mkdir -p out/linux
+          cp packaging/dist/*.deb packaging/dist/*.rpm out/linux/
+          (cd out/linux && for f in *.deb *.rpm; do sha256sum "$f" | tee "$f.sha256"; done)
+          sums="$(python3 scripts/ci-hashes.py create out/linux)"
+          echo "sums=$sums" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-packages-${{ matrix.arch }}
-          path: |
-            packaging/dist/*.deb
-            packaging/dist/*.rpm
-            packaging/dist/*.sha256
+          path: out/linux
           if-no-files-found: error
 
+  # ---------------------------------------------------------------- publish
   release:
     name: Publish GitHub pre-release
     runs-on: ubuntu-latest
-    needs: [windows-home-hub, windows-arm64-smoke, windows-installer, linux-packages]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [plan, quality, package-home-hub, windows-arm64-smoke, finalize-installer, linux-packages, sign-programs, sign-msi, sign-bundle]
+    # Explicit result checks: skipped upstream jobs must not silently skip (or
+    # worse, silently allow) a release. On a tag, signing must actually have run.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.plan.outputs.sign == 'true' && needs.quality.result == 'success' && needs.package-home-hub.result == 'success' && needs.windows-arm64-smoke.result == 'success' && needs.finalize-installer.result == 'success' && needs.linux-packages.result == 'success' && needs.sign-programs.result == 'success' && needs.sign-msi.result == 'success' && needs.sign-bundle.result == 'success' }}
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Download build artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: artifacts
-          merge-multiple: true
+      - name: Verify every artifact against its producing job
+        env:
+          HOME_HUB_SUMS: ${{ needs.package-home-hub.outputs.sums }}
+          INSTALLER_SUMS: ${{ needs.finalize-installer.outputs.sums }}
+          LINUX_SUMS: ${{ needs.linux-packages.outputs.sums }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-hashes.py verify artifacts/windows-home-hub --expect "$HOME_HUB_SUMS"
+          python3 scripts/ci-hashes.py verify artifacts/windows-msi --expect "$INSTALLER_SUMS"
+          python3 scripts/ci-hashes.py verify artifacts/linux-packages-amd64 --expect "$LINUX_SUMS"
 
       - name: Assemble release assets + SHA256SUMS
-        id: assets
+        env:
+          FULL_VERSION: ${{ needs.plan.outputs.full }}
         run: |
+          set -euo pipefail
           mkdir -p release-assets
-          find artifacts -type f \( -name '*.zip' -o -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
+          for dir in windows-home-hub windows-msi linux-packages-amd64; do
+            find "artifacts/$dir" -type f \( -name '*.zip' -o -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
+          done
+          # SBOMs generated by the quality workflow (ci.yml sbom job) in this run.
+          if [ -d artifacts/sbom-cyclonedx ]; then
+            (cd artifacts/sbom-cyclonedx && zip -q -r "../../release-assets/NeonHearth-${FULL_VERSION}-sbom-cyclonedx.zip" .)
+          else
+            echo 'SBOM artifact missing from the quality workflow' >&2; exit 1
+          fi
           cd release-assets
           # GitHub replaces "~" with "." in uploaded asset names, so a prerelease deb/rpm
           # (0.1.0~beta.1) would not match its SHA256SUMS line. Rename first, then hash.
@@ -628,11 +1017,18 @@ jobs:
           [ -n "$(ls NeonHearth-Home-Hub-*-windows-arm64.zip 2>/dev/null)" ] || { echo 'no ARM64 Home Hub artifact' >&2; exit 1; }
           [ -n "$(ls *.msi 2>/dev/null)" ] || { echo 'no MSI artifact' >&2; exit 1; }
           [ -n "$(ls *.exe 2>/dev/null)" ] || { echo 'no setup exe artifact' >&2; exit 1; }
+          [ -n "$(ls *sbom-cyclonedx.zip 2>/dev/null)" ] || { echo 'no SBOM archive' >&2; exit 1; }
           for name in '*_amd64.deb' '*.x86_64.rpm'; do
             [ -n "$(ls $name 2>/dev/null)" ] || { echo "no $name artifact" >&2; exit 1; }
           done
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
+
+      # TODO(provenance): add build-provenance attestation for release-assets/*
+      # with actions/attest-build-provenance. It is intentionally NOT wired up
+      # yet: it needs `id-token: write` and `attestations: write` on this job,
+      # and the action must be pinned by a full commit SHA that has been looked
+      # up and verified, which was not possible when this file was written.
 
       - name: Create GitHub pre-release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
@@ -642,14 +1038,16 @@ jobs:
           files: |
             release-assets/*
           body: |
-            **Pre-release.** ${{ vars.AZURE_CLIENT_ID != '' && format('Windows programs and installers are code-signed by {0}.', vars.ARTIFACT_SIGNING_PUBLISHER) || 'Windows programs and installers are unsigned.' }}
+            **Pre-release.** ${{ needs.plan.outputs.note }}
 
             **Recommended Windows download: NeonHearth-Home-Hub-...-windows-x64.zip**
             (or **-windows-arm64.zip** for Windows 11 on ARM).
-            Extract the complete folder and open NeonHearth.exe. It includes the
+            Extract the complete folder into a new folder only you can write to
+            and open NeonHearth.exe. It includes the
             native launcher, collector and authenticated local MQTT broker.
             No Npcap, Python, Node or administrator rights are needed to run it;
-            the broker requires Microsoft's Visual C++ v14 Redistributable (x64).
+            the launcher refuses to run as administrator. The broker requires
+            Microsoft's Visual C++ v14 Redistributable (x64).
             Install or repair it from https://aka.ms/vc14/vc_redist.x64.exe if
             startup reports a missing DLL; Windows may request admin approval
             for this prerequisite. Then open NeonHearth again.
@@ -674,6 +1072,8 @@ jobs:
               have only been run on CI runners, not on owner hardware.
             - Windows discovery uses native APIs; Npcap is not required by
               either the Home Hub or current service compatibility package.
+            - A CycloneDX SBOM archive is attached. Build-provenance
+              attestation is not yet enabled.
 
             See `docs/build/installers.md` for the full honest status of what
             is and is not verified.

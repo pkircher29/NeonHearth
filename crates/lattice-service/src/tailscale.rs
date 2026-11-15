@@ -34,7 +34,7 @@ use chrono::{DateTime, Duration, Utc};
 use lattice_doctor::{Clock, SystemClock};
 use lattice_store::{
     AuditActor, AuditCategory, AuditLog, NewAuditEntry, NewPhoneSession, PhoneSessionRow,
-    RemoteAccessRepository,
+    PinFailureOutcome, RemoteAccessRepository,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -344,6 +344,7 @@ struct RemoteShared {
     dedup: Mutex<HashMap<Uuid, SessionDedup>>,
     /// Per-integration-token long-poll admission.
     long_polls: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
+    pin_gate: Arc<Semaphore>,
 }
 
 impl RemoteShared {
@@ -412,6 +413,7 @@ impl RemoteAccessState {
                 pool: state.state_repository().pool().clone(),
                 dedup: Mutex::new(HashMap::new()),
                 long_polls: Mutex::new(HashMap::new()),
+                pin_gate: Arc::new(Semaphore::new(1)),
             }),
         }
     }
@@ -795,6 +797,36 @@ pub(crate) async fn remote_access_layer(
         Some(None) => return StatusCode::BAD_REQUEST.into_response(),
         Some(Some(command_id)) => command_id,
     };
+    let (parts, body) = request.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_CACHED_COMMAND_BODY).await else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    let mut hash = Sha256::new();
+    hash.update(parts.method.as_str());
+    hash.update(b"\0");
+    hash.update(parts.uri.to_string());
+    hash.update(b"\0");
+    hash.update(&bytes);
+    let fingerprint = hex_encode(&hash.finalize());
+    let request = Request::from_parts(parts, Body::from(bytes));
+    let reserved = sqlx::query("INSERT OR IGNORE INTO phone_commands(session_id, command_id, fingerprint) VALUES (?, ?, ?)")
+        .bind(session_id.to_string()).bind(command_id.to_string()).bind(&fingerprint)
+        .execute(remote.pool()).await;
+    let Ok(reserved) = reserved else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if reserved.rows_affected() == 0 {
+        let stored = sqlx::query_scalar::<_, String>(
+            "SELECT fingerprint FROM phone_commands WHERE session_id = ? AND command_id = ?",
+        )
+        .bind(session_id.to_string())
+        .bind(command_id.to_string())
+        .fetch_one(remote.pool())
+        .await;
+        if !matches!(stored, Ok(ref value) if value == &fingerprint) {
+            return StatusCode::CONFLICT.into_response();
+        }
+    }
     // Claim the id, or replay / wait on whoever holds it. The claim and the
     // lookup happen under one lock so two concurrent duplicates can never
     // both miss.
@@ -816,6 +848,9 @@ pub(crate) async fn remote_access_layer(
                     notified
                 }
                 None => {
+                    if reserved.rows_affected() == 0 {
+                        return StatusCode::CONFLICT.into_response();
+                    }
                     window.begin(command_id);
                     break;
                 }
@@ -837,7 +872,7 @@ pub(crate) async fn remote_access_layer(
     };
     // A 5xx is a transient failure, not a settled outcome: caching it would
     // pin the client's retry to the failure. Release the id instead so the
-    // retry executes for real.
+    // retry receives a conflict from the durable reservation instead of risking a second side effect.
     let cached = (!parts.status.is_server_error()).then(|| CachedCommand {
         status: parts.status,
         content_type: parts.headers.get(header::CONTENT_TYPE).cloned(),
@@ -1141,7 +1176,16 @@ pub(crate) async fn pair_route(
     let Ok(secret) = random_secret_hex() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let Ok(pin_hash) = hash_pin(&request.pin) else {
+    let Ok(permit) = remote.shared.pin_gate.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    let pin = request.pin.clone();
+    let Ok(Ok(pin_hash)) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_pin(&pin)
+    })
+    .await
+    else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let now = remote.now();
@@ -1282,21 +1326,8 @@ async fn handle_pin_failure(
     remote: &RemoteAccessState,
     session: &PhoneSessionRow,
     now: DateTime<Utc>,
+    outcome: PinFailureOutcome,
 ) -> Response {
-    let outcome = match remote
-        .repository()
-        .record_pin_failure(
-            session.id,
-            now,
-            Duration::minutes(PIN_WINDOW_MINUTES),
-            PIN_MAX_FAILURES,
-        )
-        .await
-    {
-        Ok(Some(outcome)) => outcome,
-        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     let audited = append_audit(
         remote.pool(),
         now,
@@ -1328,6 +1359,9 @@ pub(crate) async fn stepup_route(
     let Ok(Json(request)) = body else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let Ok(permit) = remote.shared.pin_gate.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
     let repository = remote.repository();
     let session = match repository.load_phone_session(principal.0).await {
         Ok(Some(session)) => session,
@@ -1341,8 +1375,31 @@ pub(crate) async fn stepup_route(
     {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    if !valid_pin_format(&request.pin) || !verify_pin(&request.pin, &session.pin_hash) {
-        return handle_pin_failure(&remote, &session, now).await;
+    let outcome = match remote
+        .repository()
+        .record_pin_failure(
+            session.id,
+            now,
+            Duration::minutes(PIN_WINDOW_MINUTES),
+            PIN_MAX_FAILURES,
+        )
+        .await
+    {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let hash = session.pin_hash.clone();
+    let pin = request.pin;
+    let verified = tokio::task::spawn_blocking(move || {
+        (valid_pin_format(&pin) && verify_pin(&pin, &hash), permit)
+    })
+    .await;
+    let Ok((valid, _permit)) = verified else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if !valid {
+        return handle_pin_failure(&remote, &session, now, outcome).await;
     }
     let expires_at = now + Duration::minutes(STEPUP_GRACE_MINUTES);
     if repository

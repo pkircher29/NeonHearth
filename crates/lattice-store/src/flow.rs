@@ -83,7 +83,7 @@ impl CompactionPolicy {
     pub fn validate(&self) -> Result<(), FlowStoreError> {
         if self.seconds <= Duration::zero()
             || self.minutes < self.seconds
-            || self.hours.is_some()
+            || self.hours.is_some_and(|hours| hours < self.minutes)
             || self.max_rows == 0
         {
             Err(FlowStoreError::Invalid)
@@ -127,7 +127,7 @@ impl FlowRepository {
         changes: &[RollupChange],
         now: DateTime<Utc>,
     ) -> Result<(), FlowStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin_write(&self.pool).await?;
         self.apply_in_transaction(&mut tx, changes, now).await?;
         tx.commit().await?;
         Ok(())
@@ -160,6 +160,18 @@ impl FlowRepository {
         now: DateTime<Utc>,
         p: &CompactionPolicy,
     ) -> Result<u64, FlowStoreError> {
+        self.compact_limited(now, p, u64::MAX).await
+    }
+    /// Like [`Self::compact`] but stops once about `budget` child rows have
+    /// been removed (whole parent buckets are never split, so the bound is
+    /// approximate by up to one batch). Also applies hour retention when
+    /// `p.hours` is set: hour rows and the seals protecting them are deleted.
+    pub async fn compact_limited(
+        &self,
+        now: DateTime<Utc>,
+        p: &CompactionPolicy,
+        budget: u64,
+    ) -> Result<u64, FlowStoreError> {
         p.validate()?;
         let sec = now
             .checked_sub_signed(p.seconds)
@@ -168,10 +180,43 @@ impl FlowRepository {
             .checked_sub_signed(p.minutes)
             .ok_or(FlowStoreError::Overflow)?;
         let batch = i64::try_from(p.max_rows).map_err(|_| FlowStoreError::Overflow)?;
-        let mut removed = self.compact_level(true, sec, now, batch).await?;
+        let mut removed = self.compact_level(true, sec, now, batch, budget).await?;
         removed = removed
-            .checked_add(self.compact_level(false, min, now, batch).await?)
+            .checked_add(
+                self.compact_level(false, min, now, batch, budget.saturating_sub(removed))
+                    .await?,
+            )
             .ok_or(FlowStoreError::Overflow)?;
+        if let Some(hours) = p.hours {
+            let cut = now
+                .checked_sub_signed(hours)
+                .ok_or(FlowStoreError::Overflow)?;
+            removed = removed
+                .checked_add(
+                    self.prune_hours(cut, budget.saturating_sub(removed))
+                        .await?,
+                )
+                .ok_or(FlowStoreError::Overflow)?;
+        }
+        Ok(removed)
+    }
+    /// Deletes hour rollups older than `cut` plus compaction seals whose parent
+    /// bucket is older than `cut` (the rows they guarded are gone).
+    async fn prune_hours(&self, cut: DateTime<Utc>, budget: u64) -> Result<u64, FlowStoreError> {
+        let mut removed: u64 = 0;
+        while removed < budget {
+            let step = i64::try_from((budget - removed).min(10_000)).unwrap_or(10_000);
+            let mut tx = crate::begin_write(&self.pool).await?;
+            let hours = sqlx::query("DELETE FROM flow_rollups WHERE rowid IN (SELECT rowid FROM flow_rollups WHERE resolution='hour' AND unixepoch(bucket) < ?1 LIMIT ?2)")
+                .bind(cut.timestamp()).bind(step).execute(&mut *tx).await?.rows_affected();
+            let seals = sqlx::query("DELETE FROM flow_compaction_seals WHERE rowid IN (SELECT rowid FROM flow_compaction_seals WHERE unixepoch(parent_bucket) < ?1 LIMIT ?2)")
+                .bind(cut.timestamp()).bind(step).execute(&mut *tx).await?.rows_affected();
+            tx.commit().await?;
+            removed = removed.saturating_add(hours).saturating_add(seals);
+            if hours == 0 && seals == 0 {
+                break;
+            }
+        }
         Ok(removed)
     }
     async fn compact_level(
@@ -180,6 +225,7 @@ impl FlowRepository {
         cut: DateTime<Utc>,
         now: DateTime<Utc>,
         batch: i64,
+        budget: u64,
     ) -> Result<u64, FlowStoreError> {
         let (child, width) = if seconds_to_minutes {
             ("second", 60)
@@ -193,8 +239,8 @@ impl FlowRepository {
             "DELETE FROM flow_rollups WHERE resolution='{child}' AND unixepoch(bucket)-((unixepoch(bucket)%{width}+{width})%{width})+{width}<=unixepoch(?)"
         );
         let mut removed: u64 = 0;
-        loop {
-            let mut tx = self.pool.begin().await?;
+        while removed < budget {
+            let mut tx = crate::begin_write(&self.pool).await?;
             let groups: Vec<(i64, i64)> = sqlx::query_as(&groups_sql)
                 .bind(cut.to_rfc3339())
                 .bind(MAX_COMPACTION_GROUPS)
@@ -287,10 +333,19 @@ async fn upsert(
         let sealed: Option<i64> = sqlx::query_scalar("SELECT 1 FROM flow_compaction_seals WHERE child_resolution=? AND parent_bucket=? AND device_id=? AND protocol=? AND destination=? AND interface=? AND metadata_ip=? AND metadata_domain=?")
             .bind(res_s(r.key.resolution)).bind(parent).bind(r.key.device_id.to_string()).bind(proto_s(r.key.protocol)).bind(dest_s(r.key.destination)).bind(i64::from(r.key.interface)).bind(&ip).bind(&domain).fetch_optional(&mut **tx).await?;
         if sealed.is_some() {
-            return Err(FlowStoreError::Invalid);
+            // A late row for a parent that was already compacted cannot be
+            // merged (its old value is gone). Failing here would roll back the
+            // whole discovery commit it rides in and poison every retry, so
+            // the late row is dropped instead.
+            tracing::warn!(
+                device_id = %r.key.device_id,
+                bucket = %r.key.bucket,
+                "dropping flow rollup for an already-compacted parent bucket"
+            );
+            return Ok(());
         }
     }
-    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_confirmed) VALUES(?,?,?,0) ON CONFLICT(device_id) DO UPDATE SET last_seen_at=CASE WHEN excluded.last_seen_at>last_seen_at THEN excluded.last_seen_at ELSE last_seen_at END").bind(r.key.device_id.to_string()).bind(ts(r.key.bucket)).bind(ts(r.key.bucket)).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_confirmed) VALUES(?,?,?,0) ON CONFLICT(device_id) DO UPDATE SET last_seen_at=CASE WHEN unixepoch(excluded.last_seen_at)>unixepoch(last_seen_at) THEN excluded.last_seen_at ELSE last_seen_at END").bind(r.key.device_id.to_string()).bind(ts(r.key.bucket)).bind(ts(r.key.bucket)).execute(&mut **tx).await?;
     sqlx::query("INSERT INTO flow_rollups(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain,upload,download,coverage,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(resolution,bucket,device_id,protocol,destination,interface,metadata_ip,metadata_domain) DO UPDATE SET upload=excluded.upload,download=excluded.download,coverage=excluded.coverage,updated_at=excluded.updated_at").bind(res_s(r.key.resolution)).bind(ts(r.key.bucket)).bind(r.key.device_id.to_string()).bind(proto_s(r.key.protocol)).bind(dest_s(r.key.destination)).bind(i64::from(r.key.interface)).bind(ip).bind(domain).bind(up).bind(down).bind(cov_s(r.coverage)).bind(ts(now)).execute(&mut **tx).await?;
     Ok(())
 }

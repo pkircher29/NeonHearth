@@ -75,7 +75,7 @@
   .tray-device > span:first-child{color:var(--blue)}
   .tray-label{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .tray-ip{flex:none;color:var(--muted);font:10px var(--font-mono)}
-  .tray-device.arming{border-color:var(--accent);color:var(--ink);box-shadow:inset 0 0 16px var(--accent)14}
+  .tray-device.arming{border-color:var(--accent);color:var(--ink);box-shadow:inset 0 0 16px color-mix(in srgb, var(--accent) 8%, transparent)}
   .tray-muted{margin:8px 0 0;color:var(--muted);font-size:11px;line-height:1.5}
   .estimate-list{list-style:none;margin:0;padding:0;display:grid;gap:9px}
   .estimate-list li{display:grid;gap:2px;padding:8px;border:1px dashed var(--line-strong);border-radius:6px}

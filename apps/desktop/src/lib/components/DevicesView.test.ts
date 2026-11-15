@@ -37,9 +37,9 @@ it('shows searchable web clues as text while preserving the owner name and trust
   expect(container.querySelector('.web-identity')?.textContent).toContain('<img src=x onerror=alert(1)>');
   expect(container.querySelector('.web-identity img')).toBeNull();
   expect(getByText(/certificate unverified/)).toBeTruthy();
-  await fireEvent.input(getByRole('textbox', { name: 'Search devices' }), { target: { value: 'home assistant' } });
+  await fireEvent.input(getByRole('searchbox', { name: 'Search devices' }), { target: { value: 'home assistant' } });
   expect(getByText('My confirmed name')).toBeTruthy();
-  await fireEvent.input(getByRole('textbox', { name: 'Search devices' }), { target: { value: 'no such product' } });
+  await fireEvent.input(getByRole('searchbox', { name: 'Search devices' }), { target: { value: 'no such product' } });
   expect(getByText('No devices match')).toBeTruthy();
 });
 

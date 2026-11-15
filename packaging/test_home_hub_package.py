@@ -166,5 +166,50 @@ class PackageTests(unittest.TestCase):
         self.assertEqual((self.output/'licenses/npm/inner/1.0.0/LICENSE').read_text(),'nested license')
 
 
+    def test_prebuilt_notices_and_external_ui_need_no_cargo_or_node_modules(self):
+        """The packaging step that follows signing must not run cargo or read node_modules."""
+        import shutil
+        self.complete_inputs()
+        notices = self.root/'notices'
+        (notices/'rust/dep-1.0.0').mkdir(parents=True)
+        (notices/'rust/dep-1.0.0/LICENSE').write_text('rust licence')
+        (notices/'rust-components.json').write_text('[{"name":"dep"}]')
+        (notices/'npm-components.json').write_text('[]')
+        ui = self.root/'external-ui'
+        ui.mkdir()
+        (ui/'index.html').write_text('external dashboard')
+        shutil.rmtree(self.root/'apps/desktop/dist')
+        (self.root/'apps/desktop/package-lock.json').unlink()
+        calls = []
+        with patch.object(package, 'ROOT', self.root), patch.object(sys, 'argv', [str(SCRIPT), '--mosquitto', str(self.root/'mqtt'), '--output', str(self.output), '--ui', str(ui), '--notices', str(notices)]):
+            def command(args, **kwargs):
+                calls.append(args[0])
+                return 'a' * 40 if args[:2] == ['git', 'rev-parse'] else ''
+            with patch.object(package.subprocess, 'check_output', side_effect=command):
+                package.main()
+        self.assertNotIn('cargo', calls)
+        self.assertEqual((self.output/'ui/index.html').read_text(), 'external dashboard')
+        self.assertEqual((self.output/'licenses/rust/dep-1.0.0/LICENSE').read_text(), 'rust licence')
+        listed = {row['path'] for row in json.loads((self.output/'PACKAGE-MANIFEST.json').read_text())['files']}
+        self.assertIn('licenses/rust-components.json', listed)
+
+    def test_incomplete_prebuilt_notices_are_refused(self):
+        self.complete_inputs()
+        notices = self.root/'notices'
+        notices.mkdir()
+        with self.assertRaises(ValueError):
+            self.run_package('--notices', str(notices))
+        self.assertTrue(not self.output.exists() or not (self.output/'PACKAGE-MANIFEST.json').exists())
+
+    def test_emit_notices_writes_only_the_notices_folder(self):
+        target = self.root/'emitted'
+        with patch.object(package, 'ROOT', self.root), patch.object(sys, 'argv', [str(SCRIPT), '--emit-notices', str(target)]):
+            with patch.object(package.subprocess, 'check_output', return_value=b'{"packages":[]}'):
+                package.main()
+        self.assertTrue((target/'rust-components.json').is_file())
+        self.assertTrue((target/'npm-components.json').is_file())
+        self.assertFalse(self.output.exists())
+
+
 if __name__ == '__main__':
     unittest.main()

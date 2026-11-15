@@ -154,3 +154,82 @@ impl Evaluation {
         }
     }
 }
+
+/// Basis points are 0..=10_000; larger values are malformed input.
+pub const MAX_BASIS_POINTS: u16 = 10_000;
+
+impl Identification {
+    /// Checked constructor for an automatic identification.
+    pub fn automatic(
+        confidence_basis_points: u16,
+        evidence_families: Vec<EvidenceFamily>,
+    ) -> Result<Self, &'static str> {
+        let value = Self::Automatic {
+            confidence_basis_points,
+            evidence_families,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Rejects values that deserialization alone cannot (basis points > 100%).
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Automatic {
+                confidence_basis_points,
+                ..
+            } if *confidence_basis_points > MAX_BASIS_POINTS => {
+                Err("confidence basis points exceed 10000")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl RiskSignal {
+    /// Checked constructor for a danger signal: needs evidence and <= 100%.
+    pub fn danger(
+        confidence_basis_points: u16,
+        evidence: impl Into<String>,
+    ) -> Result<Self, &'static str> {
+        let value = Self::HighConfidenceDanger {
+            confidence_basis_points,
+            evidence: evidence.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Rejects a danger signal with no evidence or more than 100% confidence.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::None => Ok(()),
+            Self::HighConfidenceDanger {
+                confidence_basis_points,
+                evidence,
+            } => {
+                if *confidence_basis_points > MAX_BASIS_POINTS {
+                    Err("confidence basis points exceed 10000")
+                } else if evidence.trim().is_empty() {
+                    Err("danger signal needs evidence")
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_signals_are_rejected() {
+        assert!(RiskSignal::danger(10_001, "x").is_err());
+        assert!(RiskSignal::danger(9_000, "  ").is_err());
+        assert!(RiskSignal::danger(10_000, "x").is_ok());
+        assert!(Identification::automatic(10_001, vec![]).is_err());
+        assert!(Identification::automatic(8_500, vec![]).is_ok());
+    }
+}

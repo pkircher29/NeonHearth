@@ -58,10 +58,10 @@ function Write-Log {
     param([string]$Message)
     $line = '{0:yyyy-MM-ddTHH:mm:ssK} {1}' -f (Get-Date), $Message
     Write-Host $line
-    try { Add-Content -Path $logPath -Value $line } catch {}
+    try { Add-Content -LiteralPath $logPath -Value $line } catch {}
 }
 
-if (-not (Test-Path $serviceKey)) {
+if (-not (Test-Path -Path $serviceKey)) {
     throw "Service '$ServiceName' is not registered; run the installer first."
 }
 
@@ -73,29 +73,107 @@ $sidAdmins = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
 $serviceAccount = [System.Security.Principal.NTAccount]::new("NT SERVICE\$ServiceName")
 $serviceSid = $serviceAccount.Translate([System.Security.Principal.SecurityIdentifier])
 
-# --- 1. State directory with an explicit, non-inherited ACL (H-2) ----------
-New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+# --- 1. State directory, created with its final protected descriptor ------
+# %ProgramData% lets ANY standard user create subfolders, and this script runs
+# as SYSTEM. A pre-created C:\ProgramData\NeonHearth could therefore be (a) a
+# junction, making Set-Acl rewrite some other directory, or (b) owned by the
+# user, who would keep implicit WRITE_DAC over the "protected" state. So:
+#   - a reparse point is refused outright;
+#   - a directory not owned by SYSTEM / Administrators is moved aside (data is
+#     preserved, never read or reused) and a fresh one is created;
+#   - the new directory is created already carrying the final protected DACL.
 $dirInherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
 $noProp = [System.Security.AccessControl.PropagationFlags]::None
 $allow = [System.Security.AccessControl.AccessControlType]::Allow
+$trustedOwners = @($sidSystem.Value, $sidAdmins.Value)
 
-$dirAcl = Get-Acl -Path $stateDir
-# Cut inheritance and DROP the inherited rules (second arg $false) so the
-# ProgramData default (BUILTIN\Users read) does not survive as explicit rules.
-$dirAcl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($dirAcl.Access | Where-Object { -not $_.IsInherited })) {
-    [void]$dirAcl.RemoveAccessRuleSpecific($rule)
+function New-StateSecurity {
+    $sec = [System.Security.AccessControl.DirectorySecurity]::new()
+    $sec.SetAccessRuleProtection($true, $false)
+    foreach ($pair in @(@($sidSystem, 'FullControl'), @($sidAdmins, 'FullControl'), @($serviceSid, 'Modify'))) {
+        $sec.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $pair[0], $pair[1], $dirInherit, $noProp, $allow))
+    }
+    return $sec
 }
-$dirAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
-    $sidSystem, 'FullControl', $dirInherit, $noProp, $allow))
-$dirAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
-    $sidAdmins, 'FullControl', $dirInherit, $noProp, $allow))
-$dirAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
-    $serviceSid, 'Modify', $dirInherit, $noProp, $allow))
-Set-Acl -Path $stateDir -AclObject $dirAcl
-Write-Log "State directory ACL set explicitly: SYSTEM/Administrators full, NT SERVICE\$ServiceName modify, inheritance off."
+function Get-OwnerSid([string]$Path) {
+    $acl = Get-Acl -LiteralPath $Path
+    return $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+}
 
-# --- 2. Service-private environment (token, ffmpeg, UI) ---
+if (Test-Path -LiteralPath $stateDir) {
+    $item = Get-Item -LiteralPath $stateDir -Force
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Refusing to use ${stateDir}: it is a junction or symbolic link. Remove it (not its target) and run the installer again."
+    }
+    if (-not $item.PSIsContainer) {
+        throw "Refusing to use ${stateDir}: it is a file."
+    }
+    if ($trustedOwners -notcontains (Get-OwnerSid $stateDir)) {
+        $aside = "$stateDir.untrusted-" + [guid]::NewGuid().ToString('N')
+        Move-Item -LiteralPath $stateDir -Destination $aside -ErrorAction Stop
+        Write-Host "Existing $stateDir was not owned by SYSTEM or Administrators; moved to $aside and NOT used."
+    }
+}
+if (-not (Test-Path -LiteralPath $stateDir)) {
+    $creationSecurity = New-StateSecurity
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        [void][System.IO.FileSystemAclExtensions]::Create([System.IO.DirectoryInfo]::new($stateDir), $creationSecurity)
+    } else {
+        [void][System.IO.Directory]::CreateDirectory($stateDir, $creationSecurity)
+    }
+}
+# Re-apply (idempotent repair of a hand-edited trusted directory) and make the
+# owner explicit: Administrators, never a standard user.
+$dirAcl = New-StateSecurity
+$dirAcl.SetOwner($sidAdmins)
+Set-Acl -LiteralPath $stateDir -AclObject $dirAcl
+if ($trustedOwners -notcontains (Get-OwnerSid $stateDir)) {
+    throw "State directory owner is not SYSTEM or Administrators after hardening."
+}
+Write-Log "State directory ACL set explicitly: SYSTEM/Administrators full, NT SERVICE\$ServiceName modify, inheritance off, owner verified."
+
+# --- 2. Service registry key ACL FIRST, then the service-private environment -
+# The key inherits BUILTIN\Users read by default (audit H-1), so the ACL is
+# applied and verified BEFORE any token is written, and a failure removes the
+# Environment value again (fail closed: the service refuses to start without a
+# token, and re-running this script generates one).
+$keyInherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit
+$keyAcl = Get-Acl -Path $serviceKey
+$keyAcl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($keyAcl.Access | Where-Object { -not $_.IsInherited })) {
+    [void]$keyAcl.RemoveAccessRuleSpecific($rule)
+}
+$keyAcl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new(
+    $sidSystem, 'FullControl', $keyInherit, $noProp, $allow))
+$keyAcl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new(
+    $sidAdmins, 'FullControl', $keyInherit, $noProp, $allow))
+$keyAcl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new(
+    $serviceSid, 'ReadKey', $keyInherit, $noProp, $allow))
+Set-Acl -Path $serviceKey -AclObject $keyAcl
+$permitted = @($sidSystem.Value, $sidAdmins.Value, $serviceSid.Value)
+$applied = Get-Acl -Path $serviceKey
+$stray = @($applied.Access | Where-Object {
+    $_.AccessControlType -eq 'Allow' -and
+    ($permitted -notcontains $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value)
+})
+if ($stray.Count -gt 0 -or -not $applied.AreAccessRulesProtected) {
+    throw "Service registry key ACL verification failed; the token was not written."
+}
+Write-Log "Service registry key ACL set and verified: SYSTEM/Administrators full, NT SERVICE\$ServiceName read, inheritance off (BUILTIN\Users removed)."
+
+# Token generations: earlier installers wrote the token BEFORE tightening the
+# key ACL, so a token created by them may have been readable by local users
+# for a moment. Generation 2 = written only after hardening. A token without
+# generation 2 is rotated exactly once (a restart is forced below). Pairing is
+# re-established by the Start-menu shortcut, which always reads the current
+# value; only an already-open dashboard tab needs to be reopened.
+$generationKey = 'HKLM:\SOFTWARE\NeonHearth'
+$generation = 0
+try {
+    $generation = [int](Get-ItemProperty -Path $generationKey -Name 'TokenGeneration' -ErrorAction Stop).TokenGeneration
+} catch { $generation = 0 }
+
 $existing = @()
 $existingProp = Get-ItemProperty -Path $serviceKey -Name 'Environment' -ErrorAction SilentlyContinue
 if ($null -ne $existingProp) { $existing = @($existingProp.Environment) }
@@ -110,17 +188,22 @@ function Set-EnvEntry {
     if ($idx -ge 0) { $List[$idx] = "$Name=$Value" } else { $List.Add("$Name=$Value") }
 }
 
-if (-not ($entries | Where-Object { $_ -like 'LATTICE_SERVICE_TOKEN=*' })) {
-    # The MSI custom action runs Windows PowerShell 5.1 (.NET Framework),
-    # where RandomNumberGenerator has no static Fill() — Create()/GetBytes()
-    # works on both 5.1 and 7+. (First real install failed exactly here.)
+$tokenRotated = $false
+$hasToken = [bool]($entries | Where-Object { $_ -like 'LATTICE_SERVICE_TOKEN=*' })
+if ($hasToken -and $generation -lt 2) {
+    $kept = [System.Collections.Generic.List[string]]::new()
+    foreach ($e in $entries) { if ($e -notlike 'LATTICE_SERVICE_TOKEN=*') { $kept.Add($e) } }
+    $entries = $kept
+    $hasToken = $false
+    $tokenRotated = $true
+    Write-Log 'Rotating the pairing token once: it predates the hardened install order.'
+}
+if (-not $hasToken) {
+    # Windows PowerShell 5.1 (.NET Framework) has no static RandomNumberGenerator.Fill().
     $bytes = New-Object byte[] 48
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-    # URL-safe alphabet, NOT standard base64: AppState::new (state.rs) only
-    # accepts [A-Za-z0-9._-] tokens, and '+'/'/' from plain ToBase64String
-    # made the service reject its own installer-generated token (verified
-    # against a live service: "invalid service token configuration").
+    # URL-safe alphabet: AppState::new (state.rs) only accepts [A-Za-z0-9._-].
     # 48 bytes -> exactly 64 chars, no '=' padding.
     $token = [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_')
     $entries.Add("LATTICE_SERVICE_TOKEN=$token")
@@ -131,47 +214,32 @@ if (-not ($entries | Where-Object { $_ -like 'LATTICE_SERVICE_TOKEN=*' })) {
 
 # Bundled ffmpeg (opt-in MSI component; flat in the install folder).
 $ffmpegPath = Join-Path $installDir 'ffmpeg.exe'
-if (Test-Path $ffmpegPath) {
+if (Test-Path -LiteralPath $ffmpegPath) {
     Set-EnvEntry -List $entries -Name 'NEONHEARTH_FFMPEG' -Value $ffmpegPath
     Write-Log "Bundled ffmpeg found; NEONHEARTH_FFMPEG=$ffmpegPath"
 } else {
     Write-Log 'No bundled ffmpeg.exe in the install folder; camera media will use the service default lookup.'
 }
-# The service hosts the installed UI bundle when LATTICE_UI_DIR points at it
-# (crates/lattice-service/src/main.rs). This script lives in
-# <INSTALLFOLDER>\scripts, so the bundle is the sibling ui\ directory —
-# derived from $PSScriptRoot instead of hardcoding Program Files so custom
-# install locations keep working.
+# The service hosts the installed UI bundle when LATTICE_UI_DIR points at it.
+# Derived from $PSScriptRoot so custom install locations keep working.
 $uiDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'ui'
-$uiEntry = "LATTICE_UI_DIR=$uiDir"
-$uiIdx = -1
-for ($i = 0; $i -lt $entries.Count; $i++) { if ($entries[$i] -like 'LATTICE_UI_DIR=*') { $uiIdx = $i } }
-if ($uiIdx -ge 0) { $entries[$uiIdx] = $uiEntry } else { $entries.Add($uiEntry) }
+Set-EnvEntry -List $entries -Name 'LATTICE_UI_DIR' -Value $uiDir
 Write-Log "Service will serve the dashboard UI from $uiDir on http://127.0.0.1:58120/."
 
-Set-ItemProperty -Path $serviceKey -Name 'Environment' `
-    -Value ([string[]]$entries) -Type MultiString
-Write-Log 'Service Environment registry value written.'
-
-# --- 3b. Service registry key ACL (H-1) ------------------------------------
-# The Environment value now holds the pairing token, so the key must not keep
-# the default inherited BUILTIN\Users read. The Service Control Manager runs
-# as SYSTEM and reads the key on its behalf; the service account itself only
-# needs read so its own config queries keep working.
-$keyInherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit
-$keyAcl = Get-Acl -Path $serviceKey
-$keyAcl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($keyAcl.Access | Where-Object { -not $_.IsInherited })) {
-    [void]$keyAcl.RemoveAccessRuleSpecific($rule)
+try {
+    Set-ItemProperty -Path $serviceKey -Name 'Environment' `
+        -Value ([string[]]$entries) -Type MultiString
+    # Read back: the ACL must still be the hardened one when the secret lands.
+    $after = Get-Acl -Path $serviceKey
+    if (-not $after.AreAccessRulesProtected) { throw 'Service key ACL is no longer protected.' }
+    New-Item -Path $generationKey -Force | Out-Null
+    Set-ItemProperty -Path $generationKey -Name 'TokenGeneration' -Value 2 -Type DWord
+} catch {
+    # Fail closed: never leave a token behind a key we could not verify.
+    Remove-ItemProperty -Path $serviceKey -Name 'Environment' -ErrorAction SilentlyContinue
+    throw
 }
-$keyAcl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new(
-    $sidSystem, 'FullControl', $keyInherit, $noProp, $allow))
-$keyAcl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new(
-    $sidAdmins, 'FullControl', $keyInherit, $noProp, $allow))
-$keyAcl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new(
-    $serviceSid, 'ReadKey', $keyInherit, $noProp, $allow))
-Set-Acl -Path $serviceKey -AclObject $keyAcl
-Write-Log "Service registry key ACL set explicitly: SYSTEM/Administrators full, NT SERVICE\$ServiceName read, inheritance off (BUILTIN\Users removed)."
+Write-Log 'Service Environment registry value written.'
 
 # --- 4. Recovery settings --------------------------------------------------
 & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/30000 | Out-Null
@@ -185,8 +253,17 @@ Write-Log 'Native Windows collector configured for Automatic startup; no Npcap r
 $obsoleteNotice = Join-Path $stateDir 'NPCAP-REQUIRED.txt'
 if (Test-Path -LiteralPath $obsoleteNotice) { Remove-Item -LiteralPath $obsoleteNotice }
 if ($Start) {
-    Start-Service -Name $ServiceName
-    Write-Log 'Service started.'
+    $svc = Get-Service -Name $ServiceName
+    if ($tokenRotated -and $svc.Status -ne 'Stopped') {
+        # The running service still holds the old token in memory.
+        Restart-Service -Name $ServiceName -Force
+        Write-Log 'Service restarted to load the rotated pairing token. Reopen NeonHearth from the Start menu.'
+    } elseif ($svc.Status -eq 'Stopped') {
+        Start-Service -Name $ServiceName
+        Write-Log 'Service started.'
+    } else {
+        Write-Log 'Service already running.'
+    }
 }
 
 # --- 6. Uninstall data note ------------------------------------------------
@@ -200,7 +277,7 @@ baseline cohort, and approvals survive a reinstall.
 
 To remove all NeonHearth data after uninstalling, delete this folder.
 "@
-Set-Content -Path (Join-Path $stateDir 'README-UNINSTALL.txt') -Value $uninstallNote
+Set-Content -LiteralPath (Join-Path $stateDir 'README-UNINSTALL.txt') -Value $uninstallNote
 
 # --- 7. Open through the protected pairing shortcut ------------------------
 # WiX QuietExec can copy custom-action stdout into the Windows Installer log.

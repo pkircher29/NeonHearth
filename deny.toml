@@ -19,12 +19,25 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # Vulnerabilities and unsound crates fail the build ("deny" is the default for
 # `vulnerability` and `unsound` in current cargo-deny; listed here for clarity).
 version = 2
-# Unmaintained warnings surface in logs but do not fail the gate yet; each one
-# must be triaged and either replaced or moved to `ignore` with a reason.
-unmaintained = "workspace"
+# Unmaintained crates anywhere in the graph (not only direct workspace
+# dependencies) fail the gate. Each one must be replaced or listed in `ignore`
+# below with a reason, an owner action and a re-check condition.
+unmaintained = "all"
 yanked = "deny"
 # No vulnerability exceptions. Fix or remove affected dependencies.
-ignore = []
+# The four entries below are UNMAINTAINED-crate notices only (no known
+# vulnerability), all transitive, surfaced when `unmaintained` was widened from
+# "workspace" to "all". Each is waiting for an upstream release, none can be
+# upgraded from here (the advisories report "no safe upgrade"); re-check when
+# wasmtime and keyring are next updated, and delete the entry then.
+ignore = [
+    # fxhash 0.2.1 <- fxprof-processed-profile <- wasmtime 36 (lattice-audit-wasm).
+    { id = "RUSTSEC-2025-0057", reason = "unmaintained, transitive via wasmtime 36; removed by a wasmtime upgrade" },
+    # zbus family <- secret-service <- keyring 4.1.6 (lattice-service, Linux Secret Service store).
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained (merged into zbus 6); transitive via keyring -> secret-service -> zbus 5" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained (merged into zbus 6); transitive via keyring -> secret-service -> zbus 5" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained (merged into zbus 6); transitive via keyring -> secret-service -> zbus 5" },
+]
 
 [licenses]
 version = 2

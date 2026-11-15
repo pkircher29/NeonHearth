@@ -12,6 +12,17 @@ pub enum Resume {
     SnapshotRequired,
 }
 
+/// Identifies one run of the bus. Sequence numbers restart at 1 in every run,
+/// so a resume position is only meaningful together with its epoch.
+fn new_epoch() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    // Never 0 so "0" can mean "unknown/legacy" to clients.
+    nanos.max(1)
+}
+
 struct State {
     next_sequence: u64,
     replay: VecDeque<EventEnvelope>,
@@ -19,6 +30,7 @@ struct State {
 
 #[derive(Clone)]
 pub struct EventBus {
+    epoch: u64,
     replay_capacity: usize,
     state: Arc<Mutex<State>>,
     sender: broadcast::Sender<EventEnvelope>,
@@ -36,6 +48,7 @@ impl EventBus {
         );
         let (sender, _) = broadcast::channel(subscriber_capacity);
         Self {
+            epoch: new_epoch(),
             replay_capacity,
             state: Arc::new(Mutex::new(State {
                 next_sequence: 1,
@@ -74,12 +87,53 @@ impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.sender.subscribe()
     }
+
+    /// The identifier of this bus run. Clients should store it next to the last
+    /// sequence they saw and present both to [`Self::resume_after_epoch`].
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Like [`Self::resume_after`] but a position from a different run of the
+    /// bus (`epoch` is `Some` and differs) can never resume: sequence numbers
+    /// restart at 1 after a restart, so the same number names another event.
+    /// `None` keeps the legacy, epoch-less behaviour.
+    pub async fn resume_after_epoch(&self, epoch: Option<u64>, sequence: u64) -> Resume {
+        if epoch.is_some_and(|epoch| epoch != self.epoch) {
+            return Resume::SnapshotRequired;
+        }
+        self.resume_after(sequence).await
+    }
+
+    /// Subscribes and computes the replay in one step: `publish` holds the same
+    /// lock while it stores and broadcasts an event, so no event can fall
+    /// between the replay and the live receiver (duplicates are still possible
+    /// only if the caller reads the receiver before draining the replay; filter
+    /// by sequence).
+    pub async fn subscribe_and_resume(
+        &self,
+        epoch: Option<u64>,
+        sequence: u64,
+    ) -> (broadcast::Receiver<EventEnvelope>, Resume) {
+        let state = self.state.lock().await;
+        let receiver = self.sender.subscribe();
+        let resume = if epoch.is_some_and(|epoch| epoch != self.epoch) {
+            Resume::SnapshotRequired
+        } else {
+            Self::resume_locked(&state, sequence)
+        };
+        (receiver, resume)
+    }
     pub async fn current_sequence(&self) -> u64 {
         self.state.lock().await.next_sequence.saturating_sub(1)
     }
 
     pub async fn resume_after(&self, sequence: u64) -> Resume {
         let state = self.state.lock().await;
+        Self::resume_locked(&state, sequence)
+    }
+
+    fn resume_locked(state: &State, sequence: u64) -> Resume {
         let last_sequence = state.next_sequence.saturating_sub(1);
         if sequence == last_sequence {
             return Resume::Events(Vec::new());

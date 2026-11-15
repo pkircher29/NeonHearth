@@ -2,6 +2,7 @@
 // Playwright route handlers stand in for the lattice-service Home API described in
 // docs/architecture/m5-home-twin-contracts.md. State lives in an in-memory object in
 // the test process so committed saves and placements persist across page.reload().
+import { isolateApi } from './isolation';
 import type { Page } from '@playwright/test';
 import type { Estimate, HomeDraft, HomePlan, Placement } from '../../src/lib/stores/home';
 
@@ -147,6 +148,7 @@ export async function installHomeFixture(page: Page, options: HomeServerOptions 
     placementDeletes: []
   };
 
+  await isolateApi(page);
   await page.route('**/api/v1/health', (route) => route.fulfill({ json: { status: 'ok', api_version: 'fixture' } }));
   await page.route('**/api/v1/state**', (route) => route.fulfill({
     json: {

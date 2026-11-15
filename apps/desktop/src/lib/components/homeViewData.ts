@@ -85,8 +85,9 @@ export function toPresenceMap(devices: Record<string, DeviceSnapshot>): Record<s
 export function toBandwidthMap(devices: Record<string, DeviceSnapshot>): Record<string, number> {
   const map: Record<string, number> = {};
   for (const device of Object.values(devices)) {
-    if (!device.bandwidth.available) continue;
-    map[device.device_id] = (device.bandwidth.upload ?? 0) + (device.bandwidth.download ?? 0);
+    // A direction the collector did not report is unknown, not zero: without both, there is no heat to show.
+    if (!device.bandwidth.available || device.bandwidth.upload === null || device.bandwidth.download === null) continue;
+    map[device.device_id] = device.bandwidth.upload + device.bandwidth.download;
   }
   return map;
 }
