@@ -169,7 +169,10 @@ impl AppState {
     /// session manager when every prerequisite held, and in every case the
     /// status the routes report (the specific reason when it did not).
     #[must_use]
-    pub fn with_camera_media(mut self, build: crate::cameras::production::CameraMediaBuild) -> Self {
+    pub fn with_camera_media(
+        mut self,
+        build: crate::cameras::production::CameraMediaBuild,
+    ) -> Self {
         let status = build.status;
         self = match build.manager {
             Some(manager) => self.with_camera_sessions(manager),

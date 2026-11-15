@@ -51,7 +51,12 @@ fn fake_ffmpeg(directory: &Path) -> PathBuf {
     path
 }
 
-async fn call(router: &Router, method: Method, uri: &str, body: Option<&str>) -> (StatusCode, Value) {
+async fn call(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    body: Option<&str>,
+) -> (StatusCode, Value) {
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
@@ -76,7 +81,10 @@ async fn call(router: &Router, method: Method, uri: &str, body: Option<&str>) ->
     (status, value)
 }
 
-async fn router_for(environment: CameraMediaEnvironment, state_dir: &Path) -> (Router, sqlx::SqlitePool) {
+async fn router_for(
+    environment: CameraMediaEnvironment,
+    state_dir: &Path,
+) -> (Router, sqlx::SqlitePool) {
     let pool = connect_memory().await.unwrap();
     let build = assemble(
         &environment,
@@ -123,7 +131,11 @@ async fn a_missing_ffmpeg_gives_specific_reasons_and_leaves_the_service_ready() 
             format!("/api/v1/cameras/{camera}/sessions"),
             Some(session_body.as_str()),
         ),
-        (Method::GET, format!("/api/v1/cameras/{camera}/snapshot"), None),
+        (
+            Method::GET,
+            format!("/api/v1/cameras/{camera}/snapshot"),
+            None,
+        ),
         (
             Method::GET,
             format!("/api/v1/camera-sessions/{SESSION}/playlist.m3u8"),
@@ -134,7 +146,11 @@ async fn a_missing_ffmpeg_gives_specific_reasons_and_leaves_the_service_ready() 
             format!("/api/v1/camera-sessions/{SESSION}/segments/segment-000001.ts"),
             None,
         ),
-        (Method::DELETE, format!("/api/v1/camera-sessions/{SESSION}"), None),
+        (
+            Method::DELETE,
+            format!("/api/v1/camera-sessions/{SESSION}"),
+            None,
+        ),
     ] {
         let (status, body) = call(&router, method.clone(), &uri, body).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}");

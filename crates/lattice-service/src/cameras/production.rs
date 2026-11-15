@@ -249,14 +249,7 @@ pub async fn build(pool: SqlitePool, state_dir: &Path) -> CameraMediaBuild {
         Err(status) => CameraMediaBuild::disabled(status),
         Ok(()) => match tokio::time::timeout(VAULT_OPEN_TIMEOUT, platform_vault(state_dir)).await {
             Ok(Ok((vault, backend))) => {
-                assemble(
-                    &environment,
-                    pool,
-                    vault,
-                    vault_label(backend),
-                    state_dir,
-                )
-                .await
+                assemble(&environment, pool, vault, vault_label(backend), state_dir).await
             }
             Ok(Err(_)) | Err(_) => CameraMediaBuild::disabled(CameraMediaStatus::disabled(
                 REASON_VAULT_UNAVAILABLE,
@@ -408,17 +401,21 @@ mod tests {
 
     #[test]
     fn status_serializes_with_stable_keys() {
-        let value = serde_json::to_value(CameraMediaStatus::disabled(
-            REASON_FFMPEG_NOT_FOUND,
-            "gone",
-        ))
-        .unwrap();
+        let value =
+            serde_json::to_value(CameraMediaStatus::disabled(REASON_FFMPEG_NOT_FOUND, "gone"))
+                .unwrap();
         let object = value.as_object().unwrap();
         let mut keys: Vec<_> = object.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["detail", "enabled", "reason", "setup_available", "setup_detail"]
+            [
+                "detail",
+                "enabled",
+                "reason",
+                "setup_available",
+                "setup_detail"
+            ]
         );
         assert_eq!(value["enabled"], false);
         assert_eq!(value["reason"], "ffmpeg_not_found");
