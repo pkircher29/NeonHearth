@@ -472,8 +472,16 @@ mod tests {
                 granted += 1;
             }
         }
-        assert_eq!(granted, MAX_OUTSTANDING_EVENT_TICKETS - OWNER_RESERVED_TICKETS);
-        assert!(state.issue_event_ticket(now, Principal::Owner).await.is_ok());
+        assert_eq!(
+            granted,
+            MAX_OUTSTANDING_EVENT_TICKETS - OWNER_RESERVED_TICKETS
+        );
+        assert!(
+            state
+                .issue_event_ticket(now, Principal::Owner)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
