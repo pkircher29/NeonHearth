@@ -353,15 +353,6 @@ impl PolicyRepository {
         &self,
         now: DateTime<Utc>,
     ) -> anyhow::Result<DateTime<Utc>> {
-        // An already-persisted baseline is returned unchanged even on a bad
-        // clock; only *creating* the immutable baseline needs a sane clock.
-        if let Some(existing) = self.baseline_started_at().await? {
-            return Ok(existing);
-        }
-        ensure!(
-            now.timestamp() >= MIN_PLAUSIBLE_CLOCK_UNIX,
-            "system clock is not plausible; refusing to start the policy baseline until it is corrected"
-        );
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let install_exists: Option<i64> =
             sqlx::query_scalar("SELECT singleton FROM install_state WHERE singleton=1")
@@ -370,6 +361,23 @@ impl PolicyRepository {
         ensure!(
             install_exists.is_some(),
             "cannot start policy baseline before install initialization"
+        );
+        // An already-persisted baseline is returned unchanged even on a bad
+        // clock; only *creating* the immutable baseline needs a sane clock.
+        // The check runs inside the write transaction so every call, new or
+        // repeated, queues behind a competing writer.
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT baseline_started_at FROM policy_install_state WHERE singleton=1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(existing) = existing {
+            tx.commit().await?;
+            return parse_time(&existing, "policy baseline timestamp");
+        }
+        ensure!(
+            now.timestamp() >= MIN_PLAUSIBLE_CLOCK_UNIX,
+            "system clock is not plausible; refusing to start the policy baseline until it is corrected"
         );
         sqlx::query(
             "INSERT OR IGNORE INTO policy_install_state(singleton, baseline_started_at)
