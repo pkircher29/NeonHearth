@@ -63,6 +63,13 @@ contents:
     file_info:
       mode: 0644
 
+  # Root-only helper that prints the current owner token (rotated token file
+  # first, then the install-time env file).
+  - src: neonhearth-token
+    dst: /usr/bin/neonhearth-token
+    file_info:
+      mode: 0755
+
   # Dedicated service user.
   - src: neonhearth.sysusers.conf
     dst: /usr/lib/sysusers.d/neonhearth.conf
