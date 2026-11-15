@@ -1,6 +1,10 @@
 # Windows delivery and upgrades
 
 The recommended beta download is **NeonHearth-Home-Hub-<version>-windows-x64.zip**.
+On Windows 11 on ARM use **NeonHearth-Home-Hub-<version>-windows-arm64.zip**: its
+launcher and collector are native ARM64 programs, and its broker is the same x64
+build, which Windows runs through its built-in x64 emulation (so it needs the
+same x64 runtime described below).
 Extract the entire ZIP to a new folder, then open `NeonHearth.exe`. It includes
 the native launcher, collector, UI, authenticated MQTT broker, license notices,
 build information and a file manifest. Running it needs no Python, Node,

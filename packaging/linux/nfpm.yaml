@@ -5,6 +5,7 @@
 # working directory, so run nfpm from this directory):
 #
 #   export NEONHEARTH_VERSION=0.1.0            # or the tag version, no leading v
+#   export NEONHEARTH_ARCH=amd64               # or arm64; must match the staged binary
 #   nfpm package --config nfpm.yaml --packager deb --target ../dist/
 #   nfpm package --config nfpm.yaml --packager rpm --target ../dist/
 #
@@ -17,7 +18,7 @@
 # tree; produced by .github/workflows/release.yml on tagged releases.
 
 name: neonhearth
-arch: amd64
+arch: ${NEONHEARTH_ARCH}
 platform: linux
 version: ${NEONHEARTH_VERSION}
 section: net

@@ -20,12 +20,24 @@ def digest(path):
     with path.open('rb') as handle:
         return hashlib.file_digest(handle, 'sha256').hexdigest()
 
+# The launcher and collector are native to the platform. Eclipse Mosquitto publishes no
+# Windows ARM64 build, so the ARM64 package carries the same pinned x64 broker, which Windows 11
+# on ARM runs through its built-in x64 emulation.
+PLATFORMS = {'windows-x64': 'Windows x64', 'windows-arm64': 'Windows 11 on ARM (ARM64)'}
+BROKER_NOTE = {
+    'windows-x64': '',
+    'windows-arm64': ('NeonHearth.exe and the collector are native ARM64 programs. The bundled MQTT broker is the x64 build,\n'
+                      'which Windows 11 on ARM runs through its built-in x64 emulation; it still needs the x64 Visual C++ runtime below.\n'),
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--target', type=Path, default=ROOT / 'target' / 'release')
     parser.add_argument('--mosquitto', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--version', help='Release tag version without v; defaults to Cargo workspace version')
+    parser.add_argument('--platform', choices=sorted(PLATFORMS), default='windows-x64', help='Windows architecture the launcher and collector were built for')
     parser.add_argument('--signed-by', help='Publisher whose code signature the build already verified on NeonHearth.exe and lattice-service.exe; omit for an unsigned package')
     args = parser.parse_args()
     output = args.output.resolve()
@@ -105,13 +117,12 @@ def main():
                     copy(path, f"licenses/npm/{name}/{component_version}/{path.name}")
     (output / 'licenses' / 'npm-components.json').write_text(json.dumps(packages,indent=2),encoding='utf-8')
     (output / 'BUILD-INFO.json').write_text(json.dumps({'format_version':1, 'source_commit':source_commit,
-        'source_dirty':source_dirty, 'version':version, 'platform':'windows-x64', 'delivery':'portable-home-hub',
+        'source_dirty':source_dirty, 'version':version, 'platform':args.platform, 'delivery':'portable-home-hub',
         'unsigned':not args.signed_by, **({'signed_by':args.signed_by} if args.signed_by else {}), 'broker':{'name':'mosquitto', 'version':BROKER_SOURCE['version'],
         'installer_sha256':BROKER_SOURCE['sha256']}}, indent=2), encoding='utf-8')
     signing_note = (f'NeonHearth.exe and bin/lattice-service.exe are code-signed by {args.signed_by}.'
                     if args.signed_by else 'This development package is unsigned.')
-    (output / 'Read me.txt').write_text('''NeonHearth Home Hub for Windows x64
-
+    (output / 'Read me.txt').write_text(f'NeonHearth Home Hub for {PLATFORMS[args.platform]}\n{BROKER_NOTE[args.platform]}' + '''
 Open NeonHearth.exe. The launcher starts the local collector and authenticated MQTT hub, then opens your browser.
 No Python, Node, administrator account, or packet-capture driver is required by the launcher.
 If an older NeonHearth Windows service is installed, keep using its dashboard until you have

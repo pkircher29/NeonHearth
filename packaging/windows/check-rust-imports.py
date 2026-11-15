@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build-time gate for direct imports of our x64 Rust EXEs, not a DLL resolver."""
+"""Build-time gate for direct imports of our x64 and ARM64 Rust EXEs, not a DLL resolver."""
 import argparse
 import json
 from pathlib import Path
@@ -31,8 +31,9 @@ def imports(data):
         raise InvalidPE('missing PE signature')
     machine, count = unpack('<HH', pe + 4)
     optional_size, characteristics = unpack('<HH', pe + 20)
-    if machine != 0x8664 or not 1 <= count <= 96 or not characteristics & 2 or characteristics & 0x2000:
-        raise InvalidPE('expected an x64 executable, not a DLL')
+    # 0x8664 is x64, 0xAA64 is ARM64; both are PE32+ with the same import layout.
+    if machine not in (0x8664, 0xAA64) or not 1 <= count <= 96 or not characteristics & 2 or characteristics & 0x2000:
+        raise InvalidPE('expected an x64 or ARM64 executable, not a DLL')
     optional = pe + 24
     need(optional, optional_size)
     if optional_size < 128 or unpack('<H', optional)[0] != 0x20b:
