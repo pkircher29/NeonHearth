@@ -12,10 +12,9 @@
 #     toolchain, so mingw64 gcc must be first on PATH (prepended only when
 #     C:\msys64 exists; hosted CI runners use the MSVC toolchain and have no
 #     msys64).
-#   - Linking needs Npcap's Packet.lib import library. If the caller already
-#     set RUSTFLAGS (CI points it at an extracted Npcap SDK Lib\x64), it is
-#     respected; otherwise the dev-machine default (installed Npcap's
-#     System32\Npcap directory) is used.
+#   - Windows discovery uses native APIs; no Npcap SDK/runtime is required.
+#     This stages the compatibility MSI; the recommended native ZIP is built
+#     by scripts/package-home-hub.py.
 
 [CmdletBinding()]
 param(
@@ -30,20 +29,20 @@ $PackagingRoot = $PSScriptRoot
 $RepoRoot = Split-Path -Parent $PackagingRoot
 $DistRoot = Join-Path $PackagingRoot 'dist\windows'
 $Desktop = Join-Path $RepoRoot 'apps\desktop'
+if ($env:CARGO_BUILD_TARGET -and $env:CARGO_BUILD_TARGET -notmatch '^[A-Za-z0-9_-]+$') {
+    throw 'Expected a Cargo target triple'
+}
 
 if (Test-Path 'C:\msys64\mingw64\bin') {
     $env:PATH = 'C:\msys64\mingw64\bin;' + $env:PATH
 }
-if (-not $env:RUSTFLAGS) {
-    $env:RUSTFLAGS = '-L C:\Windows\System32\Npcap'
-}
-Write-Host "RUSTFLAGS: $env:RUSTFLAGS"
-
 if (-not $SkipRust) {
     Write-Host '== cargo build --release -p lattice-service =='
     Push-Location $RepoRoot
     try {
-        cargo build --release -p lattice-service
+        $cargoArgs = @('build', '--locked', '--release', '-p', 'lattice-service')
+        if ($env:CARGO_BUILD_TARGET) { $cargoArgs += @('--target', $env:CARGO_BUILD_TARGET) }
+        cargo @cargoArgs
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
     } finally { Pop-Location }
 }
@@ -58,13 +57,27 @@ if (-not $SkipUi) {
     if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit code $LASTEXITCODE" }
 }
 
-$exe = Join-Path $RepoRoot 'target\release\lattice-service.exe'
+$targetRoot = if ($env:CARGO_TARGET_DIR) {
+    if ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR } else { Join-Path $RepoRoot $env:CARGO_TARGET_DIR }
+} else { Join-Path $RepoRoot 'target' }
+if ($env:CARGO_BUILD_TARGET) {
+    # Explicit targets nest release output even when CARGO_TARGET_DIR is custom.
+    $targetRoot = Join-Path $targetRoot $env:CARGO_BUILD_TARGET
+}
+$exe = Join-Path $targetRoot 'release\lattice-service.exe'
 $uiDist = Join-Path $Desktop 'dist'
 if (-not (Test-Path $exe)) { throw "Missing $exe - run without -SkipRust first" }
 if (-not (Test-Path (Join-Path $uiDist 'index.html'))) { throw "Missing $uiDist\index.html - run without -SkipUi first" }
 
 Write-Host "== staging into $DistRoot =="
-if (Test-Path $DistRoot) { Remove-Item -Recurse -Force $DistRoot }
+if (Test-Path -LiteralPath $DistRoot) {
+    $resolvedDist = (Resolve-Path -LiteralPath $DistRoot).Path
+    $expectedDist = [IO.Path]::GetFullPath((Join-Path $PackagingRoot 'dist\windows'))
+    if ($resolvedDist -ne $expectedDist -or ((Get-Item -LiteralPath $DistRoot).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Refusing to replace a staging path outside packaging/dist/windows or a reparse point'
+    }
+    Remove-Item -LiteralPath $resolvedDist -Recurse -Force
+}
 New-Item -ItemType Directory -Force -Path (Join-Path $DistRoot 'bin') | Out-Null
 Copy-Item $exe (Join-Path $DistRoot 'bin\lattice-service.exe')
 Copy-Item -Recurse $uiDist (Join-Path $DistRoot 'ui')

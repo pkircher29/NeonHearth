@@ -8,8 +8,8 @@ use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    path::Path,
-    process::Stdio,
+    path::{Path, PathBuf},
+    process::{ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -40,6 +40,36 @@ fn config_path(path: &Path) -> Result<String> {
         .replace('\\', "/"))
 }
 
+fn check_component_exit(status: ExitStatus, component: &str) -> Result<()> {
+    if status.code().map(|code| code as u32) == Some(0xc0000135) {
+        anyhow::bail!(
+            "{component} could not load a required DLL (0xC0000135). Install or repair the Microsoft Visual C++ v14 Redistributable (x64) from https://aka.ms/vc14/vc_redist.x64.exe, then open NeonHearth again. Windows may ask for administrator approval to install this Microsoft prerequisite. If it still fails, extract the complete NeonHearth ZIP again; do not download individual DLL files. Your saved NeonHearth data is preserved."
+        );
+    }
+    ensure!(
+        status.success(),
+        "{component} failed (exit code {:?})",
+        status.code()
+    );
+    Ok(())
+}
+
+struct PrivateSetupDirectory(PathBuf);
+impl PrivateSetupDirectory {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for PrivateSetupDirectory {
+    fn drop(&mut self) {
+        // This exact random child was created below inside protected hub state.
+        // After a successful rename it no longer exists. Never follow a link.
+        if platform::reject_reparse(&self.0).is_ok() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 fn provision(root: &Path, state: &Path, port: u16) -> Result<()> {
     let directory = state.join("mqtt");
     if directory.exists() {
@@ -50,10 +80,12 @@ fn provision(root: &Path, state: &Path, port: u16) -> Result<()> {
         );
         return Ok(());
     }
-    let stage = tempfile::Builder::new()
-        .prefix("mqtt-setup-")
-        .tempdir_in(state)?;
-    platform::private_directory(stage.path())?;
+    // Create with the explicit current-user owner before adopting RAII cleanup.
+    // An elevated default tempdir can otherwise be owned by Administrators.
+    let stage_path = state.join(format!("mqtt-setup-{}", random_secret()?));
+    ensure!(!stage_path.exists(), "MQTT setup directory already exists");
+    platform::private_directory(&stage_path)?;
+    let stage = PrivateSetupDirectory(stage_path);
     let password = Zeroizing::new(random_secret()?);
     let ha_password = Zeroizing::new(random_secret()?);
     write_atomic(
@@ -69,7 +101,11 @@ fn provision(root: &Path, state: &Path, port: u16) -> Result<()> {
         .arg(stage.path().join("passwords"))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    ensure!(hash.status()?.success(), "MQTT password hashing failed");
+    check_component_exit(
+        hash.status()
+            .context("Could not start the MQTT password tool")?,
+        "MQTT password tool",
+    )?;
     let hashed = Zeroizing::new(read_bounded(&stage.path().join("passwords"), 8192)?);
     ensure!(
         !hashed
@@ -200,14 +236,48 @@ pub(super) fn ensure(
     let stamp = platform::process_stamp(child_id, &binary)?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        ensure!(
-            started.children.last_mut().unwrap().try_wait()?.is_none(),
-            "MQTT exited. Inspect its private broker.log"
-        );
+        if let Some(status) = started.children.last_mut().unwrap().try_wait()? {
+            check_component_exit(status, "MQTT broker")?;
+            anyhow::bail!("MQTT exited. Inspect its private broker.log");
+        }
         if authenticated(&credentials, &stamp)? {
             return Ok(stamp);
         }
         ensure!(Instant::now() < deadline, "MQTT did not become ready");
         thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::process::ExitStatusExt;
+
+    #[test]
+    fn missing_broker_dll_explains_the_official_runtime_and_retry() {
+        let error = check_component_exit(
+            std::process::ExitStatus::from_raw(0xc0000135),
+            "MQTT password tool",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Microsoft Visual C++ v14 Redistributable (x64)"));
+        assert!(error.contains("https://aka.ms/vc14/vc_redist.x64.exe"));
+        assert!(error.contains("open NeonHearth again"));
+        assert!(error.contains("0xC0000135"));
+    }
+
+    #[test]
+    fn other_broker_failures_do_not_claim_a_missing_runtime() {
+        assert!(
+            check_component_exit(std::process::ExitStatus::from_raw(0), "MQTT password tool")
+                .is_ok()
+        );
+        let error =
+            check_component_exit(std::process::ExitStatus::from_raw(1), "MQTT password tool")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("MQTT password tool"));
+        assert!(!error.contains("Redistributable"));
     }
 }

@@ -1,4 +1,35 @@
-# Installer and packaging scaffolding (Stage 7: RLS4 / RLS5)
+# Installer and packaging evidence (Stage 7: RLS4 / RLS5)
+
+## Current delivery model — 2026-11-14
+
+The recommended Windows beta is the native **Home Hub ZIP** described in
+[Windows delivery and upgrades](windows-delivery.md). Release CI now builds
+both `NeonHearth.exe` and `lattice-service.exe`, bundles the checksum-pinned
+Mosquitto payload without executing its installer, and includes third-party
+notices, `BUILD-INFO.json`, and a verified runtime manifest. The exact tagged
+source must pass the reusable CI workflow before release publication.
+
+The legacy MSI/Setup EXE remain separate compatibility downloads. They retain
+their service identity, component GUIDs, ProgramData state and owner token.
+The Windows collector now uses native discovery APIs and does not import
+`Packet.dll`; the service configure script starts without Npcap and clears the
+obsolete `NPCAP-REQUIRED.txt` notice. No Npcap SDK is used by release CI.
+
+The portable hub uses per-user DPAPI credentials and a different state/port
+layout. It must not silently replace or migrate a legacy installation. Follow
+the delivery guide's backup and stop-before-switch process; do not start two
+collectors or copy a live database and WAL.
+
+Signing, clean-machine installation/upgrade/uninstall, Linux package runtime
+acceptance, and the extended hardware soak remain separate evidence gates.
+Neither a file hash nor a successful payload build establishes those outcomes.
+
+## Historical evidence below
+
+The remaining dated sections preserve earlier build/installer evidence. Their
+Npcap loader dependency and limited-mode descriptions refer to the old binaries,
+not to the current native Windows collector. Current build commands and customer
+instructions are in the Windows delivery guide above.
 
 Status date: 2026-08-25. This document separates, per the project honesty
 rule, what is **verified** (and where: build machine vs CI) from what is

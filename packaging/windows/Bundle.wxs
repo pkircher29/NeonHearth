@@ -5,8 +5,8 @@
   Chains the validated NeonHearth MSI (NeonHearth.wxs) into a single
   NeonHearth-Setup-<version>-x64.exe with the standard WiX bootstrapper UI.
   This is a wrapper only: all install logic (service registration, token
-  generation, Npcap limited mode) lives in the MSI and its custom action;
-  the bundle adds no behavior of its own. Npcap detection is deliberately
+  generation, native collector startup) lives in the MSI and its custom action;
+  the bundle adds no behavior of its own. Prerequisite handling is deliberately
   NOT duplicated here - configure-service.ps1 in the MSI is authoritative.
 
   Build (after the MSI exists; requires WiX v5, pinned 5.0.2 in CI):

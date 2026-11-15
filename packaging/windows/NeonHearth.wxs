@@ -44,11 +44,7 @@
   - NO Windows Firewall rule is authored, deliberately: the listener is
     loopback-only and Windows Firewall does not filter loopback traffic.
     If a LAN listener is ever added, an inbound rule must be added then.
-  - The executable is linked against Npcap's Packet.dll (pnet_datalink), so
-    Npcap absence is a load-time failure, not a runtime degradation. The
-    configure-service.ps1 custom action therefore implements "limited mode"
-    by leaving the service registered but Manual/stopped when Npcap is
-    missing, and writes %ProgramData%\NeonHearth\NPCAP-REQUIRED.txt.
+  - The Windows executable uses native discovery APIs and has no Npcap dependency.
   - Service state lives in %ProgramData%\NeonHearth (platform.rs). Uninstall
     leaves it in place; configure-service.ps1 writes README-UNINSTALL.txt
     there explaining that.
@@ -104,16 +100,6 @@
                   DowngradeErrorMessage="A newer version of NeonHearth is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Npcap presence: WinPcap-compatible Packet.dll in System32. The
-         configure-service.ps1 custom action performs the authoritative
-         check (it also looks in System32\Npcap); this property only feeds
-         the summary log. -->
-    <Property Id="NPCAP_COMPAT_PRESENT">
-      <DirectorySearch Id="System64Search" Path="[System64Folder]">
-        <FileSearch Id="PacketDllSearch" Name="Packet.dll" />
-      </DirectorySearch>
-    </Property>
-
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="NeonHearth">
         <Directory Id="UIFOLDER" Name="ui" />
@@ -126,8 +112,7 @@
         <File Id="LatticeServiceExe" Source="!(bindpath.dist)\bin\lattice-service.exe" KeyPath="yes" />
         <!-- Dedicated service identity: the NT SERVICE\NeonHearth virtual
              account (matches docs/architecture/privilege-boundary.md).
-             Start=auto is the with-Npcap default; configure-service.ps1
-             demotes it to demand when Npcap is absent (limited mode) and
+             Start=auto is the native collector default; configure-service.ps1
              performs the actual start, so no ServiceControl Start here. -->
         <!-- The Arguments flag selects the SCM dispatcher entry point in
              the binary (win_service.rs). Without it the exe runs as a console
@@ -217,8 +202,8 @@
     </ComponentGroup>
 
     <!-- Post-registration configuration: token generation, state-dir ACL,
-         Npcap detection / limited mode, recovery settings, data-retention
-         note, and service start when Npcap is present. Deferred + no
+         native collector startup, recovery settings, data-retention
+         note, and service start without a packet driver. Deferred + no
          impersonation so it runs elevated after InstallServices. -->
     <SetProperty Id="ConfigureNeonHearthService"
                  Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[SCRIPTSFOLDER]configure-service.ps1&quot; -Start"

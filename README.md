@@ -12,28 +12,34 @@ NeonHearth is for private networks the owner administers. It does not scan publi
 
 ## Current status
 
-Implementation follows the approved M1–M7 build checklist in the parent
-workspace. M1 is complete, the automated M2 discovery/identity/presence work is
-complete with real departure/rejoin acceptance still pending, and the simulated
-M3 live UI, approval policy, and W6 enforcement gate is complete.
+The current Windows Home Hub combines native device discovery, owner-confirmed
+names, local-computer traffic/history, a home editor and 3D view, and optional
+Home Assistant/MQTT integration. It uses a native launcher, a local collector,
+and a browser dashboard. The recommended Windows delivery is the portable Home
+Hub ZIP; the service MSI remains a compatibility path. See
+[Windows delivery and upgrades](docs/build/windows-delivery.md).
 
-The W6 adapter is fixture-verified but intentionally not enabled in the main
-runtime until an owner-authorized, sanitized compatibility capture identifies
-the real interface.
+Measurement and control depend on the connected source:
 
-Camera fixture and real-host acceptance gate: [M4 camera evidence](docs/protocols/m4-camera-evidence.md).
+- This computer's interface totals are separate from sampled TCP application
+  counters. Short connections and UDP usage are not fully attributed.
+- The optional Predator Connect W6 feed supplies household internet totals,
+  not per-device traffic or all LAN traffic. Pulse labels it separately from
+  device counters. Other routers do not gain this integration automatically.
+- Guard records owner policy; the default router actuator requires manual
+  enforcement. Application firewall controls and explicitly permitted Home
+  Assistant appliance controls are separate capabilities.
 
-M5 (Home editor + 3D Home Twin) is complete with a browser-level gate proof:
-[M5 evidence](docs/architecture/m5-evidence.md). M6 software is in place —
-Network Doctor (diagnostic DAG, typed repairs with enforced approval tokens,
-snapshot/verify/rollback execution, service routes and UI), private Tailscale
-Serve phone access with PIN step-up and command-replay dedup, and scoped
-read-only integration tokens — with the away-from-home tailnet acceptance
-pending real hardware. M7 hardening so far: a hash-chained append-only audit
-log with anchor-based retention, DB integrity/backup/restore maintenance,
-cargo-deny/license/SBOM/CI gates ([supply chain](docs/build/supply-chain.md)),
-owner documentation ([docs/owner](docs/owner/index.md)), and installer
-packaging scaffolding with a smoke-verified staged build
-([installers](docs/build/installers.md)). Real-hardware acceptance, signed
-installers, performance budgets, and the 72-hour soak remain open before an
-M7 release claim.
+[Network coverage](docs/owner/network-monitor.md),
+[traffic and permissions](docs/owner/traffic-monitor.md), and
+[home automation](docs/owner/home-automation.md) explain setup and limits.
+
+Release-candidate work includes refreshed dependency gates and documented
+security backports, protected local credentials, reproducible package manifests,
+and isolated smoke/soak tooling. Historical tests and fixture proofs are not a
+substitute for fresh-machine installation, physical-hardware compatibility,
+remote-phone acceptance, trusted signing or the actual 72-hour soak. These
+remain explicit release gates until their evidence is recorded. See
+[candidate acceptance](docs/build/acceptance.md),
+[dependency maintenance](docs/build/dependency-maintenance.md), and
+[installer status](docs/build/installers.md). The current candidate is unsigned.

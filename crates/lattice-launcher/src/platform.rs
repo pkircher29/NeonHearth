@@ -13,8 +13,9 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE,
-        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SERVICE_DOES_NOT_EXIST,
+        FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
+        SetHandleInformation,
     },
     NetworkManagement::IpHelper::{
         GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
@@ -26,7 +27,7 @@ use windows_sys::Win32::{
         CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_TYPE_PIPE, GetFileAttributesW,
         GetFileType, INVALID_FILE_ATTRIBUTES,
     },
-    System::{Com::CoTaskMemFree, Console::*, Threading::*},
+    System::{Com::CoTaskMemFree, Console::*, Diagnostics::Debug::*, Services::*, Threading::*},
     UI::{
         Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, ShellExecuteW},
         WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW, SW_SHOWNORMAL},
@@ -59,6 +60,47 @@ impl Drop for Local {
     }
 }
 
+struct ServiceHandle(SC_HANDLE);
+impl Drop for ServiceHandle {
+    fn drop(&mut self) {
+        // SAFETY: this handle was returned by OpenSCManagerW/OpenServiceW.
+        unsafe {
+            CloseServiceHandle(self.0);
+        }
+    }
+}
+
+/// A running/transitioning legacy SCM collector must not silently compete with
+/// the portable hub on another port and a different database. Read-only query;
+/// never stop/reconfigure the installed service or send it an owner credential.
+pub fn legacy_collector_active() -> Result<bool> {
+    // SAFETY: null names select the local machine; only connect/query access.
+    let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
+    ensure!(
+        !manager.is_null(),
+        "Could not check the installed NeonHearth service"
+    );
+    let manager = ServiceHandle(manager);
+    let name = wide("NeonHearth")?;
+    // SAFETY: valid SCM handle and null-terminated service name.
+    let service = unsafe { OpenServiceW(manager.0, name.as_ptr(), SERVICE_QUERY_STATUS) };
+    if service.is_null() {
+        // SAFETY: read immediately after failed OpenServiceW.
+        if unsafe { GetLastError() } == ERROR_SERVICE_DOES_NOT_EXIST {
+            return Ok(false);
+        }
+        bail!("Could not check the installed NeonHearth service; no second collector was started");
+    }
+    let service = ServiceHandle(service);
+    let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+    // SAFETY: valid read-only service handle and writable structure.
+    ensure!(
+        unsafe { QueryServiceStatus(service.0, &mut status) } != 0,
+        "Could not read installed NeonHearth service status"
+    );
+    Ok(status.dwCurrentState != SERVICE_STOPPED)
+}
+
 pub fn default_state() -> Result<PathBuf> {
     let mut value = ptr::null_mut();
     // SAFETY: documented out-pointer; returned buffer is freed with CoTaskMemFree.
@@ -89,6 +131,16 @@ pub fn default_state() -> Result<PathBuf> {
 /// Background components have their own log handles. Inherited caller pipes
 /// must not keep a scripting client's read open after the launcher exits.
 pub fn prevent_stdio_inheritance() -> Result<()> {
+    // Child loader failures must return their status for our actionable error,
+    // rather than opening a blocking Windows DLL-error dialog behind the app.
+    unsafe {
+        SetErrorMode(
+            GetErrorMode()
+                | SEM_FAILCRITICALERRORS
+                | SEM_NOGPFAULTERRORBOX
+                | SEM_NOOPENFILEERRORBOX,
+        );
+    }
     for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         // SAFETY: borrowed handles stay open and retain their read/write access.
         let handle = unsafe { GetStdHandle(kind) };

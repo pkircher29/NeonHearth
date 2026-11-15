@@ -33,7 +33,7 @@
   <div class="notice mqtt-state"><strong>MQTT hub · {snapshot?.mqtt?.status.replaceAll('_', ' ') ?? 'Checking'}</strong><span>{snapshot?.mqtt?.detail ?? 'Waiting for the local service.'}</span></div>
   <details class="connection-panel" open={!connected}>
     <summary>Home Assistant connection</summary>
-    <p>Use a dedicated Home Assistant account. Its token stays in service memory for this session; reconnect after restarting NeonHearth.</p>
+    <p>Requires a running Home Assistant instance with your devices already configured. Use a dedicated Home Assistant account. Its token stays in service memory for this session; reconnect after restarting NeonHearth. Imported lights and switches remain read-only until you explicitly allow power control for each entity.</p>
     <form onsubmit={(event) => { event.preventDefault(); connect(); }}>
       <label>Home Assistant address<input type="url" bind:value={url} required placeholder="https://homeassistant.your-tailnet.ts.net" autocomplete="url" maxlength="512" /></label>
       <label>Access token<input type="password" bind:value={token} required minlength="16" maxlength="4096" autocomplete="off" spellcheck="false" /></label>

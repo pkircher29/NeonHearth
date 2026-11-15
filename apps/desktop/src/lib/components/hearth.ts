@@ -152,10 +152,10 @@ export function sparkAt(sparks: readonly Spark[], x: number, y: number): Spark |
 
 /** Accessible summary read by screen readers in place of the canvas. */
 export function describeHearth(input: { connected: boolean; upload: number | null; download: number | null; sparks: readonly Spark[]; format: (bytesPerSecond: number | null) => string }): string {
-  if (!input.connected) return 'Network hearth: live readings unavailable until the collector is paired.';
+  if (!input.connected) return 'Network hearth: collector connection unavailable; reconnect or sign in if requested.';
   const online = input.sparks.filter((spark) => spark.presence === 'online').length;
   const blocked = input.sparks.filter((spark) => spark.blocked).length;
-  const total = (input.upload ?? 0) + (input.download ?? 0);
+  const total = input.upload === null && input.download === null ? null : (input.upload ?? 0) + (input.download ?? 0);
   const parts = [
     `Network hearth: ${input.format(total)} total`,
     `${input.format(input.download)} down`,

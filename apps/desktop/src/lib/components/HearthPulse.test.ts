@@ -72,9 +72,9 @@ describe('HearthPulse', () => {
     expect(ctx.clearRect).toHaveBeenCalled();
   });
 
-  it('falls back to an unavailable description before pairing', () => {
+  it('describes a missing collector connection without demanding a new pairing', () => {
     const { getByRole, getAllByText } = render(HearthPulse, { devices: [], connected: false });
-    expect(getByRole('img').getAttribute('aria-label')).toMatch(/unavailable until the collector is paired/);
+    expect(getByRole('img').getAttribute('aria-label')).toBe('Network hearth: collector connection unavailable; reconnect or sign in if requested.');
     expect(getAllByText('unavailable').length).toBeGreaterThanOrEqual(1);
   });
 
