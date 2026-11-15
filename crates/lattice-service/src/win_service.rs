@@ -17,6 +17,9 @@ use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use lattice_service::service_stop::{
+    self, FIRST_STOP_CHECKPOINT, SHUTDOWN_DRAIN, STOP_WAIT_HINT,
+};
 use tokio::sync::watch;
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
@@ -32,11 +35,6 @@ pub const SERVICE_NAME: &str = "NeonHearth";
 /// Exit code reported to the SCM when startup or serving fails. Surfaces as
 /// Win32 error 1066 (ERROR_SERVICE_SPECIFIC_ERROR) with this code attached.
 const EXIT_CODE_RUNTIME_FAILURE: u32 = 1;
-
-/// Wait hint reported while stopping; the checkpoint is advanced every half hint.
-const STOP_WAIT_HINT: Duration = Duration::from_secs(10);
-/// Longest the runtime may take to drop outstanding blocking work after `serve` returns.
-const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 define_windows_service!(ffi_service_main, service_main);
 
@@ -75,26 +73,25 @@ fn run_service() -> Result<()> {
                     ServiceState::StopPending,
                     ServiceExitCode::Win32(0),
                     STOP_WAIT_HINT,
-                    1,
+                    FIRST_STOP_CHECKPOINT,
                 ));
                 // Draining in-flight probes can outlast one wait hint. Keep advancing the
                 // checkpoint so the SCM sees progress instead of declaring a hung stop.
                 let stopped = Arc::clone(&handler_stopped);
                 std::thread::spawn(move || {
-                    let mut checkpoint = 2;
-                    while !stopped.load(Ordering::Acquire) {
-                        std::thread::sleep(STOP_WAIT_HINT / 2);
-                        if stopped.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let _ = handle.set_service_status(status(
-                            ServiceState::StopPending,
-                            ServiceExitCode::Win32(0),
-                            STOP_WAIT_HINT,
-                            checkpoint,
-                        ));
-                        checkpoint += 1;
-                    }
+                    service_stop::stop_pending_heartbeat(
+                        &stopped,
+                        STOP_WAIT_HINT,
+                        std::thread::sleep,
+                        |checkpoint| {
+                            let _ = handle.set_service_status(status(
+                                ServiceState::StopPending,
+                                ServiceExitCode::Win32(0),
+                                STOP_WAIT_HINT,
+                                checkpoint,
+                            ));
+                        },
+                    );
                 });
             }
             let _ = handler_shutdown.send(true);
@@ -162,7 +159,7 @@ fn run_shared_startup(
     }));
     // Dropping a runtime waits for every spawn_blocking task (ICMP echoes, neighbor and
     // socket-table reads) with no limit; bound it so Stopped is always reported promptly.
-    runtime.shutdown_timeout(SHUTDOWN_DRAIN);
+    service_stop::shutdown_runtime(runtime, SHUTDOWN_DRAIN);
     result
 }
 
