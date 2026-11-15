@@ -569,6 +569,8 @@ pub struct Snapshot {
     /// string: it exceeds 2^53). Present it as `epoch` when opening the event
     /// stream so a position from before a service restart gets a resync.
     pub events_epoch: String,
+    /// Whether deadline-driven enforcement can trust the system clock.
+    pub clock: ClockProjection,
     pub devices: Vec<DeviceSnapshot>,
     pub next_after: Option<DeviceId>,
     pub service_status: String,
@@ -664,6 +666,9 @@ pub async fn state(
         return Err(StatusCode::BAD_REQUEST);
     }
     let sequence = snapshot_watermark(&state).await;
+    let clock = clock_projection(&state, Utc::now())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let devices = state
         .state_repository()
         .list_device_snapshots(limit, query.after)
@@ -710,6 +715,7 @@ pub async fn state(
     Ok(Json(Snapshot {
         sequence,
         events_epoch: state.events().epoch().to_string(),
+        clock,
         devices: mapped,
         next_after,
         service_status: state.service_status().await,
@@ -969,7 +975,7 @@ pub async fn event_ticket(
     }))
 }
 #[derive(OpenApi)]
-#[openapi(paths(health, state, policy_action, event_ticket, cameras, camera, camera_health, camera_inventory, device_advisories, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route, crate::home::home_snapshot, crate::home::save_plan_route, crate::home::upsert_placement_route, crate::home::delete_placement_route, crate::home::get_draft_route, crate::home::put_draft_route, crate::home::delete_draft_route, crate::doctor::run_route, crate::doctor::report_route, crate::doctor::approvals_route, crate::doctor::repair_route, crate::doctor::settings_route, crate::doctor::update_settings_route, crate::tailscale::serve_route, rotate_owner_token, crate::tailscale::status_route, crate::tailscale::pair_route, crate::tailscale::sessions_route, crate::tailscale::revoke_session_route, crate::tailscale::stepup_route, crate::integrations::mint_token_route, crate::integrations::list_tokens_route, crate::integrations::revoke_token_route, crate::integrations::devices_route, crate::integrations::presence_route, crate::integrations::bandwidth_route, crate::integrations::policy_route, crate::integrations::events_route), components(schemas(Health, Snapshot, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, RotatedToken, PolicyActionRequest, PolicyActionResponse, PolicyActionRejected, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraStreamProjection, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse, BinaryMedia, AdvisoryList, AdvisoryProjection, AdvisoryRisk, crate::home::HomeSnapshot, crate::home::SavePlanRequest, crate::home::SavePlanResponse, crate::home::PlanVersionConflict, crate::home::PlanRejected, crate::home::PlacementRequest, crate::home::DraftCorrupt, lattice_domain::HomePlan, lattice_domain::Floor, lattice_domain::Wall, lattice_domain::Room, lattice_domain::Opening, lattice_domain::Point, lattice_domain::OpeningKind, lattice_domain::Mounting, lattice_domain::OwnerPlacement, lattice_domain::LocationEstimate, lattice_domain::HomeId, lattice_domain::FloorId, lattice_domain::RoomId, lattice_domain::WallId, lattice_domain::OpeningId, lattice_domain::PlacementId, crate::doctor::DoctorRun, crate::doctor::DoctorFinding, crate::doctor::DoctorApproval, crate::doctor::DoctorApprovalRequest, crate::doctor::DoctorRepairRequest, crate::doctor::DoctorRepairResponse, crate::doctor::DoctorSettings, crate::doctor::DoctorSettingsUpdate, crate::doctor::DoctorSettingsRejected, crate::doctor::TargetSource, lattice_doctor::check::CheckKind, lattice_doctor::check::CheckStatus, lattice_doctor::check::SkipReason, lattice_doctor::check::CheckDetail, lattice_doctor::check::CheckResult, lattice_doctor::check::Confidence, lattice_doctor::check::Metric, lattice_doctor::check::Unit, lattice_doctor::check::Measurement, lattice_doctor::check::ResolverEvidence, lattice_doctor::check::ResolverOutcome, lattice_doctor::check::DiagnosticBudget, lattice_doctor::check::DiagnosticReport, lattice_doctor::probe::LeaseState, lattice_doctor::probe::DnsFailureReason, lattice_doctor::probe::RouteEntry, lattice_doctor::diagnosis::Diagnosis, lattice_doctor::diagnosis::DiagnosisKind, lattice_doctor::repair::RepairClass, lattice_doctor::repair::SafeAction, lattice_doctor::repair::ApprovalAction, lattice_doctor::repair::GuidedAction, lattice_doctor::repair::RepairPlan, lattice_doctor::repair::StateKey, lattice_doctor::executor::Verdict, lattice_doctor::executor::Verification, lattice_doctor::executor::RollbackSkipReason, lattice_doctor::executor::RollbackOutcome, lattice_doctor::executor::RepairEventKind, lattice_doctor::executor::RepairEvent, lattice_doctor::executor::RepairOutcome, lattice_doctor::executor::RepairReport, crate::tailscale::TailscaleDaemon, crate::tailscale::ServeMapping, crate::tailscale::RemoteServeResponse, crate::tailscale::RemoteStatusResponse, crate::tailscale::RemoteError, crate::tailscale::PairRequest, crate::tailscale::PairResponse, crate::tailscale::PhoneSessionProjection, crate::tailscale::PhoneSessionList, crate::tailscale::StepupRequest, crate::tailscale::StepupResponse, crate::integrations::MintTokenRequest, crate::integrations::MintTokenResponse, crate::integrations::IntegrationTokenProjection, crate::integrations::IntegrationTokenList, crate::integrations::IntegrationDevice, crate::integrations::IntegrationDeviceList, crate::integrations::IntegrationPresence, crate::integrations::IntegrationPresenceList, crate::integrations::IntegrationBandwidth, crate::integrations::IntegrationBandwidthList, crate::integrations::IntegrationPolicy, crate::integrations::IntegrationPolicyList, crate::integrations::IntegrationEvents)), modifiers(&SecurityAddon))]
+#[openapi(paths(health, state, policy_action, acknowledge_clock, event_ticket, cameras, camera, camera_health, camera_inventory, device_advisories, crate::cameras::start_session_route, crate::cameras::snapshot_route, crate::cameras::playlist_route, crate::cameras::segment_route, crate::cameras::close_session_route, crate::home::home_snapshot, crate::home::save_plan_route, crate::home::upsert_placement_route, crate::home::delete_placement_route, crate::home::get_draft_route, crate::home::put_draft_route, crate::home::delete_draft_route, crate::doctor::run_route, crate::doctor::report_route, crate::doctor::approvals_route, crate::doctor::repair_route, crate::doctor::settings_route, crate::doctor::update_settings_route, crate::tailscale::serve_route, rotate_owner_token, crate::tailscale::status_route, crate::tailscale::pair_route, crate::tailscale::sessions_route, crate::tailscale::revoke_session_route, crate::tailscale::stepup_route, crate::integrations::mint_token_route, crate::integrations::list_tokens_route, crate::integrations::revoke_token_route, crate::integrations::devices_route, crate::integrations::presence_route, crate::integrations::bandwidth_route, crate::integrations::policy_route, crate::integrations::events_route), components(schemas(Health, Snapshot, ClockProjection, DeviceSnapshot, PolicyProjection, Presence, Evidence, Identity, Bandwidth, EventTicket, RotatedToken, PolicyActionRequest, PolicyActionResponse, PolicyActionRejected, OwnerAction, CameraSummary, CameraList, CameraDetail, CameraStreamProjection, CameraHealth, CameraInventoryProjection, CameraSessionRequest, CameraSessionResponse, BinaryMedia, AdvisoryList, AdvisoryProjection, AdvisoryRisk, crate::home::HomeSnapshot, crate::home::SavePlanRequest, crate::home::SavePlanResponse, crate::home::PlanVersionConflict, crate::home::PlanRejected, crate::home::PlacementRequest, crate::home::DraftCorrupt, lattice_domain::HomePlan, lattice_domain::Floor, lattice_domain::Wall, lattice_domain::Room, lattice_domain::Opening, lattice_domain::Point, lattice_domain::OpeningKind, lattice_domain::Mounting, lattice_domain::OwnerPlacement, lattice_domain::LocationEstimate, lattice_domain::HomeId, lattice_domain::FloorId, lattice_domain::RoomId, lattice_domain::WallId, lattice_domain::OpeningId, lattice_domain::PlacementId, crate::doctor::DoctorRun, crate::doctor::DoctorFinding, crate::doctor::DoctorApproval, crate::doctor::DoctorApprovalRequest, crate::doctor::DoctorRepairRequest, crate::doctor::DoctorRepairResponse, crate::doctor::DoctorSettings, crate::doctor::DoctorSettingsUpdate, crate::doctor::DoctorSettingsRejected, crate::doctor::TargetSource, lattice_doctor::check::CheckKind, lattice_doctor::check::CheckStatus, lattice_doctor::check::SkipReason, lattice_doctor::check::CheckDetail, lattice_doctor::check::CheckResult, lattice_doctor::check::Confidence, lattice_doctor::check::Metric, lattice_doctor::check::Unit, lattice_doctor::check::Measurement, lattice_doctor::check::ResolverEvidence, lattice_doctor::check::ResolverOutcome, lattice_doctor::check::DiagnosticBudget, lattice_doctor::check::DiagnosticReport, lattice_doctor::probe::LeaseState, lattice_doctor::probe::DnsFailureReason, lattice_doctor::probe::RouteEntry, lattice_doctor::diagnosis::Diagnosis, lattice_doctor::diagnosis::DiagnosisKind, lattice_doctor::repair::RepairClass, lattice_doctor::repair::SafeAction, lattice_doctor::repair::ApprovalAction, lattice_doctor::repair::GuidedAction, lattice_doctor::repair::RepairPlan, lattice_doctor::repair::StateKey, lattice_doctor::executor::Verdict, lattice_doctor::executor::Verification, lattice_doctor::executor::RollbackSkipReason, lattice_doctor::executor::RollbackOutcome, lattice_doctor::executor::RepairEventKind, lattice_doctor::executor::RepairEvent, lattice_doctor::executor::RepairOutcome, lattice_doctor::executor::RepairReport, crate::tailscale::TailscaleDaemon, crate::tailscale::ServeMapping, crate::tailscale::RemoteServeResponse, crate::tailscale::RemoteStatusResponse, crate::tailscale::RemoteError, crate::tailscale::PairRequest, crate::tailscale::PairResponse, crate::tailscale::PhoneSessionProjection, crate::tailscale::PhoneSessionList, crate::tailscale::StepupRequest, crate::tailscale::StepupResponse, crate::integrations::MintTokenRequest, crate::integrations::MintTokenResponse, crate::integrations::IntegrationTokenProjection, crate::integrations::IntegrationTokenList, crate::integrations::IntegrationDevice, crate::integrations::IntegrationDeviceList, crate::integrations::IntegrationPresence, crate::integrations::IntegrationPresenceList, crate::integrations::IntegrationBandwidth, crate::integrations::IntegrationBandwidthList, crate::integrations::IntegrationPolicy, crate::integrations::IntegrationPolicyList, crate::integrations::IntegrationEvents)), modifiers(&SecurityAddon))]
 pub struct ApiDoc;
 struct SecurityAddon;
 impl Modify for SecurityAddon {
@@ -987,6 +993,60 @@ impl Modify for SecurityAddon {
             );
     }
 }
+/// Whether the system clock can drive deadline enforcement.
+#[derive(Serialize, ToSchema)]
+pub struct ClockProjection {
+    /// `trusted`, or `suspect` while deadline-driven quarantine is paused.
+    pub status: String,
+    /// Why the clock is suspect; absent while trusted.
+    pub detail: Option<String>,
+}
+
+async fn clock_projection(
+    state: &AppState,
+    now: DateTime<Utc>,
+) -> anyhow::Result<ClockProjection> {
+    let repo = PolicyRepository::new(state.state_repository().pool().clone());
+    Ok(match repo.clock_status(now).await? {
+        lattice_store::ClockStatus::Trusted => ClockProjection {
+            status: "trusted".to_owned(),
+            detail: None,
+        },
+        lattice_store::ClockStatus::Suspect(reason) => ClockProjection {
+            status: "suspect".to_owned(),
+            detail: Some(reason),
+        },
+    })
+}
+
+/// Accepts the current system clock as correct after the policy clock gate
+/// flagged a jump. Owner-only (a phone session is refused by the phone
+/// allowlist and by the principal check). The audit entry is written in the
+/// same transaction as the state change, so an unaudited acknowledgement never
+/// takes effect.
+#[utoipa::path(post, path = "/api/v1/clock/acknowledge", security(("bearer_auth" = [])), responses((status = 200, body = ClockProjection), (status = 401), (status = 403), (status = 409, description = "the clock itself is implausible"), (status = 503)))]
+pub async fn acknowledge_clock(principal: Principal, State(state): State<AppState>) -> Response {
+    if principal != Principal::Owner {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let now = Utc::now();
+    if now.timestamp() < lattice_store::MIN_PLAUSIBLE_CLOCK_UNIX {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let repo = PolicyRepository::new(state.state_repository().pool().clone());
+    if let Err(error) = repo
+        .acknowledge_clock(now, "owner confirmed the system clock is correct")
+        .await
+    {
+        tracing::error!(%error, "clock acknowledgement failed");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match clock_projection(&state, now).await {
+        Ok(projection) => Json(projection).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct RotatedToken {
     /// The new owner token. Shown exactly once; the previous token stops working immediately.

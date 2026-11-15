@@ -403,6 +403,8 @@ fn expected(method: &str, path: &str) -> Verdict {
         | ("PUT", "/api/v1/home/plan")
         | ("PUT" | "DELETE", "/api/v1/home/placements/{device_id}")
         | ("PUT" | "DELETE", "/api/v1/home/draft") => HighImpact,
+        // Acknowledging a suspect clock re-enables deadline enforcement: owner bearer only.
+        ("POST", "/api/v1/clock/acknowledge") => Denied,
         _ => Denied,
     }
 }
@@ -486,6 +488,7 @@ async fn every_scanned_route_has_an_explicit_phone_verdict() {
         ("PUT", "/api/v1/home/plan"),
         ("POST", "/api/v1/doctor/repair"),
         ("POST", "/api/v1/events/ticket"),
+        ("POST", "/api/v1/clock/acknowledge"),
     ] {
         assert!(paths.contains(path), "{method} {path} is not registered");
     }

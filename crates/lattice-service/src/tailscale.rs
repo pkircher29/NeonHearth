@@ -1606,6 +1606,7 @@ mod tests {
             (Method::DELETE, "/api/v1/home/draft", HighImpact),
             (Method::GET, "/api/v1/audit/modules", HighImpact),
             (Method::POST, "/api/v1/remote/pair", Denied),
+            (Method::POST, "/api/v1/clock/acknowledge", Denied),
             (Method::GET, "/api/v1/remote/sessions", Denied),
             (Method::DELETE, "/api/v1/remote/sessions/x", Denied),
             (Method::POST, "/api/v1/remote/serve", Denied),

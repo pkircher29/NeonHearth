@@ -127,6 +127,7 @@ pub fn app_with_parts(
                 .delete(home::delete_draft_route),
         )
         .route("/api/v1/policy/action", post(api::policy_action))
+        .route("/api/v1/clock/acknowledge", post(api::acknowledge_clock))
         .route("/api/v1/events/ticket", post(api::event_ticket))
         .route("/api/v1/events", get(events_socket))
         .route(
