@@ -1240,7 +1240,7 @@
   .tool-hint{margin:8px 0 0;padding:8px 12px;border-left:2px solid var(--accent);background:var(--surface);color:var(--muted-strong);font:12px/1.5 var(--font-display)}
   .tool-palette{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
   .tool-palette button{min-height:40px;padding:7px 12px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
-  .tool-palette button.active{border-color:var(--accent);color:var(--accent);box-shadow:inset 0 0 14px var(--accent)14}
+  .tool-palette button.active{border-color:var(--accent);color:var(--accent);box-shadow:inset 0 0 14px color-mix(in srgb, var(--accent) 8%, transparent)}
   .tool-palette button.finish{border-color:var(--accent);color:var(--accent-ink);background:var(--accent)}
   .tool-palette button.quiet{border-color:var(--line-strong);color:var(--muted-strong)}
   .tool-palette button:disabled{opacity:.4;cursor:not-allowed}

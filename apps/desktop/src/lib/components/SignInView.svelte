@@ -3,6 +3,7 @@
   // Desktop: the owner pastes the service token. Phone: the pairing code the
   // owner minted from a signed-in desktop (Settings → Pair a phone).
   import type { AuthFailure } from '../auth/session';
+  import { onTablistKeydown } from '../a11y';
 
   interface Props {
     failure?: AuthFailure;
@@ -33,9 +34,10 @@
   <p class="kicker">SIGN IN / PROTECTED</p>
   <h1 id="sign-in-heading">Unlock your home.</h1>
   <p class="muted">The collector refused an unauthenticated request. Sign in with the credential for this device; nothing is stored beyond this browser tab unless you ask. Opening NeonHearth from the Start-menu launcher pairs this tab automatically and keeps that pairing in this tab's session storage so a reload does not sign you out; Sign out removes it.</p>
-  <div class="tabs" role="tablist" aria-label="Credential kind">
-    <button type="button" role="tab" aria-selected={mode === 'owner'} class:active={mode === 'owner'} onclick={() => (mode = 'owner')}>This computer</button>
-    <button type="button" role="tab" aria-selected={mode === 'phone'} class:active={mode === 'phone'} onclick={() => (mode = 'phone')}>A paired phone</button>
+  <!-- svelte-ignore a11y_interactive_supports_focus -->
+  <div class="tabs" role="tablist" aria-label="Credential kind" onkeydown={onTablistKeydown}>
+    <button type="button" role="tab" tabindex={mode === 'owner' ? 0 : -1} aria-selected={mode === 'owner'} class:active={mode === 'owner'} onclick={() => (mode = 'owner')}>This computer</button>
+    <button type="button" role="tab" tabindex={mode === 'phone' ? 0 : -1} aria-selected={mode === 'phone'} class:active={mode === 'phone'} onclick={() => (mode = 'phone')}>A paired phone</button>
   </div>
   <form class="sign-in-form" onsubmit={submit}>
     {#if mode === 'owner'}

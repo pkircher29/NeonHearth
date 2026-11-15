@@ -6,6 +6,7 @@
   import type { AutomationSnapshot, NetworkDetails } from '../api/automation';
   import type { TwinDevice } from '../twin/geometry';
   import { motionReduced } from '../stores/preferences';
+  import { onTablistKeydown } from '../a11y';
   import HomeEditorView from './HomeEditorView.svelte';
   import HomeTwin3D from './HomeTwin3D.svelte';
   import { buildDeviceRefs, sameTwinDevices, toBandwidthMap, toTwinDeviceInfo, toPresenceMap, toTwinDevices, withEmptyPlanOn404 } from './homeViewData';
@@ -96,9 +97,10 @@
 
 <section class="home-view" aria-label="Home">
   <div class="home-topbar">
-    <div class="home-tabs" role="tablist" aria-label="Home views">
-      <button type="button" role="tab" id="home-tab-editor" aria-selected={tab === 'editor'} aria-controls="home-panel-editor" onclick={() => openTab('editor')}>Plan editor</button>
-      <button type="button" role="tab" id="home-tab-twin" aria-selected={tab === 'twin'} aria-controls="home-panel-twin" onclick={() => openTab('twin')}>3D view</button>
+    <!-- svelte-ignore a11y_interactive_supports_focus -->
+    <div class="home-tabs" role="tablist" aria-label="Home views" onkeydown={onTablistKeydown}>
+      <button type="button" role="tab" id="home-tab-editor" tabindex={tab === 'editor' ? 0 : -1} aria-selected={tab === 'editor'} aria-controls="home-panel-editor" onclick={() => openTab('editor')}>Plan editor</button>
+      <button type="button" role="tab" id="home-tab-twin" tabindex={tab === 'twin' ? 0 : -1} aria-selected={tab === 'twin'} aria-controls="home-panel-twin" onclick={() => openTab('twin')}>3D view</button>
     </div>
     {#if selectedName}
       <p class="home-selection" role="status">Selected device: <strong>{selectedName}</strong></p>
@@ -157,7 +159,7 @@
   .home-topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
   .home-tabs { display: flex; gap: 7px; }
   .home-tabs button { min-height: 44px; padding: 9px 15px; border: 1px solid var(--line-strong); border-radius: 5px; background: transparent; color: var(--ink); font: 600 12px var(--font-display); cursor: pointer; }
-  .home-tabs button[aria-selected='true'] { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 14px var(--accent)14; }
+  .home-tabs button[aria-selected='true'] { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 14px color-mix(in srgb, var(--accent) 8%, transparent); }
   .home-selection { margin: 0; color: var(--muted-strong); font: 11px var(--font-mono); }
   .home-selection strong { color: var(--accent); font-weight: 700; }
   .home-banner { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px 14px; border: 1px solid var(--gold); border-radius: 8px; background: var(--surface); color: var(--ink); font-size: 12px; }

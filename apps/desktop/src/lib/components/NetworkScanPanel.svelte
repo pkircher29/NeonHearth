@@ -99,9 +99,9 @@
 </details>
 <style>
   .scan-panel{margin:18px 0;padding:16px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
-  summary{cursor:pointer;font-weight:600;min-height:32px}p{font-size:13px;color:var(--muted-strong,var(--ink-mute));line-height:1.5}
+  summary{cursor:pointer;font-weight:600;min-height:32px}p{font-size:13px;color:var(--muted-strong);line-height:1.5}
   fieldset{border:0;padding:0;display:grid;gap:14px;min-width:0}label{display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:13px}
   .device-pick{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:6px;max-height:220px;overflow:auto}.snmp-devices{border:1px solid var(--line);border-radius:8px;padding:10px}.protocols{display:flex;gap:16px;flex-wrap:wrap}.credentials{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}.credentials label{display:grid}
-  select,input:not([type=checkbox]){min-height:40px;max-width:100%;padding:8px;background:var(--surface-2,var(--surface));color:var(--ink);border:1px solid var(--line);border-radius:6px}
-  button{min-height:42px;justify-self:start;padding:10px 16px;border:1px solid var(--accent,var(--ember));border-radius:6px;background:var(--surface);color:var(--ink);cursor:pointer}button:disabled{opacity:.5}progress{width:100%;height:12px}
+  select,input:not([type=checkbox]){min-height:40px;max-width:100%;padding:8px;background:var(--surface-raised);color:var(--ink);border:1px solid var(--line);border-radius:6px}
+  button{min-height:42px;justify-self:start;padding:10px 16px;border:1px solid var(--accent);border-radius:6px;background:var(--surface);color:var(--ink);cursor:pointer}button:disabled{opacity:.5}progress{width:100%;height:12px}
 </style>

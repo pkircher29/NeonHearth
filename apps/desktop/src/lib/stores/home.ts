@@ -1,7 +1,7 @@
 // Home Twin 2D plan editor store (M5 · H2, H3, H4, H11).
 // Types mirror docs/architecture/m5-home-twin-contracts.md exactly (snake_case wire shape).
 
-import type { AuthSource } from '../api/client';
+import { createHttp, type AuthSource } from '../api/http';
 
 // ---- Contract types ----
 export interface PlanPoint { x: number; y: number }
@@ -481,26 +481,14 @@ export interface HomeApi {
 
 export interface HomeApiOptions { baseUrl: string; serviceToken?: string; auth?: AuthSource; fetchImpl?: typeof fetch; requestTimeoutMs?: number }
 
-export function createHomeApi({ baseUrl, serviceToken, auth, fetchImpl = fetch, requestTimeoutMs = 15_000 }: HomeApiOptions): HomeApi {
-  const apiUrl = (path: string) => new URL(path, baseUrl).toString();
-  const credential = (): string | null => auth ? auth.header() : (serviceToken ? `Bearer ${serviceToken}` : null);
+export function createHomeApi({ baseUrl, serviceToken, auth, fetchImpl, requestTimeoutMs = 15_000 }: HomeApiOptions): HomeApi {
+  const http = createHttp({ baseUrl, auth, serviceToken, fetchImpl, timeoutMs: requestTimeoutMs });
   const authorized = (method: string, body?: unknown): RequestInit => {
-    const header = credential();
-    const headers: Record<string, string> = header === null ? {} : { Authorization: header };
-    if (body !== undefined) headers['content-type'] = 'application/json';
+    const headers = http.authHeaders(body !== undefined ? { 'content-type': 'application/json' } : {});
     return { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) };
   };
-  // Same discipline as the API client: bounded fetches, auth refusals reported.
-  async function send(path: string, init: RequestInit): Promise<Response> {
-    const controller = new AbortController();
-    const timer = requestTimeoutMs > 0 ? setTimeout(() => controller.abort(new Error('Request timed out')), requestTimeoutMs) : undefined;
-    try {
-      const response = await fetchImpl(apiUrl(path), { ...init, signal: controller.signal });
-      if (response.status === 401) auth?.unauthorized?.();
-      else if (response.status === 403 && credential()?.startsWith('PhoneSession ')) auth?.stepupRequired?.();
-      return response;
-    } finally { if (timer !== undefined) clearTimeout(timer); }
-  }
+  // Same path as every other API module: bounded fetches, auth refusals reported with the header that was sent.
+  const send = (path: string, init: RequestInit) => http.send(path, init);
 
   async function fetchHome(): Promise<HomeSnapshot> {
     const response = await send('/api/v1/home', authorized('GET'));
