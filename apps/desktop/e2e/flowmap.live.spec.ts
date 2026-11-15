@@ -6,13 +6,13 @@
 // shows real devices, real MAC makers and this computer's real traffic, but no bandwidth frames.
 //
 //   FLOW_REAL=1 E2E_PORT=4183 npx playwright test --config=e2e/playwright.config.ts e2e/flowmap.live.spec.ts
-//   NH_LIVE_CONNECTION=<path to connection.json {url, token}> overrides the default location.
+//   NH_LIVE_CONNECTION=<path to connection.json {url, token}> is required: the file scripts/run-local.py writes.
 import { test, expect, type Page } from '@playwright/test';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const OUT = resolve(process.cwd(), '../../output/flow-map');
-const CONNECTION = process.env.NH_LIVE_CONNECTION ?? 'D:/worktrees/nh-live-state/connection.json';
+const CONNECTION = process.env.NH_LIVE_CONNECTION ?? '';
 const ALLOW = [/^\/api\/v1\/health$/, /^\/api\/v1\/state$/, /^\/api\/v1\/automation\/network$/, /^\/api\/v1\/host\/snapshot$/];
 
 async function installLive(page: Page) {
@@ -55,7 +55,7 @@ async function shoot(page: Page, name: string) {
 }
 
 test.describe('flow map against the live service', () => {
-  test.skip(!process.env.FLOW_REAL, 'set FLOW_REAL=1 to run against the live service');
+  test.skip(!process.env.FLOW_REAL || !CONNECTION, 'set FLOW_REAL=1 and NH_LIVE_CONNECTION to run against the live service');
 
   test('live motion, frame time, paused, mobile', async ({ browser }) => {
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'no-preference', deviceScaleFactor: 1 });

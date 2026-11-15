@@ -572,15 +572,31 @@ test.describe('touch gestures on the plan canvas', () => {
     await page.goto('/');
     await openHome(page);
     await planCanvas(page).scrollIntoViewIfNeeded();
-    const box = (await planCanvas(page).boundingBox())!;
     const cdp = await page.context().newCDPSession(page);
-    const send = (type: 'touchStart' | 'touchMove' | 'touchEnd', fingers: Finger[]) =>
-      cdp.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : fingers.map((f) => ({ x: box.x + f.x, y: box.y + f.y, id: f.id })) });
+    // Finger positions are canvas-relative, so the canvas box is read for every event: late
+    // layout (fonts, the device tray, banners) may still move the canvas after the editor opens.
+    const send = async (type: 'touchStart' | 'touchMove' | 'touchEnd', fingers: Finger[]) => {
+      const at = (await planCanvas(page).boundingBox())!;
+      await cdp.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : fingers.map((f) => ({ x: at.x + f.x, y: at.y + f.y, id: f.id })) });
+    };
+    const box = (await planCanvas(page).boundingBox())!;
     /** Move fingers from one layout to another in small steps, like a real gesture. */
     async function drag(from: Finger[], to: Finger[], steps = 12) {
       for (let step = 1; step <= steps; step += 1) {
         const t = step / steps;
         await send('touchMove', from.map((f, i) => ({ id: f.id, x: f.x + (to[i].x - f.x) * t, y: f.y + (to[i].y - f.y) * t })));
+      }
+      await settle();
+    }
+    // The CDP call resolves before Chromium has delivered every finger's pointermove, so the view
+    // can still be one event behind. Wait until the viewBox stops changing across animation frames.
+    async function settle() {
+      const frame = () => page.evaluate(() => new Promise<string>((done) => requestAnimationFrame(() => requestAnimationFrame(() => done(document.querySelector('svg.plan-canvas')!.getAttribute('viewBox')!)))));
+      let previous = await frame();
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const current = await frame();
+        if (current === previous) return;
+        previous = current;
       }
     }
     const state = async () => {
@@ -619,7 +635,6 @@ test.describe('touch gestures on the plan canvas', () => {
     expect(plan.x * during.scale - during.vx).toBeCloseTo(mid.x, -1);
     expect(Math.abs(plan.x * during.scale - during.vx - mid.x)).toBeLessThan(4);
     expect(Math.abs(plan.y * during.scale - during.vy - mid.y)).toBeLessThan(4);
-    await page.screenshot({ path: 'D:/worktrees/nh-editor/output/editor-v2/5-pinch.png' }); // mid-pinch, fingers still down
     await send('touchEnd', []);
     // Pinching back in reduces the zoom again.
     await send('touchStart', f(120));
