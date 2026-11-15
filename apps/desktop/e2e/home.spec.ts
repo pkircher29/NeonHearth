@@ -220,6 +220,44 @@ test('drag a wall endpoint (snapping onto another wall) and drag a wall body, ea
   await expect(planCanvas(page).locator('.dimension')).toHaveText('6.00 m'); // moving does not change the length
 });
 
+test('imperial: a chained closed room joins exactly, is detected with an ft² area, and a typed length is in feet', async ({ page }) => {
+  const server = await installHomeFixture(page);
+  await page.goto('/');
+  await openHome(page);
+  await page.getByRole('combobox', { name: 'Measurement units' }).selectOption('imperial');
+  await editorTools(page).getByRole('button', { name: 'Wall' }).click();
+
+  // A closed chain: the last click lands on the first point, so the loop ends itself.
+  for (const [x, y] of [[160, 120], [400, 120], [400, 300], [160, 300], [160, 120]]) await planCanvas(page).click({ position: { x, y } });
+  await expect(planCanvas(page).locator('line.wall')).toHaveCount(4);
+  const offer = page.getByRole('region', { name: 'Detected rooms' });
+  await expect(offer).toBeVisible();
+  await expect(offer).toContainText(/\d+ ft²/);
+  await expect(offer).not.toContainText('m²');
+  await offer.getByRole('button', { name: 'Add' }).click();
+  await expect(planCanvas(page).locator('text.room-area')).toContainText(/^\d+ ft²$/);
+  await expect(floorBar(page)).toContainText(/\d+ ft²/);
+
+  // A typed length in feet: 10 ft is exactly 3.048 m.
+  await planCanvas(page).click({ position: { x: 500, y: 440 } });
+  await page.keyboard.type('10');
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('Escape');
+  await expect(planCanvas(page).locator('line.wall')).toHaveCount(5);
+  await expect(planCanvas(page).locator('text.dimension')).toHaveText('10.00 ft');
+
+  await page.getByRole('button', { name: 'Save plan' }).click();
+  await expect(page.getByText('Plan saved as version 1.')).toBeVisible();
+  const walls = server.planPuts[0].plan.floors[0].walls;
+  expect(walls).toHaveLength(5);
+  for (let i = 0; i < 4; i += 1) expect(walls[i].end).toEqual(walls[(i + 1) % 4].start); // every corner joins exactly, on inch grid points
+  const typed = walls[4];
+  expect(typed.end.x - typed.start.x).toBeCloseTo(3.048, 6);
+  expect(typed.end.y).toBeCloseTo(typed.start.y, 6);
+  expect(server.planPuts[0].plan.floors[0].rooms).toHaveLength(1);
+  for (const wall of walls) expect(wall.thickness_m).toBe(0.1);
+});
+
 test('a low-confidence device stays advisory until the owner places it by hand', async ({ page }) => {
   const server = await installHomeFixture(page, { estimates: [speakerEstimate()] });
   await page.goto('/');

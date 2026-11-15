@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  DEFAULT_SCALE, MAX_SCALE, MIN_SCALE, boundsOf, clampScale, defaultView, fitView, minorGridOpacity, panBy, scaleBar, toPlan, toScreen, units, viewBox, zoomAt, zoomTo
+  DEFAULT_SCALE, MAX_SCALE, MIN_SCALE, boundsOf, clampScale, defaultView, fitView, minorGridOpacity, panBy, pinchView, scaleBar, toPlan, toScreen, units, viewBox, zoomAt, zoomTo
 } from './view';
 
 const size = { width: 800, height: 600 };
@@ -105,5 +105,41 @@ describe('view maths', () => {
     }
     expect(scaleBar(40)).toMatchObject({ meters: 2, label: '2 m' });
     expect(scaleBar(200).label).toBe('50 cm');
+  });
+});
+
+describe('pinchView', () => {
+  const pair = (ax: number, ay: number, bx: number, by: number) => ({ a: { x: ax, y: ay }, b: { x: bx, y: by } });
+  it('zooms by the ratio of finger spacing about the midpoint', () => {
+    const view = { scale: 40, origin: { x: 2, y: 1 } };
+    const before = toPlan(view, 150, 100);
+    const next = pinchView(view, pair(100, 100, 200, 100), pair(50, 100, 250, 100));
+    expect(next.scale).toBe(80);
+    const after = toPlan(next, 150, 100); // same midpoint, so the same plan point stays under it
+    expect(after.x).toBeCloseTo(before.x, 10);
+    expect(after.y).toBeCloseTo(before.y, 10);
+  });
+  it('pans when the fingers translate without changing spacing', () => {
+    const view = { scale: 50, origin: { x: 0, y: 0 } };
+    const next = pinchView(view, pair(100, 100, 200, 100), pair(150, 120, 250, 120));
+    expect(next.scale).toBe(50);
+    expect(next.origin.x).toBeCloseTo(-1, 10);
+    expect(next.origin.y).toBeCloseTo(-0.4, 10);
+  });
+  it('moves the plan point under the old midpoint to the new midpoint while zooming', () => {
+    const view = { scale: 40, origin: { x: 0, y: 0 } };
+    const prev = pair(100, 100, 200, 100);
+    const next = pair(100, 200, 300, 200);
+    const anchor = toPlan(view, 150, 100);
+    const out = pinchView(view, prev, next);
+    const landed = toScreen(out, anchor);
+    expect(landed.x).toBeCloseTo(200, 8);
+    expect(landed.y).toBeCloseTo(200, 8);
+  });
+  it('clamps to the zoom range and ignores coincident fingers', () => {
+    const view = { scale: 150, origin: { x: 1, y: 1 } };
+    expect(pinchView(view, pair(0, 0, 10, 0), pair(0, 0, 1000, 0)).scale).toBe(MAX_SCALE);
+    expect(pinchView(view, pair(0, 0, 1000, 0), pair(0, 0, 1, 0)).scale).toBe(MIN_SCALE);
+    expect(pinchView(view, pair(5, 5, 5, 5), pair(0, 0, 100, 0)).scale).toBe(150);
   });
 });

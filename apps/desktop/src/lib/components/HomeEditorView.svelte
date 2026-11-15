@@ -2,7 +2,7 @@
   import { onMount, untrack } from 'svelte';
   import {
     DEFAULT_THICKNESS_M, copyFloorFootprint, createEditorState, emptyHomePlan, reduceEditor, selectUncertain, selectUnplaced, snap, snapPoint, wallLength,
-    type EditorAction, type EditorState, type Estimate, type HomeApi, type HomeDeviceRef, type HomeDraft, type HomeSnapshot, type OpeningKind, type Placement, type PlanPoint, type Room, type Wall
+    type EditAction, type EditorAction, type EditorState, type Estimate, type HomeApi, type HomeDeviceRef, type HomeDraft, type HomeSnapshot, type OpeningKind, type Placement, type PlanPoint, type Room, type Wall
   } from '../stores/home';
   import HomeEditorFloorBar from './HomeEditorFloorBar.svelte';
   import HomeEditorInspector, { type InspectorTarget } from './HomeEditorInspector.svelte';
@@ -11,11 +11,11 @@
   import HomePlanWall from './HomePlanWall.svelte';
   import { formatArea, formatLength, fromDisplayLength, gridStep, readHomeUnits, saveHomeUnits, unitSymbol, type HomeUnits } from '../homeUnits';
   import {
-    DEFAULT_SCALE, boundsOf, defaultView, fitView, panBy, scaleBar, toPlan, viewBox, zoomAt, zoomTo, type Size, type ViewState
+    DEFAULT_SCALE, boundsOf, defaultView, fitView, panBy, pinchView, scaleBar, toPlan, viewBox, zoomAt, zoomTo, type Size, type TouchPair, type ViewState
   } from '../home/view';
   import { SNAP_LABELS, angleDegrees, computeSnap, constrainAngle, pointAtLength, type SnapResult } from '../home/snap';
   import { newRoomCandidates, polygonArea, polygonCentroid, type RoomCandidate } from '../home/rooms';
-  import { parseLengthEntry, planRectangleBatch, planWallBatch } from '../home/draft';
+  import { blockedOpening, blockedOpeningNotice, parseLengthEntry, planRectangleBatch, planWallBatch } from '../home/draft';
   import { DEFAULT_CANVAS_SIZE, floorPoints, initialFloorView, readFloorView, saveFloorView } from '../home/viewStore';
 
   // `snapshot` is the already-loaded home when a parent owns it (HomeView
@@ -67,6 +67,9 @@
   let roomNameEdits = $state<Record<string, string>>({});
   let autosaveTimer: ReturnType<typeof setTimeout> | undefined;
   let suppressClick = false;
+  // Active touch pointers (CSS px inside the canvas) and the finger pair of a running pinch.
+  const touches = new Map<number, { x: number; y: number }>();
+  let pinch: TouchPair | null = null;
   const viewsByFloor = new Map<string, ViewState>();
 
   const doc = $derived(editor.doc);
@@ -385,8 +388,33 @@
   function capture(event: PointerEvent) {
     try { svgEl?.setPointerCapture?.(event.pointerId); } catch { /* Capture is an enhancement; some pointers cannot be captured. */ }
   }
+  function touchPair(): TouchPair | null {
+    if (touches.size !== 2) return null;
+    const [a, b] = [...touches.values()];
+    return { a, b };
+  }
+  function endTouch(event: PointerEvent) {
+    touches.delete(event.pointerId);
+    if (pinch && touches.size < 2) {
+      pinch = null;
+      suppressClick = true; // lifting the fingers must not click the plan
+      setTimeout(() => { suppressClick = false; }, 0);
+    }
+  }
   function onPointerDownCapture(event: PointerEvent) {
     if (!activeFloor) return;
+    if (event.pointerType === 'touch') {
+      touches.set(event.pointerId, offsetOf(event));
+      if (touches.size === 2) {
+        // A second finger turns whatever the first started into a pinch/pan gesture.
+        drag = null;
+        pinch = touchPair();
+        event.preventDefault();
+        event.stopPropagation();
+        capture(event);
+        return;
+      }
+    }
     const wantsPan = event.button === 1 || (event.button === 0 && panReady);
     if (!wantsPan) return;
     event.preventDefault();
@@ -395,6 +423,12 @@
     drag = { kind: 'pan', x: event.clientX, y: event.clientY, moved: false };
   }
   function onPointerMove(event: PointerEvent) {
+    if (touches.has(event.pointerId)) touches.set(event.pointerId, offsetOf(event));
+    if (pinch) {
+      const next = touchPair();
+      if (next) { setView(pinchView(view, pinch, next)); pinch = next; }
+      return;
+    }
     const current = drag;
     if (current?.kind === 'pan') {
       const dx = event.clientX - current.x;
@@ -423,6 +457,7 @@
     cursor = draftingSnap(raw, event.shiftKey);
   }
   function onPointerUp(event: PointerEvent) {
+    endTouch(event);
     const current = drag;
     if (!current) return;
     drag = null;
@@ -446,16 +481,33 @@
   }
 
   function commitHandle(current: Extract<Drag, { kind: 'handle' }>) {
+    const wall = activeFloor?.walls.find((candidate) => candidate.wall_id === current.wall_id);
+    if (wall) moveEndpoint(wall, current.end, current.point);
+  }
+  /** Move one wall endpoint, joining it to any wall body it lands on. */
+  function moveEndpoint(wall: Wall, end: 'start' | 'end', point: PlanPoint) {
     const floor = activeFloor;
-    const wall = floor?.walls.find((candidate) => candidate.wall_id === current.wall_id);
-    if (!floor || !wall) return;
-    const start = current.end === 'start' ? current.point : wall.start;
-    const end = current.end === 'end' ? current.point : wall.end;
-    if (samePoint(start, end)) { notice = 'A wall cannot shrink to a point.'; return; }
-    if (samePoint(current.end === 'start' ? wall.start : wall.end, current.point)) return;
-    const batch = planWallBatch({ floor, walls: [{ start, end }], newId, moveWallId: wall.wall_id, ignoreWallIds: [wall.wall_id] });
+    if (!floor) return;
+    const start = end === 'start' ? point : wall.start;
+    const stop = end === 'end' ? point : wall.end;
+    if (samePoint(start, stop)) { notice = 'A wall cannot shrink to a point.'; return; }
+    if (samePoint(end === 'start' ? wall.start : wall.end, point)) return;
+    const batch = planWallBatch({ floor, walls: [{ start, end: stop }], newId, moveWallId: wall.wall_id, ignoreWallIds: [wall.wall_id] });
     if (batch && dispatch({ type: 'batch', actions: batch })) return;
-    if (!dispatch({ type: 'move_wall', floor_id: floor.floor_id, wall_id: wall.wall_id, start, end, exact: true })) notice = 'That would overlap another wall.';
+    if (dispatch({ type: 'move_wall', floor_id: floor.floor_id, wall_id: wall.wall_id, start, end: stop, exact: true })) {
+      const blocked = blockedOpening(floor, [point], wall.wall_id);
+      if (blocked) notice = blockedOpeningNotice(blocked);
+    } else notice = 'That would overlap another wall.';
+  }
+  const HANDLE_NUDGES: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+  function onHandleKeydown(event: KeyboardEvent, wall: Wall, end: 'start' | 'end') {
+    const nudge = HANDLE_NUDGES[event.key];
+    if (!nudge || event.ctrlKey || event.metaKey || event.altKey) return;
+    event.preventDefault();
+    event.stopPropagation(); // the window handler would otherwise nudge the whole wall
+    const steps = (event.shiftKey ? 10 : 1) * grid;
+    const from = end === 'start' ? wall.start : wall.end;
+    moveEndpoint(wall, end, snapPoint({ x: from.x + nudge[0] * steps, y: from.y + nudge[1] * steps }, grid));
   }
   function commitBody(current: Extract<Drag, { kind: 'body' }>) {
     const floor = activeFloor;
@@ -514,7 +566,8 @@
     // Splitting was refused (an opening is in the way): draw the wall without joining it.
     const wall_id = newId();
     if (dispatch({ type: 'add_wall', floor_id: floor.floor_id, wall_id, start, end, thickness_m: DEFAULT_THICKNESS_M, exact: true })) {
-      notice = 'The wall was drawn, but it could not be joined to the wall it touches because an opening is in the way.';
+      const blocked = blockedOpening(floor, [start, end]);
+      notice = blocked ? blockedOpeningNotice(blocked) : 'The wall was drawn, but it could not be joined to the wall it touches.';
       return wall_id;
     }
     notice = 'That wall is not allowed.';
@@ -677,11 +730,38 @@
   const inCanvas = (element: EventTarget | null) => !!svgEl && (element === svgEl || svgEl.contains(element as Node | null));
   const onBody = (element: EventTarget | null) => !element || element === document.body || element === document.documentElement;
 
+  /** Ctrl+D: copy the selected wall or room one major grid step down-right, as one undo step. */
+  function duplicateSelection() {
+    const floor = activeFloor;
+    const current = selection;
+    if (!floor || !current) return;
+    const step = units === 'imperial' ? 0.3048 : 1;
+    const shift = (point: PlanPoint) => ({ x: point.x + step, y: point.y + step });
+    if (current.kind === 'wall') {
+      const wall = floor.walls.find((candidate) => candidate.wall_id === current.id);
+      if (!wall) return;
+      const wall_id = newId();
+      const actions: EditAction[] = [
+        { type: 'add_wall', floor_id: floor.floor_id, wall_id, start: shift(wall.start), end: shift(wall.end), thickness_m: wall.thickness_m ?? DEFAULT_THICKNESS_M, exact: true },
+        ...wall.openings.map((opening): EditAction => ({ type: 'add_opening', floor_id: floor.floor_id, wall_id, opening: { ...opening, opening_id: newId() } }))
+      ];
+      if (dispatch({ type: 'batch', actions })) selection = { kind: 'wall', id: wall_id };
+      else notice = 'That wall could not be duplicated.';
+    } else if (current.kind === 'room') {
+      const room = floor.rooms.find((candidate) => candidate.room_id === current.id);
+      if (!room) return;
+      const room_id = newId();
+      const name = `${room.name.slice(0, 58)} copy`;
+      if (dispatch({ type: 'add_room', floor_id: floor.floor_id, room_id, name, polygon: room.polygon.map(shift), exact: true })) selection = { kind: 'room', id: room_id };
+      else notice = 'That room could not be duplicated.';
+    }
+  }
   function onWindowKeydown(event: KeyboardEvent) {
     const textEntry = isTextEntry(event.target);
     if (event.ctrlKey || event.metaKey) {
       if (textEntry) return;
       const key = event.key.toLowerCase();
+      if (key === 'd' && !event.shiftKey && !event.altKey) { event.preventDefault(); duplicateSelection(); return; }
       if (key === 'z' && !event.shiftKey) { event.preventDefault(); dispatch({ type: 'undo' }); }
       else if ((key === 'z' && event.shiftKey) || key === 'y') { event.preventDefault(); dispatch({ type: 'redo' }); }
       return;
@@ -819,8 +899,8 @@
 
   const tools: Array<{ id: Tool; label: string; key: string }> = [
     { id: 'select', label: 'Select', key: 'V' }, { id: 'pan', label: 'Pan', key: 'H' }, { id: 'wall', label: 'Wall', key: 'W' },
-    { id: 'room', label: 'Room', key: 'R' }, { id: 'rect', label: 'Rectangle', key: 'B' },
-    { id: 'opening', label: 'Opening', key: 'O' }, { id: 'place', label: 'Place device', key: 'P' }
+    { id: 'opening', label: 'Opening', key: 'O' }, { id: 'place', label: 'Place device', key: 'P' },
+    { id: 'room', label: 'Room', key: 'R' }, { id: 'rect', label: 'Rectangle', key: 'B' }
   ];
 </script>
 
@@ -868,6 +948,7 @@
     {/if}
 
     <div class="editor-toolbar">
+      <div class="tool-row">
       <div class="tool-palette" role="toolbar" aria-label="Editor tools">
         <label class="opening-kind">Units
           <select aria-label="Measurement units" value={units} onchange={event => { units = event.currentTarget.value as HomeUnits; saveHomeUnits(units); cancelPending(); }}>
@@ -892,6 +973,8 @@
           <span class="placing-hint" role="status">Placing {deviceName(placingDevice)} — click the plan.</span>
         {/if}
       </div>
+        <button type="button" class="detect" title="Find closed loops of walls that are not rooms yet" onclick={() => offerRooms(true)}>Detect rooms</button>
+      </div>
       <div class="history-actions">
         <button type="button" disabled={!canUndo} onclick={() => dispatch({ type: 'undo' })} aria-keyshortcuts="Control+Z">Undo</button>
         <button type="button" disabled={!canRedo} onclick={() => dispatch({ type: 'redo' })} aria-keyshortcuts="Control+Shift+Z">Redo</button>
@@ -901,31 +984,20 @@
     </div>
     <p class="tool-hint" aria-live="polite">{hint}</p>
 
+    <div class="floor-row">
     <HomeEditorFloorBar {units} floors={plan.floors} active={activeFloor?.floor_id ?? null} onselect={(floorId) => { activeFloorId = floorId; selection = { kind: 'floor' }; cancelPending(); roomOfferOpen = false; }} onadd={addFloor} />
-
-    {#if activeFloor}
-      <div class="footprint-controls tool-palette">
-        <label class="opening-kind">Copy footprint to
-          <select aria-label="Footprint destination" bind:value={copyTarget}>
-            <option value="new">New floor above</option>
-            {#each copyTargets as floor (floor.floor_id)}<option value={floor.floor_id}>{floor.name}</option>{/each}
-          </select>
-        </label>
-        <button type="button" disabled={!activeFloor.walls.length && !activeFloor.rooms.length} onclick={copyFootprint}>Copy footprint</button>
-        <span class="placing-hint">Copies walls (with thickness), openings, and rooms. Devices keep their locations.</span>
-      </div>
-    {/if}
-
-    {#if activeFloor}
-      <div class="view-controls" role="toolbar" aria-label="Plan view">
-        <button type="button" onclick={() => zoomBy(1 / 1.25)}>Zoom out</button>
-        <span class="zoom-readout" aria-label="Current zoom">{Math.round(scale)} px/m</span>
-        <button type="button" onclick={() => zoomBy(1.25)}>Zoom in</button>
-        <button type="button" onclick={fitPlan}>Fit plan</button>
-        <button type="button" onclick={actualSize}>100%</button>
-        <button type="button" class="detect" onclick={() => offerRooms(true)}>Detect rooms</button>
-      </div>
-    {/if}
+      {#if activeFloor}
+        <div class="footprint-controls tool-palette" title="Copies walls (with thickness), openings, and rooms. Devices keep their locations.">
+          <label class="opening-kind">Copy footprint to
+            <select aria-label="Footprint destination" bind:value={copyTarget}>
+              <option value="new">New floor above</option>
+              {#each copyTargets as floor (floor.floor_id)}<option value={floor.floor_id}>{floor.name}</option>{/each}
+            </select>
+          </label>
+          <button type="button" disabled={!activeFloor.walls.length && !activeFloor.rooms.length} onclick={copyFootprint}>Copy footprint</button>
+        </div>
+      {/if}
+    </div>
 
     {#if roomOfferOpen && candidates.length > 0}
       <div class="banner offer" role="region" aria-label="Detected rooms">
@@ -980,10 +1052,10 @@
             {#if selectedWall && shownSelected}
               <text class="dimension" x={px((shownSelected.start.x + shownSelected.end.x) / 2)} y={px((shownSelected.start.y + shownSelected.end.y) / 2) - 12}>{formatLength(Math.hypot(shownSelected.end.x - shownSelected.start.x, shownSelected.end.y - shownSelected.start.y), units)}</text>
               {#if tool === 'select'}
-                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-                <circle class="handle" role="presentation" data-handle="start" cx={px(shownSelected.start.x)} cy={px(shownSelected.start.y)} r="6" onpointerdown={(event) => onHandlePointerDown(event, selectedWall, 'start')} />
-                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-                <circle class="handle" role="presentation" data-handle="end" cx={px(shownSelected.end.x)} cy={px(shownSelected.end.y)} r="6" onpointerdown={(event) => onHandlePointerDown(event, selectedWall, 'end')} />
+                <circle class="handle" role="button" tabindex="0" aria-label="Wall start handle" data-handle="start" cx={px(shownSelected.start.x)} cy={px(shownSelected.start.y)} r="6"
+                  onpointerdown={(event) => onHandlePointerDown(event, selectedWall, 'start')} onkeydown={(event) => onHandleKeydown(event, selectedWall, 'start')} />
+                <circle class="handle" role="button" tabindex="0" aria-label="Wall end handle" data-handle="end" cx={px(shownSelected.end.x)} cy={px(shownSelected.end.y)} r="6"
+                  onpointerdown={(event) => onHandlePointerDown(event, selectedWall, 'end')} onkeydown={(event) => onHandleKeydown(event, selectedWall, 'end')} />
               {/if}
             {/if}
             {#each floorPlacements as placement (placement.device_id)}
@@ -1038,6 +1110,13 @@
               <text x="0" y="-9">{bar.label}</text>
             </g>
           </svg>
+          <div class="view-controls" role="toolbar" aria-label="Plan view">
+            <button type="button" onclick={() => zoomBy(1 / 1.25)}>Zoom out</button>
+            <span class="zoom-readout" aria-label="Current zoom">{Math.round(scale)} px/m</span>
+            <button type="button" onclick={() => zoomBy(1.25)}>Zoom in</button>
+            <button type="button" onclick={fitPlan}>Fit plan</button>
+            <button type="button" onclick={actualSize}>100%</button>
+          </div>
         {:else}
           <div class="editor-state">This home has no floors yet. Add a floor to start drawing.
             <button type="button" onclick={addFloor}>Add floor</button>
@@ -1055,7 +1134,11 @@
 </section>
 
 <style>
-  .footprint-controls{margin:0 0 14px;gap:10px}
+  .view-heading h1{font-size:clamp(26px,2.6vw,36px);line-height:1.1;margin:2px 0 4px}
+  .view-heading .muted{margin:0}
+  .footprint-controls{gap:8px;margin-left:auto}
+  .footprint-controls button{min-height:38px!important;padding:6px 12px!important}
+  .floor-row{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:10px 0}
   .editor-state{margin-top:28px;padding:18px;border:1px dashed var(--line-strong);color:var(--muted-strong);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   .editor-state.error{border-color:var(--pink);color:#ffb4cc}
   .editor-state button{min-height:40px;padding:8px 14px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
@@ -1078,10 +1161,12 @@
   .offer-index{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:var(--accent);color:var(--accent-ink);font:700 11px var(--font-mono)}
   .offer-list input{min-height:34px;width:130px;padding:4px 8px;border:1px solid var(--line-strong);border-radius:5px;background:#0e2430;color:var(--ink);font:13px var(--font-display)}
   .offer-area{color:var(--muted-strong);font:11px var(--font-mono)}
-  .editor-toolbar{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;margin:22px 0 0}
-  .tool-hint{margin:10px 0 0;padding:8px 12px;border-left:2px solid var(--accent);background:var(--surface);color:var(--muted-strong);font:12px/1.5 var(--font-display)}
+  .editor-toolbar{display:flex;flex-wrap:wrap;gap:8px 14px;justify-content:space-between;align-items:center;margin:14px 0 0}
+  .tool-row{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
+  .tool-row .detect{min-height:40px;padding:7px 12px;border:1px solid var(--accent);border-radius:5px;background:transparent;color:var(--accent);font:600 12px var(--font-display);cursor:pointer}
+  .tool-hint{margin:8px 0 0;padding:8px 12px;border-left:2px solid var(--accent);background:var(--surface);color:var(--muted-strong);font:12px/1.5 var(--font-display)}
   .tool-palette{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
-  .tool-palette button{min-height:44px;padding:9px 13px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
+  .tool-palette button{min-height:40px;padding:7px 12px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
   .tool-palette button.active{border-color:var(--accent);color:var(--accent);box-shadow:inset 0 0 14px var(--accent)14}
   .tool-palette button.finish{border-color:var(--accent);color:var(--accent-ink);background:var(--accent)}
   .tool-palette button.quiet{border-color:var(--line-strong);color:var(--muted-strong)}
@@ -1090,16 +1175,16 @@
   .opening-kind select{min-height:38px;padding:6px 8px;border:1px solid var(--line-strong);border-radius:5px;background:#0e2430;color:var(--ink);font:12px var(--font-display)}
   .placing-hint{color:var(--accent);font:11px var(--font-mono)}
   .history-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-  .history-actions button{min-height:44px;padding:9px 14px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
+  .history-actions button{min-height:40px;padding:7px 12px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
   .history-actions button:disabled{opacity:.4;cursor:not-allowed}
   .history-actions button.save{border-color:var(--accent);background:var(--accent);color:var(--accent-ink)}
   .autosave{color:var(--muted-strong);font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.07em}
-  .view-controls{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:0 0 10px}
-  .view-controls button{min-height:38px;padding:6px 12px;border:1px solid var(--line-strong);border-radius:5px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
-  .view-controls button.detect{border-color:var(--accent);color:var(--accent);margin-left:auto}
+  .view-controls{position:absolute;top:10px;right:10px;z-index:2;display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:6px;border:1px solid var(--line-strong);border-radius:10px;background:rgba(8,23,34,.72);backdrop-filter:blur(10px) saturate(1.2);box-shadow:0 6px 24px rgba(0,0,0,.35)}
+  .view-controls button{min-height:34px;padding:4px 10px;border:1px solid var(--line-strong);border-radius:6px;background:transparent;color:var(--ink);font:600 12px var(--font-display);cursor:pointer}
+  .view-controls button:hover{border-color:var(--accent);color:var(--accent)}
   .zoom-readout{min-width:64px;text-align:center;color:var(--muted-strong);font:11px var(--font-mono)}
   .editor-body{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:16px;align-items:start;margin-top:4px}
-  .canvas-frame{position:relative;overflow:hidden;height:max(480px,min(70vh,680px));border:1px solid var(--line-mid);border-radius:10px;background:var(--bg)}
+  .canvas-frame{position:relative;overflow:hidden;height:max(560px,min(72vh,720px));border:1px solid var(--line-mid);border-radius:10px;background:var(--bg)}
   .canvas-frame .editor-state{margin:0;height:100%}
   .plan-canvas{--plan-bg:#081722;display:block;width:100%;height:100%;background:var(--plan-bg);outline:none;touch-action:none;user-select:none}
   .plan-canvas:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
@@ -1113,7 +1198,7 @@
   .candidate-label{fill:var(--accent);font:700 14px var(--font-mono);text-anchor:middle;dominant-baseline:middle;pointer-events:none}
   .dimension{fill:var(--accent);font:700 12px var(--font-mono);text-anchor:middle;pointer-events:none;paint-order:stroke;stroke:var(--plan-bg);stroke-width:3px}
   .handle{fill:var(--plan-bg);stroke:var(--accent);stroke-width:2;cursor:grab}
-  .handle:hover{fill:var(--accent)}
+  .handle:hover,.handle:focus-visible{fill:var(--accent);outline:none;stroke:var(--ink);stroke-width:3}
   .placement{cursor:pointer}
   .placement circle{fill:#0e2430;stroke:var(--accent);stroke-width:2}
   .placement.selected circle{fill:var(--accent)}

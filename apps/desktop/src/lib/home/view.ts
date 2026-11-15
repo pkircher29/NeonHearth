@@ -106,3 +106,20 @@ export function scaleBar(scale: number): { meters: number; px: number; label: st
   const label = meters < 1 ? `${(meters * 100).toFixed(0)} cm` : `${meters} m`;
   return { meters, px: meters * scale, label };
 }
+
+export interface TouchPair { a: { x: number; y: number }; b: { x: number; y: number } }
+
+/**
+ * Two-finger pinch + pan in one step: the plan point that was under the previous finger
+ * midpoint ends up under the new midpoint, and the zoom changes by the ratio of finger spacing.
+ */
+export function pinchView(view: ViewState, prev: TouchPair, next: TouchPair): ViewState {
+  const spacing = (pair: TouchPair) => Math.hypot(pair.a.x - pair.b.x, pair.a.y - pair.b.y);
+  const centre = (pair: TouchPair) => ({ x: (pair.a.x + pair.b.x) / 2, y: (pair.a.y + pair.b.y) / 2 });
+  const before = spacing(prev);
+  const scale = before < 1 ? view.scale : clampScale((view.scale * spacing(next)) / before);
+  const from = centre(prev);
+  const to = centre(next);
+  const anchor = toPlan(view, from.x, from.y);
+  return { scale, origin: { x: anchor.x - to.x / scale, y: anchor.y - to.y / scale } };
+}

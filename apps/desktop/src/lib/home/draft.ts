@@ -1,7 +1,7 @@
 // Drafting actions for the plan editor (home tools v2 · spec B/C): everything that turns
 // snapped clicks into reducer actions, kept pure so it is unit-testable without a canvas.
 
-import type { EditAction, Floor, PlanPoint, Wall } from '../stores/home';
+import type { EditAction, Floor, Opening, PlanPoint, Wall } from '../stores/home';
 import { DEFAULT_THICKNESS_M } from '../stores/home';
 import { projectOnSegment } from './snap';
 
@@ -104,3 +104,18 @@ export function parseLengthEntry(entry: string): number | null {
   const value = Number(entry);
   return Number.isFinite(value) && value > 0 ? value : null;
 }
+
+/** The opening (if any) that a point lands inside, on a wall other than `ignoreWallId`. Splitting there is refused. */
+export function blockedOpening(floor: Pick<Floor, 'walls'>, points: readonly PlanPoint[], ignoreWallId?: string): Opening | null {
+  for (const point of points) {
+    for (const id of wallsContaining(floor.walls.filter((wall) => wall.wall_id !== ignoreWallId), point)) {
+      const wall = floor.walls.find((candidate) => candidate.wall_id === id)!;
+      const along = Math.hypot(point.x - wall.start.x, point.y - wall.start.y);
+      const hit = wall.openings.find((opening) => opening.offset_m < along - 1e-6 && opening.offset_m + opening.width_m > along + 1e-6);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+export const blockedOpeningNotice = (opening: Opening) => `That point is inside a ${opening.kind} opening — the wall was drawn but not joined.`;

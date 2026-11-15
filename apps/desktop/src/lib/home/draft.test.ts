@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { createEditorState, reduceEditor, type EditorState, type Floor } from '../stores/home';
-import { parseLengthEntry, planRectangleBatch, planWallBatch, rectangleCorners, wallsContaining } from './draft';
+import { blockedOpening, blockedOpeningNotice, parseLengthEntry, planRectangleBatch, planWallBatch, rectangleCorners, wallsContaining } from './draft';
 
 const groundId = 'f1';
 function floor(walls: Floor['walls'] = []): Floor {
@@ -118,5 +118,21 @@ describe('parseLengthEntry', () => {
     expect(parseLengthEntry('12')).toBe(12);
     expect(parseLengthEntry('3.')).toBe(3);
     for (const bad of ['', '.', '0', '0.0', '1.2.3', '-4', '1e3', 'abc']) expect(parseLengthEntry(bad)).toBeNull();
+  });
+});
+
+describe('blockedOpening', () => {
+  const doorWall = { ...wall('a', 0, 0, 4, 0), openings: [{ opening_id: 'o', kind: 'door' as const, offset_m: 0.8, width_m: 0.9 }] };
+  it('finds the opening a point lands inside and words the notice for it', () => {
+    const hit = blockedOpening(floor([doorWall]), [{ x: 1, y: 0 }]);
+    expect(hit?.kind).toBe('door');
+    expect(blockedOpeningNotice(hit!)).toBe('That point is inside a door opening — the wall was drawn but not joined.');
+  });
+  it('is null on solid wall, at an opening edge, off the wall, and for the ignored wall', () => {
+    const f = floor([doorWall]);
+    expect(blockedOpening(f, [{ x: 3, y: 0 }])).toBeNull();
+    expect(blockedOpening(f, [{ x: 0.8, y: 0 }])).toBeNull();
+    expect(blockedOpening(f, [{ x: 1, y: 1 }])).toBeNull();
+    expect(blockedOpening(f, [{ x: 1, y: 0 }], 'a')).toBeNull();
   });
 });

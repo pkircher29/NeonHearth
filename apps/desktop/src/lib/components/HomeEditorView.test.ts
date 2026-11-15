@@ -567,4 +567,104 @@ describe('HomeEditorView', () => {
       expect(screen.getByRole('button', { name: /Ground.*12\.0 m²/ })).toBeTruthy();
     });
   });
+
+  describe('v2 editor follow-up', () => {
+    const canvasOf = (container: HTMLElement) => container.querySelector('.plan-canvas')!;
+    const wallAttrs = (element: Element) => ['x1', 'y1', 'x2', 'y2'].map((name) => element.getAttribute(name));
+    async function openEditor(api = apiStub()) {
+      const view = render(HomeEditorView, { api, devices });
+      await screen.findByRole('button', { name: /Ground/ });
+      return { view, api, canvas: canvasOf(view.container) };
+    }
+    const touch = (pointerId: number, x: number, y: number) => ({ pointerType: 'touch', pointerId, clientX: x, clientY: y, isPrimary: pointerId === 11 });
+
+    it('keeps the controls compact: zoom cluster inside the canvas frame, Detect rooms beside the room tools, Copy footprint on the floor row', async () => {
+      const { view } = await openEditor();
+      const frame = view.container.querySelector('.canvas-frame')!;
+      expect(frame.querySelector('[role="toolbar"][aria-label="Plan view"]')).toBeTruthy();
+      const tools = screen.getByRole('toolbar', { name: 'Editor tools' });
+      expect(tools.querySelector('button.detect')).toBeNull(); // not inside the tools toolbar (name collisions), but its sibling
+      expect(tools.nextElementSibling!.textContent).toBe('Detect rooms');
+      expect(tools.lastElementChild!.textContent).toBe('Rectangle');
+      const row = view.container.querySelector('.floor-row')!;
+      expect(row.contains(screen.getByRole('combobox', { name: 'Footprint destination' }))).toBe(true);
+      expect(row.contains(screen.getByRole('button', { name: 'Copy footprint' }))).toBe(true);
+      // Undo / Redo / Save share the toolbar row with the tools.
+      const toolbar = view.container.querySelector('.editor-toolbar')!;
+      expect(toolbar.contains(screen.getByRole('button', { name: 'Undo' }))).toBe(true);
+      expect(toolbar.contains(screen.getByRole('button', { name: 'Save plan' }))).toBe(true);
+    });
+
+    it('two-finger pinch zooms about the finger midpoint and two-finger drag pans, without drawing', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await fireEvent.pointerDown(canvas, touch(11, 100, 100));
+      await fireEvent.pointerDown(canvas, touch(12, 200, 100));
+      await fireEvent.pointerMove(canvas, touch(12, 300, 100)); // spacing 100 -> 200: 40 -> 80 px/m
+      expect(screen.getByLabelText('Current zoom').textContent).toBe('80 px/m');
+      expect(canvas.getAttribute('viewBox')).toBe('100 100 720 480'); // the plan point under the old midpoint is under the new one
+      await fireEvent.pointerMove(canvas, touch(11, 140, 100)); // both fingers move right 40: pure pan
+      await fireEvent.pointerMove(canvas, touch(12, 340, 100));
+      expect(screen.getByLabelText('Current zoom').textContent).toBe('80 px/m');
+      expect(canvas.getAttribute('viewBox')).toBe('60 100 720 480'); // midpoint moved 40 px right at 80 px/m
+      await fireEvent.pointerUp(canvas, touch(12, 340, 100));
+      await fireEvent.pointerUp(canvas, touch(11, 140, 100));
+      await fireEvent.click(canvas, { clientX: 140, clientY: 100 }); // the click ending the gesture is swallowed
+      expect(view.container.querySelector('.pending-start')).toBeNull();
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(1);
+    });
+
+    it('Ctrl+D duplicates the selected wall one grid step over, in one undo step, and selects the copy', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall, 4.20 m' }));
+      await fireEvent.keyDown(canvas, { key: 'd', ctrlKey: true });
+      const walls = [...view.container.querySelectorAll('.wall')];
+      expect(walls).toHaveLength(2);
+      expect(wallAttrs(walls[1])).toEqual(['40', '40', '208', '40']);
+      expect(walls[1].classList.contains('selected')).toBe(true);
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(1);
+    });
+
+    it('Ctrl+D duplicates a selected room with a new name, and does nothing in a text field or with no selection', async () => {
+      const { view, canvas } = await openEditor();
+      await fireEvent.keyDown(canvas, { key: 'd', ctrlKey: true });
+      expect(view.container.querySelectorAll('.room')).toHaveLength(1);
+      await fireEvent.click(screen.getByRole('button', { name: 'Room Kitchen' }));
+      await fireEvent.keyDown(screen.getByLabelText('Room name'), { key: 'd', ctrlKey: true });
+      expect(view.container.querySelectorAll('.room')).toHaveLength(1);
+      await fireEvent.keyDown(canvas, { key: 'd', ctrlKey: true });
+      expect(view.container.querySelectorAll('.room')).toHaveLength(2);
+      expect(screen.getByText('Kitchen copy', { selector: '.room-label' })).toBeTruthy();
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(view.container.querySelectorAll('.room')).toHaveLength(1);
+    });
+
+    it('endpoint handles are focusable, labelled, and arrow keys nudge just that endpoint (Shift = 10 steps)', async () => {
+      const { view } = await openEditor();
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall, 4.20 m' }));
+      const start = screen.getByRole('button', { name: 'Wall start handle' });
+      const end = screen.getByRole('button', { name: 'Wall end handle' });
+      expect(start.getAttribute('tabindex')).toBe('0');
+      expect(end.getAttribute('tabindex')).toBe('0');
+      await fireEvent.keyDown(start, { key: 'ArrowRight' });
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['4', '0', '168', '0']); // only the start moved, by 0.1 m
+      await fireEvent.keyDown(end, { key: 'ArrowDown', shiftKey: true });
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['4', '0', '168', '40']); // ten steps = 1 m
+      await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+      expect(wallAttrs(view.container.querySelector('.wall')!)).toEqual(['4', '0', '168', '0']);
+    });
+
+    it('says exactly why a wall could not be joined when its end lands inside a door opening', async () => {
+      const plan = fixturePlan();
+      plan.floors[0].walls[0].openings = [{ opening_id: '018f47a0-9b5c-7a22-8a33-aabbccdd0030', kind: 'door', offset_m: 0.8, width_m: 0.9 }];
+      const api = apiStub({ fetchHome: vi.fn(async () => ({ plan, placements: [], estimates: [] })) });
+      const { view, canvas } = await openEditor(api);
+      await fireEvent.click(screen.getByRole('button', { name: 'Wall' }));
+      await fireEvent.click(canvas, { clientX: 41, clientY: 121 });
+      await fireEvent.click(canvas, { clientX: 41, clientY: 1 }); // (1, 0) is inside the door's 0.8-1.7 m span
+      expect(screen.getByText('That point is inside a door opening — the wall was drawn but not joined.')).toBeTruthy();
+      expect(view.container.querySelectorAll('.wall')).toHaveLength(2); // drawn, not split
+    });
+  });
 });
