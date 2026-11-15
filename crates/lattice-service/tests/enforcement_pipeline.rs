@@ -1026,3 +1026,68 @@ async fn active_verified_block_suppresses_later_discovery_presence_events() -> a
     );
     Ok(())
 }
+
+async fn enrolled_unknown_device(
+    pool: &sqlx::SqlitePool,
+) -> anyhow::Result<(PolicyRepository, DeviceId)> {
+    InstallRepository::new(pool.clone())
+        .initialize(at(0))
+        .await?;
+    let repo = PolicyRepository::new(pool.clone());
+    repo.mark_successful_service_start(at(0)).await?;
+    let device = DeviceId::new();
+    sqlx::query("INSERT INTO devices(device_id, first_seen_at, last_seen_at, owner_confirmed) VALUES(?, ?, ?, 0)")
+        .bind(device.to_string()).bind(at(60).to_rfc3339()).bind(at(60).to_rfc3339()).execute(pool).await?;
+    repo.enroll(device).await?;
+    Ok((repo, device))
+}
+
+#[tokio::test]
+async fn a_suspect_clock_turns_deadline_expiry_into_owner_attention_until_acknowledged()
+-> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    let (repo, device) = enrolled_unknown_device(&pool).await?;
+    assert!(repo.record_clock_heartbeat(at(61)).await?.is_trusted());
+    let coordinator = PolicyCoordinator::with_actuator(repo.clone(), None, FakeActuator::default());
+
+    // Sixty days later is far beyond the plausible gap since the last heartbeat: the expired
+    // unknown-device deadline is not evidence, so nothing is quarantined.
+    let jumped = at(61 + 24 * 60);
+    let suspect = coordinator
+        .evaluate(repo.load(device).await?.unwrap(), jumped)
+        .await?;
+    assert_eq!(suspect.requested_action, RequestedAction::OwnerAttention);
+
+    // Once the owner accepts the clock, the same expiry enforces normally.
+    repo.acknowledge_clock(jumped, "clock confirmed correct")
+        .await?;
+    let trusted = coordinator
+        .evaluate(repo.load(device).await?.unwrap(), jumped)
+        .await?;
+    assert_eq!(trusted.requested_action, RequestedAction::Quarantine);
+    Ok(())
+}
+
+#[tokio::test]
+async fn extending_with_a_past_deadline_is_refused_and_keeps_the_single_extension()
+-> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    let (repo, device) = enrolled_unknown_device(&pool).await?;
+    let coordinator = PolicyCoordinator::with_actuator(repo.clone(), None, FakeActuator::default());
+
+    // `at(120)` is later than the original deadline but already past at `at(200)`.
+    assert!(
+        coordinator
+            .extend_once(device, at(120), at(200))
+            .await
+            .is_err()
+    );
+    assert!(
+        coordinator
+            .extend_once(device, at(300), at(200))
+            .await
+            .is_ok(),
+        "the refused call must not have consumed the one extension"
+    );
+    Ok(())
+}
