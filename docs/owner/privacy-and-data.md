@@ -47,9 +47,11 @@ Nothing, by default. The only designed exceptions are:
 - **Advisory lookups** — fetching vendor advisory / NVD / CISA KEV data so
   findings can be matched locally. Fetched data is cached with its source
   and provenance; your device details are matched locally against the cache.
-- **Optional private Tailscale access** (future) — a private tailnet proxy
-  of the same loopback API for your own phone. Public exposure (Tailscale
-  Funnel or any public listener) is prohibited by design.
+- **Optional private Tailscale access** — off until you turn it on in
+  Settings. It makes the same API reachable from your own phone, inside your
+  own tailnet only, through Tailscale Serve. Public exposure (Tailscale
+  Funnel or any public listener) is refused. See
+  [Getting started](getting-started.md#private-phone-access).
 
 ## Retention
 
@@ -131,4 +133,5 @@ backup was taken: the restored database no longer knows about them.
 - Retention and destination-metadata settings in the app. Retention uses
   the fixed defaults listed above; the Settings view has no control for it.
 - Support-export redaction tooling (no export feature exists yet).
-- Tailscale phone access (see above; not implemented).
+- Confirmation of Tailscale phone access on a real tailnet and phone. It is
+  built and tested against a simulated Tailscale only.
