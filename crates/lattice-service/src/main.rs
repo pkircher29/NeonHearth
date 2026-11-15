@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 #[cfg(windows)]
 mod win_service;
@@ -114,6 +115,119 @@ pub(crate) fn parse_bind(value: Option<&str>) -> Result<std::net::SocketAddr, St
     Ok(addr)
 }
 
+/// File (in the state directory) holding a rotated owner token. When present
+/// it wins over the environment value, so a rotation survives a restart.
+const OWNER_TOKEN_FILE: &str = "owner-token";
+
+/// Reads the owner token and removes `LATTICE_SERVICE_TOKEN` from the process
+/// environment before anything is spawned: child processes (ffmpeg, firewall
+/// and tailscale tools, the broker) inherit the environment, and none of them
+/// may see the API's only credential.
+fn take_service_token(token_file: &std::path::Path) -> Result<String> {
+    let from_env = std::env::var("LATTICE_SERVICE_TOKEN").ok();
+    // SAFETY: called once at startup from `serve`, before any monitor, worker
+    // or child process is started; nothing reads the environment concurrently.
+    unsafe { std::env::remove_var("LATTICE_SERVICE_TOKEN") };
+    choose_token(from_env, token_file)
+}
+
+/// A rotated token persisted in `token_file` wins over the environment value
+/// (the environment still holds the pre-rotation token after a restart).
+fn choose_token(from_env: Option<String>, token_file: &std::path::Path) -> Result<String> {
+    if let Ok(rotated) = std::fs::read_to_string(token_file) {
+        let rotated = rotated.trim();
+        if !rotated.is_empty() {
+            return Ok(rotated.to_owned());
+        }
+    }
+    from_env.context("LATTICE_SERVICE_TOKEN must be supplied by platform secret provider")
+}
+
+/// Accepts both the handle-returning and the fire-and-forget (`()`) shapes of
+/// a background `start`, so supervision works today for tasks that expose a
+/// handle and starts covering the rest the moment their `start` returns one.
+trait IntoHandle {
+    fn into_handle(self) -> Option<JoinHandle<()>>;
+}
+impl IntoHandle for () {
+    fn into_handle(self) -> Option<JoinHandle<()>> {
+        None
+    }
+}
+impl IntoHandle for JoinHandle<()> {
+    fn into_handle(self) -> Option<JoinHandle<()>> {
+        Some(self)
+    }
+}
+
+/// Watches one background task. If it panics, or ends while the service is
+/// still running, the service is marked degraded (and the failure logged).
+fn supervise_background(
+    name: &'static str,
+    handle: Option<JoinHandle<()>>,
+    state: &AppState,
+    shutdown: watch::Receiver<bool>,
+) {
+    let Some(handle) = handle else {
+        return;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let outcome = handle.await;
+        if *shutdown.borrow() {
+            return;
+        }
+        match outcome {
+            Err(error) if error.is_panic() => {
+                tracing::error!(task = name, "background task panicked");
+            }
+            Err(error) => tracing::error!(task = name, %error, "background task was cancelled"),
+            Ok(()) => tracing::error!(task = name, "background task exited unexpectedly"),
+        }
+        state.report_task_failure(name).await;
+    });
+}
+
+/// Binds the loopback listener so no other process can share the port. On
+/// Windows that needs `SO_EXCLUSIVEADDRUSE` (otherwise another local process
+/// may bind the same port with `SO_REUSEADDR` and receive some connections);
+/// elsewhere the ordinary exclusive bind of a listener is already sufficient.
+fn bind_exclusive(addr: std::net::SocketAddr) -> Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    #[cfg(windows)]
+    set_exclusive_address_use(&socket)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(TcpListener::from_std(socket.into())?)
+}
+
+#[cfg(windows)]
+fn set_exclusive_address_use(socket: &socket2::Socket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        SO_EXCLUSIVEADDRUSE, SOCKET, SOCKET_ERROR, SOL_SOCKET, setsockopt,
+    };
+    let on: i32 = 1;
+    // SAFETY: `socket` is a live socket handle owned by the caller and the
+    // option value points at a valid i32 for the stated length.
+    let result = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as SOCKET,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            std::ptr::from_ref(&on).cast::<u8>(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if result == SOCKET_ERROR {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// The single shared startup path: token, state directories, database,
 /// runtime worker, loopback listener, and supervised serve-until-shutdown.
 /// Both the console flow and the Windows service flow run exactly this, so
@@ -125,11 +239,11 @@ pub(crate) async fn serve(
     shutdown_rx: watch::Receiver<bool>,
     on_listening: impl FnOnce(),
 ) -> Result<()> {
-    let token = std::env::var("LATTICE_SERVICE_TOKEN")
-        .context("LATTICE_SERVICE_TOKEN must be supplied by platform secret provider")?;
     let paths = resolve_state_paths()?;
     std::fs::create_dir_all(&paths.state_dir).context("create service state directory")?;
     std::fs::create_dir_all(&paths.backups).context("create service backups directory")?;
+    let token_file = paths.state_dir.join(OWNER_TOKEN_FILE);
+    let token = take_service_token(&token_file)?;
     let pool = lattice_store::connect_path(&paths.database)
         .await
         .context("open service database")?;
@@ -137,19 +251,50 @@ pub(crate) async fn serve(
         .initialize(Utc::now())
         .await
         .context("initialize install state")?;
-    let state = AppState::new(token, M2StateRepository::new(pool.clone()))?;
-    state.host_monitor().start(shutdown_rx.clone());
-    state.network_monitor().start(shutdown_rx.clone());
+    let state =
+        AppState::new(token, M2StateRepository::new(pool.clone()))?.with_token_file(token_file);
+    // A panic or early exit in a background task must show up in service
+    // status, not vanish: each task is watched by `supervise_background`.
+    supervise_background(
+        "host_monitor",
+        state
+            .host_monitor()
+            .start(shutdown_rx.clone())
+            .into_handle(),
+        &state,
+        shutdown_rx.clone(),
+    );
+    supervise_background(
+        "network_monitor",
+        state
+            .network_monitor()
+            .start(shutdown_rx.clone())
+            .into_handle(),
+        &state,
+        shutdown_rx.clone(),
+    );
     if let Some(path) = std::env::var_os("LATTICE_MQTT_CREDENTIAL_FILE") {
-        lattice_service::mqtt::start(state.clone(), PathBuf::from(path), shutdown_rx.clone());
+        supervise_background(
+            "mqtt",
+            lattice_service::mqtt::start(state.clone(), PathBuf::from(path), shutdown_rx.clone())
+                .into_handle(),
+            &state,
+            shutdown_rx.clone(),
+        );
     }
     let startup =
         lattice_service::runtime::build(state.clone(), M2StateRepository::new(pool.clone())).await;
     let bind_var = std::env::var("LATTICE_BIND").ok();
     let bind = parse_bind(bind_var.as_deref()).map_err(|message| anyhow::anyhow!(message))?;
-    let listener = TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("bind loopback listener {bind}"))?;
+    let listener =
+        bind_exclusive(bind).with_context(|| format!("bind loopback listener {bind}"))?;
+    // The Serve mapping, funnel checks and Host allowlist follow the port the
+    // listener really holds (it may differ from the default via LATTICE_BIND,
+    // or be ephemeral).
+    state.set_bound_port(listener.local_addr().context("listener address")?.port());
+    lattice_service::tailscale::RemoteAccessState::for_service(&state)
+        .prime_host_policy()
+        .await;
     on_listening();
     PolicyRepository::new(pool.clone())
         .mark_successful_service_start(Utc::now())
@@ -159,12 +304,12 @@ pub(crate) async fn serve(
     // LATTICE_UI_DIR at the staged Vite bundle, the service serves the
     // dashboard at "/" (no bearer needed for assets; API auth unchanged).
     // Absent, the historical API-only behavior is preserved exactly.
-    let router = app(state);
+    let router = app(state.clone());
     let router = match std::env::var_os("LATTICE_UI_DIR") {
         Some(dir) => {
             let dir = PathBuf::from(dir);
             tracing::info!(ui_dir = %dir.display(), "serving UI bundle at /");
-            lattice_service::with_ui_assets(router, &dir)
+            lattice_service::with_ui_assets(router, &dir, &state)
         }
         None => router,
     };
@@ -280,6 +425,25 @@ mod tests {
         for bad in ["", "not-an-address", "127.0.0.1", "127.0.0.1:notaport"] {
             assert!(parse_bind(Some(bad)).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn a_rotated_token_file_wins_over_the_environment_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(OWNER_TOKEN_FILE);
+        // No file: the environment value is used; neither: an error.
+        assert_eq!(choose_token(Some("env".into()), &file).unwrap(), "env");
+        assert!(choose_token(None, &file).is_err());
+        // A rotated token (with the trailing newline an editor may add) wins.
+        std::fs::write(&file, "rotated-token\n").unwrap();
+        assert_eq!(
+            choose_token(Some("env".into()), &file).unwrap(),
+            "rotated-token"
+        );
+        assert_eq!(choose_token(None, &file).unwrap(), "rotated-token");
+        // An empty file is ignored rather than becoming an empty token.
+        std::fs::write(&file, "  \n").unwrap();
+        assert_eq!(choose_token(Some("env".into()), &file).unwrap(), "env");
     }
 
     #[test]

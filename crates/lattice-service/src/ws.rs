@@ -1,8 +1,22 @@
+use crate::{auth::Principal, state::SocketLimits};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, close_code};
+use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use lattice_domain::EventEnvelope;
 use lattice_event_bus::{EventBus, Resume};
+use lattice_store::RemoteAccessRepository;
 use serde::Serialize;
+use sqlx::SqlitePool;
+use tokio::{
+    sync::{OwnedSemaphorePermit, broadcast},
+    time::{Instant, MissedTickBehavior, interval, sleep_until, timeout},
+};
+use uuid::Uuid;
+
+/// Largest frame or message a client may send. Clients never legitimately
+/// send data (anything but control frames is refused), so this is tiny; it
+/// stops a peer buffering megabytes before the first frame is even seen.
+pub(crate) const MAX_CLIENT_MESSAGE_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -18,10 +32,22 @@ pub async fn resume_messages(bus: &EventBus, sequence: u64) -> Vec<ServerMessage
     }
 }
 
+/// Everything an event socket needs to stay bound to the principal that
+/// redeemed its ticket.
+pub(crate) struct SocketGuard {
+    pub principal: Principal,
+    pub pool: SqlitePool,
+    pub revocations: broadcast::Receiver<Uuid>,
+    pub limits: SocketLimits,
+    /// Held for the socket's lifetime; releases the connection cap on drop.
+    pub permit: OwnedSemaphorePermit,
+}
+
 #[derive(Debug)]
 enum SendMessageError {
     Serialization(serde_json::Error),
     Transport(axum::Error),
+    TimedOut,
 }
 
 impl std::fmt::Display for SendMessageError {
@@ -31,6 +57,7 @@ impl std::fmt::Display for SendMessageError {
                 write!(formatter, "message serialization failed: {error}")
             }
             Self::Transport(error) => write!(formatter, "message transport failed: {error}"),
+            Self::TimedOut => formatter.write_str("message send timed out"),
         }
     }
 }
@@ -40,52 +67,94 @@ impl std::error::Error for SendMessageError {
         match self {
             Self::Serialization(error) => Some(error),
             Self::Transport(error) => Some(error),
+            Self::TimedOut => None,
         }
+    }
+}
+
+type Sink = futures_util::stream::SplitSink<WebSocket, Message>;
+
+/// Writes one frame, giving up when the peer stops reading: a stalled client
+/// must not pin a task (and its subscription) forever.
+async fn send_frame(
+    sink: &mut Sink,
+    message: Message,
+    limit: std::time::Duration,
+) -> Result<(), SendMessageError> {
+    match timeout(limit, sink.send(message)).await {
+        Ok(result) => result.map_err(SendMessageError::Transport),
+        Err(_) => Err(SendMessageError::TimedOut),
     }
 }
 
 async fn send_message(
-    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    sink: &mut Sink,
     message: ServerMessage,
+    limit: std::time::Duration,
 ) -> Result<(), SendMessageError> {
     let encoded = serde_json::to_string(&message).map_err(SendMessageError::Serialization)?;
-    sink.send(Message::Text(encoded.into()))
-        .await
-        .map_err(SendMessageError::Transport)
+    send_frame(sink, Message::Text(encoded.into()), limit).await
 }
 
-async fn send_close(
-    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    code: u16,
-    reason: &'static str,
-) {
-    let _ = sink
-        .send(Message::Close(Some(CloseFrame {
+async fn send_close(sink: &mut Sink, code: u16, reason: &'static str, limit: std::time::Duration) {
+    let _ = send_frame(
+        sink,
+        Message::Close(Some(CloseFrame {
             code,
             reason: reason.into(),
-        })))
-        .await;
+        })),
+        limit,
+    )
+    .await;
 }
 
-async fn handle_send_error(
-    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    error: SendMessageError,
-) {
+async fn handle_send_error(sink: &mut Sink, error: SendMessageError, limit: std::time::Duration) {
     if matches!(error, SendMessageError::Serialization(_)) {
-        send_close(sink, close_code::ERROR, "internal server error").await;
+        send_close(sink, close_code::ERROR, "internal server error", limit).await;
     }
 }
 
-async fn send_resync_and_close(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>) {
-    match send_message(sink, ServerMessage::ResyncRequired).await {
+async fn send_resync_and_close(sink: &mut Sink, limit: std::time::Duration) {
+    match send_message(sink, ServerMessage::ResyncRequired, limit).await {
         Ok(()) => {
-            let _ = sink.send(Message::Close(None)).await;
+            let _ = send_frame(sink, Message::Close(None), limit).await;
         }
-        Err(error) => handle_send_error(sink, error).await,
+        Err(error) => handle_send_error(sink, error, limit).await,
     }
 }
 
-pub(crate) async fn serve_socket(socket: WebSocket, bus: EventBus, after_sequence: u64) {
+/// Whether a phone session may still stream. Storage trouble keeps the socket
+/// (fail open for availability is wrong for revocation, but a transient read
+/// error must not drop every phone; the next recheck retries, and the
+/// broadcast path closes immediately on an explicit revoke).
+async fn session_still_valid(pool: &SqlitePool, session: Uuid) -> bool {
+    match RemoteAccessRepository::new(pool.clone())
+        .load_phone_session(session)
+        .await
+    {
+        Ok(Some(row)) => !row.revoked && Utc::now() < row.expires_at,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(%error, "phone session recheck failed; keeping socket until next check");
+            true
+        }
+    }
+}
+
+pub(crate) async fn serve_socket(
+    socket: WebSocket,
+    bus: EventBus,
+    after_sequence: u64,
+    guard: SocketGuard,
+) {
+    let SocketGuard {
+        principal,
+        pool,
+        mut revocations,
+        limits,
+        permit: _permit,
+    } = guard;
+    let send_limit = limits.send_timeout;
     // Subscribe before reading replay so publish cannot be lost between the two operations.
     let mut receiver = bus.subscribe();
     let messages = resume_messages(&bus, after_sequence).await;
@@ -95,57 +164,112 @@ pub(crate) async fn serve_socket(socket: WebSocket, bus: EventBus, after_sequenc
     for message in messages {
         match message {
             ServerMessage::ResyncRequired => {
-                send_resync_and_close(&mut sink).await;
+                send_resync_and_close(&mut sink, send_limit).await;
                 return;
             }
             ServerMessage::Event(event) => {
                 last_sent_sequence = event.sequence;
-                if let Err(error) = send_message(&mut sink, ServerMessage::Event(event)).await {
-                    handle_send_error(&mut sink, error).await;
+                if let Err(error) =
+                    send_message(&mut sink, ServerMessage::Event(event), send_limit).await
+                {
+                    handle_send_error(&mut sink, error, send_limit).await;
                     return;
                 }
             }
         }
     }
 
+    let phone = principal.session_id();
+    let mut last_seen = Instant::now();
+    let mut ping = interval(limits.ping_interval);
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ping.tick().await;
+    let mut recheck = interval(limits.session_recheck);
+    recheck.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    recheck.tick().await;
+    let lifetime = sleep_until(Instant::now() + limits.max_lifetime);
+    tokio::pin!(lifetime);
+
     loop {
         tokio::select! {
-            incoming = stream.next() => match incoming {
-                Some(Ok(Message::Ping(payload))) => {
-                    if sink.send(Message::Pong(payload)).await.is_err() {
+            incoming = stream.next() => {
+                last_seen = Instant::now();
+                match incoming {
+                    Some(Ok(Message::Ping(payload))) => {
+                        if send_frame(&mut sink, Message::Pong(payload), send_limit).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {},
+                    Some(Ok(Message::Close(_))) => {
+                        let _ = send_frame(&mut sink, Message::Close(None), send_limit).await;
                         return;
                     }
+                    Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
+                        send_close(&mut sink, close_code::UNSUPPORTED, "unsolicited client data", send_limit).await;
+                        return;
+                    }
+                    None | Some(Err(_)) => return,
                 }
-                Some(Ok(Message::Pong(_))) => {},
-                Some(Ok(Message::Close(_))) => {
-                    let _ = sink.send(Message::Close(None)).await;
-                    return;
-                }
-                Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
-                    send_close(&mut sink, close_code::UNSUPPORTED, "unsolicited client data").await;
-                    return;
-                }
-                None | Some(Err(_)) => return,
             },
             event = receiver.recv() => match event {
                 Ok(event) if event.sequence <= last_sent_sequence => {},
                 Ok(event) if event.sequence != last_sent_sequence.saturating_add(1) => {
-                    send_resync_and_close(&mut sink).await;
+                    send_resync_and_close(&mut sink, send_limit).await;
                     return;
                 }
                 Ok(event) => {
                     last_sent_sequence = event.sequence;
-                    if let Err(error) = send_message(&mut sink, ServerMessage::Event(event)).await {
-                        handle_send_error(&mut sink, error).await;
+                    if let Err(error) = send_message(&mut sink, ServerMessage::Event(event), send_limit).await {
+                        handle_send_error(&mut sink, error, send_limit).await;
                         return;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    send_resync_and_close(&mut sink).await;
+                    send_resync_and_close(&mut sink, send_limit).await;
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            }
+            },
+            _ = ping.tick() => {
+                if last_seen.elapsed() >= limits.idle_timeout {
+                    send_close(&mut sink, close_code::AWAY, "idle timeout", send_limit).await;
+                    return;
+                }
+                if send_frame(&mut sink, Message::Ping(Vec::<u8>::new().into()), send_limit).await.is_err() {
+                    return;
+                }
+            },
+            () = &mut lifetime => {
+                // Clients reconnect and resume by sequence.
+                send_close(&mut sink, close_code::AWAY, "lifetime reached; reconnect", send_limit).await;
+                return;
+            },
+            _ = recheck.tick(), if phone.is_some() => {
+                if let Some(session) = phone
+                    && !session_still_valid(&pool, session).await
+                {
+                    send_close(&mut sink, close_code::POLICY, "session no longer valid", send_limit).await;
+                    return;
+                }
+            },
+            revoked = revocations.recv(), if phone.is_some() => match revoked {
+                Ok(id) if Some(id) == phone => {
+                    send_close(&mut sink, close_code::POLICY, "session revoked", send_limit).await;
+                    return;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Missed announcements: validate against storage now.
+                    if let Some(session) = phone
+                        && !session_still_valid(&pool, session).await
+                    {
+                        send_close(&mut sink, close_code::POLICY, "session no longer valid", send_limit).await;
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
         }
     }
 }

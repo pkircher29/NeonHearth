@@ -11,7 +11,7 @@
   let { client, pageSize = 50 }: Props = $props();
 
   const CATEGORY_LABEL: Record<AuditCategory, string> = { approval: 'Approval', scan: 'Scan', enforcement: 'Enforcement', doctor_action: 'Doctor', audit_module: 'Audit module' };
-  const ACTOR_LABEL: Record<AuditActor, string> = { owner: 'You', service: 'NeonHearth', module: 'Audit module' };
+  const ACTOR_LABEL: Record<AuditActor, string> = { owner: 'You', service: 'NeonHearth', module: 'Audit module', phone: 'Paired phone' };
 
   let entries = $state<AuditEntry[]>([]);
   let head = $state<ChainHead | null>(null);
