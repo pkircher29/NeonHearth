@@ -5,6 +5,7 @@ use crate::check::{
     ResolverEvidence,
 };
 use crate::probe::{LeaseState, RouteEntry};
+use crate::types::{IpVersion, MacAddr};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -23,7 +24,7 @@ pub enum DiagnosisKind {
     },
     DuplicateIp {
         address: String,
-        macs: Vec<String>,
+        macs: Vec<MacAddr>,
     },
     WeakWifiQuality {
         rssi_dbm: i16,
@@ -35,8 +36,11 @@ pub enum DiagnosisKind {
         median_rtt_ms: Option<f64>,
     },
     MtuBlackhole {
-        largest_passing_bytes: Option<u16>,
-        smallest_failing_bytes: Option<u16>,
+        /// ICMP payload sizes, not link MTUs: convert with
+        /// [`Mtu::from_icmp_payload`].
+        largest_passing_payload_bytes: Option<u16>,
+        smallest_failing_payload_bytes: Option<u16>,
+        ip_version: IpVersion,
     },
     DnsFailure {
         resolvers: Vec<ResolverEvidence>,
@@ -142,12 +146,14 @@ fn kind_for(result: &CheckResult) -> DiagnosisKind {
         (
             CheckKind::Mtu,
             Some(CheckDetail::Mtu {
-                largest_passing_bytes,
-                smallest_failing_bytes,
+                largest_passing_payload_bytes,
+                smallest_failing_payload_bytes,
+                ip_version,
             }),
         ) => DiagnosisKind::MtuBlackhole {
-            largest_passing_bytes: *largest_passing_bytes,
-            smallest_failing_bytes: *smallest_failing_bytes,
+            largest_passing_payload_bytes: *largest_passing_payload_bytes,
+            smallest_failing_payload_bytes: *smallest_failing_payload_bytes,
+            ip_version: *ip_version,
         },
         (CheckKind::Dns, Some(CheckDetail::Dns { resolvers })) => DiagnosisKind::DnsFailure {
             resolvers: resolvers.clone(),

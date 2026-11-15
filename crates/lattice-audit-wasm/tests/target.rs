@@ -1,4 +1,4 @@
-use lattice_audit_wasm::{AuthorizedTarget, TargetError};
+use lattice_audit_wasm::{AuthorizedTarget, AuthorizerWitness, TargetError};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[test]
@@ -12,7 +12,13 @@ fn accepts_only_explicit_private_or_link_local_unicast_targets() {
         "fe80::1",
     ] {
         assert!(
-            AuthorizedTarget::new(target.parse().unwrap(), 7, 443).is_ok(),
+            AuthorizedTarget::new(
+                AuthorizerWitness::for_tests(),
+                target.parse().unwrap(),
+                7,
+                443
+            )
+            .is_ok(),
             "{target}"
         );
     }
@@ -30,7 +36,12 @@ fn accepts_only_explicit_private_or_link_local_unicast_targets() {
         "::ffff:192.168.1.1",
     ] {
         assert_eq!(
-            AuthorizedTarget::new(target.parse().unwrap(), 7, 443),
+            AuthorizedTarget::new(
+                AuthorizerWitness::for_tests(),
+                target.parse().unwrap(),
+                7,
+                443
+            ),
             Err(TargetError::InvalidTarget),
             "{target}"
         );
@@ -41,16 +52,16 @@ fn accepts_only_explicit_private_or_link_local_unicast_targets() {
 fn rejects_zero_interface_and_port() {
     let target = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
     assert_eq!(
-        AuthorizedTarget::new(target, 0, 80),
+        AuthorizedTarget::new(AuthorizerWitness::for_tests(), target, 0, 80),
         Err(TargetError::InvalidInterface)
     );
     assert_eq!(
-        AuthorizedTarget::new(target, 1, 0),
+        AuthorizedTarget::new(AuthorizerWitness::for_tests(), target, 1, 0),
         Err(TargetError::InvalidPort)
     );
     let mapped = IpAddr::V6("::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap());
     assert_eq!(
-        AuthorizedTarget::new(mapped, 1, 80),
+        AuthorizedTarget::new(AuthorizerWitness::for_tests(), mapped, 1, 80),
         Err(TargetError::InvalidTarget)
     );
 }

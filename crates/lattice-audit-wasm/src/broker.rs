@@ -1,6 +1,6 @@
 use crate::{
-    AuditError, AuditHost, AuditHostError, AuthorizedTarget, Capability, Limits, Sandbox,
-    TargetAuthorizer, TargetError, VerifiedManifest, manifest::valid_limits,
+    AuditError, AuditHost, AuditHostError, AuthorizedTarget, AuthorizerWitness, Capability, Limits,
+    Sandbox, TargetAuthorizer, TargetError, VerifiedManifest, manifest::valid_limits,
     runtime::CompiledModule,
 };
 use async_trait::async_trait;
@@ -300,15 +300,22 @@ impl Broker {
         if request.cancellation.is_cancelled() {
             return Err(BrokerError::Cancelled);
         }
-        let target = self
-            .authorizer
-            .authorize(request.target, request.interface, request.port)?;
+        let target = self.authorizer.authorize(
+            AuthorizerWitness::new(),
+            request.target,
+            request.interface,
+            request.port,
+        )?;
         if target.target() != request.target
             || target.interface() != request.interface
             || target.port() != request.port
         {
             return Err(BrokerError::Target(TargetError::Rejected));
         }
+        // The approval must be real, unexpired, unused, and for exactly this
+        // target and module; a non-nil UUID proves nothing.
+        self.authorizer
+            .redeem_approval(request.approval_id, &target, request.module.sha256())?;
         if Instant::now() >= deadline {
             return Err(BrokerError::DeadlineExceeded);
         }
@@ -411,6 +418,7 @@ impl AuditHost for BrokerHost {
                     _ => AuditHostError::ExchangeFailed,
                 })?;
         let refreshed = match self.authorizer.authorize(
+            AuthorizerWitness::new(),
             self.target.target(),
             self.target.interface(),
             self.target.port(),
@@ -540,13 +548,22 @@ mod tests {
 
     struct Auth;
     impl TargetAuthorizer for Auth {
+        fn redeem_approval(
+            &self,
+            _: Uuid,
+            _: &AuthorizedTarget,
+            _: [u8; 32],
+        ) -> Result<(), TargetError> {
+            Ok(())
+        }
         fn authorize(
             &self,
+            _witness: AuthorizerWitness,
             target: IpAddr,
             interface: u32,
             port: u16,
         ) -> Result<AuthorizedTarget, TargetError> {
-            AuthorizedTarget::new(target, interface, port)
+            AuthorizedTarget::new(AuthorizerWitness::for_tests(), target, interface, port)
         }
     }
     struct UnusedExchange;

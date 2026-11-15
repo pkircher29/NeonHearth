@@ -2040,6 +2040,7 @@ dependencies = [
  "base64",
  "chrono",
  "ed25519-dalek",
+ "lattice-advisory",
  "reqwest",
  "serde",
  "serde_json",
@@ -2056,6 +2057,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "ed25519-dalek",
+ "lattice-audit-wasm",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2074,6 +2076,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "lattice-camera",
  "quick-xml",
  "secrecy",
  "serde",
@@ -2088,7 +2091,9 @@ name = "lattice-doctor"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "lattice-doctor",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "utoipa",

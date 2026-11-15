@@ -277,7 +277,9 @@ async fn memory_and_table_declarations_and_growth_fail_closed() {
         Sandbox::new(verified(&extra_memory, limits()))
             .await
             .unwrap_err(),
-        AuditError::InvalidAbi
+        // The engine no longer enables multi-memory, so the module is refused
+        // at compile time (previously by the ABI check); both fail closed.
+        AuditError::InvalidModule
     );
     let extra_tables = wasm(
         r#"(module (table 1 funcref) (table 1 funcref) (memory (export "memory") 1) (func (export "run") (param i32 i32) (result i64) i64.const 0))"#,

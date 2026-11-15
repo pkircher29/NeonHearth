@@ -13,13 +13,11 @@ use std::{
     fmt,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::Arc,
 };
 use thiserror::Error;
 use tokio::{
     io::AsyncReadExt,
     process::{Child, Command},
-    sync::Mutex,
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -27,6 +25,19 @@ use uuid::Uuid;
 use crate::{CameraId, StreamId};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+/// Input protocols ffmpeg may open for the loopback RTSP source and nothing else.
+const INPUT_PROTOCOLS: &str = "rtsp,tcp,rtp,udp";
+/// Socket read timeout in microseconds (15 s): a stalled source ends the process.
+const READ_TIMEOUT_MICROS: &str = "15000000";
+/// One HLS segment may not exceed 8 MiB, so a source that never sends a
+/// keyframe cannot grow a single segment without bound.
+const MAX_SEGMENT_BYTES: &str = "8388608";
+/// Hard media-time ceiling for an HLS job: the 10 minute lease plus margin.
+const MAX_HLS_SECONDS: &str = "660";
+const MAX_SNAPSHOT_BYTES: &str = "4194304";
+/// The only environment variables the ffmpeg child receives. Everything else,
+/// including service tokens, is withheld.
+const CHILD_ENV_ALLOWLIST: &[&str] = &["SystemRoot", "windir", "TEMP", "TMP"];
 const MEDIA_PROCESS_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 macro_rules! opaque_uuid_v7 {
@@ -293,9 +304,8 @@ pub const FFMPEG_ENV: &str = "NEONHEARTH_FFMPEG";
 /// The ffmpeg executable this process will spawn, resolved once per process.
 ///
 /// Resolution order (see [`resolve_ffmpeg_executable`]): the absolute path in
-/// `NEONHEARTH_FFMPEG`, then the platform install location if it exists, then
-/// the first `ffmpeg` found on `PATH`, then the platform install location
-/// regardless (so a missing binary fails at spawn with a typed error).
+/// `NEONHEARTH_FFMPEG`, otherwise the platform install location (so a missing
+/// binary fails at spawn with a typed error). `PATH` is never consulted.
 #[must_use]
 pub fn ffmpeg_executable() -> &'static Path {
     static RESOLVED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -323,14 +333,14 @@ pub fn platform_default_ffmpeg() -> &'static Path {
     }
 }
 
-const FFMPEG_FILE_NAME: &str = if cfg!(target_os = "windows") {
-    "ffmpeg.exe"
-} else {
-    "ffmpeg"
-};
-
 /// Pure resolver behind [`ffmpeg_executable`]; `exists` abstracts the
 /// filesystem so the order is testable without touching the host.
+///
+/// `PATH` is deliberately not searched: this process may run with more
+/// privilege than the user who controls `PATH`, and a writable directory
+/// earlier on it would substitute the binary. An administrator who keeps
+/// ffmpeg elsewhere sets `NEONHEARTH_FFMPEG`. The `path_var` parameter is
+/// retained for API compatibility and ignored.
 ///
 /// A relative or traversing override is ignored rather than honoured: the
 /// media contract only ever spawns an absolute, non-traversing path.
@@ -340,28 +350,14 @@ pub fn resolve_ffmpeg_executable(
     path_var: Option<&OsStr>,
     exists: &dyn Fn(&Path) -> bool,
 ) -> PathBuf {
+    let _ = (path_var, exists);
     if let Some(value) = override_path {
         let candidate = PathBuf::from(value);
         if !value.is_empty() && validate_output_dir(&candidate).is_ok() {
             return candidate;
         }
     }
-    let default = platform_default_ffmpeg();
-    if exists(default) {
-        return default.to_path_buf();
-    }
-    if let Some(path_var) = path_var {
-        for directory in std::env::split_paths(path_var) {
-            if !directory.is_absolute() {
-                continue;
-            }
-            let candidate = directory.join(FFMPEG_FILE_NAME);
-            if validate_output_dir(&candidate).is_ok() && exists(&candidate) {
-                return candidate;
-            }
-        }
-    }
-    default.to_path_buf()
+    platform_default_ffmpeg().to_path_buf()
 }
 
 pub fn hls_args(
@@ -378,6 +374,10 @@ pub fn hls_args(
         "error",
         "-rtsp_transport",
         "tcp",
+        "-protocol_whitelist",
+        INPUT_PROTOCOLS,
+        "-rw_timeout",
+        READ_TIMEOUT_MICROS,
         "-i",
         &source,
         "-map",
@@ -385,12 +385,16 @@ pub fn hls_args(
         "-an",
         "-c:v",
         "copy",
+        "-t",
+        MAX_HLS_SECONDS,
         "-f",
         "hls",
         "-hls_time",
         "2",
         "-hls_list_size",
         "4",
+        "-hls_segment_size",
+        MAX_SEGMENT_BYTES,
         "-hls_flags",
         "delete_segments+append_list+omit_endlist+independent_segments",
         "-hls_segment_filename",
@@ -417,6 +421,10 @@ pub fn snapshot_args(
         "error",
         "-rtsp_transport",
         "tcp",
+        "-protocol_whitelist",
+        INPUT_PROTOCOLS,
+        "-rw_timeout",
+        READ_TIMEOUT_MICROS,
         "-i",
         &source,
         "-map",
@@ -424,6 +432,8 @@ pub fn snapshot_args(
         "-an",
         "-frames:v",
         "1",
+        "-fs",
+        MAX_SNAPSHOT_BYTES,
         "-f",
         "image2",
         "-c:v",
@@ -504,6 +514,8 @@ impl MediaProcessFactory for ProductionMediaProcessFactory {
     async fn spawn(&self, spec: MediaProcessSpec) -> Result<Box<dyn MediaProcess>, MediaError> {
         validate_production_spec(&spec)?;
         let mut command = Command::new(spec.executable());
+        command.env_clear();
+        command.envs(allowlisted_env(std::env::vars_os()));
         command
             .args(spec.args())
             .stdin(Stdio::null())
@@ -533,6 +545,17 @@ impl MediaProcessFactory for ProductionMediaProcessFactory {
             waited: false,
         }))
     }
+}
+
+/// The subset of `vars` the ffmpeg child may inherit. Names are compared
+/// case-insensitively because Windows environment names are.
+fn allowlisted_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
+    vars.filter(|(name, _)| {
+        CHILD_ENV_ALLOWLIST
+            .iter()
+            .any(|allowed| name.to_string_lossy().eq_ignore_ascii_case(allowed))
+    })
+    .collect()
 }
 
 fn validate_production_spec(spec: &MediaProcessSpec) -> Result<(), MediaError> {
@@ -639,149 +662,189 @@ pub struct MediaProcessObservation {
     pub awaited: bool,
 }
 
-#[derive(Clone, Default)]
-pub struct FakeMediaProcessFactory {
-    inner: Arc<Mutex<FakeState>>,
-    exits: Arc<std::sync::Mutex<Vec<Option<MediaProcessExit>>>>,
-}
+#[cfg(any(test, feature = "test-support"))]
+mod fake {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
-#[derive(Default)]
-struct FakeState {
-    specs: Vec<MediaProcessSpec>,
-    observations: Vec<MediaProcessObservation>,
-    fail_next: Option<Vec<u8>>,
-    last_diagnostic: Option<Vec<u8>>,
-    hls_output: Option<FakeHlsOutput>,
-    snapshot_output: Option<Vec<u8>>,
-    snapshot_hangs: bool,
-}
+    #[derive(Clone, Default)]
+    pub struct FakeMediaProcessFactory {
+        inner: Arc<Mutex<FakeState>>,
+        exits: Arc<std::sync::Mutex<Vec<Option<MediaProcessExit>>>>,
+    }
 
-type FakeHlsOutput = (Vec<u8>, Vec<FakeSegment>);
-type FakeSegment = (String, Vec<u8>);
+    #[derive(Default)]
+    struct FakeState {
+        specs: Vec<MediaProcessSpec>,
+        observations: Vec<MediaProcessObservation>,
+        fail_next: Option<Vec<u8>>,
+        last_diagnostic: Option<Vec<u8>>,
+        hls_output: Option<FakeHlsOutput>,
+        snapshot_output: Option<Vec<u8>>,
+        snapshot_hangs: bool,
+    }
 
-impl FakeMediaProcessFactory {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub async fn specs(&self) -> Vec<MediaProcessSpec> {
-        self.inner.lock().await.specs.clone()
-    }
-    pub async fn observations(&self) -> Vec<MediaProcessObservation> {
-        self.inner.lock().await.observations.clone()
-    }
-    pub async fn fail_next(&self, diagnostic: Vec<u8>) {
-        self.inner.lock().await.fail_next = Some(diagnostic);
-    }
-    pub async fn last_diagnostic(&self) -> Option<Vec<u8>> {
-        self.inner.lock().await.last_diagnostic.clone()
-    }
-    pub async fn set_hls_output(&self, playlist: Vec<u8>, segments: Vec<(String, Vec<u8>)>) {
-        self.inner.lock().await.hls_output = Some((playlist, segments));
-    }
-    pub async fn set_snapshot_output(&self, jpeg: Vec<u8>) {
-        self.inner.lock().await.snapshot_output = Some(jpeg);
-    }
-    pub async fn set_snapshot_hang(&self, hangs: bool) {
-        self.inner.lock().await.snapshot_hangs = hangs;
-    }
-    pub async fn crash_last(&self) {
-        if let Some(exit) = self
-            .exits
-            .lock()
-            .expect("fake media exits poisoned")
-            .last_mut()
-        {
-            *exit = Some(MediaProcessExit { success: false });
+    type FakeHlsOutput = (Vec<u8>, Vec<FakeSegment>);
+    type FakeSegment = (String, Vec<u8>);
+
+    impl FakeMediaProcessFactory {
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+        pub async fn specs(&self) -> Vec<MediaProcessSpec> {
+            self.inner.lock().await.specs.clone()
+        }
+        pub async fn observations(&self) -> Vec<MediaProcessObservation> {
+            self.inner.lock().await.observations.clone()
+        }
+        pub async fn fail_next(&self, diagnostic: Vec<u8>) {
+            self.inner.lock().await.fail_next = Some(diagnostic);
+        }
+        pub async fn last_diagnostic(&self) -> Option<Vec<u8>> {
+            self.inner.lock().await.last_diagnostic.clone()
+        }
+        pub async fn set_hls_output(&self, playlist: Vec<u8>, segments: Vec<(String, Vec<u8>)>) {
+            self.inner.lock().await.hls_output = Some((playlist, segments));
+        }
+        pub async fn set_snapshot_output(&self, jpeg: Vec<u8>) {
+            self.inner.lock().await.snapshot_output = Some(jpeg);
+        }
+        pub async fn set_snapshot_hang(&self, hangs: bool) {
+            self.inner.lock().await.snapshot_hangs = hangs;
+        }
+        pub async fn crash_last(&self) {
+            if let Some(exit) = self
+                .exits
+                .lock()
+                .expect("fake media exits poisoned")
+                .last_mut()
+            {
+                *exit = Some(MediaProcessExit { success: false });
+            }
         }
     }
-}
 
-#[async_trait]
-impl MediaProcessFactory for FakeMediaProcessFactory {
-    async fn spawn(&self, spec: MediaProcessSpec) -> Result<Box<dyn MediaProcess>, MediaError> {
-        let mut state = self.inner.lock().await;
-        let job = spec.job();
-        let output = spec.args().last().map(PathBuf::from);
-        state.specs.push(spec);
-        if let Some(diagnostic) = state.fail_next.take() {
-            state.last_diagnostic = Some(sanitized_diagnostic(diagnostic.len()));
-            return Err(MediaError::ProcessFailed);
-        }
-        let index = state.observations.len();
-        state.observations.push(MediaProcessObservation::default());
-        let hls_output = state.hls_output.clone();
-        let snapshot_output = state.snapshot_output.clone();
-        let snapshot_hangs = state.snapshot_hangs;
-        drop(state);
-        self.exits.lock().expect("fake media exits poisoned").push(
-            (job == MediaJob::Snapshot && !snapshot_hangs)
-                .then_some(MediaProcessExit { success: true }),
-        );
-        if let Some(output) = output {
-            match job {
-                MediaJob::Hls => {
-                    if let Some((playlist, segments)) = hls_output {
-                        tokio::fs::write(&output, playlist)
-                            .await
-                            .map_err(|_| MediaError::ProcessFailed)?;
-                        let directory = output.parent().ok_or(MediaError::ProcessFailed)?;
-                        for (name, bytes) in segments {
-                            if name.contains('/') || name.contains('\\') {
-                                return Err(MediaError::ProcessFailed);
+    #[async_trait]
+    impl MediaProcessFactory for FakeMediaProcessFactory {
+        async fn spawn(&self, spec: MediaProcessSpec) -> Result<Box<dyn MediaProcess>, MediaError> {
+            let mut state = self.inner.lock().await;
+            let job = spec.job();
+            let output = spec.args().last().map(PathBuf::from);
+            state.specs.push(spec);
+            if let Some(diagnostic) = state.fail_next.take() {
+                state.last_diagnostic = Some(sanitized_diagnostic(diagnostic.len()));
+                return Err(MediaError::ProcessFailed);
+            }
+            let index = state.observations.len();
+            state.observations.push(MediaProcessObservation::default());
+            let hls_output = state.hls_output.clone();
+            let snapshot_output = state.snapshot_output.clone();
+            let snapshot_hangs = state.snapshot_hangs;
+            drop(state);
+            self.exits.lock().expect("fake media exits poisoned").push(
+                (job == MediaJob::Snapshot && !snapshot_hangs)
+                    .then_some(MediaProcessExit { success: true }),
+            );
+            if let Some(output) = output {
+                match job {
+                    MediaJob::Hls => {
+                        if let Some((playlist, segments)) = hls_output {
+                            tokio::fs::write(&output, playlist)
+                                .await
+                                .map_err(|_| MediaError::ProcessFailed)?;
+                            let directory = output.parent().ok_or(MediaError::ProcessFailed)?;
+                            for (name, bytes) in segments {
+                                if name.contains('/') || name.contains('\\') {
+                                    return Err(MediaError::ProcessFailed);
+                                }
+                                tokio::fs::write(directory.join(name), bytes)
+                                    .await
+                                    .map_err(|_| MediaError::ProcessFailed)?;
                             }
-                            tokio::fs::write(directory.join(name), bytes)
+                        }
+                    }
+                    MediaJob::Snapshot => {
+                        if let Some(jpeg) = snapshot_output {
+                            tokio::fs::write(output, jpeg)
                                 .await
                                 .map_err(|_| MediaError::ProcessFailed)?;
                         }
                     }
                 }
-                MediaJob::Snapshot => {
-                    if let Some(jpeg) = snapshot_output {
-                        tokio::fs::write(output, jpeg)
-                            .await
-                            .map_err(|_| MediaError::ProcessFailed)?;
-                    }
+            }
+            Ok(Box::new(FakeMediaProcess {
+                state: self.inner.clone(),
+                exits: self.exits.clone(),
+                index,
+            }))
+        }
+    }
+
+    struct FakeMediaProcess {
+        state: Arc<Mutex<FakeState>>,
+        exits: Arc<std::sync::Mutex<Vec<Option<MediaProcessExit>>>>,
+        index: usize,
+    }
+
+    #[async_trait]
+    impl MediaProcess for FakeMediaProcess {
+        async fn kill(&mut self) -> Result<(), MediaError> {
+            self.state.lock().await.observations[self.index].kill_requested = true;
+            self.exits.lock().expect("fake media exits poisoned")[self.index] =
+                Some(MediaProcessExit { success: false });
+            Ok(())
+        }
+        async fn wait(&mut self) -> Result<MediaProcessExit, MediaError> {
+            self.state.lock().await.observations[self.index].awaited = true;
+            loop {
+                if let Some(exit) =
+                    self.exits.lock().expect("fake media exits poisoned")[self.index]
+                {
+                    return Ok(exit);
                 }
+                tokio::task::yield_now().await;
             }
         }
-        Ok(Box::new(FakeMediaProcess {
-            state: self.inner.clone(),
-            exits: self.exits.clone(),
-            index,
-        }))
-    }
-}
-
-struct FakeMediaProcess {
-    state: Arc<Mutex<FakeState>>,
-    exits: Arc<std::sync::Mutex<Vec<Option<MediaProcessExit>>>>,
-    index: usize,
-}
-
-#[async_trait]
-impl MediaProcess for FakeMediaProcess {
-    async fn kill(&mut self) -> Result<(), MediaError> {
-        self.state.lock().await.observations[self.index].kill_requested = true;
-        self.exits.lock().expect("fake media exits poisoned")[self.index] =
-            Some(MediaProcessExit { success: false });
-        Ok(())
-    }
-    async fn wait(&mut self) -> Result<MediaProcessExit, MediaError> {
-        self.state.lock().await.observations[self.index].awaited = true;
-        loop {
-            if let Some(exit) = self.exits.lock().expect("fake media exits poisoned")[self.index] {
-                return Ok(exit);
-            }
-            tokio::task::yield_now().await;
+        fn try_wait(&mut self) -> Result<Option<MediaProcessExit>, MediaError> {
+            Ok(self.exits.lock().expect("fake media exits poisoned")[self.index])
         }
     }
-    fn try_wait(&mut self) -> Result<Option<MediaProcessExit>, MediaError> {
-        Ok(self.exits.lock().expect("fake media exits poisoned")[self.index])
-    }
 }
+#[cfg(any(test, feature = "test-support"))]
+pub use fake::FakeMediaProcessFactory;
 
 fn sanitized_diagnostic(bytes: usize) -> Vec<u8> {
     let bounded = bytes.min(MAX_DIAGNOSTIC_BYTES);
     format!("media process diagnostic redacted ({bounded} bytes)").into_bytes()
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn child_environment_withholds_service_secrets() {
+        // Regression: the ffmpeg child used to inherit the whole environment,
+        // including service tokens.
+        let vars = [
+            ("NEONHEARTH_API_TOKEN", "secret-token"),
+            ("NEONHEARTH_FFMPEG", "/x"),
+            ("PATH", "/bin"),
+            ("SystemRoot", "C:\\Windows"),
+            ("TEMP", "/tmp"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let kept = allowlisted_env(vars.into_iter());
+        let names: Vec<_> = kept
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["SystemRoot", "TEMP"]);
+        assert!(
+            kept.iter()
+                .all(|(_, value)| !value.to_string_lossy().contains("secret"))
+        );
+    }
 }

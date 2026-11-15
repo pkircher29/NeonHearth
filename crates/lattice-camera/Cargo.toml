@@ -14,6 +14,11 @@ secrecy.workspace = true
 quick-xml.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "process"] }
 
+[features]
+# Test doubles (FakeMediaProcessFactory) for this and dependent crates.
+test-support = []
+
 [dev-dependencies]
+lattice-camera = { path = ".", features = ["test-support"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

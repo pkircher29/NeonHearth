@@ -1,17 +1,19 @@
 use crate::{AuditError, Limits, VerifiedManifest, manifest::valid_limits};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 use wasmparser::{Parser, Payload, TypeRef};
 use wasmtime::{Config, Engine, ExternType, Linker, Module, ResourceLimiter, Store, Trap};
 
 const WASM_PAGE_SIZE: u64 = 65_536;
 const MAX_TABLE_ELEMENTS: u64 = 64;
+/// Longest the broker waits for Cranelift. The compile itself runs on a
+/// blocking thread and cannot be interrupted, so the cost is also bounded by
+/// the structural limits below.
+const COMPILE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_FUNCTIONS: u32 = 4_096;
+const MAX_FUNCTION_BODY_BYTES: usize = 512 * 1024;
+/// Fuel units between cooperative yields; also bounds how long one poll can
+/// run before a timeout or cancellation takes effect.
+const FUEL_YIELD_INTERVAL: u64 = 1_000;
 
 #[async_trait::async_trait]
 pub trait AuditHost: Send + Sync {
@@ -50,30 +52,32 @@ impl std::fmt::Debug for Sandbox {
 /// A compiled module and the engine it was compiled for. Compilation is the
 /// expensive part of admission, so a broker keeps one of these per verified
 /// module digest and builds a [`Sandbox`] around it per request.
+///
+/// Executions of one module run concurrently. Time limits are enforced by
+/// fuel-driven cooperative yields plus a tokio timeout around the execution
+/// future, not by the engine-global epoch, so one long invocation cannot
+/// interrupt or block another.
 pub(crate) struct CompiledModule {
     engine: Engine,
     module: Module,
-    /// A module runs in a fresh store, but an engine epoch is global. Serialize
-    /// admissions so one invocation's deadline cannot interrupt another one.
-    /// The mutex lives with the engine so sharing the compiled module keeps
-    /// that guarantee.
-    execution: tokio::sync::Mutex<()>,
 }
 
 impl CompiledModule {
     fn compile(wasm: &[u8]) -> Result<Self, AuditError> {
+        validate_complexity(wasm)?;
         let mut config = Config::new();
         config.consume_fuel(true);
         config.async_support(true);
-        config.epoch_interruption(true);
+        // Identical results on every host: no hardware-dependent NaN bit
+        // patterns, no relaxed-SIMD, and no features the ABI never needs.
+        config.cranelift_nan_canonicalization(true);
+        config.wasm_relaxed_simd(false);
+        config.wasm_threads(false);
+        config.wasm_multi_memory(false);
         let engine = Engine::new(&config).map_err(|_| AuditError::InvalidModule)?;
         let module = Module::new(&engine, wasm).map_err(|_| AuditError::InvalidModule)?;
         validate_abi(&module)?;
-        Ok(Self {
-            engine,
-            module,
-            execution: tokio::sync::Mutex::new(()),
-        })
+        Ok(Self { engine, module })
     }
 }
 
@@ -183,42 +187,6 @@ impl ResourceLimiter for LimitsState {
     }
 }
 
-struct EpochTicker {
-    stop: Arc<AtomicBool>,
-    join: Option<thread::JoinHandle<()>>,
-}
-
-impl EpochTicker {
-    fn start(engine: Engine, limit: Duration) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let ticker_stop = Arc::clone(&stop);
-        let join = thread::spawn(move || {
-            let deadline = Instant::now() + limit;
-            while !ticker_stop.load(Ordering::Acquire) {
-                let now = Instant::now();
-                if now >= deadline {
-                    engine.increment_epoch();
-                    return;
-                }
-                thread::sleep((deadline - now).min(Duration::from_millis(1)));
-            }
-        });
-        Self {
-            stop,
-            join: Some(join),
-        }
-    }
-}
-
-impl Drop for EpochTicker {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
-}
-
 impl Sandbox {
     pub async fn new(verified: VerifiedManifest) -> Result<Self, AuditError> {
         let limits = verified.limits().clone();
@@ -258,9 +226,13 @@ impl Sandbox {
         verified: &VerifiedManifest,
     ) -> Result<Arc<CompiledModule>, AuditError> {
         let wasm = verified.wasm().to_vec();
-        let compiled = tokio::task::spawn_blocking(move || CompiledModule::compile(&wasm))
-            .await
-            .map_err(|_| AuditError::InvalidModule)??;
+        let compiled = tokio::time::timeout(
+            COMPILE_TIMEOUT,
+            tokio::task::spawn_blocking(move || CompiledModule::compile(&wasm)),
+        )
+        .await
+        .map_err(|_| AuditError::TimedOut)?
+        .map_err(|_| AuditError::InvalidModule)??;
         Ok(Arc::new(compiled))
     }
     /// Builds a sandbox around an already compiled module, re-checking the
@@ -286,10 +258,6 @@ impl Sandbox {
         if input.len() as u64 > self.limits.max_bytes || input.len() > i32::MAX as usize {
             return Err(AuditError::InputLimitExceeded);
         }
-        // Tokio's mutex is not poisonable. The guard covers the epoch ticker's
-        // entire lifetime, and max_time begins only after this admission.
-        let _execution = self.compiled.execution.lock().await;
-        let ticker = EpochTicker::start(self.compiled.engine.clone(), self.limits.max_time);
         let (send, mut receive) = tokio::sync::mpsc::channel(1);
         let forward = async {
             while let Some(call) = receive.recv().await {
@@ -310,7 +278,6 @@ impl Sandbox {
             }
         };
         let result = tokio::time::timeout(self.limits.max_time, execution).await;
-        drop(ticker);
         match result {
             Ok(result) => result,
             Err(_) => Err(AuditError::TimedOut),
@@ -343,9 +310,8 @@ impl Sandbox {
             .set_fuel(self.limits.max_fuel)
             .map_err(|_| AuditError::FuelExhausted)?;
         store
-            .fuel_async_yield_interval(Some(1_000))
+            .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
             .map_err(|_| AuditError::FuelExhausted)?;
-        store.set_epoch_deadline(1);
         let mut linker = Linker::new(&self.compiled.engine);
         linker
             .func_wrap_async(
@@ -490,6 +456,28 @@ impl Sandbox {
     }
 }
 
+/// Cheap structural bounds checked before Cranelift sees the module.
+fn validate_complexity(wasm: &[u8]) -> Result<(), AuditError> {
+    let mut functions = 0u32;
+    for payload in Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|_| AuditError::InvalidModule)? {
+            Payload::FunctionSection(section) => {
+                functions = functions.saturating_add(section.count());
+            }
+            Payload::CodeSectionEntry(body) => {
+                if body.range().len() > MAX_FUNCTION_BODY_BYTES {
+                    return Err(AuditError::InvalidModule);
+                }
+            }
+            _ => {}
+        }
+        if functions > MAX_FUNCTIONS {
+            return Err(AuditError::InvalidModule);
+        }
+    }
+    Ok(())
+}
+
 fn validate_static_limits(wasm: &[u8], limits: &Limits) -> Result<(), AuditError> {
     let mut memories = 0_u32;
     let mut tables = 0_u32;
@@ -619,7 +607,6 @@ fn map_error(store: &Store<StoreState>, error: &anyhow::Error) -> AuditError {
         Some(ExecutionFailure::Host(_)) => AuditError::HostRejected,
         None => match error.downcast_ref::<Trap>() {
             Some(Trap::OutOfFuel) => AuditError::FuelExhausted,
-            Some(Trap::Interrupt) => AuditError::TimedOut,
             _ => AuditError::Trap,
         },
     }

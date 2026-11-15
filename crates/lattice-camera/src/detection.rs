@@ -200,6 +200,14 @@ impl<'de> Deserialize<'de> for CameraEvidence {
     }
 }
 
+/// Classifies a candidate from evidence the sensor collected.
+///
+/// Trust boundary: every `CameraEvidence` confidence is supplied by the caller
+/// and every fact is derived from what the device itself answered, so a host
+/// can present ONVIF- or RTSP-shaped answers and be classified `Camera`. The
+/// result is a hint for the owner to confirm, not proof of identity, and must
+/// not by itself grant a camera any privilege. Families are only independent
+/// if the sensor collected them from independent exchanges.
 pub fn classify_candidate(
     id: CameraId,
     inputs: impl IntoIterator<Item = CameraEvidence>,

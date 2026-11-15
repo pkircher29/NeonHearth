@@ -74,6 +74,8 @@ http-body-util = "0.1"
 tokio-tungstenite = "0.29"
 tempfile = "3"
 sqlx.workspace = true
+lattice-camera = { path = "../lattice-camera", features = ["test-support"] }
+lattice-doctor = { path = "../lattice-doctor", features = ["test-support"] }
 
 [lib]
 path = "src/lib.rs"

@@ -12,10 +12,12 @@ pub use detection::{
     CameraCandidate, CameraClassification, CameraEvidence, CameraEvidenceFamily, CameraHealth,
     DetectionError, classify_candidate,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use media::FakeMediaProcessFactory;
 pub use media::{
-    FFMPEG_ENV, FakeMediaProcessFactory, HlsSession, HlsSessionId, LoopbackSourceToken, MediaError,
-    MediaJob, MediaProcess, MediaProcessExit, MediaProcessFactory, MediaProcessObservation,
-    MediaProcessSpec, ProductionMediaProcessFactory, SnapshotRequest, ffmpeg_executable, hls_args,
+    FFMPEG_ENV, HlsSession, HlsSessionId, LoopbackSourceToken, MediaError, MediaJob, MediaProcess,
+    MediaProcessExit, MediaProcessFactory, MediaProcessObservation, MediaProcessSpec,
+    ProductionMediaProcessFactory, SnapshotRequest, ffmpeg_executable, hls_args,
     platform_default_ffmpeg, resolve_ffmpeg_executable, snapshot_args,
 };
 pub use onvif::{
