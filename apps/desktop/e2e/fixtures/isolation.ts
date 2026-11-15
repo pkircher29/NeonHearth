@@ -6,7 +6,9 @@ import type { Page } from '@playwright/test';
  * falling through the dev server's proxy to a collector that may be running on this machine.
  */
 export async function isolateApi(page: Page): Promise<void> {
-  await page.route('**/api/**', (route) => route.fulfill({ status: 503, json: { error: 'not mocked by this test' } }));
+  // Match on the URL path, not a glob: `**/api/**` also matches the dev server's own source modules under
+  // `/src/lib/api/`, which answered them with 503 and left the page blank.
+  await page.route((url) => url.pathname.startsWith('/api/'), (route) => route.fulfill({ status: 503, json: { error: 'not mocked by this test' } }));
 }
 
 /** Waits for the page to have painted at least two frames and for fonts to load: an assertion-friendly replacement for a fixed sleep before a screenshot. */
