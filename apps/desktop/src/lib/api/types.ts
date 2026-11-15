@@ -149,6 +149,8 @@ export interface CameraDetail extends CameraSummary { inventory: CameraInventory
 export interface CameraHealth { health: string; confidence: number }
 export interface CameraInventoryProjection { manufacturer: string | null; model: string | null; firmware: string | null; serial: string | null; capabilities: string[]; health: string }
 export interface CameraSessionResponse { session_id: string }
+/** Whether camera media (live view, snapshots) runs on this machine; `reason` is a stable code, `detail` plain words. */
+export interface CameraMediaStatus { enabled: boolean; reason: string; detail: string; setup_available: boolean; setup_detail: string }
 
 export interface EventTicket {
   ticket: string;

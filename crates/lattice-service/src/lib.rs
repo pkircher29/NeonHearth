@@ -132,6 +132,7 @@ pub fn app_with_parts(
         .route("/api/v1/clock/acknowledge", post(api::acknowledge_clock))
         .route("/api/v1/events/ticket", post(api::event_ticket))
         .route("/api/v1/events", get(events_socket))
+        .route("/api/v1/camera-media", get(cameras::camera_media_route))
         .route(
             "/api/v1/cameras/{id}/sessions",
             post(cameras::start_session_route),
