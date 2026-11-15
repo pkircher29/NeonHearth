@@ -124,6 +124,7 @@ pub struct AppState {
     // observe a changed status without its corresponding transition event being queued.
     service_status: Arc<Mutex<ServiceRuntimeStatus>>,
     camera_sessions: Option<Arc<crate::cameras::CameraSessionManager>>,
+    camera_media: crate::cameras::production::CameraMediaStatus,
 }
 impl AppState {
     pub fn new(
@@ -151,6 +152,7 @@ impl AppState {
             failed_tasks: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             service_status: Arc::new(Mutex::new(ServiceRuntimeStatus::Ready)),
             camera_sessions: None,
+            camera_media: crate::cameras::production::CameraMediaStatus::not_configured(),
         })
     }
     #[must_use]
@@ -160,7 +162,24 @@ impl AppState {
     ) -> Self {
         camera_sessions.start_background_reaper();
         self.camera_sessions = Some(camera_sessions);
+        self.camera_media = crate::cameras::production::CameraMediaStatus::injected();
         self
+    }
+    /// Installs the outcome of the production camera media startup: the
+    /// session manager when every prerequisite held, and in every case the
+    /// status the routes report (the specific reason when it did not).
+    #[must_use]
+    pub fn with_camera_media(mut self, build: crate::cameras::production::CameraMediaBuild) -> Self {
+        let status = build.status;
+        self = match build.manager {
+            Some(manager) => self.with_camera_sessions(manager),
+            None => self,
+        };
+        self.camera_media = status;
+        self
+    }
+    pub(crate) fn camera_media_status(&self) -> &crate::cameras::production::CameraMediaStatus {
+        &self.camera_media
     }
     /// Overrides the WebSocket timing bounds (tests; production keeps the defaults).
     #[must_use]
