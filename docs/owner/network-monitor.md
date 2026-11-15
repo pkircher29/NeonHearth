@@ -6,6 +6,8 @@
 
 ## Predator Connect W6
 
+The Acer Predator Connect W6 is the only router whose traffic feed NeonHearth can read. Other routers, including Netgear Orbi mesh systems, give no household totals: the graph stays empty and the Devices inventory comes from NeonHearth's own discovery instead.
+
 In **Network preferences**, enter the W6's numeric LAN IPv4 address and web port. The firmware inspected for this implementation serves its dashboard at port 8080. NeonHearth reads the router's live WAN feed; no router login, configuration change, or firmware installation is performed. Clear the address to disconnect.
 
 The graph shows router-reported download/upload rates for household internet traffic. Its device count is labeled as a router report and can differ from the observed inventory, especially with downstream switches, access points, sleeping devices, or isolated networks. Graph gaps indicate missing measurements. A stale feed loses its live rates and device count after ten seconds. Averages are available for 5 minutes, 1 hour, and 24 hours; raw rates are retained locally for one day, up to 50,000 samples. Pausing freezes the graph while collection continues.

@@ -94,6 +94,11 @@ required**: the Guard card shows exactly that, keeps the device's state
 truthful, and the action stays retryable. Nothing is ever displayed as
 blocked without router verification.
 
+No other router brand has a connector. On any other router, including mesh
+systems such as Netgear Orbi, blocking a device is always a manual step in
+the router's own app; the Guard card shows "manual required" and NeonHearth
+never marks the device as blocked itself.
+
 ## Undo
 
 Each Guard card shows whether owner undo is available. Before mutating the
@@ -111,9 +116,14 @@ than being reported as success.
   manual-required.
 - Wi-Fi kick / association ban. The W6's documented interface does not
   verify these capabilities, so NeonHearth will not offer or claim them.
-- In-app buttons for approve / reject / extend / quarantine. The decisions
-  exist as authenticated service API actions and Guard displays their full
-  lifecycle, but the click-to-decide controls are not wired into the app
-  yet.
+- Anything that makes Reject or Quarantine block a device by itself. The
+  Guard view has Approve, Reject (with a confirm step), Quarantine (with a
+  confirm step) and a one-time Extend once (moves a pending deadline 24 hours
+  later). Which buttons appear depends on the device's state: protected
+  devices (router, collector, administrator phone, safety devices) only offer
+  Approve, and a device already rejected or quarantined offers Approve only
+  while an undo is available. Reject and Quarantine record your decision, but
+  in this build nothing is blocked on your network until you do it yourself
+  in the router's app.
 - Owner-configurable deadline lengths and danger thresholds (current values
   are fixed: 48 h / 7 d / 0.85 / 0.90).

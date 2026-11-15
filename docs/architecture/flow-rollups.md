@@ -1,5 +1,12 @@
 # Flow rollup contract
 
+> **Status: implemented and tested, not fed by any production source.** The service
+> never constructs `lattice_sensor::flow::FlowEngine`, and discovery passes an empty
+> rollup change list, so no per-device bandwidth rollup is ever produced and per-device
+> bandwidth is always reported as unavailable. What is missing is a traffic source with
+> per-device counters (for example gateway counters or a mirrored switch port). This
+> document describes the contract the engine enforces when such a source exists.
+
 The flow engine trusts only the bounded source registry supplied at construction. Observations
 contain an opaque source ID; they cannot claim a visibility class. Verified gateways, bridges,
 and mirrors map to `complete`, verified router counters to `router_reported`, the local collector
