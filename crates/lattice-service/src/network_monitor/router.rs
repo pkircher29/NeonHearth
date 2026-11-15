@@ -1,10 +1,61 @@
 use super::*;
 use serde_json::Value;
 use std::net::Ipv4Addr;
+use std::time::Instant;
 
 const MAX_LINE: usize = 65536;
 const SETTINGS_RECHECK: Duration = Duration::from_secs(5);
 const PRUNE_EVERY: Duration = Duration::from_secs(60);
+/// Longest the SSE stream may stay silent before the read fails and the feed reconnects.
+/// An idle bound, not a total one: a healthy stream is never cut by it.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether the raw-sample retention prune should run now: never ran, or a full interval ago.
+pub(super) fn prune_due(last_prune: Option<Instant>, now: Instant) -> bool {
+    last_prune.is_none_or(|at| now.saturating_duration_since(at) >= PRUNE_EVERY)
+}
+/// One day of raw rates, a hard ceiling even across clock changes (at most 50 000 newest rows
+/// survive the OFFSET bound). Rows are keyed by `at`, so the cutoff compares seconds.
+pub(super) async fn prune_samples(
+    pool: &SqlitePool,
+    now_timestamp: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM network_router_samples WHERE at < ? OR at <= COALESCE((SELECT at FROM network_router_samples ORDER BY at DESC LIMIT 1 OFFSET 50000), -1)")
+        .bind(now_timestamp - 86400)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+/// Settings are re-read from the database at most every `SETTINGS_RECHECK`, not once per sample.
+pub(super) struct SettingsWatch {
+    checked: Instant,
+}
+impl SettingsWatch {
+    pub(super) fn new(now: Instant) -> Self {
+        Self { checked: now }
+    }
+    /// True while the settings the session started with are still current. Within the recheck
+    /// period nothing is read; afterwards `reload` runs once and the period restarts.
+    pub(super) async fn still_current<F, Fut>(
+        &mut self,
+        now: Instant,
+        reload: F,
+        current: &Settings,
+    ) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<Settings>>,
+    {
+        if now.saturating_duration_since(self.checked) < SETTINGS_RECHECK {
+            return true;
+        }
+        if reload().await.as_ref() != Some(current) {
+            return false;
+        }
+        self.checked = now;
+        true
+    }
+}
 const MAX_SESSION_BYTES: usize = 2 * 1024 * 1024;
 fn counter(value: &Value) -> Option<f64> {
     let number = value.as_f64().or_else(|| value.as_str()?.parse().ok())?;
@@ -94,7 +145,7 @@ impl NetworkMonitor {
             .connect_timeout(Duration::from_secs(3))
             // The feed is a long-lived stream: bound idle time, not total time. A total
             // timeout cut the stream every 20 s and forced a reconnect gap each time.
-            .read_timeout(Duration::from_secs(15));
+            .read_timeout(IDLE_TIMEOUT);
         #[cfg(target_os = "linux")]
         let builder = {
             let Ok(inventory) = lattice_sensor::SystemInterfaceManager.snapshot() else {
@@ -134,8 +185,8 @@ impl NetworkMonitor {
         let mut stream = response.bytes_stream();
         let mut feed = Feed::default();
         let mut received = 0;
-        let mut settings_checked = std::time::Instant::now();
-        let mut last_prune: Option<std::time::Instant> = None;
+        let mut settings_watch = SettingsWatch::new(Instant::now());
+        let mut last_prune: Option<Instant> = None;
         while let Some(Ok(chunk)) = stream.next().await {
             received += chunk.len();
             if received > MAX_SESSION_BYTES || feed.push(&chunk).is_err() {
@@ -145,12 +196,19 @@ impl NetworkMonitor {
                 continue;
             };
             // Settings are re-read at most every few seconds, not once per sample.
-            if settings_checked.elapsed() >= SETTINGS_RECHECK {
-                let _lock = self.settings_lock.lock().await;
-                if self.settings().await.ok().as_ref() != Some(&settings) {
-                    return;
-                }
-                settings_checked = std::time::Instant::now();
+            let monitor = self;
+            if !settings_watch
+                .still_current(
+                    Instant::now(),
+                    move || async move {
+                        let _lock = monitor.settings_lock.lock().await;
+                        monitor.settings().await.ok()
+                    },
+                    &settings,
+                )
+                .await
+            {
+                return;
             }
             let now = Utc::now();
             let source = format!("{ip}:{}", settings.router_port);
@@ -171,10 +229,10 @@ impl NetworkMonitor {
             // One day of raw rates, a hard ceiling even across clock changes. Pruned once a
             // minute: the old per-sample `NOT IN (SELECT ... LIMIT 50000)` re-sorted the table
             // every second.
-            if last_prune.is_none_or(|at| at.elapsed() >= PRUNE_EVERY) {
-                last_prune = Some(std::time::Instant::now());
-                let _ = sqlx::query("DELETE FROM network_router_samples WHERE at < ? OR at <= COALESCE((SELECT at FROM network_router_samples ORDER BY at DESC LIMIT 1 OFFSET 50000), -1)")
-                    .bind(now.timestamp()-86400).execute(&self.pool).await;
+            let tick = Instant::now();
+            if prune_due(last_prune, tick) {
+                last_prune = Some(tick);
+                let _ = prune_samples(&self.pool, now.timestamp()).await;
             }
         }
     }

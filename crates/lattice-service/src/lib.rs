@@ -18,6 +18,7 @@ pub mod platform;
 pub mod policy;
 pub mod runtime;
 mod security;
+pub mod service_stop;
 mod state;
 pub mod tailscale;
 pub mod vault;
