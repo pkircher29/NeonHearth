@@ -5,7 +5,7 @@ mod router;
 #[cfg(test)]
 mod tests;
 use chrono::Utc;
-use futures_util::{StreamExt, stream};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use std::{
@@ -252,28 +252,30 @@ impl NetworkMonitor {
         let targets = plan.targets.clone();
         let mut sightings = Vec::new();
         let mut errors = 0;
-        let mut probes = stream::iter(plan.targets)
-            .map(|target| async move {
-                if self.cancel.load(Ordering::Acquire) {
-                    return None;
-                }
-                Some(lan::probe(target).await)
-            })
-            .buffer_unordered(16);
-        while let Some(result) = probes.next().await {
-            let Some(result) = result else { continue };
-            let mut status = self.discovery.lock().await;
-            if let Some(status) = status.as_mut() {
-                status.completed += 1;
-                match result {
-                    Ok(Some(sighting)) => {
-                        status.responding += 1;
-                        sightings.push(sighting);
-                    }
-                    Ok(None) => {}
-                    Err(()) => {
-                        status.errors += 1;
-                        errors += 1;
+        // The plan is validated once for the sweep; probes run in batches that share one
+        // neighbor snapshot (previously every target re-planned the whole network).
+        let names: std::collections::BTreeMap<u32, String> = inventory
+            .interfaces()
+            .map(|i| (i.id.get(), i.name.clone()))
+            .collect();
+        for batch in plan.targets.chunks(lan::BATCH) {
+            if self.cancel.load(Ordering::Acquire) {
+                break;
+            }
+            for result in lan::probe_batch(batch, &names).await {
+                let mut status = self.discovery.lock().await;
+                if let Some(status) = status.as_mut() {
+                    status.completed += 1;
+                    match result {
+                        Ok(Some(sighting)) => {
+                            status.responding += 1;
+                            sightings.push(sighting);
+                        }
+                        Ok(None) => {}
+                        Err(()) => {
+                            status.errors += 1;
+                            errors += 1;
+                        }
                     }
                 }
             }
