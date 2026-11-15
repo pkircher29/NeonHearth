@@ -82,7 +82,10 @@ fn mismatches_and_missing_device_are_conservative() {
 }
 
 #[test]
-fn ranges_are_possible_without_provider_comparator() {
+fn ranges_are_compared_numerically_by_a_typed_comparator() {
+    // This test previously asserted `Possible` ("no provider comparator"),
+    // encoding the bug that ranges were never evaluated. 1.10 is inside
+    // 1.9..=1.10 and below 10 when compared as versions, not as text.
     for firmware in [
         VersionConstraint::Range {
             min: "1.9".into(),
@@ -97,7 +100,7 @@ fn ranges_are_possible_without_provider_comparator() {
             )
             .unwrap()
             .label(),
-            MatchLabel::Possible
+            MatchLabel::Exact
         );
     }
 }
@@ -284,4 +287,138 @@ fn risk_dimensions_remain_independent() {
     assert_eq!(risk.exposure, Exposure::Exposed);
     assert_eq!(risk.confidence, Confidence::High);
     assert_eq!(risk.remediation, Remediation::Upgrade);
+}
+
+fn label(device: &DeviceIdentity, advisory: &NormalizedAdvisory) -> MatchLabel {
+    match_advisory(device, advisory).unwrap().label()
+}
+
+#[test]
+fn version_prefix_and_build_suffix_do_not_cause_false_contradictions() {
+    // Regression: "v1.2.3" in the advisory against "1.2.3" on the device was a
+    // byte mismatch and returned Contradicted/High, silently dropping the CVE.
+    for (advisory_version, device_version) in [
+        ("v1.2.3", "1.2.3"),
+        ("1.2.3", "V1.2.3"),
+        ("1.2.3", "1.2.3+build7"),
+        ("1.2", "1.2.0"),
+    ] {
+        assert_eq!(
+            label(
+                &device("Acme", "Cam-1", device_version),
+                &advisory("Acme", Some("Cam-1"), exact(advisory_version))
+            ),
+            MatchLabel::Exact,
+            "{advisory_version} vs {device_version}"
+        );
+    }
+    assert_eq!(
+        label(
+            &device("Acme", "Cam-1", "1.2.4"),
+            &advisory("Acme", Some("Cam-1"), exact("1.2.3"))
+        ),
+        MatchLabel::Contradicted
+    );
+}
+
+#[test]
+fn unparsable_versions_are_possible_never_contradicted() {
+    for device_version in ["factory-image", "1.2-rc1"] {
+        assert_eq!(
+            label(
+                &device("Acme", "Cam-1", device_version),
+                &advisory("Acme", Some("Cam-1"), exact("1.2"))
+            ),
+            MatchLabel::Possible,
+            "{device_version}"
+        );
+    }
+    assert_eq!(
+        label(
+            &device("Acme", "Cam-1", "factory-image"),
+            &advisory(
+                "Acme",
+                Some("Cam-1"),
+                VersionConstraint::LessThan("2.1".into())
+            )
+        ),
+        MatchLabel::Possible
+    );
+}
+
+#[test]
+fn fixed_firmware_is_not_affected_by_a_less_than_advisory() {
+    // Regression: LessThan/Range matched every version, so a device already on
+    // the fixed release was reported as possibly vulnerable.
+    let fixed_in_2_1 = advisory(
+        "Acme",
+        Some("Cam-1"),
+        VersionConstraint::LessThan("2.1".into()),
+    );
+    assert_eq!(
+        label(&device("Acme", "Cam-1", "3.0"), &fixed_in_2_1),
+        MatchLabel::Contradicted
+    );
+    assert_eq!(
+        label(&device("Acme", "Cam-1", "2.1"), &fixed_in_2_1),
+        MatchLabel::Contradicted
+    );
+    assert_eq!(
+        label(&device("Acme", "Cam-1", "2.0.9"), &fixed_in_2_1),
+        MatchLabel::Exact
+    );
+    let inclusive = advisory(
+        "Acme",
+        Some("Cam-1"),
+        VersionConstraint::LessThan("<=2.1".into()),
+    );
+    assert_eq!(
+        label(&device("Acme", "Cam-1", "2.1"), &inclusive),
+        MatchLabel::Exact
+    );
+}
+
+#[test]
+fn ranges_keep_inclusive_exclusive_and_open_ended_bounds() {
+    let range = |min: &str, max: &str| {
+        advisory(
+            "Acme",
+            Some("Cam-1"),
+            VersionConstraint::Range {
+                min: min.into(),
+                max: max.into(),
+            },
+        )
+    };
+    let d = |v: &str| device("Acme", "Cam-1", v);
+    assert_eq!(label(&d("1.0"), &range("1.0", "<2.0")), MatchLabel::Exact);
+    assert_eq!(
+        label(&d("2.0"), &range("1.0", "<2.0")),
+        MatchLabel::Contradicted
+    );
+    assert_eq!(
+        label(&d("1.0"), &range(">1.0", "2.0")),
+        MatchLabel::Contradicted
+    );
+    assert_eq!(label(&d("9.9"), &range("2.0", "*")), MatchLabel::Exact);
+    assert_eq!(
+        label(&d("1.9"), &range("2.0", "*")),
+        MatchLabel::Contradicted
+    );
+}
+
+#[test]
+fn an_expired_cache_window_blocks_exact_when_a_clock_is_supplied() {
+    // Regression: freshness was frozen at parse time, so a week-old cached
+    // advisory stayed Exact-eligible forever.
+    let value = advisory("Acme", Some("Cam-1"), exact("1.2"));
+    let d = device("Acme", "Cam-1", "1.2");
+    assert_eq!(
+        match_advisory_at(&d, &value, at(100)).unwrap().label(),
+        MatchLabel::Exact
+    );
+    assert_eq!(
+        match_advisory_at(&d, &value, at(101)).unwrap().label(),
+        MatchLabel::Possible
+    );
 }

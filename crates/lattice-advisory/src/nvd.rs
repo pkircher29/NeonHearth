@@ -1,4 +1,4 @@
-use crate::transport::{MAX_RESPONSE_BYTES, NVD_URL};
+use crate::transport::{FeedResponse, MAX_RESPONSE_BYTES, NVD_URL};
 use crate::{
     AdvisoryError, AdvisoryInput, AdvisorySource, Confidence, Exploitability, Exposure, Freshness,
     MAX_PARSER_OUTPUTS, NormalizedAdvisory, Remediation, Severity, SourceTrust, VersionConstraint,
@@ -21,10 +21,42 @@ pub enum NvdParseError {
     Advisory(#[from] AdvisoryError),
 }
 
+/// Parses a bare body of unknown origin. It can never be `OfficialApi`: use
+/// [`parse_nvd_response`] for a body that arrived through a feed transport.
 pub fn parse_nvd(
     body: &str,
     retrieved_at: DateTime<Utc>,
     cache_expires_at: DateTime<Utc>,
+) -> Result<Vec<NormalizedAdvisory>, NvdParseError> {
+    parse_nvd_with_trust(
+        body,
+        retrieved_at,
+        cache_expires_at,
+        SourceTrust::RegisteredHttps,
+    )
+}
+
+/// Parses a transport response; trust and timestamps come from the response.
+pub fn parse_nvd_response(
+    response: &FeedResponse,
+    cache_expires_at: DateTime<Utc>,
+) -> Result<Vec<NormalizedAdvisory>, NvdParseError> {
+    if !response.source_url.starts_with(NVD_URL) {
+        return Err(NvdParseError::Malformed);
+    }
+    parse_nvd_with_trust(
+        &response.body,
+        response.retrieved_at,
+        cache_expires_at,
+        response.trust,
+    )
+}
+
+fn parse_nvd_with_trust(
+    body: &str,
+    retrieved_at: DateTime<Utc>,
+    cache_expires_at: DateTime<Utc>,
+    trust: SourceTrust,
 ) -> Result<Vec<NormalizedAdvisory>, NvdParseError> {
     if body.len() > MAX_RESPONSE_BYTES {
         return Err(NvdParseError::Oversized);
@@ -87,6 +119,7 @@ pub fn parse_nvd(
                             retrieved_at,
                             cache_expires_at,
                             severity,
+                            trust,
                         )?;
                         emitted = true;
                         Ok(())
@@ -107,6 +140,7 @@ pub fn parse_nvd(
                 retrieved_at,
                 cache_expires_at,
                 severity,
+                trust,
             )?;
         }
     }
@@ -125,6 +159,7 @@ fn push_advisory(
     retrieved_at: DateTime<Utc>,
     cache_expires_at: DateTime<Utc>,
     severity: Severity,
+    trust: SourceTrust,
 ) -> Result<(), NvdParseError> {
     if output.len() == MAX_PARSER_OUTPUTS {
         return Err(NvdParseError::Oversized);
@@ -142,7 +177,7 @@ fn push_advisory(
         retrieved_at,
         cache_expires_at,
         freshness: Freshness::Fresh,
-        source_trust: SourceTrust::OfficialApi,
+        source_trust: trust,
         severity,
         exploitability: Exploitability::Unknown,
         exposure: Exposure::Unknown,
@@ -159,9 +194,18 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str, NvdParseError>
         .ok_or(NvdParseError::Malformed)
 }
 fn time(cve: &Value, field: &str) -> Result<DateTime<Utc>, NvdParseError> {
-    required(cve, field)?
-        .parse()
-        .map_err(|_| NvdParseError::Malformed)
+    parse_nvd_time(required(cve, field)?).ok_or(NvdParseError::Malformed)
+}
+
+/// NVD 2.0 documents timestamps as `2021-12-10T10:15:09.143` with no offset
+/// (UTC). Offset and `Z` forms are accepted as well.
+pub fn parse_nvd_time(raw: &str) -> Option<DateTime<Utc>> {
+    if let Ok(value) = DateTime::parse_from_rfc3339(raw) {
+        return Some(value.with_timezone(&Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f")
+        .ok()
+        .map(|value| value.and_utc())
 }
 
 fn visit_nodes_iterative(
@@ -276,17 +320,27 @@ fn cpe(value: &Value) -> Result<Option<Selector>, NvdParseError> {
     {
         return Err(NvdParseError::Malformed);
     }
-    let firmware = match (
-        start_including.as_deref().or(start_excluding.as_deref()),
-        end_including.as_deref().or(end_excluding.as_deref()),
-        &parts[5],
-    ) {
-        (Some(min), Some(max), _) => VersionConstraint::Range {
-            min: min.into(),
-            max: max.into(),
+    // Bare bounds keep the legacy meaning (see `version`): inclusive in a
+    // `Range`, exclusive in `LessThan`. Markers carry the other cases.
+    let lower = start_including
+        .clone()
+        .or_else(|| start_excluding.as_deref().map(|v| format!(">{v}")));
+    let upper_in_range = end_including
+        .clone()
+        .or_else(|| end_excluding.as_deref().map(|v| format!("<{v}")));
+    let upper_less_than = end_excluding
+        .clone()
+        .or_else(|| end_including.as_deref().map(|v| format!("<={v}")));
+    let firmware = match (lower, upper_in_range, &parts[5]) {
+        (Some(min), Some(max), _) => VersionConstraint::Range { min, max },
+        (None, Some(_), _) => {
+            VersionConstraint::LessThan(upper_less_than.expect("upper bound present"))
+        }
+        // A start-only bound is an open-ended range, not "every version".
+        (Some(min), None, _) => VersionConstraint::Range {
+            min,
+            max: "*".into(),
         },
-        (None, Some(max), _) => VersionConstraint::LessThan(max.into()),
-        (Some(_), None, _) => VersionConstraint::Any,
         (None, None, version) if !version.wildcard_or_na() => {
             VersionConstraint::Exact(version.text.clone())
         }
@@ -317,6 +371,7 @@ fn bound(value: &Value, name: &str) -> Result<Option<String>, NvdParseError> {
 fn valid_bound(value: &str) -> bool {
     !value.trim().is_empty()
         && value.len() <= MAX_CPE_FIELD
+        && !value.starts_with(['<', '>', '*', '='])
         && !value.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 struct CpeField {
