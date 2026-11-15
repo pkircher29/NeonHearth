@@ -295,7 +295,8 @@ impl ScanHub {
         Ok(current.status.clone())
     }
     async fn targets(&self, requested: &[String]) -> Result<(Vec<Target>, usize), StatusCode> {
-        let evidence: Vec<(String,String,String)> = sqlx::query_as("SELECT DISTINCT device_id,source,fact_value FROM evidence WHERE family='link_layer' AND fact_key='mac' AND length(fact_value)=17 AND length(source)<128 AND length(device_id)=36 ORDER BY device_id LIMIT 4096").fetch_all(&self.pool).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let stale_before = (Utc::now() - chrono::Duration::days(LOCAL_MAC_MAX_AGE_DAYS)).to_rfc3339();
+        let evidence = scan_candidate_evidence(&self.pool, &stale_before).await?;
         let mut identities: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         let mut known = BTreeSet::new();
         for (id, source, mac) in evidence {
@@ -881,8 +882,71 @@ pub(crate) async fn cancel_route(_: LocalOwner, State(state): State<AppState>) -
 )]
 pub struct ScanApiDoc;
 
+/// Identities created from randomized (locally administered) MACs are not scan candidates once
+/// they have been quiet this long and the owner never confirmed them. Without this a LAN
+/// peer that cycles MAC addresses fills the 4096-row candidate window with dead identities.
+const LOCAL_MAC_MAX_AGE_DAYS: i64 = 7;
+
+/// Link-layer identities that may be scanned, most recently observed first, so a flood of old
+/// randomized MACs can never push live devices out of the bounded window.
+async fn scan_candidate_evidence(
+    pool: &SqlitePool,
+    stale_before: &str,
+) -> Result<Vec<(String, String, String)>, StatusCode> {
+    sqlx::query_as(
+        "SELECT device_id,source,fact_value FROM evidence          WHERE family='link_layer' AND fact_key='mac' AND length(fact_value)=17            AND length(source)<128 AND length(device_id)=36            AND NOT (upper(substr(fact_value,2,1)) IN ('2','6','A','E')                     AND owner_confirmed=0 AND observed_at < ?)          GROUP BY device_id,source,fact_value          ORDER BY MAX(observed_at) DESC, device_id LIMIT 4096",
+    )
+    .bind(stale_before)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stale_unconfirmed_randomized_macs_are_not_scan_candidates() {
+        let pool = lattice_store::connect_memory().await.unwrap();
+        let now = Utc::now();
+        let old = (now - chrono::Duration::days(30)).to_rfc3339();
+        let recent = now.to_rfc3339();
+        // (mac, observed_at, owner_confirmed)
+        let rows = [
+            ("02:00:00:00:00:01", &old, 0),    // randomized, stale, unconfirmed: dropped
+            ("02:00:00:00:00:02", &recent, 0), // randomized but recent: kept
+            ("02:00:00:00:00:03", &old, 1),    // randomized, stale, owner confirmed: kept
+            ("00:11:22:33:44:55", &old, 0),    // universally administered: kept
+        ];
+        for (mac, at, confirmed) in rows {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at) VALUES(?,?,?)")
+                .bind(&id)
+                .bind(at)
+                .bind(at)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO evidence(device_id,family,source,fact_key,fact_value,confidence,observed_at,owner_confirmed) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(&id)
+                .bind("link_layer")
+                .bind("neighbor-interface-1")
+                .bind("mac")
+                .bind(mac)
+                .bind(0.9)
+                .bind(at)
+                .bind(confirmed)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let stale_before = (now - chrono::Duration::days(LOCAL_MAC_MAX_AGE_DAYS)).to_rfc3339();
+        let kept = scan_candidate_evidence(&pool, &stale_before).await.unwrap();
+        let macs: Vec<&str> = kept.iter().map(|(_, _, mac)| mac.as_str()).collect();
+        assert_eq!(macs.len(), 3, "{macs:?}");
+        assert!(!macs.contains(&"02:00:00:00:00:01"));
+        assert_eq!(macs[0], "02:00:00:00:00:02", "most recent first");
+    }
+
     use super::*;
     use active::{AttemptTransport, ProbeDescriptor, TransportResponse};
     use lattice_sensor::{Interface, InterfaceClass, InterfaceInventory};
