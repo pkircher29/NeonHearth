@@ -77,6 +77,33 @@ connection_messages false
     print(f"Hub configured at {directory}. Credentials are in the private accounts.json file.")
 
 
+def listener_owner(port):
+    """PID of the single process listening on the loopback port; None if nobody."""
+    try:
+        import psutil
+    except ImportError as error:
+        raise ValueError("psutil is required to verify who owns the MQTT port (pip install psutil)") from error
+    owners = {c.pid for c in psutil.net_connections(kind="tcp")
+              if c.status == "LISTEN" and c.laddr.port == port and c.laddr.ip in ("127.0.0.1", "0.0.0.0", "::", "::1")}
+    if len(owners) > 1:
+        raise ValueError("More than one process claims the MQTT port")
+    return next(iter(owners), None)
+
+
+def saved_broker_owns_port(directory, binary, port):
+    """True only if process.json names the process that listens on the port and runs this binary."""
+    import psutil
+    record = directory / "process.json"
+    try:
+        saved = json.loads(record.read_text(encoding="utf-8"))
+        pid = saved["pid"]
+        if not isinstance(pid, int) or listener_owner(port) != pid:
+            return False
+        return Path(psutil.Process(pid).exe()).resolve() == binary.resolve()
+    except (OSError, KeyError, ValueError, psutil.Error):
+        return False
+
+
 def authenticated(config):
     """Bounded MQTT 3.1.1 CONNECT probe against the configured loopback port."""
     def field(value):
@@ -122,7 +149,8 @@ def ensure_running(binary, directory, port):
             not isinstance(config.get("port"), int) or not 1024 <= config["port"] <= 65535 or
             not isinstance(config.get("password"), str) or not 32 <= len(config["password"]) <= 256):
         raise ValueError("Invalid MQTT configuration")
-    if authenticated(config):
+    # The password is only ever sent to the broker this directory started.
+    if saved_broker_owns_port(directory, binary, config["port"]) and authenticated(config):
         print("Authenticated local MQTT hub is ready.")
         return
     # Never replace an existing listener that does not accept these credentials.
@@ -140,7 +168,7 @@ def ensure_running(binary, directory, port):
     for _ in range(40):
         if process.poll() is not None:
             raise ValueError("MQTT hub exited; inspect its private broker.log")
-        if authenticated(config):
+        if listener_owner(config["port"]) == process.pid and authenticated(config):
             print("Authenticated local MQTT hub started.")
             return
         time.sleep(0.25)
