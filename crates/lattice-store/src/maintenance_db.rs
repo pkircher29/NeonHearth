@@ -288,19 +288,21 @@ impl DbMaintenance {
         for suffix in ["-wal", "-shm"] {
             let sidecar = suffixed(&self.db_path, suffix);
             if sidecar.exists() {
-                std::fs::remove_file(&sidecar)
+                retry_while_in_use(|| std::fs::remove_file(&sidecar))
+                    .await
                     .map_err(|error| io_error("remove database sidecar file", error))?;
             }
         }
         let previous = suffixed(&self.db_path, ".pre-restore");
         let previous_kept = if self.db_path.exists() {
-            std::fs::rename(&self.db_path, &previous)
+            retry_while_in_use(|| std::fs::rename(&self.db_path, &previous))
+                .await
                 .map_err(|error| io_error("set aside current database", error))?;
             true
         } else {
             false
         };
-        if let Err(error) = std::fs::rename(&staged, &self.db_path) {
+        if let Err(error) = retry_while_in_use(|| std::fs::rename(&staged, &self.db_path)).await {
             // Best-effort rollback: put the original database back.
             if previous_kept {
                 let _ = std::fs::rename(&previous, &self.db_path);
@@ -539,4 +541,32 @@ fn resolve_target(path: &Path) -> PathBuf {
 
 fn same_target(a: &Path, b: &Path) -> bool {
     resolve_target(a) == resolve_target(b)
+}
+
+/// Retries a file operation that Windows refuses while another handle is
+/// still open on the file. Closing the pool returns before the operating
+/// system has released every handle (and a virus scanner may briefly hold
+/// the file too), so the first rename after a close can fail with a sharing
+/// violation. Other errors, and every error on other platforms, are returned
+/// immediately; the wait is bounded at about five seconds.
+async fn retry_while_in_use<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    const ATTEMPTS: u32 = 50;
+    let mut attempt = 0;
+    loop {
+        match operation() {
+            Err(error) if cfg!(windows) && attempt < ATTEMPTS && file_in_use(&error) => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33) or access denied
+/// (5), which Windows also reports for a file with a pending delete.
+fn file_in_use(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
