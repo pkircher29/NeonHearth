@@ -163,6 +163,9 @@ impl ApprovedRtspTarget {
     /// Permits answering an RTSP `Basic` challenge for this camera. Off by
     /// default: Basic sends the password in cleartext, and a LAN attacker
     /// impersonating the camera could otherwise force that downgrade.
+    ///
+    /// The flag lives only in memory with the registered target; it is not
+    /// persisted, so whatever registers a camera must set it again each start.
     #[must_use]
     pub const fn with_basic_auth_allowed(mut self, allowed: bool) -> Self {
         self.allow_basic = allowed;
@@ -264,6 +267,8 @@ impl GuardedCameraTargetRegistry {
     }
 
     /// Opts one registered stream in to cleartext RTSP Basic authentication.
+    /// In-memory only: it is not persisted and is lost when the target is
+    /// unregistered or the process restarts.
     pub async fn allow_basic_auth(&self, camera: CameraId, stream: StreamId, allowed: bool) {
         if let Some(entry) = self.targets.lock().await.get_mut(&(camera, stream)) {
             entry.3 = allowed;

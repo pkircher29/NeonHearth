@@ -3,7 +3,10 @@ use crate::AppState;
 use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::sync::watch;
 
 #[derive(Clone, Serialize, utoipa::ToSchema)]
@@ -31,7 +34,30 @@ struct Credentials {
 const CREDENTIAL_RETRY: Duration = Duration::from_secs(2);
 const MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
-async fn load_credentials(path: &PathBuf) -> Option<Credentials> {
+/// Whether a serialised inventory fits the broker packet limit.
+fn within_packet_limit(len: usize) -> bool {
+    len < MAX_PAYLOAD_BYTES
+}
+
+fn dropped_detail(dropped: u64) -> String {
+    format!(
+        "Authenticated broker connected. {dropped} publish(es) were dropped (queue full or payload over the 4 MiB limit); MQTT commands are disabled."
+    )
+}
+
+/// Best-effort clean goodbye: the retained status becomes `offline` and the
+/// session is closed properly instead of leaving the last-will to fire. Bounded
+/// so shutdown never waits on an unresponsive broker.
+async fn farewell(client: &AsyncClient, eventloop: &mut rumqttc::EventLoop) {
+    let _ = client.try_publish("neonhearth/status", QoS::AtLeastOnce, true, "offline");
+    let _ = client.try_disconnect();
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while eventloop.poll().await.is_ok() {}
+    })
+    .await;
+}
+
+async fn load_credentials(path: &Path) -> Option<Credentials> {
     let metadata = tokio::fs::metadata(path).await.ok()?;
     if !metadata.is_file() || metadata.len() > 4096 {
         return None;
@@ -107,7 +133,12 @@ pub fn start_with_retry_interval(
             .await;
         loop {
             tokio::select! {
-                _ = shutdown.changed() => return,
+                _ = shutdown.changed() => {
+                    if connected {
+                        farewell(&client, &mut eventloop).await;
+                    }
+                    return;
+                },
                 event = eventloop.poll() => match event {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
                         connected = true;
@@ -126,7 +157,7 @@ pub fn start_with_retry_interval(
                     if let Ok(snapshot) = state.automation().snapshot().await {
                         let payload = json!({"api_version":"v1","observed_at":chrono::Utc::now(),"source":"home_assistant","connection_status":snapshot.status,"devices":snapshot.devices});
                         match serde_json::to_vec(&payload) {
-                            Ok(bytes) if bytes.len() < MAX_PAYLOAD_BYTES => {
+                            Ok(bytes) if within_packet_limit(bytes.len()) => {
                                 if client.try_publish("neonhearth/automation/inventory", QoS::AtMostOnce, false, bytes).is_err() {
                                     dropped += 1;
                                 }
@@ -159,11 +190,39 @@ pub fn start_with_retry_interval(
                         tracing::warn!(dropped, "mqtt bridge dropped publishes (queue full or payload over the packet limit)");
                         state.automation().mqtt_status(
                             "connected",
-                            &format!("Authenticated broker connected. {dropped} publish(es) were dropped (queue full or payload over the 4 MiB limit); MQTT commands are disabled."),
+                            &dropped_detail(dropped),
                         ).await;
                     }
                 },
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_limit_and_drop_report_are_exact() {
+        assert!(within_packet_limit(MAX_PAYLOAD_BYTES - 1));
+        assert!(!within_packet_limit(MAX_PAYLOAD_BYTES));
+        let detail = dropped_detail(3);
+        assert!(detail.contains("3 publish(es) were dropped") && detail.contains("4 MiB"));
+    }
+
+    #[tokio::test]
+    async fn credential_loading_rejects_missing_oversized_and_weak_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("client.json");
+        assert!(load_credentials(&path).await.is_none());
+        let good = serde_json::json!({"port": 40000, "username": "neonhearth", "password": "p".repeat(40)});
+        std::fs::write(&path, good.to_string()).unwrap();
+        assert!(load_credentials(&path).await.is_some());
+        let weak = serde_json::json!({"port": 40000, "username": "neonhearth", "password": "short"});
+        std::fs::write(&path, weak.to_string()).unwrap();
+        assert!(load_credentials(&path).await.is_none());
+        std::fs::write(&path, vec![b' '; 5000]).unwrap();
+        assert!(load_credentials(&path).await.is_none());
+    }
 }

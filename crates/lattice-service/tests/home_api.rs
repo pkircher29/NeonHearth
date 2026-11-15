@@ -800,3 +800,31 @@ async fn rejected_bodies_use_the_problem_shape_and_their_own_status() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn a_plan_save_that_drops_a_floor_with_placements_is_refused_naming_the_floor() {
+    let (router, _, _) = fixture().await;
+    save_plan(&router, 0, "Home").await;
+    let uri = format!("/api/v1/home/placements/{DEVICE_ID}");
+    assert_eq!(
+        send(&router, "PUT", &uri, Some(placement_body()))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let mut emptied = sample_plan("Home");
+    emptied["floors"] = serde_json::json!([]);
+    let response = send(
+        &router,
+        "PUT",
+        "/api/v1/home/plan",
+        Some(save_request(1, emptied)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert!(body["error"].as_str().unwrap().contains(FLOOR_ID), "{body}");
+    let snapshot = json_body(send(&router, "GET", "/api/v1/home", None).await).await;
+    assert_eq!(snapshot["placements"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["plan"]["version"], 1);
+}

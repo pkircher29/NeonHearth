@@ -58,6 +58,8 @@ pub enum HomeStoreError {
     Invalid,
     #[error("the home id of an existing plan cannot change")]
     HomeIdChanged,
+    #[error("floors still hold placed devices: {}", .0.join(", "))]
+    FloorsHoldPlacements(Vec<String>),
     #[error("draft exceeds the {MAX_DRAFT_BYTES}-byte cap")]
     DraftTooLarge,
     #[error("stored draft was corrupt and has been discarded")]
@@ -165,6 +167,25 @@ impl HomeRepository {
         {
             return Err(HomeStoreError::HomeIdChanged);
         }
+        // A floor that still holds owner placements cannot be dropped: the
+        // owner moves or removes those devices first, nothing is deleted here.
+        let placed: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT floor_id FROM owner_placements ORDER BY floor_id")
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(map_sqlx)?;
+        let kept: std::collections::BTreeSet<String> = stored
+            .floors
+            .iter()
+            .map(|floor| floor.floor_id.to_string())
+            .collect();
+        let stranded: Vec<String> = placed
+            .into_iter()
+            .filter(|floor| !kept.contains(floor))
+            .collect();
+        if !stranded.is_empty() {
+            return Err(HomeStoreError::FloorsHoldPlacements(stranded));
+        }
         sqlx::query(
             "INSERT INTO home_plans(singleton, home_id, version, plan, saved_at) \
              VALUES(1, ?, ?, ?, ?) \
@@ -197,16 +218,6 @@ impl HomeRepository {
                 .await
                 .map_err(map_sqlx)?;
         }
-        // Placements on a floor the saved plan no longer has would dangle
-        // invisibly; the device returns to the unplaced tray instead.
-        sqlx::query(
-            "DELETE FROM owner_placements WHERE floor_id NOT IN \
-             (SELECT json_extract(value, '$.floor_id') FROM json_each(?, '$.floors'))",
-        )
-        .bind(&json)
-        .execute(&mut *transaction)
-        .await
-        .map_err(map_sqlx)?;
         let prune_below = i64::from(new_version) - i64::from(PLAN_HISTORY_KEEP);
         if prune_below > 0 {
             sqlx::query("DELETE FROM home_plan_history WHERE version <= ?")

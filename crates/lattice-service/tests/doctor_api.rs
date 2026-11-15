@@ -106,7 +106,7 @@ fn mixed_fault_probes() -> FakeProbeTransport {
         ProbeRequest::ArpProbe { .. } => Ok(ProbeResponse::ArpProbe {
             responding_macs: vec![
                 "aa:aa:aa:aa:aa:01".to_owned(),
-                "bb:bb:bb:bb:bb:02".to_owned(),
+                "ba:bb:bb:bb:bb:02".to_owned(),
             ],
         }),
         ProbeRequest::WifiMetrics { .. } => Ok(ProbeResponse::WifiMetrics {

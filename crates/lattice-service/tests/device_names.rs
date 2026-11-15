@@ -107,3 +107,26 @@ async fn name_and_audit_rollback_together_when_the_audit_cannot_be_written() {
             .unwrap();
     assert!(saved.is_none());
 }
+#[tokio::test]
+async fn a_rejected_body_gets_the_problem_shape_and_its_own_status() {
+    let pool = connect_memory().await.unwrap();
+    let app = app(AppState::new(TOKEN, M2StateRepository::new(pool)).unwrap());
+    let broken = Request::put(format!("/api/v1/devices/{ID}/name"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::from("{not json"))
+        .unwrap();
+    let response = app.clone().oneshot(broken).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(body["error"].is_string(), "{body}");
+    let untyped = Request::put(format!("/api/v1/devices/{ID}/name"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(untyped).await.unwrap().status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+}

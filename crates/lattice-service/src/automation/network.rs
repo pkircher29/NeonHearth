@@ -90,6 +90,18 @@ fn enrich(devices: &mut [NetworkDeviceDetails], imported: &[Device]) {
     }
 }
 
+/// Overall answer quality: no neighbor source beats everything, then a cut
+/// evidence set, otherwise complete.
+fn network_status(neighbors_available: bool, evidence_truncated: bool) -> &'static str {
+    if !neighbors_available {
+        "unavailable"
+    } else if evidence_truncated {
+        "partial"
+    } else {
+        "ready"
+    }
+}
+
 impl AutomationHub {
     pub async fn network_details(&self) -> Result<NetworkDetails, StatusCode> {
         let mut cache = self.network_cache.lock().await;
@@ -150,13 +162,7 @@ impl AutomationHub {
                 .ok(),
             None => None,
         };
-        let status = if neighbors.is_none() {
-            "unavailable"
-        } else if evidence_truncated {
-            "partial"
-        } else {
-            "ready"
-        };
+        let status = network_status(neighbors.is_some(), evidence_truncated);
         for row in neighbors.into_iter().flatten() {
             let source = format!("neighbor-interface-{}", row.interface().get());
             let Some(mac) = canonical_mac(&row.link_address().to_string()) else {
@@ -212,6 +218,12 @@ pub(crate) async fn network_route(_: LocalOwner, State(state): State<AppState>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn truncated_evidence_is_reported_as_partial_not_ready() {
+        assert_eq!(network_status(true, true), "partial");
+        assert_eq!(network_status(true, false), "ready");
+        assert_eq!(network_status(false, true), "unavailable");
+    }
     #[test]
     fn mac_matching_requires_one_device_and_never_manufactures_identity() {
         let imported: Device = serde_json::from_value(serde_json::json!({

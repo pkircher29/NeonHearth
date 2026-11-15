@@ -163,7 +163,8 @@ fn storage_status(error: &HomeStoreError) -> StatusCode {
         HomeStoreError::VersionConflict { .. } => StatusCode::CONFLICT,
         HomeStoreError::InvalidPlan(_)
         | HomeStoreError::Invalid
-        | HomeStoreError::HomeIdChanged => StatusCode::BAD_REQUEST,
+        | HomeStoreError::HomeIdChanged
+        | HomeStoreError::FloorsHoldPlacements(_) => StatusCode::BAD_REQUEST,
         HomeStoreError::DraftTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         HomeStoreError::DraftCorrupt | HomeStoreError::Corrupt | HomeStoreError::Storage => {
             StatusCode::SERVICE_UNAVAILABLE
@@ -239,7 +240,7 @@ pub(crate) async fn save_plan_route(
             }),
         )
             .into_response(),
-        Err(error @ HomeStoreError::HomeIdChanged) => (
+        Err(error @ (HomeStoreError::HomeIdChanged | HomeStoreError::FloorsHoldPlacements(_))) => (
             StatusCode::BAD_REQUEST,
             Json(PlanRejected {
                 error: error.to_string(),

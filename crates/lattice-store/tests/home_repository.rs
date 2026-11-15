@@ -477,16 +477,28 @@ async fn placement_count_is_capped() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn saving_a_plan_without_a_floor_returns_its_placed_devices_to_the_tray() -> anyhow::Result<()>
-{
+async fn saving_a_plan_that_drops_a_floor_with_placements_is_refused_and_deletes_nothing()
+-> anyhow::Result<()> {
     let repository = HomeRepository::new(connect_memory().await?);
     repository
         .save_plan(0, &plan("Home"), at(1_700_000_000))
         .await?;
-    repository.upsert_placement(&placement()).await?;
+    let owner = placement();
+    repository.upsert_placement(&owner).await?;
     let mut emptied = plan("Home");
     emptied.floors.clear();
-    repository.save_plan(1, &emptied, at(1_700_000_001)).await?;
-    assert!(repository.list_placements().await?.is_empty());
+    let error = repository
+        .save_plan(1, &emptied, at(1_700_000_001))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        HomeStoreError::FloorsHoldPlacements(vec![owner.floor_id.to_string()])
+    );
+    assert_eq!(repository.list_placements().await?.len(), 1);
+    assert_eq!(repository.load_plan().await?.unwrap().plan.version, 1);
+    // Once the device is removed the floor can go.
+    repository.delete_placement(owner.device_id).await?;
+    repository.save_plan(1, &emptied, at(1_700_000_002)).await?;
     Ok(())
 }
