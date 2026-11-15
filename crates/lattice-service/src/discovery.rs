@@ -916,7 +916,12 @@ impl PersistentDiscoveryPipeline {
                 None => return Ok(RefreshOutcome::NeedsCommit),
             },
         };
-        if self.pipeline.presence.state(id) != Some(lattice_domain::PresenceState::Online) {
+        // Neighbor-cache support never yields `Online` (that needs Traffic); a present device
+        // settles in `Quiet`. Either is a steady state that a refresh cannot change.
+        if !matches!(
+            self.pipeline.presence.state(id),
+            Some(lattice_domain::PresenceState::Online | lattice_domain::PresenceState::Quiet)
+        ) {
             return Ok(RefreshOutcome::NeedsCommit);
         }
         match self.pipeline.presence.ingest_events(

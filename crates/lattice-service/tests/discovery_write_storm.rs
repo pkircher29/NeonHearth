@@ -78,7 +78,8 @@ async fn steady_cycles_do_not_commit_or_serialize_per_device() {
     let repo = M2StateRepository::new(connect_memory().await.unwrap());
     let source = Steady(Arc::new(Mutex::new(rows(DEVICES))));
     let (mut coordinator, _state) = open(&repo, source).await;
-    // Warm-up: Appeared, then the second confirmation takes every device Online.
+    // Warm-up: Appeared, then the second confirmation settles every device in Quiet (neighbor
+    // cache support never yields Online); from then on refreshes are in-memory only.
     for cycle in 0..3 {
         coordinator.cycle(t(cycle * 5)).await.unwrap();
     }
@@ -130,7 +131,10 @@ async fn repo_online(repo: &M2StateRepository, coordinator: &NeighborCoordinator
             .await
             .unwrap()
             .expect("identity survives restart");
-        if coordinator.pipeline().presence_state(id) == Some(PresenceState::Online) {
+        if matches!(
+            coordinator.pipeline().presence_state(id),
+            Some(PresenceState::Online | PresenceState::Quiet)
+        ) {
             online += 1;
         }
     }

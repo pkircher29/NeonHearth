@@ -113,9 +113,10 @@ async fn removing_and_adding_interfaces_keeps_identities_and_discovery_running()
         Some(id7),
         "the surviving interface keeps its device identity"
     );
+    // Neighbor-cache support settles a present device in Quiet (Online needs Traffic).
     assert_eq!(
         second.pipeline().presence_state(id7),
-        Some(PresenceState::Online)
+        Some(PresenceState::Quiet)
     );
     assert_ne!(
         second.pipeline().presence_state(id8),
@@ -142,7 +143,7 @@ async fn removing_and_adding_interfaces_keeps_identities_and_discovery_running()
     );
     assert_eq!(
         third.pipeline().presence_state(id8),
-        Some(PresenceState::Online)
+        Some(PresenceState::Quiet)
     );
 }
 

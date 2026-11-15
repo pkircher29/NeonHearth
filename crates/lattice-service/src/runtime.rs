@@ -13,7 +13,7 @@ use lattice_domain::DeviceId;
 use lattice_sensor::neighbor::{NeighborSnapshotConfig, SystemNeighborSnapshotSource};
 use lattice_sensor::{InterfaceId, InterfaceInventory, InterfaceOverride, SystemInterfaceManager};
 use lattice_store::M2StateRepository;
-use std::{fmt, future::Future, io, time::Duration};
+use std::{fmt, future::Future, io};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
