@@ -62,6 +62,11 @@ enum Mutation {
     WrongHealthAction,
     InvalidUtf8Declaration,
     NonUtf8Declaration,
+    EscapedManufacturer,
+    UnknownEntity,
+    ControlCharRef,
+    Interoperable,
+    PasswordName,
 }
 
 struct FixtureTransport {
@@ -213,6 +218,13 @@ impl OnvifTransport for FixtureTransport {
             Mutation::EscapedAttributeWireTooLong if matches!(request.action(), OnvifAction::GetProfiles) => {
                 body = body.replace("main-profile", &"&#65;".repeat(60));
             }
+            Mutation::EscapedManufacturer if matches!(request.action(), OnvifAction::GetDeviceInformation) => body = body.replace("Acme", "A&amp;B &lt;C&gt; &quot;D&quot; &apos;E&apos; &#65;&#x42;"),
+            Mutation::UnknownEntity if matches!(request.action(), OnvifAction::GetDeviceInformation) => body = body.replace("Acme", "A&bogus;B"),
+            Mutation::ControlCharRef if matches!(request.action(), OnvifAction::GetDeviceInformation) => body = body.replace("Acme", "A&#1;B"),
+            Mutation::PasswordName if matches!(request.action(), OnvifAction::GetDeviceInformation) => body = body.replace("Acme", "Password Cam @ Home"),
+            Mutation::Interoperable if matches!(request.action(), OnvifAction::GetDeviceInformation) => body = body.replace("</tds:GetDeviceInformationResponse>", "<tds:VendorBlob>x</tds:VendorBlob></tds:GetDeviceInformationResponse>"),
+            Mutation::Interoperable if matches!(request.action(), OnvifAction::GetCapabilities) => body = body.replace("<tt:Media/>", "<tt:Media/><tt:Extension><tt:Other/></tt:Extension>"),
+            Mutation::Interoperable if matches!(request.action(), OnvifAction::GetSystemDateAndTime) => body = body.replace("</tds:SystemDateAndTime>", "<tt:Extension/></tds:SystemDateAndTime>"),
             Mutation::EmptyHealth if matches!(request.action(), OnvifAction::GetSystemDateAndTime) => {
                 body = "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime/></tds:GetSystemDateAndTimeResponse>".into();
             }
@@ -228,9 +240,14 @@ impl OnvifTransport for FixtureTransport {
             _ => {}
         }
 
+        let extra_header = if matches!(self.mutation, Mutation::Interoperable) {
+            "<wsa:MessageID>urn:uuid:device-chosen</wsa:MessageID>"
+        } else {
+            ""
+        };
         let header_xml = if header {
             format!(
-                "<s:Header><wsa:Action>{response_action}</wsa:Action><wsa:RelatesTo>{relates_to}</wsa:RelatesTo></s:Header>"
+                "<s:Header><wsa:Action>{response_action}</wsa:Action>{extra_header}<wsa:RelatesTo>{relates_to}</wsa:RelatesTo></s:Header>"
             )
         } else {
             String::new()
@@ -847,6 +864,19 @@ fn public_output_constructors_preserve_bounds() {
     assert!(BoundedMetadata::new("x".repeat(129)).is_err());
     assert!(BoundedMetadata::new("rtsp://metadata-secret.invalid/live").is_err());
     assert!(BoundedMetadata::new("authorization: bearer value").is_err());
+    for secret in [
+        "Bearer abc123",
+        "Basic dXNlcjpwYXNz",
+        "password=hunter2",
+        "passwd: hunter2",
+        "api_key = abc",
+        "user:pass@192.168.1.5",
+    ] {
+        assert!(BoundedMetadata::new(secret).is_err(), "{secret}");
+    }
+    for product in ["Password Cam @ Home", "Acme Token Reader", "A&B <C>"] {
+        assert!(BoundedMetadata::new(product).is_ok(), "{product}");
+    }
     assert!(BoundedSerial::new("serial with spaces").is_err());
     assert!(StreamSourceRef::new("x".repeat(129)).is_err());
     let profile = CameraProfile::new(
@@ -854,4 +884,103 @@ fn public_output_constructors_preserve_bounds() {
         StreamSourceRef::new("opaque-ref").unwrap(),
     );
     assert_eq!(profile.source_ref().as_str(), "opaque-ref");
+}
+
+#[tokio::test]
+async fn escaped_entities_and_real_device_extras_are_accepted() {
+    // Regression: any entity reference was rejected as InvalidResponse, and so
+    // were extra header blocks, vendor elements and Extension containers.
+    let value = inventory(
+        &FixtureTransport::mutated(Mutation::EscapedManufacturer),
+        &Sink::default(),
+        target(),
+        None,
+        InventoryLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        value.manufacturer.as_ref().map(BoundedMetadata::as_str),
+        Some("A&B <C> \"D\" 'E' AB")
+    );
+    for mutation in [Mutation::Interoperable, Mutation::PasswordName] {
+        let value = inventory(
+            &FixtureTransport::mutated(mutation),
+            &Sink::default(),
+            target(),
+            None,
+            InventoryLimits::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{mutation:?} rejected: {error}"));
+        assert_eq!(
+            value.model.as_ref().map(BoundedMetadata::as_str),
+            Some("Cam-1")
+        );
+        assert_eq!(value.capabilities.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn undefined_entities_and_control_character_references_are_rejected() {
+    for mutation in [Mutation::UnknownEntity, Mutation::ControlCharRef] {
+        let result = inventory(
+            &FixtureTransport::mutated(mutation),
+            &Sink::default(),
+            target(),
+            None,
+            InventoryLimits::default(),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            OnvifError::InvalidResponse,
+            "{mutation:?}"
+        );
+    }
+}
+
+#[test]
+fn onvif_targets_must_not_be_loopback_or_unspecified() {
+    for address in [
+        "127.0.0.1",
+        "0.0.0.0",
+        "224.0.0.1",
+        "255.255.255.255",
+        "::1",
+        "::",
+    ] {
+        assert!(
+            matches!(
+                TargetAddress::new(address.parse().unwrap(), 80, false, "/onvif"),
+                Err(OnvifError::InvalidTarget)
+            ),
+            "{address}"
+        );
+    }
+    assert!(TargetAddress::new("192.168.1.9".parse().unwrap(), 80, false, "/onvif").is_ok());
+}
+
+#[tokio::test]
+async fn escaped_field_length_bound_is_on_decoded_bytes_at_the_boundary() {
+    // `A&amp;B&amp;C` decodes to 5 bytes: 5 is accepted, 4 is rejected.
+    let run = |max_field_bytes| async move {
+        inventory(
+            &FixtureTransport::mutated(Mutation::EscapedFieldTooLong),
+            &Sink::default(),
+            target(),
+            None,
+            InventoryLimits {
+                max_field_bytes,
+                ..InventoryLimits::default()
+            },
+        )
+        .await
+    };
+    let accepted = run(5).await.unwrap();
+    assert_eq!(
+        accepted.manufacturer.as_ref().map(BoundedMetadata::as_str),
+        Some("A&B&C")
+    );
+    assert_eq!(run(4).await.unwrap_err(), OnvifError::InvalidResponse);
 }

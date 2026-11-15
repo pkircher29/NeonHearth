@@ -65,9 +65,21 @@ pub enum FeedError {
 struct Cached {
     result: FeedResult,
 }
+
+/// Validator and body cache for one request URL (one page). Holds only that
+/// page's response; the aggregate is kept once per window in `completed`, so
+/// memory is linear in the number of pages.
+#[derive(Clone, Debug)]
+struct PageCache {
+    response: FeedResponse,
+}
+
+type WindowKey = (i64, i64);
+
 pub struct NvdFeed<T> {
     transport: T,
-    cache: Mutex<HashMap<String, Cached>>,
+    pages: Mutex<HashMap<String, PageCache>>,
+    completed: Mutex<HashMap<WindowKey, Cached>>,
     clock: Arc<dyn Clock>,
 }
 impl<T> NvdFeed<T> {
@@ -77,13 +89,18 @@ impl<T> NvdFeed<T> {
     pub fn with_clock(transport: T, clock: impl Clock + 'static) -> Self {
         Self {
             transport,
-            cache: Mutex::new(HashMap::new()),
+            pages: Mutex::new(HashMap::new()),
+            completed: Mutex::new(HashMap::new()),
             clock: Arc::new(clock),
         }
     }
 }
 impl<T: FeedTransport> NvdFeed<T> {
     pub async fn sync(&self, window: ModifiedWindow) -> Result<FeedResult, FeedError> {
+        let window_key = (
+            window.start.timestamp_millis(),
+            window.end.timestamp_millis(),
+        );
         let mut start = 0usize;
         let mut all = Vec::new();
         let mut first_response = None;
@@ -95,26 +112,25 @@ impl<T: FeedTransport> NvdFeed<T> {
                 let uncached = FeedRequest::nvd(start, results_per_page, window.start, window.end)
                     .map_err(FeedError::Transport)?;
                 let key = uncached.url.clone();
-                let cached = self.cache.lock().expect("cache lock").get(&key).cloned();
+                let cached = self.pages.lock().expect("cache lock").get(&key).cloned();
                 let request = if let Some(cached) = &cached {
                     uncached
                         .with_validators(
-                            cached.result.response.etag.clone(),
-                            cached.result.response.last_modified.clone(),
+                            cached.response.etag.clone(),
+                            cached.response.last_modified.clone(),
                         )
                         .map_err(FeedError::Transport)?
                 } else {
                     uncached
                 };
                 let response = match self.transport.get(request).await {
+                    // A 304 means the cached body is still current whether or
+                    // not the local TTL has passed; the TTL is refreshed below.
                     Ok(response) if response.status == 304 => {
                         let Some(cached) = cached else {
                             return Err(FeedError::Unavailable(TransportError::Unavailable));
                         };
-                        if cached.result.cache_expires_at < self.clock.now() {
-                            return Err(FeedError::Unavailable(TransportError::Unavailable));
-                        }
-                        let mut merged = cached.result.response;
+                        let mut merged = cached.response;
                         if response.etag.is_some() {
                             merged.etag = response.etag;
                         }
@@ -126,7 +142,7 @@ impl<T: FeedTransport> NvdFeed<T> {
                     Ok(response) if response.status == 200 => response,
                     Ok(response) => {
                         return self.stale_or_unavailable(
-                            &key,
+                            window_key,
                             TransportError::HttpStatus(response.status),
                         );
                     }
@@ -139,14 +155,15 @@ impl<T: FeedTransport> NvdFeed<T> {
                         reductions += 1;
                         continue;
                     }
-                    Err(error) => return self.stale_or_unavailable(&key, error),
+                    Err(error) => return self.stale_or_unavailable(window_key, error),
                 };
                 break (key, response);
             };
             let (meta_start, page_size, total, records) = match parse_nvd(&response.body) {
                 Ok(parsed) => parsed,
                 Err(_) => {
-                    return self.stale_or_unavailable(&key, TransportError::MalformedDocument);
+                    return self
+                        .stale_or_unavailable(window_key, TransportError::MalformedDocument);
                 }
             };
             if meta_start != start
@@ -168,35 +185,29 @@ impl<T: FeedTransport> NvdFeed<T> {
             }
             all.extend(records);
             let expiry = self.clock.now() + CACHE_TTL;
-            let result = FeedResult {
-                source_url: NVD_URL.into(),
-                records: all.clone(),
-                response: response.clone(),
-                cache_expires_at: expiry,
-                warnings: Vec::new(),
-            };
-            self.cache.lock().expect("cache lock").insert(
+            self.pages.lock().expect("cache lock").insert(
                 key,
-                Cached {
-                    result: FeedResult {
-                        source_url: NVD_URL.into(),
-                        records: result.records.clone(),
-                        response: response.clone(),
-                        cache_expires_at: expiry,
-                        warnings: Vec::new(),
-                    },
+                PageCache {
+                    response: response.clone(),
                 },
             );
             first_response.get_or_insert(response);
             first_expiry.get_or_insert(expiry);
             if next == total {
-                return Ok(FeedResult {
+                let result = FeedResult {
                     source_url: NVD_URL.into(),
                     records: all,
                     response: first_response.expect("set"),
                     cache_expires_at: first_expiry.expect("set"),
                     warnings: Vec::new(),
-                });
+                };
+                self.completed.lock().expect("cache lock").insert(
+                    window_key,
+                    Cached {
+                        result: result.clone(),
+                    },
+                );
+                return Ok(result);
             }
             if next <= start || next > total {
                 return Err(FeedError::MalformedMetadata);
@@ -210,10 +221,16 @@ impl<T: FeedTransport> NvdFeed<T> {
     }
     fn stale_or_unavailable(
         &self,
-        key: &str,
+        key: WindowKey,
         error: TransportError,
     ) -> Result<FeedResult, FeedError> {
-        if let Some(cached) = self.cache.lock().expect("cache lock").get(key).cloned() {
+        let cached = self
+            .completed
+            .lock()
+            .expect("cache lock")
+            .get(&key)
+            .cloned();
+        if let Some(cached) = cached {
             let Some(stale_until) = cached
                 .result
                 .cache_expires_at
@@ -287,9 +304,8 @@ impl<T: FeedTransport> CisaKevFeed<T> {
                 let Some(cached) = cached else {
                     return Err(FeedError::Unavailable(TransportError::Unavailable));
                 };
-                if cached.result.cache_expires_at < self.clock.now() {
-                    return Err(FeedError::Unavailable(TransportError::Unavailable));
-                }
+                // 304: the cached body is current even past the local TTL; the
+                // TTL is refreshed below.
                 let mut result = cached.result;
                 if response.etag.is_some() {
                     result.response.etag = response.etag;

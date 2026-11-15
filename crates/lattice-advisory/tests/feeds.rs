@@ -38,7 +38,7 @@ fn nvd_requests_have_canonical_url_encoded_incremental_query_and_bounded_window(
     assert_eq!(
         request.url,
         format!(
-            "{NVD_URL}?lastModStartDate=1970-01-01T00%3A00%3A00.000Z&lastModEndDate=1970-01-01T00%3A00%3A01.000Z&startIndex=4&resultsPerPage=2000"
+            "{NVD_URL}?lastModStartDate=1970-01-01T00%3A00%3A00.000%2B00%3A00&lastModEndDate=1970-01-01T00%3A00%3A01.000%2B00%3A00&startIndex=4&resultsPerPage=2000"
         )
     );
     assert_eq!(request.results_per_page, MAX_RESULTS_PER_PAGE);
@@ -352,20 +352,72 @@ async fn cisa_304_refreshes_expiry_and_retains_cached_provenance() {
 }
 
 #[tokio::test]
-async fn cisa_304_after_expiry_is_unavailable_without_extending_cache() {
+async fn cisa_304_after_local_ttl_refreshes_the_cache_instead_of_wedging() {
+    // Regression: validators are sent for an expired entry, the server answers
+    // 304 for an unchanged file, and the old code returned Unavailable forever.
     let initial = at(400);
     let clock = MutableClock(Arc::new(Mutex::new(initial)));
     let transport = FixtureTransport::with_clock(
         [
-            Ok(FixtureReply::json(r#"{"vulnerabilities":[{}]}"#)),
+            Ok(FixtureReply::json(r#"{"vulnerabilities":[{}]}"#).with_headers(Some("t"), None)),
+            Ok(FixtureReply::status(304)),
             Ok(FixtureReply::status(304)),
         ],
         clock.clone(),
     );
     let feed = CisaKevFeed::with_clock(transport, clock.clone());
     feed.sync().await.unwrap();
-    clock.set(initial + Duration::hours(1) + Duration::seconds(1));
-    assert!(matches!(feed.sync().await, Err(FeedError::Unavailable(_))));
+    for hours in [2, 5] {
+        clock.set(initial + Duration::hours(hours));
+        let refreshed = feed.sync().await.unwrap();
+        assert!(!refreshed.is_stale());
+        assert_eq!(refreshed.records.len(), 1);
+        assert_eq!(
+            refreshed.cache_expires_at,
+            initial + Duration::hours(hours) + Duration::hours(1)
+        );
+    }
+}
+
+#[tokio::test]
+async fn nvd_304_after_local_ttl_refreshes_the_cache_instead_of_wedging() {
+    let clock = MutableClock(Arc::new(Mutex::new(at(1_000))));
+    let transport = FixtureTransport::with_clock(
+        [
+            Ok(FixtureReply::json(nvd_page(0, 1, 1)).with_headers(Some("t"), None)),
+            Ok(FixtureReply::status(304)),
+        ],
+        clock.clone(),
+    );
+    let feed = NvdFeed::with_clock(transport, clock.clone());
+    let window = ModifiedWindow::new(at(0), at(1)).unwrap();
+    feed.sync(window.clone()).await.unwrap();
+    clock.set(at(1_000) + Duration::hours(3));
+    let refreshed = feed.sync(window).await.unwrap();
+    assert!(!refreshed.is_stale());
+    assert_eq!(refreshed.records.len(), 1);
+    assert_eq!(
+        refreshed.cache_expires_at,
+        at(1_000) + Duration::hours(3) + Duration::hours(1)
+    );
+}
+
+#[tokio::test]
+async fn multi_page_sync_keeps_only_one_aggregate_per_window() {
+    // Regression for quadratic memory: each page used to cache a clone of every
+    // record gathered so far. A later failure now serves one stale aggregate.
+    let transport = FixtureTransport::queued([
+        Ok(FixtureReply::json(nvd_page(0, 3, 2))),
+        Ok(FixtureReply::json(nvd_page(2, 3, 1))),
+        Err(TransportError::Unavailable),
+    ]);
+    let feed = NvdFeed::new(transport);
+    let window = ModifiedWindow::new(at(0), at(1)).unwrap();
+    let first = feed.sync(window.clone()).await.unwrap();
+    assert_eq!(first.records.len(), 3);
+    let stale = feed.sync(window).await.unwrap();
+    assert!(stale.is_stale());
+    assert_eq!(stale.records.len(), 3);
 }
 
 #[tokio::test]

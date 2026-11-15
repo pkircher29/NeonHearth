@@ -7,8 +7,9 @@ use lattice_doctor::diagnosis::DiagnosisKind;
 use lattice_doctor::probe::LeaseState;
 use lattice_doctor::repair::{
     ApprovalAction, ApprovalId, ApprovedRepair, ExecutableRepair, GuidedAction, RepairClass,
-    RepairContext, RepairPlan, SafeAction, StateKey, plan_repair,
+    RepairContext, RepairPlan, SafeAction, StateKey, plan_dhcp_reservation, plan_repair,
 };
+use lattice_doctor::types::{InterfaceName, IpVersion, MacAddr};
 
 fn context() -> RepairContext {
     RepairContext {
@@ -46,7 +47,7 @@ fn adapter_link_down_requires_approval_for_adapter_reset() {
         RepairPlan::ApprovalRequiredReversible {
             action: ApprovalAction::ResetAdapter { ref interface },
             ..
-        } if interface == "eth0"
+        } if interface.as_str() == "eth0"
     ));
 }
 
@@ -80,26 +81,116 @@ fn lease_renewal_stays_automatic_only_when_management_path_is_safe() {
         RepairPlan::ApprovalRequiredReversible {
             action: ApprovalAction::RenewDhcpLease { ref interface },
             ..
-        } if interface == "eth0"
+        } if interface.as_str() == "eth0"
     ));
 }
 
+fn mac(text: &str) -> MacAddr {
+    text.parse().unwrap()
+}
+
 #[test]
-fn duplicate_ip_proposes_an_approved_dhcp_reservation() {
-    let plan = plan_repair(
-        &DiagnosisKind::DuplicateIp {
-            address: "192.168.1.50".into(),
-            macs: vec!["aa:aa:aa:aa:aa:aa".into(), "bb:bb:bb:bb:bb:bb".into()],
+fn duplicate_ip_never_picks_a_claimant_for_the_owner() {
+    // Regression: the plan used `macs.first()`, so whichever device answered
+    // the (spoofable) ARP probe first was proposed as the reservation holder.
+    let kind = DiagnosisKind::DuplicateIp {
+        address: "192.168.1.50".into(),
+        macs: vec![mac("aa:aa:aa:aa:aa:aa"), mac("ac:ac:ac:ac:ac:ac")],
+    };
+    let plan = plan_repair(&kind, &context());
+    let RepairPlan::ApprovalRequiredReversible {
+        action: ApprovalAction::SetDhcpReservation {
+            chosen, claimants, ..
         },
-        &context(),
-    );
+        ..
+    } = plan
+    else {
+        panic!("approval-required reservation expected");
+    };
+    assert_eq!(chosen, None);
+    assert_eq!(claimants.len(), 2);
+    // The owner chooses; the choice must be one of the observed claimants.
+    let action = plan_dhcp_reservation(&kind, mac("ac:ac:ac:ac:ac:ac")).unwrap();
     assert!(matches!(
-        plan,
-        RepairPlan::ApprovalRequiredReversible {
-            action: ApprovalAction::SetDhcpReservation { ref device, ref address },
-            ..
-        } if device == "aa:aa:aa:aa:aa:aa" && address == "192.168.1.50"
+        action,
+        ApprovalAction::SetDhcpReservation { chosen: Some(device), address, .. }
+            if device == mac("ac:ac:ac:ac:ac:ac") && address.to_string() == "192.168.1.50"
     ));
+    assert!(plan_dhcp_reservation(&kind, mac("cc:cc:cc:cc:cc:cc")).is_err());
+    // An undecided reservation can never be executed.
+    let undecided = ExecutableRepair::Approved(ApprovedRepair::new(
+        ApprovalAction::SetDhcpReservation {
+            address: "192.168.1.50".parse().unwrap(),
+            claimants: vec![mac("aa:aa:aa:aa:aa:aa")],
+            chosen: None,
+        },
+        ApprovalId::try_new("a").unwrap(),
+    ));
+    assert!(!undecided.is_decided());
+}
+
+#[test]
+fn invalid_context_values_never_become_executable_actions() {
+    let mut hostile = context();
+    hostile.interface = "--help".into();
+    assert_eq!(
+        plan_repair(&DiagnosisKind::AdapterLinkDown, &hostile).class(),
+        RepairClass::ObservationOnly
+    );
+    let mut hostile = context();
+    hostile.fallback_dns_servers = vec!["9.9.9.9".into(), "-evil".into()];
+    assert_eq!(
+        plan_repair(
+            &DiagnosisKind::DnsFailure {
+                resolvers: Vec::new()
+            },
+            &hostile
+        )
+        .class(),
+        RepairClass::ObservationOnly
+    );
+}
+
+#[test]
+fn only_state_restorable_repairs_are_marked_reversible() {
+    let approved = |action| {
+        ExecutableRepair::Approved(ApprovedRepair::new(
+            action,
+            ApprovalId::try_new("a").unwrap(),
+        ))
+    };
+    let eth0 = InterfaceName::parse("eth0").unwrap();
+    // Regression: every approved repair was "reversible", including a router
+    // reboot, so a restored snapshot was reported as a successful rollback.
+    assert!(!approved(ApprovalAction::RebootRouter).reversible());
+    assert!(
+        !approved(ApprovalAction::ResetAdapter {
+            interface: eth0.clone()
+        })
+        .reversible()
+    );
+    assert!(!approved(ApprovalAction::RenewDhcpLease { interface: eth0 }).reversible());
+    assert!(
+        approved(ApprovalAction::ChangeDnsServers {
+            servers: vec!["9.9.9.9".parse().unwrap()]
+        })
+        .reversible()
+    );
+}
+
+#[test]
+fn deserialising_an_approval_runs_its_validation() {
+    assert!(serde_json::from_str::<ApprovalId>("\"\"").is_err());
+    assert!(serde_json::from_str::<ApprovalId>("\"ok-1\"").is_ok());
+    assert!(serde_json::from_str::<InterfaceName>("\"-h\"").is_err());
+    assert!(serde_json::from_str::<MacAddr>("\"01:00:5e:00:00:01\"").is_err());
+    assert_eq!(
+        serde_json::from_str::<lattice_doctor::types::Mtu>("1400")
+            .unwrap()
+            .get(),
+        1400
+    );
+    assert!(serde_json::from_str::<lattice_doctor::types::Mtu>("100").is_err());
 }
 
 #[test]
@@ -165,23 +256,42 @@ fn loss_latency_and_route_conflict_are_observation_only() {
 fn mtu_blackhole_proposes_measured_mtu_or_only_observes() {
     let plan = plan_repair(
         &DiagnosisKind::MtuBlackhole {
-            largest_passing_bytes: Some(1_400),
-            smallest_failing_bytes: Some(1_500),
+            largest_passing_payload_bytes: Some(1_372),
+            smallest_failing_payload_bytes: Some(1_472),
+            ip_version: IpVersion::V4,
+        },
+        &context(),
+    );
+    // Regression: the ICMP payload (1372) was used as the MTU; the link MTU
+    // is payload + 28 for IPv4.
+    assert!(matches!(
+        plan,
+        RepairPlan::ApprovalRequiredReversible {
+            action: ApprovalAction::SetInterfaceMtu { ref interface, mtu },
+            ..
+        } if interface.as_str() == "eth0" && mtu.get() == 1_400
+    ));
+    let v6 = plan_repair(
+        &DiagnosisKind::MtuBlackhole {
+            largest_passing_payload_bytes: Some(1_352),
+            smallest_failing_payload_bytes: None,
+            ip_version: IpVersion::V6,
         },
         &context(),
     );
     assert!(matches!(
-        plan,
+        v6,
         RepairPlan::ApprovalRequiredReversible {
-            action: ApprovalAction::SetInterfaceMtu { ref interface, mtu: 1_400 },
+            action: ApprovalAction::SetInterfaceMtu { mtu, .. },
             ..
-        } if interface == "eth0"
+        } if mtu.get() == 1_400
     ));
 
     let plan = plan_repair(
         &DiagnosisKind::MtuBlackhole {
-            largest_passing_bytes: None,
-            smallest_failing_bytes: Some(1_200),
+            largest_passing_payload_bytes: None,
+            smallest_failing_payload_bytes: Some(1_200),
+            ip_version: IpVersion::V4,
         },
         &context(),
     );
@@ -201,7 +311,7 @@ fn dns_change_requires_approval_and_a_fallback_resolver() {
         RepairPlan::ApprovalRequiredReversible {
             action: ApprovalAction::ChangeDnsServers { ref servers },
             ..
-        } if servers == &vec!["9.9.9.9".to_owned()]
+        } if servers == &vec!["9.9.9.9".parse::<std::net::IpAddr>().unwrap()]
     ));
 
     let mut no_fallback = context();
@@ -279,7 +389,7 @@ fn approval_required_repairs_only_execute_with_a_token() {
     let approval = ApprovalId::try_new("approval-42").unwrap();
     let repair = ExecutableRepair::Approved(ApprovedRepair::new(
         ApprovalAction::ChangeDnsServers {
-            servers: vec!["9.9.9.9".into()],
+            servers: vec!["9.9.9.9".parse().unwrap()],
         },
         approval,
     ));
@@ -315,7 +425,7 @@ fn safe_action_reversibility_and_state_keys_are_declared_per_action() {
 
     let approved = ExecutableRepair::Approved(ApprovedRepair::new(
         ApprovalAction::BlockDevice {
-            device: "aa:bb".into(),
+            device: mac("aa:bb:cc:dd:ee:01"),
         },
         ApprovalId::try_new("t").unwrap(),
     ));

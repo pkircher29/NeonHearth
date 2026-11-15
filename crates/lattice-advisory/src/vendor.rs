@@ -1,5 +1,5 @@
 //! Registered vendor advisories use the fixed `neonhearth.vendor-advisory.v1` JSON schema.
-//! A detached signature covers `b"NeonHearth vendor advisory v1\0" || raw UTF-8 body` exactly;
+//! A detached signature covers `b"NeonHearth vendor advisory v2\0" || source URL || 0x00 || raw UTF-8 body` (the URL binds the signature to one feed) exactly;
 //! whitespace or key-order changes invalidate it. The parsed JSON is never reserialized to sign.
 //! Vendor bodies are capped at 1 MiB and each source produces at most 2,000 advisories.
 use crate::{
@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 pub const VENDOR_SCHEMA_ID: &str = "neonhearth.vendor-advisory.v1";
 pub const MAX_VENDOR_BYTES: usize = 1024 * 1024;
-const SIGNING_PREFIX: &[u8] = b"NeonHearth vendor advisory v1\0";
+const SIGNING_PREFIX: &[u8] = b"NeonHearth vendor advisory v2\0";
 
 #[derive(Clone)]
 pub struct VendorSource {
@@ -127,6 +127,12 @@ pub fn parse_vendor(
         .iter()
         .find(|source| source.url == source_url)
         .ok_or(VendorParseError::Malformed)?;
+    // A source registered with a key must be signed. Accepting its body
+    // unsigned would let anyone who can strip the detached signature downgrade
+    // the document to `RegisteredHttps` instead of failing it.
+    if source.public_key.is_some() && signature.is_none() {
+        return Err(VendorParseError::Malformed);
+    }
     if source.schema_id != VENDOR_SCHEMA_ID
         || !is_https(source_url)
         || (!source.enabled && signature.is_none())
@@ -141,7 +147,8 @@ pub fn parse_vendor(
     if document.advisories.len() > MAX_PARSER_OUTPUTS {
         return Err(VendorParseError::Oversized);
     }
-    let (source_trust, confidence) = trust(source, signature, body.as_bytes(), retrieved_at);
+    let (source_trust, confidence) =
+        trust(source, signature, source_url, body.as_bytes(), retrieved_at);
     document
         .advisories
         .into_iter()
@@ -176,6 +183,7 @@ fn signature_input_valid(signature: &VendorSignature) -> bool {
 fn trust(
     source: &VendorSource,
     signature: Option<&VendorSignature>,
+    source_url: &str,
     body: &[u8],
     retrieved_at: DateTime<Utc>,
 ) -> (SourceTrust, Confidence) {
@@ -189,14 +197,14 @@ fn trust(
         && source.key_id.as_deref() == Some(signature.key_id.as_str())
         && source
             .public_key
-            .is_some_and(|key| verify(key, &signature.encoded, body));
+            .is_some_and(|key| verify(key, &signature.encoded, source_url, body));
     if verified {
         (SourceTrust::VerifiedSignature, Confidence::High)
     } else {
         (SourceTrust::Invalid, Confidence::Low)
     }
 }
-fn verify(key: [u8; 32], encoded: &str, body: &[u8]) -> bool {
+fn verify(key: [u8; 32], encoded: &str, source_url: &str, body: &[u8]) -> bool {
     if encoded.contains('=') || encoded.len() != 86 {
         return false;
     }
@@ -211,8 +219,10 @@ fn verify(key: [u8; 32], encoded: &str, body: &[u8]) -> bool {
     let Ok(key) = VerifyingKey::from_bytes(&key) else {
         return false;
     };
-    let mut message = Vec::with_capacity(SIGNING_PREFIX.len() + body.len());
+    let mut message = Vec::with_capacity(SIGNING_PREFIX.len() + source_url.len() + 1 + body.len());
     message.extend_from_slice(SIGNING_PREFIX);
+    message.extend_from_slice(source_url.as_bytes());
+    message.push(0);
     message.extend_from_slice(body);
     key.verify_strict(&message, &signature).is_ok()
 }

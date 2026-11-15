@@ -1,12 +1,10 @@
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, TimeZone, Utc};
-#[cfg(target_os = "linux")]
-use lattice_camera::resolve_ffmpeg_executable;
 use lattice_camera::{
     CameraId, FakeMediaProcessFactory, HlsSession, HlsSessionId, LoopbackSourceToken, MediaError,
     MediaJob, MediaProcess, MediaProcessExit, MediaProcessFactory, MediaProcessSpec,
     ProductionMediaProcessFactory, SnapshotRequest, StreamId, ffmpeg_executable, hls_args,
-    platform_default_ffmpeg, snapshot_args,
+    platform_default_ffmpeg, resolve_ffmpeg_executable, snapshot_args,
 };
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
@@ -131,6 +129,10 @@ fn hls_arguments_are_an_exact_shell_free_vector_with_localhost_only_input() {
             "error",
             "-rtsp_transport",
             "tcp",
+            "-protocol_whitelist",
+            "rtsp,tcp,rtp,udp",
+            "-rw_timeout",
+            "15000000",
             "-i",
             "rtsp://127.0.0.1:43123/source/0190c6d1-1234-7abc-8def-0123456789ab",
             "-map",
@@ -138,12 +140,16 @@ fn hls_arguments_are_an_exact_shell_free_vector_with_localhost_only_input() {
             "-an",
             "-c:v",
             "copy",
+            "-t",
+            "660",
             "-f",
             "hls",
             "-hls_time",
             "2",
             "-hls_list_size",
             "4",
+            "-hls_segment_size",
+            "8388608",
             "-hls_flags",
             "delete_segments+append_list+omit_endlist+independent_segments",
             "-hls_segment_filename",
@@ -180,6 +186,10 @@ fn snapshot_arguments_are_fixed_to_one_jpeg_in_the_owned_directory() {
             "error",
             "-rtsp_transport",
             "tcp",
+            "-protocol_whitelist",
+            "rtsp,tcp,rtp,udp",
+            "-rw_timeout",
+            "15000000",
             "-i",
             "rtsp://127.0.0.1:43123/source/0190c6d1-1234-7abc-8def-0123456789ab",
             "-map",
@@ -187,6 +197,8 @@ fn snapshot_arguments_are_fixed_to_one_jpeg_in_the_owned_directory() {
             "-an",
             "-frames:v",
             "1",
+            "-fs",
+            "4194304",
             "-f",
             "image2",
             "-c:v",
@@ -234,7 +246,7 @@ fn platform_default_matches_the_installer_layout() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn ffmpeg_resolution_prefers_override_then_default_then_path() {
+fn ffmpeg_resolution_prefers_override_then_default_and_never_searches_path() {
     let default = platform_default_ffmpeg();
     let override_path = Path::new("/opt/custom/ffmpeg");
     let on_path = Path::new("/opt/tools/ffmpeg");
@@ -251,28 +263,34 @@ fn ffmpeg_resolution_prefers_override_then_default_then_path() {
         let only_path = |candidate: &Path| candidate == on_path;
         assert_eq!(
             resolve_ffmpeg_executable(Some(OsStr::new(bad)), Some(&path_var), &only_path),
-            on_path,
+            default,
             "override {bad:?} must be ignored"
         );
     }
-    // 3. The platform default is preferred over PATH when it exists.
+    // 3. Regression: a binary found on PATH is never selected. A privileged
+    //    service must not run whatever ffmpeg a user-writable PATH entry holds.
+    let only_path = |candidate: &Path| candidate == on_path;
+    assert_eq!(
+        resolve_ffmpeg_executable(None, Some(&path_var), &only_path),
+        default
+    );
     let both = |candidate: &Path| candidate == default || candidate == on_path;
     assert_eq!(
         resolve_ffmpeg_executable(None, Some(&path_var), &both),
         default
     );
-    // 4. PATH is searched in order, skipping relative entries.
-    let only_path = |candidate: &Path| candidate == on_path;
-    assert_eq!(
-        resolve_ffmpeg_executable(None, Some(&path_var), &only_path),
-        on_path
-    );
-    // 5. Nothing found: fall back to the platform default so spawn fails typed.
-    assert_eq!(
-        resolve_ffmpeg_executable(None, Some(&path_var), &never),
-        default
-    );
     assert_eq!(resolve_ffmpeg_executable(None, None, &never), default);
+}
+
+#[test]
+fn a_binary_on_path_is_never_selected_on_any_platform() {
+    let dir = if cfg!(windows) { r"C:\evil" } else { "/evil" };
+    let path_var = OsString::from(dir);
+    let found_on_path = |candidate: &Path| candidate.starts_with(dir);
+    assert_eq!(
+        resolve_ffmpeg_executable(None, Some(&path_var), &found_on_path),
+        platform_default_ffmpeg()
+    );
 }
 
 #[tokio::test]

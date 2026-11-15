@@ -232,6 +232,14 @@ pub struct AdvisoryInput {
     pub remediation: Remediation,
 }
 
+/// A validated advisory plus an integrity digest of its fields.
+///
+/// `provenance_sha256` is an unkeyed checksum: it detects accidental
+/// corruption and field drift, nothing more. Anyone able to edit stored JSON
+/// can recompute it, so `source_trust` and `freshness` in a deserialised value
+/// are claims, not evidence. Trust is assigned only by the feed transport
+/// (see `nvd::parse_nvd_response`), and freshness is re-evaluated at match
+/// time with `match_advisory_at`.
 #[derive(Clone, Debug, Serialize)]
 pub struct NormalizedAdvisory {
     input: AdvisoryInput,
@@ -380,4 +388,5 @@ pub mod kev;
 pub mod nvd;
 pub mod transport;
 pub mod vendor;
+pub mod version;
 pub use advisory_match::*;

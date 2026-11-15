@@ -31,7 +31,7 @@ use lattice_doctor::{
     engine::{DiagnosticEngine, DoctorConfig, Thresholds},
     executor::{
         MetricDirection, RepairExecutor, RepairReport, RepairTransport, RepairTransportError,
-        StateEntry, Symptom,
+        SettlePolicy, StateEntry, Symptom,
     },
     probe::{LeaseState, Probe, ProbeError, ProbeRequest, ProbeResponse, ProbeTransport},
     repair::{
@@ -725,6 +725,8 @@ struct DoctorShared {
     clock: Arc<dyn Clock>,
     probes: Arc<dyn DynProbeTransport>,
     repairs: Arc<dyn DynRepairTransport>,
+    /// How long a repair is given to take effect before it is judged.
+    settle: SettlePolicy,
     /// One diagnostic or repair at a time (contract: concurrent runs get
     /// 409; repairs share the flag so a repair never interleaves with a run
     /// or another repair's snapshot/apply/restore).
@@ -822,10 +824,22 @@ impl DoctorState {
                 clock,
                 probes,
                 repairs,
+                settle: SettlePolicy::PerAction,
                 running: AtomicBool::new(false),
                 inner: tokio::sync::Mutex::new(DoctorInner::default()),
             }),
         })
+    }
+
+    /// Overrides how repairs are judged after applying (tests use
+    /// `SettlePolicy::Immediate`; production keeps `PerAction`). Call before
+    /// the state is shared.
+    #[must_use]
+    pub fn with_settle_policy(mut self, settle: SettlePolicy) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("doctor state is not yet shared")
+            .settle = settle;
+        self
     }
 
     /// The current owner-visible probe targets.
@@ -1090,7 +1104,8 @@ pub(crate) async fn repair_route(
         // plan table and symptom table diverged.
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let executor = RepairExecutor::with_clock(SharedClock(Arc::clone(&shared.clock)));
+    let executor = RepairExecutor::with_clock(SharedClock(Arc::clone(&shared.clock)))
+        .with_settle_policy(shared.settle);
     let repair = executor
         .execute(
             &RepairAdapter(shared.repairs.as_ref()),

@@ -7,7 +7,7 @@ use std::{
 };
 use thiserror::Error;
 
-const DOMAIN: &[u8] = b"NeonHearth/lattice-audit-wasm/manifest/v1\0";
+const DOMAIN: &[u8] = b"NeonHearth/lattice-audit-wasm/manifest/v2\0";
 /// Maximum module size and aggregate exchange/evidence bytes permitted by a manifest.
 const MAX_WASM_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TEXT: usize = 4096;
@@ -126,6 +126,20 @@ pub enum AuditError {
     HostRejected,
     #[error("audit execution cancelled")]
     Cancelled,
+    #[error("manifest names a signing key that is not trusted")]
+    UnknownKey,
+    #[error("manifest signing key is revoked")]
+    KeyRevoked,
+    #[error("module digest is revoked")]
+    ModuleRevoked,
+    #[error("module version is below the accepted floor")]
+    ModuleRollback,
+    #[error("manifest is not valid yet")]
+    NotYetValid,
+    #[error("manifest validity window has ended")]
+    Expired,
+    #[error("policy requires a bounded validity window")]
+    ValidityRequired,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -264,8 +278,22 @@ pub struct AuditManifest {
     pub rollback: RollbackPlan,
     pub evidence_schema: EvidenceSchema,
     pub limits: Limits,
+    /// Which trusted key signed this manifest (see [`VerificationPolicy`]).
+    pub key_id: String,
+    /// Unix seconds; the signed validity window. `u64::MAX` as `valid_until`
+    /// means no expiry, which a strict policy refuses.
+    pub valid_from: u64,
+    pub valid_until: u64,
     #[serde(serialize_with = "sig_bytes::serialize")]
     pub signature: [u8; 64],
+}
+
+const DEFAULT_KEY_ID: &str = "default";
+fn default_key_id() -> String {
+    DEFAULT_KEY_ID.to_owned()
+}
+fn default_valid_until() -> u64 {
+    u64::MAX
 }
 
 impl<'de> Deserialize<'de> for AuditManifest {
@@ -284,6 +312,12 @@ impl<'de> Deserialize<'de> for AuditManifest {
             rollback: BoundedRollback,
             evidence_schema: EvidenceSchema,
             limits: Limits,
+            #[serde(default = "default_key_id", deserialize_with = "deserialize_module_id")]
+            key_id: String,
+            #[serde(default)]
+            valid_from: u64,
+            #[serde(default = "default_valid_until")]
+            valid_until: u64,
             #[serde(deserialize_with = "bounded_signature")]
             signature: [u8; 64],
         }
@@ -356,6 +390,9 @@ impl<'de> Deserialize<'de> for AuditManifest {
             },
             w.evidence_schema,
             w.limits,
+            w.key_id,
+            w.valid_from,
+            w.valid_until,
             w.signature,
         )
         .map_err(serde::de::Error::custom)
@@ -387,8 +424,31 @@ impl AuditManifest {
             rollback,
             evidence_schema,
             limits,
+            default_key_id(),
+            0,
+            u64::MAX,
             [0; 64],
         )
+    }
+
+    /// Names the signing key. Part of the signed bytes.
+    pub fn with_key_id(mut self, key_id: impl Into<String>) -> Result<Self, AuditError> {
+        let key_id = key_id.into();
+        if !valid_identifier(&key_id) {
+            return Err(AuditError::InvalidManifest("noncanonical key id".into()));
+        }
+        self.key_id = key_id;
+        Ok(self)
+    }
+
+    /// Sets the signed validity window in Unix seconds.
+    pub fn with_validity(mut self, valid_from: u64, valid_until: u64) -> Result<Self, AuditError> {
+        if valid_from >= valid_until {
+            return Err(AuditError::InvalidManifest("empty validity window".into()));
+        }
+        self.valid_from = valid_from;
+        self.valid_until = valid_until;
+        Ok(self)
     }
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
@@ -402,15 +462,17 @@ impl AuditManifest {
         rollback: RollbackPlan,
         evidence_schema: EvidenceSchema,
         limits: Limits,
+        key_id: String,
+        valid_from: u64,
+        valid_until: u64,
         signature: [u8; 64],
     ) -> Result<Self, AuditError> {
-        if version == 0
-            || module_id.is_empty()
-            || module_id.len() > 128
-            || !module_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
-        {
+        if !valid_identifier(&key_id) || valid_from >= valid_until {
+            return Err(AuditError::InvalidManifest(
+                "invalid key id or validity window".into(),
+            ));
+        }
+        if version == 0 || !valid_identifier(&module_id) {
             return Err(AuditError::InvalidManifest(
                 "noncanonical module identity".into(),
             ));
@@ -468,6 +530,9 @@ impl AuditManifest {
             rollback,
             evidence_schema,
             limits,
+            key_id,
+            valid_from,
+            valid_until,
             signature,
         })
     }
@@ -526,6 +591,9 @@ impl AuditManifest {
         b.extend(self.limits.max_time.as_secs().to_be_bytes());
         b.extend(self.limits.max_fuel.to_be_bytes());
         b.extend(self.limits.max_memory_pages.to_be_bytes());
+        put_str(&mut b, &self.key_id);
+        b.extend(self.valid_from.to_be_bytes());
+        b.extend(self.valid_until.to_be_bytes());
         b
     }
     pub fn sign(&mut self, key: &SigningKey) -> Result<(), AuditError> {
@@ -556,6 +624,109 @@ impl VerifiedManifest {
         &self.wasm
     }
 }
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+}
+
+/// One trusted signing key.
+#[derive(Clone, Debug)]
+pub struct TrustedKey {
+    pub key_id: String,
+    pub key: VerifyingKey,
+    pub revoked: bool,
+}
+
+/// What a deployment trusts: keys by id, revoked module digests, and the
+/// lowest accepted version per module id. The floors are plain data so the
+/// caller can persist them (`version_floors`) and restore them
+/// (`with_version_floors`) across restarts.
+#[derive(Clone, Debug, Default)]
+pub struct VerificationPolicy {
+    keys: BTreeMap<String, TrustedKey>,
+    revoked_digests: BTreeSet<[u8; 32]>,
+    floors: BTreeMap<String, u16>,
+    require_validity_window: bool,
+}
+
+impl VerificationPolicy {
+    pub fn new(keys: impl IntoIterator<Item = TrustedKey>) -> Self {
+        Self {
+            keys: keys.into_iter().map(|k| (k.key_id.clone(), k)).collect(),
+            ..Self::default()
+        }
+    }
+    /// Refuse manifests without an expiry.
+    #[must_use]
+    pub fn require_validity_window(mut self) -> Self {
+        self.require_validity_window = true;
+        self
+    }
+    #[must_use]
+    pub fn revoke_digest(mut self, sha256: [u8; 32]) -> Self {
+        self.revoked_digests.insert(sha256);
+        self
+    }
+    #[must_use]
+    pub fn with_version_floors(mut self, floors: BTreeMap<String, u16>) -> Self {
+        self.floors = floors;
+        self
+    }
+    pub fn version_floors(&self) -> &BTreeMap<String, u16> {
+        &self.floors
+    }
+    /// Raises the floor to a manifest that was accepted and is being
+    /// installed, so an older signed manifest can no longer be replayed.
+    pub fn record_accepted(&mut self, accepted: &VerifiedManifest) {
+        let manifest = accepted.manifest();
+        let floor = self.floors.entry(manifest.module_id.clone()).or_insert(0);
+        *floor = (*floor).max(manifest.version);
+    }
+}
+
+/// Verifies against a policy at `now_unix` seconds: trusted and unrevoked key
+/// id, signature, digest, validity window, revoked digests, and version floor.
+pub fn verify_manifest_with_policy(
+    manifest: &AuditManifest,
+    wasm: &[u8],
+    policy: &VerificationPolicy,
+    now_unix: u64,
+) -> Result<VerifiedManifest, AuditError> {
+    let trusted = policy
+        .keys
+        .get(&manifest.key_id)
+        .ok_or(AuditError::UnknownKey)?;
+    if trusted.revoked {
+        return Err(AuditError::KeyRevoked);
+    }
+    if policy.require_validity_window && manifest.valid_until == u64::MAX {
+        return Err(AuditError::ValidityRequired);
+    }
+    if now_unix < manifest.valid_from {
+        return Err(AuditError::NotYetValid);
+    }
+    if now_unix > manifest.valid_until {
+        return Err(AuditError::Expired);
+    }
+    if policy.revoked_digests.contains(&manifest.sha256) {
+        return Err(AuditError::ModuleRevoked);
+    }
+    if policy
+        .floors
+        .get(&manifest.module_id)
+        .is_some_and(|floor| manifest.version < *floor)
+    {
+        return Err(AuditError::ModuleRollback);
+    }
+    verify_manifest(manifest, wasm, &trusted.key)
+}
+
+/// Verifies signature, digest and structure against one key. It does not
+/// check the validity window, revocation or version floor; deployments use
+/// [`verify_manifest_with_policy`].
 pub fn verify_manifest(
     manifest: &AuditManifest,
     wasm: &[u8],
@@ -574,6 +745,9 @@ pub fn verify_manifest(
         manifest.rollback.clone(),
         manifest.evidence_schema.clone(),
         manifest.limits.clone(),
+        manifest.key_id.clone(),
+        manifest.valid_from,
+        manifest.valid_until,
         manifest.signature,
     )?;
     if wasm.len() as u64 > MAX_WASM_BYTES {

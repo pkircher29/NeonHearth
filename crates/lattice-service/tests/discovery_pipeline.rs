@@ -33,6 +33,9 @@ fn obs(at: chrono::DateTime<Utc>, kind: PresenceEvidenceKind) -> DiscoveryObserv
             fact(EvidenceFamily::Service, "onvif_uuid", "uuid-camera-1", at),
             fact(EvidenceFamily::Naming, "vendor", "Acme", at),
             fact(EvidenceFamily::Service, "class", "camera", at),
+            // Each identity key needs two independent families agreeing.
+            fact(EvidenceFamily::Service, "vendor", "Acme", at),
+            fact(EvidenceFamily::Naming, "class", "camera", at),
         ],
         presence_source: "sensor-a".into(),
         presence_kind: kind,

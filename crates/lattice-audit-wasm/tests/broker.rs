@@ -61,9 +61,23 @@ fn verified_wasm(w: Vec<u8>, port: u16, limits: Limits) -> VerifiedManifest {
 }
 struct Auth(AtomicUsize);
 impl TargetAuthorizer for Auth {
-    fn authorize(&self, t: IpAddr, i: u32, p: u16) -> Result<AuthorizedTarget, TargetError> {
+    fn redeem_approval(
+        &self,
+        _: Uuid,
+        _: &AuthorizedTarget,
+        _: [u8; 32],
+    ) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn authorize(
+        &self,
+        _witness: AuthorizerWitness,
+        t: IpAddr,
+        i: u32,
+        p: u16,
+    ) -> Result<AuthorizedTarget, TargetError> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        AuthorizedTarget::new(t, i, p)
+        AuthorizedTarget::new(AuthorizerWitness::for_tests(), t, i, p)
     }
 }
 struct Exchange;
@@ -120,7 +134,21 @@ fn response_accumulator_rejects_the_chunk_that_would_cross_its_limit() {
 
 struct RetargetAuth(AuthorizedTarget);
 impl TargetAuthorizer for RetargetAuth {
-    fn authorize(&self, _: IpAddr, _: u32, _: u16) -> Result<AuthorizedTarget, TargetError> {
+    fn redeem_approval(
+        &self,
+        _: Uuid,
+        _: &AuthorizedTarget,
+        _: [u8; 32],
+    ) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn authorize(
+        &self,
+        _witness: AuthorizerWitness,
+        _: IpAddr,
+        _: u32,
+        _: u16,
+    ) -> Result<AuthorizedTarget, TargetError> {
         Ok(self.0.clone())
     }
 }
@@ -128,9 +156,15 @@ impl TargetAuthorizer for RetargetAuth {
 #[tokio::test]
 async fn initial_authorization_must_exactly_match_target_interface_and_port() {
     for authorized in [
-        AuthorizedTarget::new("192.168.1.45".parse().unwrap(), 7, 80).unwrap(),
-        AuthorizedTarget::new(target(), 8, 80).unwrap(),
-        AuthorizedTarget::new(target(), 7, 81).unwrap(),
+        AuthorizedTarget::new(
+            AuthorizerWitness::for_tests(),
+            "192.168.1.45".parse().unwrap(),
+            7,
+            80,
+        )
+        .unwrap(),
+        AuthorizedTarget::new(AuthorizerWitness::for_tests(), target(), 8, 80).unwrap(),
+        AuthorizedTarget::new(AuthorizerWitness::for_tests(), target(), 7, 81).unwrap(),
     ] {
         let exchange = Arc::new(CountExchange(AtomicUsize::new(0)));
         let result = Broker::new(Arc::new(RetargetAuth(authorized)), exchange.clone())
@@ -148,7 +182,21 @@ async fn initial_authorization_must_exactly_match_target_interface_and_port() {
 async fn authorization_rejection_and_exchange_failure_remain_typed() {
     struct Reject;
     impl TargetAuthorizer for Reject {
-        fn authorize(&self, _: IpAddr, _: u32, _: u16) -> Result<AuthorizedTarget, TargetError> {
+        fn redeem_approval(
+            &self,
+            _: Uuid,
+            _: &AuthorizedTarget,
+            _: [u8; 32],
+        ) -> Result<(), TargetError> {
+            Ok(())
+        }
+        fn authorize(
+            &self,
+            _witness: AuthorizerWitness,
+            _: IpAddr,
+            _: u32,
+            _: u16,
+        ) -> Result<AuthorizedTarget, TargetError> {
             Err(TargetError::Rejected)
         }
     }
@@ -285,12 +333,26 @@ struct ScriptedAuth {
     second: Mutex<Option<Result<AuthorizedTarget, TargetError>>>,
 }
 impl TargetAuthorizer for ScriptedAuth {
-    fn authorize(&self, t: IpAddr, i: u32, p: u16) -> Result<AuthorizedTarget, TargetError> {
+    fn redeem_approval(
+        &self,
+        _: Uuid,
+        _: &AuthorizedTarget,
+        _: [u8; 32],
+    ) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn authorize(
+        &self,
+        _witness: AuthorizerWitness,
+        t: IpAddr,
+        i: u32,
+        p: u16,
+    ) -> Result<AuthorizedTarget, TargetError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         if call == 1 {
             self.second.lock().unwrap().take().unwrap()
         } else {
-            AuthorizedTarget::new(t, i, p)
+            AuthorizedTarget::new(AuthorizerWitness::for_tests(), t, i, p)
         }
     }
 }
@@ -311,7 +373,7 @@ impl TargetBoundExchange for CountExchange {
 async fn rejected_or_changed_immediate_reauthorization_never_reaches_exchange() {
     for second in [
         Err(TargetError::Rejected),
-        AuthorizedTarget::new(target(), 8, 80),
+        AuthorizedTarget::new(AuthorizerWitness::for_tests(), target(), 8, 80),
     ] {
         let auth = Arc::new(ScriptedAuth {
             calls: AtomicUsize::new(0),

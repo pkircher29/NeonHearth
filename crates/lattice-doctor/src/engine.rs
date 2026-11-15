@@ -5,6 +5,7 @@ use crate::check::{
     DiagnosticReport, Measurement, Metric, ResolverEvidence, ResolverOutcome, SkipReason, Unit,
 };
 use crate::probe::{LeaseState, Probe, ProbeError, ProbeRequest, ProbeResponse, ProbeTransport};
+use crate::types::{InterfaceName, IpVersion, MacAddr, is_safe_target, sanitize_macs};
 use crate::{Clock, DoctorError, SystemClock};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -15,6 +16,10 @@ const PING_PAYLOAD_BYTES: u16 = 56;
 const MAX_PING_COUNT: u8 = 16;
 const MAX_MTU_PROBE_SIZES: usize = 8;
 const MAX_RESOLVERS: usize = 8;
+/// Echoes per do-not-fragment size: one lost reply must not look like a blackhole.
+const MTU_SAMPLES_PER_SIZE: u32 = 2;
+/// Grace beyond the per-probe timeout before the engine abandons a transport call.
+const PROBE_GRACE_MS: u64 = 500;
 
 /// Thresholds separating "degraded" from "healthy" measurements.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -65,8 +70,27 @@ impl DoctorConfig {
         if self.interface.is_empty() {
             return Err(DoctorError::InvalidConfig("interface must not be empty"));
         }
+        if InterfaceName::parse(&self.interface).is_err() {
+            return Err(DoctorError::InvalidConfig(
+                "interface must start with a letter or digit and use a restricted charset",
+            ));
+        }
         if self.gateway.is_empty() {
             return Err(DoctorError::InvalidConfig("gateway must not be empty"));
+        }
+        let free_text = std::iter::once(&self.gateway)
+            .chain(self.configured_resolvers.iter())
+            .chain([
+                &self.independent_resolver,
+                &self.internet_probe_address,
+                &self.dns_probe_name,
+            ]);
+        for value in free_text {
+            if !is_safe_target(value) {
+                return Err(DoctorError::InvalidConfig(
+                    "targets must start with a letter or digit and use a restricted charset",
+                ));
+            }
         }
         if self.configured_resolvers.is_empty() {
             return Err(DoctorError::InvalidConfig(
@@ -118,6 +142,7 @@ impl DoctorConfig {
 pub struct DiagnosticEngine {
     config: DoctorConfig,
     budget: DiagnosticBudget,
+    local_macs: Vec<MacAddr>,
     clock: Arc<dyn Clock>,
 }
 
@@ -135,8 +160,17 @@ impl DiagnosticEngine {
         Ok(Self {
             config,
             budget,
+            local_macs: Vec::new(),
             clock: Arc::new(clock),
         })
+    }
+
+    /// The host own MAC addresses. They are never reported as duplicate
+    /// claimants, and once known any other responder is a conflict.
+    #[must_use]
+    pub fn with_local_macs(mut self, macs: Vec<MacAddr>) -> Self {
+        self.local_macs = macs;
+        self
     }
 
     /// Run every check in [`CheckKind::EXECUTION_ORDER`], short-circuiting
@@ -179,7 +213,9 @@ impl DiagnosticEngine {
     fn probe_cost(&self, kind: CheckKind) -> u32 {
         match kind {
             CheckKind::Gateway | CheckKind::LossLatency => u32::from(self.config.ping_count),
-            CheckKind::Mtu => self.config.mtu_probe_sizes.len() as u32,
+            CheckKind::Mtu => {
+                (self.config.mtu_probe_sizes.len() as u32).saturating_mul(MTU_SAMPLES_PER_SIZE)
+            }
             CheckKind::Dns => self.config.configured_resolvers.len() as u32 + 1,
             _ => 1,
         }
@@ -215,12 +251,18 @@ impl DiagnosticEngine {
         request: ProbeRequest,
     ) -> Result<ProbeResponse, ProbeError> {
         *used = used.saturating_add(1);
-        transport
-            .probe(Probe {
+        let timeout_ms = self.budget.per_probe_timeout_ms();
+        let limit = std::time::Duration::from_millis(u64::from(timeout_ms) + PROBE_GRACE_MS);
+        // A transport that ignores `timeout_ms` must not hang the whole run.
+        tokio::time::timeout(
+            limit,
+            transport.probe(Probe {
                 request,
-                timeout_ms: self.budget.per_probe_timeout_ms(),
-            })
-            .await
+                timeout_ms,
+            }),
+        )
+        .await
+        .unwrap_or(Err(ProbeError::Timeout))
     }
 
     async fn check_collector<T: ProbeTransport>(&self, t: &T, used: &mut u32) -> CheckResult {
@@ -347,18 +389,20 @@ impl DiagnosticEngine {
         };
         match self.send(t, used, request).await {
             Ok(ProbeResponse::ArpProbe { responding_macs }) => {
-                let count = responding_macs.len();
+                // Untrusted wire data: parse, dedupe, drop the host itself, cap.
+                let macs = sanitize_macs(&responding_macs, &self.local_macs);
+                let count = macs.len();
                 let evidence =
                     vec![self.measurement(Metric::ConflictingMacCount, count as f64, Unit::Count)];
+                // Once the host own MACs are known, any other responder is a
+                // second claimant; otherwise the host may be among the replies.
+                let allowed = usize::from(self.local_macs.is_empty());
                 self.conclude(
                     kind,
-                    count <= 1,
+                    count <= allowed,
                     evidence,
                     Confidence::HIGH,
-                    CheckDetail::DuplicateIp {
-                        address,
-                        macs: responding_macs,
-                    },
+                    CheckDetail::DuplicateIp { address, macs },
                 )
             }
             Ok(_) => self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
@@ -416,32 +460,47 @@ impl DiagnosticEngine {
         }
     }
 
+    /// Sends the echo series. Only an actual timeout counts as loss: a
+    /// transport failure or unsupported probe says nothing about the path.
     async fn ping_sample<T: ProbeTransport>(
         &self,
         t: &T,
         used: &mut u32,
         target: &str,
-    ) -> (u32, Vec<f64>) {
-        let mut sent = 0u32;
-        let mut rtts = Vec::new();
+    ) -> PingSample {
+        let mut sample = PingSample::default();
         for _ in 0..self.config.ping_count {
-            sent += 1;
             let request = ProbeRequest::Ping {
                 target: target.into(),
                 payload_bytes: PING_PAYLOAD_BYTES,
                 dont_fragment: false,
             };
-            if let Ok(ProbeResponse::PingReply { rtt_ms }) = self.send(t, used, request).await {
-                rtts.push(rtt_ms);
+            match self.send(t, used, request).await {
+                Ok(ProbeResponse::PingReply { rtt_ms }) => {
+                    sample.measured += 1;
+                    sample.rtts.push(rtt_ms);
+                }
+                Ok(ProbeResponse::PingTimeout) | Err(ProbeError::Timeout) => sample.measured += 1,
+                Ok(_) => sample.error = Some(UNEXPECTED_RESPONSE.to_owned()),
+                Err(error) => sample.error = Some(error.to_string()),
             }
         }
-        (sent, rtts)
+        sample
     }
 
     async fn check_gateway<T: ProbeTransport>(&self, t: &T, used: &mut u32) -> CheckResult {
         let kind = CheckKind::Gateway;
         let gateway = self.config.gateway.clone();
-        let (sent, rtts) = self.ping_sample(t, used, &gateway).await;
+        let sample = self.ping_sample(t, used, &gateway).await;
+        if sample.measured == 0 {
+            return self.failed_probe(
+                kind,
+                sample
+                    .error
+                    .unwrap_or_else(|| "no ping was measured".into()),
+            );
+        }
+        let (sent, rtts) = (sample.measured, sample.rtts);
         let received = rtts.len() as u32;
         let loss_percent = loss_percent(sent, received);
         let mut evidence = vec![self.measurement(Metric::LossPercent, loss_percent, Unit::Percent)];
@@ -482,7 +541,16 @@ impl DiagnosticEngine {
     async fn check_loss_latency<T: ProbeTransport>(&self, t: &T, used: &mut u32) -> CheckResult {
         let kind = CheckKind::LossLatency;
         let gateway = self.config.gateway.clone();
-        let (sent, mut rtts) = self.ping_sample(t, used, &gateway).await;
+        let sample = self.ping_sample(t, used, &gateway).await;
+        if sample.measured == 0 {
+            return self.failed_probe(
+                kind,
+                sample
+                    .error
+                    .unwrap_or_else(|| "no ping was measured".into()),
+            );
+        }
+        let (sent, mut rtts) = (sample.measured, sample.rtts);
         let received = rtts.len() as u32;
         let loss = loss_percent(sent, received);
         let median = median(&mut rtts);
@@ -511,30 +579,44 @@ impl DiagnosticEngine {
         let mut sizes = self.config.mtu_probe_sizes.clone();
         sizes.sort_unstable_by(|a, b| b.cmp(a));
         sizes.dedup();
+        let ip_version = if self.config.internet_probe_address.contains(':') {
+            IpVersion::V6
+        } else {
+            IpVersion::V4
+        };
         let mut passing: Vec<u16> = Vec::new();
         let mut silent_failures: Vec<u16> = Vec::new();
         for size in sizes {
-            let request = ProbeRequest::Ping {
-                target: self.config.internet_probe_address.clone(),
-                payload_bytes: size,
-                dont_fragment: true,
-            };
-            match self.send(t, used, request).await {
-                Ok(ProbeResponse::PingReply { .. }) => passing.push(size),
-                Ok(ProbeResponse::PingTimeout) => silent_failures.push(size),
-                // The path signaled its MTU properly: not a blackhole.
-                Ok(ProbeResponse::FragmentationNeeded { .. }) => {}
-                Ok(_) => return self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
-                Err(error) => return self.failed_probe(kind, error.to_string()),
+            // Several samples per size: a single lost echo is not a blackhole.
+            let (mut replied, mut timeouts, mut signalled) = (false, 0u32, false);
+            for _ in 0..MTU_SAMPLES_PER_SIZE {
+                let request = ProbeRequest::Ping {
+                    target: self.config.internet_probe_address.clone(),
+                    payload_bytes: size,
+                    dont_fragment: true,
+                };
+                match self.send(t, used, request).await {
+                    Ok(ProbeResponse::PingReply { .. }) => replied = true,
+                    Ok(ProbeResponse::PingTimeout) | Err(ProbeError::Timeout) => timeouts += 1,
+                    // The path signaled its MTU properly: not a blackhole.
+                    Ok(ProbeResponse::FragmentationNeeded { .. }) => signalled = true,
+                    Ok(_) => return self.failed_probe(kind, UNEXPECTED_RESPONSE.into()),
+                    Err(error) => return self.failed_probe(kind, error.to_string()),
+                }
+            }
+            if replied {
+                passing.push(size);
+            } else if !signalled && timeouts == MTU_SAMPLES_PER_SIZE {
+                silent_failures.push(size);
             }
         }
-        let largest_passing_bytes = passing.iter().copied().max();
-        let smallest_failing_bytes = silent_failures.iter().copied().min();
+        let largest_passing = passing.iter().copied().max();
+        let smallest_failing = silent_failures.iter().copied().min();
         let mut evidence = Vec::new();
-        if let Some(bytes) = largest_passing_bytes {
+        if let Some(bytes) = largest_passing {
             evidence.push(self.measurement(Metric::PassingMtuBytes, f64::from(bytes), Unit::Bytes));
         }
-        if let Some(bytes) = smallest_failing_bytes {
+        if let Some(bytes) = smallest_failing {
             evidence.push(self.measurement(Metric::FailingMtuBytes, f64::from(bytes), Unit::Bytes));
         }
         self.conclude(
@@ -543,8 +625,9 @@ impl DiagnosticEngine {
             evidence,
             Confidence::MEDIUM,
             CheckDetail::Mtu {
-                largest_passing_bytes,
-                smallest_failing_bytes,
+                largest_passing_payload_bytes: largest_passing,
+                smallest_failing_payload_bytes: smallest_failing,
+                ip_version,
             },
         )
     }
@@ -736,6 +819,14 @@ impl DiagnosticEngine {
             detail: Some(CheckDetail::ProbeFailure { error }),
         }
     }
+}
+
+#[derive(Default)]
+struct PingSample {
+    /// Replies plus genuine timeouts.
+    measured: u32,
+    rtts: Vec<f64>,
+    error: Option<String>,
 }
 
 fn dependency_skip(kind: CheckKind, checks: &[CheckResult]) -> Option<SkipReason> {

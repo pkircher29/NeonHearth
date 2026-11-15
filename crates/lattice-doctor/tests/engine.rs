@@ -13,6 +13,7 @@ use lattice_doctor::probe::{
     RouteEntry,
 };
 use lattice_doctor::repair::{ApprovalAction, RepairContext, RepairPlan, plan_repair};
+use lattice_doctor::types::IpVersion;
 use std::sync::Mutex;
 
 fn config() -> DoctorConfig {
@@ -96,10 +97,10 @@ async fn healthy_network_passes_every_check_in_dag_order() {
         assert_eq!(check.status, CheckStatus::Passed, "{:?}", check.kind);
     }
     // collector 1 + link 1 + ip 1 + arp 1 + wifi 1 + gateway 3 + router 1
-    // + loss 3 + mtu 3 + dns 3 + route 1 + internet 1
-    assert_eq!(report.probes_used, 20);
+    // + loss 3 + mtu 3 sizes x 2 samples + dns 3 + route 1 + internet 1
+    assert_eq!(report.probes_used, 23);
     assert!(!report.budget_exhausted);
-    assert_eq!(transport.probes().len(), 20);
+    assert_eq!(transport.probes().len(), 23);
 }
 
 #[tokio::test]
@@ -260,8 +261,9 @@ async fn mtu_blackhole_is_detected_from_df_probe_sizes() {
     assert_eq!(
         mtu.kind,
         DiagnosisKind::MtuBlackhole {
-            largest_passing_bytes: Some(1_400),
-            smallest_failing_bytes: Some(1_500),
+            largest_passing_payload_bytes: Some(1_400),
+            smallest_failing_payload_bytes: Some(1_500),
+            ip_version: IpVersion::V4,
         }
     );
     assert!(
@@ -282,7 +284,7 @@ async fn duplicate_ip_uses_the_address_learned_from_dhcp_check() {
         ProbeRequest::ArpProbe { address, .. } => {
             assert_eq!(address, "192.168.1.50");
             Ok(ProbeResponse::ArpProbe {
-                responding_macs: vec!["aa:aa:aa:aa:aa:aa".into(), "bb:bb:bb:bb:bb:bb".into()],
+                responding_macs: vec!["aa:aa:aa:aa:aa:aa".into(), "ac:ac:ac:ac:ac:ac".into()],
             })
         }
         other => healthy(other),
@@ -293,7 +295,10 @@ async fn duplicate_ip_uses_the_address_learned_from_dhcp_check() {
     assert!(diagnoses.iter().any(|d| d.kind
         == DiagnosisKind::DuplicateIp {
             address: "192.168.1.50".into(),
-            macs: vec!["aa:aa:aa:aa:aa:aa".into(), "bb:bb:bb:bb:bb:bb".into()],
+            macs: vec![
+                "aa:aa:aa:aa:aa:aa".parse().unwrap(),
+                "ac:ac:ac:ac:ac:ac".parse().unwrap()
+            ],
         }));
 }
 
