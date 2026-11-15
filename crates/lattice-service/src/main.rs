@@ -273,6 +273,24 @@ pub(crate) async fn serve(
         &state,
         shutdown_rx.clone(),
     );
+    let maintenance: std::sync::Arc<dyn lattice_service::maintenance::MaintenanceRunner> =
+        std::sync::Arc::new(lattice_service::maintenance::StoreMaintenance {
+            db: lattice_store::DbMaintenance::new(pool.clone(), paths.database.clone()),
+            policy: lattice_store::MaintenancePolicy::default(),
+            batch_limit: lattice_service::maintenance::BATCH_LIMIT,
+            remote_access: lattice_store::RemoteAccessRepository::new(pool.clone()),
+            policy_repo: PolicyRepository::new(pool.clone()),
+        });
+    supervise_background(
+        "maintenance",
+        Some(lattice_service::maintenance::spawn(
+            maintenance,
+            lattice_service::maintenance::MaintenanceConfig::default(),
+            shutdown_rx.clone(),
+        )),
+        &state,
+        shutdown_rx.clone(),
+    );
     if let Some(path) = std::env::var_os("LATTICE_MQTT_CREDENTIAL_FILE") {
         supervise_background(
             "mqtt",

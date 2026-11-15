@@ -565,6 +565,10 @@ pub async fn camera_inventory(
 #[derive(Serialize, ToSchema)]
 pub struct Snapshot {
     pub sequence: u64,
+    /// Identifies the run of the event bus `sequence` belongs to (decimal
+    /// string: it exceeds 2^53). Present it as `epoch` when opening the event
+    /// stream so a position from before a service restart gets a resync.
+    pub events_epoch: String,
     pub devices: Vec<DeviceSnapshot>,
     pub next_after: Option<DeviceId>,
     pub service_status: String,
@@ -705,6 +709,7 @@ pub async fn state(
     }
     Ok(Json(Snapshot {
         sequence,
+        events_epoch: state.events().epoch().to_string(),
         devices: mapped,
         next_after,
         service_status: state.service_status().await,

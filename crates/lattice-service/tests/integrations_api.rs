@@ -563,6 +563,53 @@ async fn events_feed_filters_to_scoped_payload_types_and_keeps_raw_sequences() {
 }
 
 #[tokio::test]
+async fn events_cursor_from_another_service_run_requires_resync() {
+    let fixture = fixture().await;
+    let (_, token) = mint(&fixture, "ha", &["presence:read"]).await;
+    let auth = Auth::Bearer(token);
+    for _ in 0..3 {
+        fixture
+            .state
+            .events()
+            .publish(Utc::now(), presence_event())
+            .await;
+    }
+    let epoch = fixture.state.events().epoch();
+
+    // The running epoch resumes normally and is reported back for the next call.
+    let response = send(
+        &fixture.router,
+        "GET",
+        &format!("/api/v1/integrations/v1/events?after_sequence=1&epoch={epoch}"),
+        None,
+        &auth,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["resync"], false);
+    assert_eq!(body["events"].as_array().unwrap().len(), 2);
+    assert_eq!(body["epoch"], epoch.to_string());
+
+    // The same sequence from a different run names a different event: resync.
+    let stale = epoch.wrapping_add(1);
+    let response = send(
+        &fixture.router,
+        "GET",
+        &format!("/api/v1/integrations/v1/events?after_sequence=1&epoch={stale}"),
+        None,
+        &auth,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["resync"], true);
+    assert_eq!(body["events"], serde_json::json!([]));
+    assert_eq!(body["next_after"], 3);
+    assert_eq!(body["epoch"], epoch.to_string());
+}
+
+#[tokio::test]
 async fn events_long_poll_wakes_on_a_scoped_event_and_times_out_otherwise() {
     let fixture = fixture().await;
     let (_, token) = mint(&fixture, "ha", &["presence:read"]).await;

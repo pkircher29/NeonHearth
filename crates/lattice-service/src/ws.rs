@@ -26,7 +26,22 @@ pub enum ServerMessage {
 }
 
 pub async fn resume_messages(bus: &EventBus, sequence: u64) -> Vec<ServerMessage> {
-    match bus.resume_after(sequence).await {
+    resume_to_messages(bus.resume_after(sequence).await)
+}
+
+/// Like [`resume_messages`] for a client that remembers which bus run its
+/// sequence belongs to: a position from another run (the service restarted)
+/// answers with a resync instead of replaying unrelated events.
+pub async fn resume_messages_with_epoch(
+    bus: &EventBus,
+    epoch: Option<u64>,
+    sequence: u64,
+) -> Vec<ServerMessage> {
+    resume_to_messages(bus.resume_after_epoch(epoch, sequence).await)
+}
+
+fn resume_to_messages(resume: Resume) -> Vec<ServerMessage> {
+    match resume {
         Resume::Events(events) => events.into_iter().map(ServerMessage::Event).collect(),
         Resume::SnapshotRequired => vec![ServerMessage::ResyncRequired],
     }
@@ -145,6 +160,7 @@ pub(crate) async fn serve_socket(
     socket: WebSocket,
     bus: EventBus,
     after_sequence: u64,
+    epoch: Option<u64>,
     guard: SocketGuard,
 ) {
     let SocketGuard {
@@ -155,9 +171,10 @@ pub(crate) async fn serve_socket(
         permit: _permit,
     } = guard;
     let send_limit = limits.send_timeout;
-    // Subscribe before reading replay so publish cannot be lost between the two operations.
-    let mut receiver = bus.subscribe();
-    let messages = resume_messages(&bus, after_sequence).await;
+    // Subscribing and computing the replay under the bus lock means no publish can fall
+    // between the two; a position from an earlier run of the bus gets a resync.
+    let (mut receiver, resume) = bus.subscribe_and_resume(epoch, after_sequence).await;
+    let messages = resume_to_messages(resume);
     let (mut sink, mut stream) = socket.split();
     let mut last_sent_sequence = after_sequence;
 
@@ -312,6 +329,27 @@ mod tests {
             matches!(messages.as_slice(), [ServerMessage::Event(first), ServerMessage::Event(second)] if first.sequence == 2 && second.sequence == 3)
         );
         assert!(resume_messages(&bus, 3).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_position_from_an_earlier_bus_run_requires_resync() {
+        let restarted = EventBus::new(8, 8);
+        // Any value other than the running bus's epoch stands for an earlier run.
+        let stale = Some(restarted.epoch().wrapping_add(1));
+        restarted.publish(Utc::now(), payload()).await;
+        restarted.publish(Utc::now(), payload()).await;
+
+        assert_eq!(
+            resume_messages_with_epoch(&restarted, stale, 1).await,
+            vec![ServerMessage::ResyncRequired]
+        );
+        let same_run = resume_messages_with_epoch(&restarted, Some(restarted.epoch()), 1).await;
+        assert!(matches!(same_run.as_slice(), [ServerMessage::Event(e)] if e.sequence == 2));
+        // Clients that do not send an epoch keep the legacy behaviour.
+        assert_eq!(
+            resume_messages_with_epoch(&restarted, None, 2).await.len(),
+            0
+        );
     }
 
     #[test]

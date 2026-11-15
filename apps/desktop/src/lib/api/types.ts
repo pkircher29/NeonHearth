@@ -81,6 +81,8 @@ export type ServerMessage =
 
 export interface Snapshot {
   sequence: number;
+  /** Identifies the service run `sequence` belongs to; presented as `epoch` when opening the event stream. */
+  events_epoch?: string;
   devices: DeviceSnapshot[];
   next_after: string | null;
   service_status: string;

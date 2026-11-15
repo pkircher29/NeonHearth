@@ -7,7 +7,7 @@ use lattice_domain::{
 };
 use lattice_event_bus::EventBus;
 use lattice_store::{
-    ActuationReservation, M2StateRepository, PolicyRepository, W6PriorStateRepository,
+    ActuationReservation, ClockStatus, M2StateRepository, PolicyRepository, W6PriorStateRepository,
 };
 use lattice_w6::{
     Connector, DiscoveryStatus, Error as W6Error, RequestedQuarantine, Transport, Verification,
@@ -391,6 +391,21 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         self.evaluate(self.repo.load(device).await?.unwrap_or(policy), now)
             .await
     }
+    /// Whether deadline expiry may drive enforcement. Fails closed: an unreadable clock
+    /// state is treated as untrusted, which only ever downgrades to owner attention.
+    async fn clock_trusted(&self, now: DateTime<Utc>) -> bool {
+        match self.repo.clock_status(now).await {
+            Ok(ClockStatus::Trusted) => true,
+            Ok(ClockStatus::Suspect(reason)) => {
+                tracing::debug!(%reason, "policy clock is suspect; deadline expiry is not enforced");
+                false
+            }
+            Err(error) => {
+                tracing::warn!(%error, "policy clock state unreadable; deadline expiry is not enforced");
+                false
+            }
+        }
+    }
     pub async fn enabled(&self) -> anyhow::Result<bool> {
         Ok(self.repo.baseline_started_at().await?.is_some())
     }
@@ -453,7 +468,10 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         p: DevicePolicy,
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
-        let evaluation = evaluate_policy(&p, now);
+        // A deadline expiry is only evidence while the wall clock is trusted; a clock that
+        // jumped must degrade to owner attention rather than quarantine or ban.
+        let clock_trusted = self.clock_trusted(now).await;
+        let evaluation = evaluate_policy_guarded(&p, now, clock_trusted);
         let previously_published = self.repo.published_decision(p.device_id).await?;
         // Recover the historical split-ack crash window from older binaries:
         // an acknowledged matching verified decision proves publication was
@@ -1022,7 +1040,8 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         if self.repo.load(d).await?.is_none() {
             return Err(PolicyActionError::NotEnrolled.into());
         }
-        self.repo.extend_once(d, until).await?;
+        // Clock-aware: an extension already in the past would burn the single extension.
+        self.repo.extend_once_at(d, until, now).await?;
         let p = self.repo.load(d).await?.context("policy disappeared")?;
         self.evaluate_locked(p, now).await
     }
@@ -1035,6 +1054,15 @@ fn evaluate_policy(p: &DevicePolicy, now: DateTime<Utc>) -> Evaluation {
     // Cohort membership is persisted on the policy row; the engine's baseline timestamp is
     // intentionally irrelevant to evaluation after enrollment.
     lattice_policy::PolicyEngine::new(p.first_seen_at).evaluate(p, now)
+}
+/// [`evaluate_policy`] with the clock-trust gate; used wherever a deadline expiry can be the
+/// deciding reason. Owner-decided paths use the plain form: their outcome is not deadline-driven.
+fn evaluate_policy_guarded(
+    p: &DevicePolicy,
+    now: DateTime<Utc>,
+    clock_trusted: bool,
+) -> Evaluation {
+    lattice_policy::PolicyEngine::new(p.first_seen_at).evaluate_guarded(p, now, clock_trusted)
 }
 fn evidence_summary(p: &DevicePolicy) -> String {
     match p.risk {

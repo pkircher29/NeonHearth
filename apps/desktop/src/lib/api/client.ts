@@ -692,6 +692,11 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
     return value;
   }
 
+  // The service run the latest snapshot's sequence belongs to. Presented when the event
+  // stream opens so a position from before a service restart gets a resync instead of a
+  // silent mis-resume. Absent against an older service, which keeps the epoch-less resume.
+  let eventsEpoch: string | undefined;
+
   async function snapshot(options?: SnapshotPageOptions): Promise<Snapshot> {
     if (options?.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 256)) {
       throw new Error('Invalid snapshot page');
@@ -705,6 +710,8 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
     const query = params.toString();
     const value = await request(query ? `/api/v1/state?${query}` : '/api/v1/state', authorized('GET'), options?.signal);
     if (!isSnapshot(value)) throw new Error('Invalid snapshot response');
+    const epoch = (value as { events_epoch?: unknown }).events_epoch;
+    eventsEpoch = typeof epoch === 'string' && /^[0-9]{1,20}$/.test(epoch) ? epoch : undefined;
     return value;
   }
 
@@ -755,7 +762,7 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
       const { ticket } = await issueEventTicket(signal);
       const url = new URL('/api/v1/events', baseUrl);
       url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-      url.search = new URLSearchParams({ ticket, after_sequence: String(afterSequence) }).toString();
+      url.search = new URLSearchParams({ ticket, after_sequence: String(afterSequence), ...(eventsEpoch ? { epoch: eventsEpoch } : {}) }).toString();
       const socket = new WebSocketImpl(url.toString());
       socket.onopen = () => onState('open');
       socket.onclose = () => onState('closed');

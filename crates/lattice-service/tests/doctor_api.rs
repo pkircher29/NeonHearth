@@ -483,6 +483,10 @@ async fn minting_an_approval_returns_a_ten_minute_token_and_is_audited() {
         rows[0].detail["approval_id"], approval["approval_id"],
         "{rows:?}"
     );
+    // The bearer owner is recorded through the shared Principal helper (a phone session
+    // is attributed to the phone by the same code path).
+    assert_eq!(rows[0].actor, lattice_store::AuditActor::Owner);
+    assert_eq!(rows[0].detail["principal"], "owner");
 }
 
 // ---------------------------------------------------------------------------
