@@ -19,6 +19,7 @@ pub mod policy;
 pub mod restore;
 pub mod runtime;
 mod security;
+pub mod service_stop;
 mod state;
 pub mod tailscale;
 pub mod vault;
