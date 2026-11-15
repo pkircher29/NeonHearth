@@ -32,7 +32,7 @@
 <section class="sign-in" aria-labelledby="sign-in-heading">
   <p class="kicker">SIGN IN / PROTECTED</p>
   <h1 id="sign-in-heading">Unlock your home.</h1>
-  <p class="muted">The collector refused an unauthenticated request. Sign in with the credential for this device; nothing is stored beyond this browser tab unless you ask.</p>
+  <p class="muted">The collector refused an unauthenticated request. Sign in with the credential for this device; nothing is stored beyond this browser tab unless you ask. Opening NeonHearth from the Start-menu launcher pairs this tab automatically and keeps that pairing in this tab's session storage so a reload does not sign you out; Sign out removes it.</p>
   <div class="tabs" role="tablist" aria-label="Credential kind">
     <button type="button" role="tab" aria-selected={mode === 'owner'} class:active={mode === 'owner'} onclick={() => (mode = 'owner')}>This computer</button>
     <button type="button" role="tab" aria-selected={mode === 'phone'} class:active={mode === 'phone'} onclick={() => (mode = 'phone')}>A paired phone</button>

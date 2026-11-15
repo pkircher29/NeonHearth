@@ -32,6 +32,11 @@ export const HISTORY_LIMIT = 200;
 export const UNCERTAIN_BELOW = 0.6;
 export const DRAFT_MAX_BYTES = 512 * 1024;
 const MAX_COORDINATE_M = 10_000;
+
+/** The wire contract's bounds. The reducer enforces the same numbers the validator checks, so an edit that would produce an unsavable plan is refused up front. */
+export interface PlanLimits { floors: number; level: number; walls: number; rooms: number; roomPoints: number; openings: number }
+export const PLAN_LIMITS: PlanLimits = { floors: 64, level: 100, walls: 2048, rooms: 256, roomPoints: 256, openings: 64 };
+const UNBOUNDED: PlanLimits = { floors: Infinity, level: Infinity, walls: Infinity, rooms: Infinity, roomPoints: Infinity, openings: Infinity };
 const EPSILON = 1e-6;
 
 // ---- Geometry ----
@@ -92,6 +97,35 @@ export function copyFloorFootprint(source: Floor, destination: Floor, newId: () 
   };
 }
 
+/** Every id in the plan (floors, walls, openings, rooms): the reducer keeps them unique across the whole document. */
+function allIds(plan: HomePlan): Set<string> {
+  const ids = new Set<string>();
+  for (const floor of plan.floors) { ids.add(floor.floor_id); for (const id of geometryIds(floor)) ids.add(id); }
+  return ids;
+}
+
+const cross = (a: PlanPoint, b: PlanPoint, c: PlanPoint) => (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+function segmentsCross(a: PlanPoint, b: PlanPoint, c: PlanPoint, d: PlanPoint): boolean {
+  const d1 = cross(a, b, c); const d2 = cross(a, b, d); const d3 = cross(c, d, a); const d4 = cross(c, d, b);
+  return ((d1 > EPSILON && d2 < -EPSILON) || (d1 < -EPSILON && d2 > EPSILON)) && ((d3 > EPSILON && d4 < -EPSILON) || (d3 < -EPSILON && d4 > EPSILON));
+}
+/** Reasons a room outline cannot be a room: too few distinct corners, no area, or edges that cross each other. */
+export function polygonProblem(polygon: PlanPoint[]): string | null {
+  const points = polygon.length > 1 && samePoint(polygon[0]!, polygon[polygon.length - 1]!) ? polygon.slice(0, -1) : polygon;
+  if (points.length < 3) return 'A room needs at least three corners.';
+  for (let i = 0; i < points.length; i += 1) if (samePoint(points[i]!, points[(i + 1) % points.length]!)) return 'Two neighbouring corners are in the same place.';
+  for (let i = 0; i < points.length; i += 1) {
+    for (let j = i + 1; j < points.length; j += 1) {
+      if (j === i + 1 || (i === 0 && j === points.length - 1)) continue;
+      if (segmentsCross(points[i]!, points[(i + 1) % points.length]!, points[j]!, points[(j + 1) % points.length]!)) return 'The outline crosses itself.';
+    }
+  }
+  let area2 = 0;
+  for (let i = 0; i < points.length; i += 1) { const a = points[i]!; const b = points[(i + 1) % points.length]!; area2 += a.x * b.y - b.x * a.y; }
+  if (Math.abs(area2) / 2 < 1e-4) return 'The corners enclose no area.';
+  return null;
+}
+
 function geometryIds(floor: Floor): string[] {
   return [...floor.walls.flatMap(wall => [wall.wall_id, ...wall.openings.map(opening => opening.opening_id)]), ...floor.rooms.map(room => room.room_id)];
 }
@@ -135,7 +169,7 @@ function applyEdit(doc: EditorDoc, action: EditAction, grid: number): EditorDoc 
       if (!validThickness(thickness_m)) return null;
       return withFloor(doc, action.floor_id, (floor) => {
         // The same two endpoints (either way round) are the same wall; a second copy would double-draw it.
-        if (floor.walls.some((wall) => wall.wall_id === action.wall_id || sameSegment(wall, start, end))) return null;
+        if (floor.walls.length >= PLAN_LIMITS.walls || allIds(doc.plan).has(action.wall_id) || floor.walls.some((wall) => sameSegment(wall, start, end))) return null;
         return { ...floor, walls: [...floor.walls, { wall_id: action.wall_id, start, end, thickness_m, openings: [] }] };
       });
     }
@@ -155,10 +189,12 @@ function applyEdit(doc: EditorDoc, action: EditAction, grid: number): EditorDoc 
       return withWall(doc, action.floor_id, action.wall_id, () => []);
     case 'split_wall': {
       if (!validPoint(action.at)) return null;
-      return withWall(doc, action.floor_id, action.wall_id, (wall) => {
+      return withWall(doc, action.floor_id, action.wall_id, (wall, floor) => {
         const length = wallLength(wall);
         if (length < EPSILON) return null;
-        const t = ((action.at.x - wall.start.x) * (wall.end.x - wall.start.x) + (action.at.y - wall.start.y) * (wall.end.y - wall.start.y)) / (length * length);
+        if (floor.walls.length >= PLAN_LIMITS.walls || allIds(doc.plan).has(action.new_wall_id)) return null;
+        // Clamped: a point beyond an end projects onto that end (and is then refused as no split), never outside the wall.
+        const t = Math.min(1, Math.max(0, ((action.at.x - wall.start.x) * (wall.end.x - wall.start.x) + (action.at.y - wall.start.y) * (wall.end.y - wall.start.y)) / (length * length)));
         const projected = { x: wall.start.x + t * (wall.end.x - wall.start.x), y: wall.start.y + t * (wall.end.y - wall.start.y) };
         // An exact split keeps a point that already lies on the wall (a snapped "on wall" click) where it is.
         const split = action.exact
@@ -184,7 +220,8 @@ function applyEdit(doc: EditorDoc, action: EditAction, grid: number): EditorDoc 
     }
     case 'add_opening': {
       const opening = { ...action.opening, offset_m: snap(action.opening.offset_m, grid), width_m: snap(action.opening.width_m, grid) };
-      return withWall(doc, action.floor_id, action.wall_id, (wall) => (openingFits(wall, opening) ? [{ ...wall, openings: [...wall.openings, opening] }] : null));
+      if (!['door', 'window', 'stair'].includes(opening.kind)) return null;
+      return withWall(doc, action.floor_id, action.wall_id, (wall) => (openingFits(wall, opening) && wall.openings.length < PLAN_LIMITS.openings && !allIds(doc.plan).has(opening.opening_id) ? [{ ...wall, openings: [...wall.openings, opening] }] : null));
     }
     case 'delete_opening':
       return withWall(doc, action.floor_id, action.wall_id, (wall) => {
@@ -192,9 +229,10 @@ function applyEdit(doc: EditorDoc, action: EditAction, grid: number): EditorDoc 
         return [{ ...wall, openings: wall.openings.filter((opening) => opening.opening_id !== action.opening_id) }];
       });
     case 'add_room': {
-      if (!validName(action.name) || action.polygon.length < 3 || !action.polygon.every(validPoint)) return null;
+      if (!validName(action.name) || action.polygon.length < 3 || action.polygon.length > PLAN_LIMITS.roomPoints || !action.polygon.every(validPoint)) return null;
       const polygon = action.polygon.map(point => place(point, action.exact));
-      return withFloor(doc, action.floor_id, (floor) => ({ ...floor, rooms: [...floor.rooms, { room_id: action.room_id, name: action.name.trim(), polygon }] }));
+      if (polygonProblem(polygon) !== null) return null;
+      return withFloor(doc, action.floor_id, (floor) => (floor.rooms.length >= PLAN_LIMITS.rooms || allIds(doc.plan).has(action.room_id) ? null : { ...floor, rooms: [...floor.rooms, { room_id: action.room_id, name: action.name.trim(), polygon }] }));
     }
     case 'rename_room': {
       if (!validName(action.name)) return null;
@@ -210,8 +248,8 @@ function applyEdit(doc: EditorDoc, action: EditAction, grid: number): EditorDoc 
         return { ...floor, rooms: floor.rooms.filter((room) => room.room_id !== action.room_id) };
       });
     case 'add_floor': {
-      if (!validName(action.name) || !validCeiling(action.ceiling_height_m) || !Number.isSafeInteger(action.level)) return null;
-      if (doc.plan.floors.some((floor) => floor.level === action.level)) return null;
+      if (!validName(action.name) || !validCeiling(action.ceiling_height_m) || !Number.isSafeInteger(action.level) || Math.abs(action.level) > PLAN_LIMITS.level) return null;
+      if (doc.plan.floors.length >= PLAN_LIMITS.floors || allIds(doc.plan).has(action.floor_id) || doc.plan.floors.some((floor) => floor.level === action.level)) return null;
       const floor: Floor = { floor_id: action.floor_id, level: action.level, name: action.name.trim(), ceiling_height_m: action.ceiling_height_m, walls: [], rooms: [] };
       return { ...doc, plan: { ...doc.plan, floors: [...doc.plan.floors, floor].sort((a, b) => a.level - b.level) } };
     }
@@ -224,7 +262,7 @@ function applyEdit(doc: EditorDoc, action: EditAction, grid: number): EditorDoc 
       const existing = doc.plan.floors.find(item => item.floor_id === floor.floor_id);
       if (existing && (existing.walls.length || existing.rooms.length)) return null;
       if (existing && (existing.level !== floor.level || existing.name !== floor.name || existing.ceiling_height_m !== floor.ceiling_height_m)) return null;
-      if (!existing && (doc.plan.floors.length >= 64 || doc.plan.floors.some(item => item.level === floor.level))) return null;
+      if (!existing && (doc.plan.floors.length >= PLAN_LIMITS.floors || doc.plan.floors.some(item => item.level === floor.level))) return null;
       const used = new Set(doc.plan.floors.flatMap(item => [item.floor_id, ...geometryIds(item)]));
       const ids = geometryIds(floor);
       if (ids.some(id => used.has(id) || id === floor.floor_id) || new Set(ids).size !== ids.length) return null;
@@ -275,6 +313,43 @@ function applyEdit(doc: EditorDoc, action: EditAction, grid: number): EditorDoc 
       return { ...doc, placements: doc.placements.filter((candidate) => candidate.device_id !== action.device_id) };
     }
   }
+}
+
+/** The specific, owner-readable reason an edit was refused; null when it would be accepted (or there is no more specific reason). */
+export function rejectionReason(state: EditorState, action: EditorAction): string | null {
+  if (action.type === 'undo' || action.type === 'redo') return null;
+  const grid = action.grid_m === 0.0254 ? 0.0254 : GRID_M;
+  let doc: EditorDoc = state.doc;
+  const edits = action.type === 'batch' ? action.actions : [action];
+  for (const edit of edits) {
+    const next = applyEdit(doc, edit, grid);
+    if (next) { doc = next; continue; }
+    const floor = 'floor_id' in edit ? doc.plan.floors.find((candidate) => candidate.floor_id === edit.floor_id) : undefined;
+    const ids = allIds(doc.plan);
+    switch (edit.type) {
+      case 'add_wall': case 'split_wall':
+        if (floor && floor.walls.length >= PLAN_LIMITS.walls) return `A floor holds at most ${PLAN_LIMITS.walls} walls.`;
+        if (ids.has(edit.type === 'add_wall' ? edit.wall_id : edit.new_wall_id)) return 'That wall id is already used in this plan.';
+        return null;
+      case 'add_opening':
+        if (floor?.walls.find((wall) => wall.wall_id === edit.wall_id)?.openings.length === PLAN_LIMITS.openings) return `A wall holds at most ${PLAN_LIMITS.openings} openings.`;
+        if (ids.has(edit.opening.opening_id)) return 'That opening id is already used in this plan.';
+        return null;
+      case 'add_room': {
+        if (edit.polygon.length > PLAN_LIMITS.roomPoints) return `A room outline has at most ${PLAN_LIMITS.roomPoints} corners.`;
+        if (floor && floor.rooms.length >= PLAN_LIMITS.rooms) return `A floor holds at most ${PLAN_LIMITS.rooms} rooms.`;
+        if (ids.has(edit.room_id)) return 'That room id is already used in this plan.';
+        return polygonProblem(edit.polygon.map((point) => (edit.exact ? { x: round6(point.x), y: round6(point.y) } : snapPoint(point, grid))));
+      }
+      case 'add_floor':
+        if (doc.plan.floors.length >= PLAN_LIMITS.floors) return `A plan holds at most ${PLAN_LIMITS.floors} floors.`;
+        if (ids.has(edit.floor_id)) return 'That floor id is already used in this plan.';
+        if (Math.abs(edit.level) > PLAN_LIMITS.level) return `Floor levels run from -${PLAN_LIMITS.level} to ${PLAN_LIMITS.level}.`;
+        return null;
+      default: return null;
+    }
+  }
+  return null;
 }
 
 export function reduceEditor(state: EditorState, action: EditorAction): EditorState {
@@ -332,27 +407,28 @@ function isOpening(value: unknown): value is Opening {
   return isRecord(value) && isOpaqueId(value.opening_id) && typeof value.kind === 'string' && openingKinds.has(value.kind)
     && isCoordinate(value.offset_m) && value.offset_m >= 0 && isCoordinate(value.width_m) && value.width_m > 0;
 }
-function isWall(value: unknown): value is Wall {
+function isWall(value: unknown, limits: PlanLimits = PLAN_LIMITS): value is Wall {
   return isRecord(value) && isOpaqueId(value.wall_id) && isPoint(value.start) && isPoint(value.end)
     && (value.thickness_m === undefined || validThickness(value.thickness_m))
-    && Array.isArray(value.openings) && value.openings.length <= 64 && value.openings.every(isOpening)
+    && Array.isArray(value.openings) && value.openings.length <= limits.openings && value.openings.every(isOpening)
     && value.openings.every((opening) => openingFits({ start: (value as unknown as Wall).start, end: (value as unknown as Wall).end }, opening as Opening));
 }
-function isRoom(value: unknown): value is Room {
+function isRoom(value: unknown, limits: PlanLimits = PLAN_LIMITS): value is Room {
   return isRecord(value) && isOpaqueId(value.room_id) && typeof value.name === 'string' && value.name.length > 0 && value.name.length <= 64
-    && Array.isArray(value.polygon) && value.polygon.length >= 3 && value.polygon.length <= 256 && value.polygon.every(isPoint);
+    && Array.isArray(value.polygon) && value.polygon.length >= 3 && value.polygon.length <= limits.roomPoints && value.polygon.every(isPoint);
 }
-function isFloor(value: unknown): value is Floor {
-  return isRecord(value) && isOpaqueId(value.floor_id) && Number.isSafeInteger(value.level) && Math.abs(value.level as number) <= 100
+function isFloor(value: unknown, limits: PlanLimits = PLAN_LIMITS): value is Floor {
+  return isRecord(value) && isOpaqueId(value.floor_id) && Number.isSafeInteger(value.level) && Math.abs(value.level as number) <= limits.level
     && typeof value.name === 'string' && value.name.length > 0 && value.name.length <= 64
     && typeof value.ceiling_height_m === 'number' && validCeiling(value.ceiling_height_m)
-    && Array.isArray(value.walls) && value.walls.length <= 2048 && value.walls.every(isWall)
-    && Array.isArray(value.rooms) && value.rooms.length <= 256 && value.rooms.every(isRoom);
+    && Array.isArray(value.walls) && value.walls.length <= limits.walls && value.walls.every((wall) => isWall(wall, limits))
+    && Array.isArray(value.rooms) && value.rooms.length <= limits.rooms && value.rooms.every((room) => isRoom(room, limits));
 }
-export function isHomePlan(value: unknown): value is HomePlan {
+/** `limits` only widens the size bounds; every structural rule (ids, finite numbers, shapes) still applies. */
+export function isHomePlan(value: unknown, limits: PlanLimits = PLAN_LIMITS): value is HomePlan {
   return isRecord(value) && isOpaqueId(value.home_id) && Number.isSafeInteger(value.version) && (value.version as number) >= 0
     && typeof value.name === 'string' && value.name.length > 0 && value.name.length <= 64
-    && Array.isArray(value.floors) && value.floors.length <= 64 && value.floors.every(isFloor);
+    && Array.isArray(value.floors) && value.floors.length <= limits.floors && value.floors.every((floor) => isFloor(floor, limits));
 }
 export function isPlacement(value: unknown): value is Placement {
   return isRecord(value) && isOpaqueId(value.placement_id) && isOpaqueId(value.device_id) && isOpaqueId(value.floor_id)
@@ -373,10 +449,25 @@ function isHomeSnapshot(value: unknown): value is HomeSnapshot {
     && Array.isArray(value.estimates) && value.estimates.length <= 4096 && value.estimates.every(isEstimate);
 }
 
+/** A save was refused locally because the plan is not storable; the message is owner-readable. */
+export class PlanLimitError extends Error { constructor(message: string) { super(message); this.name = 'PlanLimitError'; } }
+/** Which size bounds a structurally valid plan exceeds. */
+export function overLimit(plan: HomePlan): string {
+  const parts: string[] = [];
+  if (plan.floors.length > PLAN_LIMITS.floors) parts.push(`${plan.floors.length} floors, max ${PLAN_LIMITS.floors}`);
+  for (const floor of plan.floors) {
+    if (floor.walls.length > PLAN_LIMITS.walls) parts.push(`${floor.name}: ${floor.walls.length} walls, max ${PLAN_LIMITS.walls}`);
+    if (floor.rooms.length > PLAN_LIMITS.rooms) parts.push(`${floor.name}: ${floor.rooms.length} rooms, max ${PLAN_LIMITS.rooms}`);
+    for (const room of floor.rooms) if (room.polygon.length > PLAN_LIMITS.roomPoints) parts.push(`${room.name}: ${room.polygon.length} corners, max ${PLAN_LIMITS.roomPoints}`);
+    for (const wall of floor.walls) if (wall.openings.length > PLAN_LIMITS.openings) parts.push(`a wall on ${floor.name}: ${wall.openings.length} openings, max ${PLAN_LIMITS.openings}`);
+  }
+  return parts.join('; ') || 'size limits';
+}
+
 // ---- API glue (loopback service; bearer-authenticated like every other route) ----
 export interface HomeDraft { plan: HomePlan; saved_at: string }
 export type SavePlanResult = { status: 'saved'; version: number } | { status: 'conflict' };
-export type DraftResult = { status: 'none' } | { status: 'draft'; draft: HomeDraft } | { status: 'corrupt' };
+export type DraftResult = { status: 'none' } | { status: 'draft'; draft: HomeDraft; /** True when the draft is intact but exceeds the size limits: it can be resumed and trimmed, not saved as is. */ overLimits?: boolean } | { status: 'corrupt' };
 
 export interface HomeApi {
   fetchHome(): Promise<HomeSnapshot>;
@@ -420,7 +511,8 @@ export function createHomeApi({ baseUrl, serviceToken, auth, fetchImpl = fetch, 
   }
 
   async function savePlan(plan: HomePlan, expectedVersion: number): Promise<SavePlanResult> {
-    if (!isHomePlan(plan) || !Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new Error('Invalid plan save');
+    if (!isHomePlan(plan)) throw new PlanLimitError(isHomePlan(plan, UNBOUNDED) ? `This plan is over the size limits (${overLimit(plan)}). Remove some before saving.` : 'This plan has invalid values and cannot be saved.');
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new Error('Invalid plan save');
     const response = await send('/api/v1/home/plan', authorized('PUT', { expected_version: expectedVersion, plan }));
     if (response.status === 409) return { status: 'conflict' };
     if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
@@ -454,8 +546,12 @@ export function createHomeApi({ baseUrl, serviceToken, auth, fetchImpl = fetch, 
     if (text.length <= DRAFT_MAX_BYTES) {
       try { draft = JSON.parse(text); } catch { draft = null; }
     }
-    if (isRecord(draft) && isHomePlan(draft.plan) && isDate(draft.saved_at)) return { status: 'draft', draft: { plan: draft.plan, saved_at: draft.saved_at } };
-    // H3: a draft that fails validation is reported corrupt and discarded — never silently merged.
+    if (isRecord(draft) && isDate(draft.saved_at)) {
+      if (isHomePlan(draft.plan)) return { status: 'draft', draft: { plan: draft.plan, saved_at: draft.saved_at } };
+      // Only the size bounds are exceeded: the owner's work is intact, so it is offered, never deleted.
+      if (isHomePlan(draft.plan, UNBOUNDED)) return { status: 'draft', draft: { plan: draft.plan, saved_at: draft.saved_at }, overLimits: true };
+    }
+    // H3: a draft that is structurally invalid is reported corrupt and discarded — never silently merged.
     try { await deleteDraft(); } catch { /* Discard is best-effort; the committed plan remains the truth. */ }
     return { status: 'corrupt' };
   }

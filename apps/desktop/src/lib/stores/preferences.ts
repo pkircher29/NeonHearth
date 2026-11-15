@@ -27,3 +27,13 @@ export function motionReduced(root: HTMLElement | null = typeof document !== 'un
   const osReduced = typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   return osReduced || root?.dataset.motion === 'reduced';
 }
+
+export const SHORTCUTS_KEY = 'neonhearth.home.letterShortcuts';
+/** Single-letter editor shortcuts (V, H, W, R, B, O, P and Space) are on by default; WCAG 2.1.4 asks for a way to turn them off. */
+export function readLetterShortcuts(store: StorageLike | null = storage()): boolean {
+  try { return store?.getItem(SHORTCUTS_KEY) !== 'off'; } catch { return true; }
+}
+export function applyLetterShortcuts(enabled: boolean, store: StorageLike | null = storage()): void {
+  try { if (enabled) store?.removeItem(SHORTCUTS_KEY); else store?.setItem(SHORTCUTS_KEY, 'off'); } catch { /* applies for this session only */ }
+  try { if (typeof window !== 'undefined') window.dispatchEvent(new Event('neonhearth:shortcuts')); } catch { /* no window */ }
+}
