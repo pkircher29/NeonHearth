@@ -24,10 +24,15 @@ async function openHome(page: Page) {
   await expect(page.getByRole('heading', { name: 'Draw the home you protect.' })).toBeVisible();
 }
 
-/** Two snapped clicks with the wall tool already armed. Coordinates are SVG pixels (40 px = 1 m). */
+/**
+ * Two snapped clicks with the wall tool already armed, then Escape: walls now chain (the next wall
+ * starts where the last ended), so Escape ends the chain and each call draws one standalone wall.
+ * Coordinates are SVG pixels (40 px = 1 m at the default view).
+ */
 async function drawWall(page: Page, x1: number, y1: number, x2: number, y2: number) {
   await planCanvas(page).click({ position: { x: x1, y: y1 } });
   await planCanvas(page).click({ position: { x: x2, y: y2 } });
+  await page.keyboard.press('Escape');
 }
 
 test('owner draws a multi-floor home, saves it with expected_version, and reopens it after reload', async ({ page }) => {
@@ -104,6 +109,115 @@ test('owner draws a multi-floor home, saves it with expected_version, and reopen
   await page.getByRole('button', { name: 'Save plan' }).click();
   await expect(page.getByText('Plan saved as version 2.')).toBeVisible();
   expect(server.planPuts[1].expected_version).toBe(1);
+});
+
+test('pan and zoom the plan, then close a chain of walls and accept the offered room', async ({ page }) => {
+  await installHomeFixture(page);
+  await page.goto('/');
+  await openHome(page);
+  const viewBox = async () => (await planCanvas(page).getAttribute('viewBox'))!.split(' ').map(Number);
+  const zoomText = () => page.locator('.zoom-readout').innerText();
+  const viewControls = page.getByRole('toolbar', { name: 'Plan view' });
+
+  // Default view: 40 px/m from the origin, filling the frame.
+  expect(await zoomText()).toBe('40 px/m');
+  const [x0, y0, width, height] = await viewBox();
+  expect([x0, y0]).toEqual([0, 0]);
+  expect(width).toBeGreaterThan(400);
+  expect(height).toBeGreaterThan(400);
+
+  // Zoom: buttons and the wheel (anchored at the cursor).
+  await viewControls.getByRole('button', { name: 'Zoom in' }).click();
+  expect(await zoomText()).toBe('50 px/m');
+  await planCanvas(page).hover({ position: { x: 100, y: 100 } });
+  await page.mouse.wheel(0, -300);
+  await expect.poll(async () => Number((await zoomText()).replace(' px/m', ''))).toBeGreaterThan(50);
+  await viewControls.getByRole('button', { name: '100%' }).click();
+  expect(await zoomText()).toBe('40 px/m');
+
+  // Pan with the Pan tool, then with the middle mouse button; neither draws anything.
+  await planCanvas(page).scrollIntoViewIfNeeded(); // page.mouse works in viewport coordinates
+  const box = (await planCanvas(page).boundingBox())!;
+  const before = await viewBox();
+  await editorTools(page).getByRole('button', { name: 'Pan' }).click();
+  await page.mouse.move(box.x + 300, box.y + 300);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 360, box.y + 340, { steps: 6 });
+  await page.mouse.up();
+  const panned = await viewBox();
+  expect(panned[0]).toBeCloseTo(before[0] - 60, 0);
+  expect(panned[1]).toBeCloseTo(before[1] - 40, 0);
+  await editorTools(page).getByRole('button', { name: 'Wall' }).click();
+  await page.mouse.move(box.x + 500, box.y + 300);
+  await page.mouse.down({ button: 'middle' });
+  await page.mouse.move(box.x + 450, box.y + 300, { steps: 5 });
+  await page.mouse.up({ button: 'middle' });
+  expect((await viewBox())[0]).toBeCloseTo(panned[0] + 50, 0);
+  await expect(planCanvas(page).locator('line.wall')).toHaveCount(0);
+
+  // Draw a closed loop with chained walls: the last click lands on the first point.
+  const corners: Array<[number, number]> = [[200, 150], [440, 150], [440, 330], [200, 330], [200, 150]];
+  for (const [x, y] of corners) await planCanvas(page).click({ position: { x, y } });
+  await expect(planCanvas(page).locator('line.wall')).toHaveCount(4);
+  const offer = page.getByRole('region', { name: 'Detected rooms' });
+  await expect(offer).toBeVisible();
+  await expect(offer).toContainText('m²');
+  await expect(planCanvas(page).locator('polygon.candidate')).toHaveCount(1);
+  await offer.getByRole('button', { name: 'Add' }).click();
+  await expect(planCanvas(page).locator('polygon.room')).toHaveCount(1);
+  await expect(planCanvas(page).locator('text.room-label')).toHaveText('Room 1');
+  await expect(planCanvas(page).locator('text.room-area')).toContainText('m²');
+  await expect(offer).toHaveCount(0);
+
+  // The view is remembered per floor across a reload.
+  await viewControls.getByRole('button', { name: 'Zoom in' }).click();
+  const remembered = await zoomText();
+  await page.reload();
+  await openHome(page);
+  expect(await zoomText()).toBe(remembered);
+});
+
+test('drag a wall endpoint (snapping onto another wall) and drag a wall body, each one undo step', async ({ page }) => {
+  await installHomeFixture(page);
+  await page.goto('/');
+  await openHome(page);
+  await editorTools(page).getByRole('button', { name: 'Wall' }).click();
+  await drawWall(page, 80, 80, 320, 80); // (2,2) -> (8,2)
+  await drawWall(page, 80, 200, 200, 200); // (2,5) -> (5,5)
+  await editorTools(page).getByRole('button', { name: 'Select' }).click();
+  const walls = planCanvas(page).locator('line.wall');
+  await expect(walls).toHaveCount(2);
+  await planCanvas(page).scrollIntoViewIfNeeded();
+  const box = (await planCanvas(page).boundingBox())!;
+  const at = (x: number, y: number) => ({ x: box.x + x, y: box.y + y });
+
+  // Select the lower wall by clicking its middle, then drag its right handle up onto the upper wall's body.
+  await planCanvas(page).click({ position: { x: 140, y: 200 } });
+  const handle = planCanvas(page).locator('[data-handle="end"]');
+  await expect(handle).toBeVisible();
+  const from = at(200, 200);
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  const to = at(200, 81);
+  await page.mouse.move(to.x, to.y, { steps: 8 });
+  await expect(planCanvas(page).locator('.snap-marker')).toHaveAttribute('data-snap-kind', /on-wall|midpoint/);
+  await page.mouse.up();
+  // The upper wall was split where the dragged end landed, so the three walls now truly join.
+  await expect(walls).toHaveCount(3);
+  await page.getByRole('button', { name: 'Undo' }).click();
+  await expect(walls).toHaveCount(2); // split + move undo together
+
+  // Drag the upper wall as a whole: both ends shift by the same grid-snapped amount.
+  await planCanvas(page).click({ position: { x: 200, y: 80 } });
+  const before = await walls.first().evaluate((line) => [line.getAttribute('x1'), line.getAttribute('y1'), line.getAttribute('x2'), line.getAttribute('y2')]);
+  const grab = at(200, 80);
+  await page.mouse.move(grab.x, grab.y);
+  await page.mouse.down();
+  await page.mouse.move(grab.x + 40, grab.y + 40, { steps: 6 });
+  await page.mouse.up();
+  const after = await walls.first().evaluate((line) => [line.getAttribute('x1'), line.getAttribute('y1'), line.getAttribute('x2'), line.getAttribute('y2')]);
+  expect(after.map(Number)).toEqual(before.map((value, index) => Number(value) + 40));
+  await expect(planCanvas(page).locator('.dimension')).toHaveText('6.00 m'); // moving does not change the length
 });
 
 test('a low-confidence device stays advisory until the owner places it by hand', async ({ page }) => {

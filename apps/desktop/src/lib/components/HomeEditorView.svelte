@@ -1011,6 +1011,7 @@
               <circle class="pending-start" cx={px(rectStart.x)} cy={px(rectStart.y)} r="5" />
             {/if}
             {#if showMarker && cursor}
+              {@const labelFlip = px(cursor.point.x) - originPx.x > viewSize.width - 100}
               {#if cursor.guides.x !== null}
                 <line class="guide" x1={px(cursor.guides.x)} y1={originPx.y} x2={px(cursor.guides.x)} y2={originPx.y + viewSize.height} />
               {/if}
@@ -1023,7 +1024,7 @@
                 {:else if cursor.kind === 'on-wall'}<path d="M0 -8 L8 0 L0 8 L-8 0 Z" />
                 {:else if cursor.kind === 'guide'}<path d="M-7 -7 L7 7 M7 -7 L-7 7" />
                 {:else}<path d="M-6 0 H6 M0 -6 V6" />{/if}
-                <text class="snap-label" x="11" y="19">{cursor.label}</text>
+                <text class="snap-label" x={labelFlip ? -11 : 11} y="19" text-anchor={labelFlip ? 'end' : 'start'}>{cursor.label}</text>
               </g>
             {/if}
             {#if readout}

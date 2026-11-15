@@ -21,6 +21,7 @@
   .floor-tab.active{border-color:var(--accent);box-shadow:inset 0 0 18px var(--accent)14;color:var(--ink)}
   .floor-tab strong{font:600 13px var(--font-display)}
   .floor-tab small{color:var(--muted);font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.06em}
+  .floor-area{text-transform:none;color:var(--accent)}
   .floor-add{min-height:44px;padding:8px 14px;border:1px dashed var(--line-strong);border-radius:6px;background:transparent;color:var(--muted-strong);font:600 12px var(--font-display);cursor:pointer}
   .floor-add:hover{border-color:var(--accent);color:var(--accent)}
 </style>
