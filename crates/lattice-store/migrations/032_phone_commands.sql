@@ -5,4 +5,4 @@ CREATE TABLE phone_commands (
  fingerprint TEXT NOT NULL,
  PRIMARY KEY(session_id, command_id)
 );
-UPDATE install_state SET schema_version = 29 WHERE singleton = 1 AND schema_version < 29;
+UPDATE install_state SET schema_version = 32 WHERE singleton = 1 AND schema_version < 32;
