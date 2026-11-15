@@ -34,8 +34,24 @@ impl W6PriorStateRepository {
     ) -> Result<()> {
         let state = serde_json::to_string(before)?;
         let action = serde_json::to_string(&action)?;
+        let mut tx = crate::begin_write(&self.pool).await?;
+        let unfinished: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT action_json, verified_after_json FROM w6_policy_prior_state WHERE device_id=?",
+        )
+        .bind(device.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((Some(existing), None)) = &unfinished {
+            // An unverified attempt may only be restarted with the same
+            // action; replacing it would lose the state needed to reconcile.
+            anyhow::ensure!(
+                *existing == action,
+                "a different W6 actuation attempt is still unfinished for this device"
+            );
+        }
         sqlx::query("INSERT INTO w6_policy_prior_state(device_id,state_json,action_json,prepared_before_json,verified_after_json) VALUES(?,?,?,?,NULL) ON CONFLICT(device_id) DO UPDATE SET action_json=excluded.action_json, prepared_before_json=excluded.prepared_before_json, verified_after_json=NULL")
-            .bind(device.to_string()).bind(&state).bind(action).bind(&state).execute(&self.pool).await?;
+            .bind(device.to_string()).bind(&state).bind(action).bind(&state).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
     pub async fn mark_verified(
@@ -51,15 +67,19 @@ impl W6PriorStateRepository {
     pub async fn load_attempt(&self, device: DeviceId) -> Result<Option<W6Attempt>> {
         let row: Option<W6AttemptRow>=sqlx::query_as("SELECT state_json,action_json,prepared_before_json,verified_after_json FROM w6_policy_prior_state WHERE device_id=?").bind(device.to_string()).fetch_optional(&self.pool).await?;
         row.map(|(restore, action, before, after)| match (action, before) {
-            (Some(action), Some(before)) => Ok(W6Attempt {
+            // A row saved by `save` (or written before migration 014) holds a
+            // restore point but no attempt: that is "no attempt", not corruption.
+            (None, None) => Ok(None),
+            (Some(action), Some(before)) => Ok(Some(W6Attempt {
                 restore: serde_json::from_str(&restore)?,
                 action: serde_json::from_str(&action)?,
                 prepared_before: serde_json::from_str(&before)?,
                 verified_after: after.map(|x| serde_json::from_str(&x)).transpose()?,
-            }),
+            })),
             _ => anyhow::bail!("incomplete W6 actuation attempt"),
         })
         .transpose()
+        .map(Option::flatten)
     }
     pub async fn load(&self, device: DeviceId) -> Result<Option<DeviceState>> {
         let value: Option<String> =

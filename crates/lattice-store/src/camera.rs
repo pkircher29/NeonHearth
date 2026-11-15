@@ -246,7 +246,7 @@ impl CameraRepository {
         {
             return Err(CameraStoreError::Invalid);
         }
-        let mut transaction = self.pool.begin().await.map_err(map_sqlx)?;
+        let mut transaction = crate::begin_write(&self.pool).await.map_err(map_sqlx)?;
         sqlx::query(
             "INSERT INTO camera_inventory(camera_id, manufacturer, model, firmware, serial, health) \
              VALUES(?, ?, ?, ?, ?, ?) \
@@ -334,7 +334,7 @@ impl CameraRepository {
         camera_id: CameraId,
         profile: &CameraProfile,
     ) -> Result<(), CameraStoreError> {
-        let mut transaction = self.pool.begin().await.map_err(map_sqlx)?;
+        let mut transaction = crate::begin_write(&self.pool).await.map_err(map_sqlx)?;
         let existing_owner: Option<String> =
             sqlx::query_scalar("SELECT camera_id FROM camera_stream_refs WHERE stream_id = ?")
                 .bind(profile.stream_id().to_string())

@@ -112,6 +112,12 @@ pub struct StoredDeviceSnapshot {
     pub evidence: Option<StoredEvidenceSummary>,
     pub bandwidth: Option<StoredBandwidthSummary>,
 }
+/// A device whose stored rows could not be decoded for a snapshot page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkippedSnapshot {
+    pub device_id: String,
+    pub reason: String,
+}
 #[derive(Clone, Debug)]
 pub struct EvidenceProjection {
     pub device_id: DeviceId,
@@ -209,7 +215,16 @@ impl M2StateRepository {
         device_id: DeviceId,
         at: DateTime<Utc>,
     ) -> Result<(), CheckpointError> {
-        let mut tx = self.pool.begin().await?;
+        Ok(crate::retry_busy(|| self.record_verified_block_once(device_id, at)).await?)
+    }
+    async fn record_verified_block_once(
+        &self,
+        device_id: DeviceId,
+        at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        // IMMEDIATE: the negative id below is allocated from MIN(transition_id);
+        // two deferred writers could both compute the same id.
+        let mut tx = crate::begin_write(&self.pool).await?;
         let current: Option<String> = sqlx::query_scalar(
             "SELECT to_state FROM presence_transitions WHERE device_id=?
              ORDER BY CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN 1 ELSE 0 END DESC,
@@ -244,7 +259,27 @@ impl M2StateRepository {
         device_id: DeviceId,
         at: DateTime<Utc>,
     ) -> Result<(), CheckpointError> {
-        let mut tx = self.pool.begin().await?;
+        Ok(crate::retry_busy(|| self.record_verified_unblock_once(device_id, at)).await?)
+    }
+    async fn record_verified_unblock_once(
+        &self,
+        device_id: DeviceId,
+        at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = crate::begin_write(&self.pool).await?;
+        // A repeated release must not append a second blocked->unknown row.
+        let latest_control: Option<String> = sqlx::query_scalar(
+            "SELECT to_state FROM presence_transitions
+             WHERE device_id=? AND trigger_kind IN ('enforcement_blocked','enforcement_unblocked')
+             ORDER BY occurred_at DESC, transition_id ASC LIMIT 1",
+        )
+        .bind(device_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if latest_control.as_deref() != Some("blocked") {
+            tx.commit().await?;
+            return Ok(());
+        }
         let transition_id: i64 = sqlx::query_scalar("SELECT COALESCE(MIN(transition_id), 0) - 1 FROM presence_transitions WHERE transition_id < 0")
             .fetch_one(&mut *tx).await?;
         sqlx::query("INSERT INTO presence_transitions(transition_id,device_id,from_state,to_state,occurred_at,reason,trigger_source,trigger_kind,evidence_observed_at,evidence_valid_until,trigger_arrival_at,correction_of) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)")
@@ -428,21 +463,32 @@ impl M2StateRepository {
             .map_err(|e| CheckpointError::Invalid(e.to_string()))
     }
 
+    /// One page of device snapshots. Strict: the first undecodable device
+    /// fails the call with `Corrupt`. Prefer
+    /// [`Self::list_device_snapshots_report`], which degrades per device.
     pub async fn list_device_snapshots(
         &self,
         limit: usize,
         after: Option<DeviceId>,
     ) -> Result<Vec<StoredDeviceSnapshot>, CheckpointError> {
-        macro_rules! corrupt_get {
-            ($row:expr, $ty:ty, $column:expr) => {
-                $row.try_get::<$ty, _>($column).map_err(|_| {
-                    CheckpointError::Corrupt(format!(
-                        "device snapshot {} has an invalid stored type",
-                        $column
-                    ))
-                })?
-            };
+        let (snapshots, skipped) = self.list_device_snapshots_report(limit, after).await?;
+        if let Some(first) = skipped.into_iter().next() {
+            return Err(CheckpointError::Corrupt(first.reason));
         }
+        Ok(snapshots)
+    }
+
+    /// One page of device snapshots read from a single consistent snapshot
+    /// with a constant number of queries (not 3 per device). Devices whose
+    /// rows cannot be decoded are skipped and returned in the second element
+    /// instead of failing the page; the keyset cursor is the last device
+    /// *scanned*, reported as `next_after` of the page by the caller via the
+    /// returned ids (skipped ids are listed too).
+    pub async fn list_device_snapshots_report(
+        &self,
+        limit: usize,
+        after: Option<DeviceId>,
+    ) -> Result<(Vec<StoredDeviceSnapshot>, Vec<SkippedSnapshot>), CheckpointError> {
         if limit == 0 {
             return Err(CheckpointError::Invalid(
                 "snapshot limit must be nonzero".into(),
@@ -453,65 +499,153 @@ impl M2StateRepository {
                 "snapshot limit exceeds configured bound".into(),
             ));
         }
+        // One read transaction: every query below sees the same commit.
+        let mut tx = self.pool.begin().await?;
         let rows = if let Some(after) = after {
-            sqlx::query("SELECT device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed FROM devices WHERE device_id>? ORDER BY device_id ASC LIMIT ?").bind(after.to_string()).bind(limit as i64).fetch_all(&self.pool).await?
+            sqlx::query("SELECT device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed FROM devices WHERE device_id>? ORDER BY device_id ASC LIMIT ?").bind(after.to_string()).bind(limit as i64).fetch_all(&mut *tx).await?
         } else {
-            sqlx::query("SELECT device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed FROM devices ORDER BY device_id ASC LIMIT ?").bind(limit as i64).fetch_all(&self.pool).await?
+            sqlx::query("SELECT device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed FROM devices ORDER BY device_id ASC LIMIT ?").bind(limit as i64).fetch_all(&mut *tx).await?
         };
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let raw_device_id = corrupt_get!(row, String, "device_id");
-            let id = DeviceId::parse(raw_device_id.as_str()).map_err(|_| {
-                CheckpointError::Corrupt(
-                    "device snapshot contains invalid device identifier".into(),
-                )
-            })?;
-            if raw_device_id != id.to_string() {
-                return Err(CheckpointError::Corrupt(
-                    "device snapshot contains noncanonical device identifier".into(),
-                ));
+        let ids: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("device_id").ok())
+            .collect();
+        let mut presence_rows = std::collections::HashMap::new();
+        let mut evidence_rows = std::collections::HashMap::new();
+        let mut flow_rows: std::collections::HashMap<String, Vec<sqlx::sqlite::SqliteRow>> =
+            std::collections::HashMap::new();
+        if !ids.is_empty() {
+            let mut query = sqlx::QueryBuilder::new(
+                "SELECT device_id,to_state,occurred_at,trigger_source,trigger_kind FROM (SELECT device_id,to_state,occurred_at,trigger_source,trigger_kind, ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN 1 ELSE 0 END DESC, occurred_at DESC, CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN transition_id END ASC, transition_id DESC) AS rn FROM presence_transitions WHERE device_id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for id in &ids {
+                separated.push_bind(id.clone());
             }
-            let first = parse_timestamp(
-                &corrupt_get!(row, String, "first_seen_at"),
-                "device first_seen_at",
-                CheckpointError::Corrupt,
-            )?;
-            let last = parse_timestamp(
-                &corrupt_get!(row, String, "last_seen_at"),
-                "device last_seen_at",
-                CheckpointError::Corrupt,
-            )?;
-            if first > last {
-                return Err(CheckpointError::Corrupt(
-                    "device first_seen_at is after last_seen_at".into(),
-                ));
-            }
-            let owner_confirmed: i64 = corrupt_get!(row, i64, "owner_confirmed");
-            let owner_confirmed = match owner_confirmed {
-                0 => false,
-                1 => true,
-                _ => {
-                    return Err(CheckpointError::Corrupt(
-                        "device owner flag is invalid".into(),
-                    ));
+            separated.push_unseparated(")) WHERE rn=1");
+            for row in query.build().fetch_all(&mut *tx).await? {
+                if let Ok(id) = row.try_get::<String, _>("device_id") {
+                    presence_rows.insert(id, row);
                 }
+            }
+            let mut query = sqlx::QueryBuilder::new(
+                "SELECT device_id,family,source,confidence,observed_at,expires_at FROM (SELECT device_id,family,source,confidence,observed_at,expires_at, ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY confidence DESC,observed_at DESC,evidence_id DESC) AS rn FROM evidence WHERE device_id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for id in &ids {
+                separated.push_bind(id.clone());
+            }
+            separated.push_unseparated(")) WHERE rn=1");
+            for row in query.build().fetch_all(&mut *tx).await? {
+                if let Ok(id) = row.try_get::<String, _>("device_id") {
+                    evidence_rows.insert(id, row);
+                }
+            }
+            let mut query = sqlx::QueryBuilder::new(
+                "SELECT f.device_id,f.bucket,f.upload,f.download,f.coverage FROM flow_rollups f WHERE f.resolution='second' AND f.device_id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for id in &ids {
+                separated.push_bind(id.clone());
+            }
+            separated.push_unseparated(") AND f.bucket=(SELECT MAX(g.bucket) FROM flow_rollups g WHERE g.device_id=f.device_id AND g.resolution='second')");
+            for row in query.build().fetch_all(&mut *tx).await? {
+                if let Ok(id) = row.try_get::<String, _>("device_id") {
+                    flow_rows.entry(id).or_default().push(row);
+                }
+            }
+        }
+        tx.rollback().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        let mut skipped = Vec::new();
+        for row in rows {
+            let raw_id = row.try_get::<String, _>("device_id").unwrap_or_default();
+            match self.decode_snapshot(
+                &row,
+                presence_rows.remove(&raw_id),
+                evidence_rows.remove(&raw_id),
+                flow_rows.remove(&raw_id).unwrap_or_default(),
+            ) {
+                Ok(snapshot) => out.push(snapshot),
+                Err(error) => skipped.push(SkippedSnapshot {
+                    device_id: raw_id,
+                    reason: match error {
+                        CheckpointError::Corrupt(reason) => reason,
+                        other => other.to_string(),
+                    },
+                }),
+            }
+        }
+        Ok((out, skipped))
+    }
+
+    fn decode_snapshot(
+        &self,
+        row: &sqlx::sqlite::SqliteRow,
+        presence_row: Option<sqlx::sqlite::SqliteRow>,
+        evidence_row: Option<sqlx::sqlite::SqliteRow>,
+        flows: Vec<sqlx::sqlite::SqliteRow>,
+    ) -> Result<StoredDeviceSnapshot, CheckpointError> {
+        macro_rules! corrupt_get {
+            ($row:expr, $ty:ty, $column:expr) => {
+                $row.try_get::<$ty, _>($column).map_err(|_| {
+                    CheckpointError::Corrupt(format!(
+                        "device snapshot {} has an invalid stored type",
+                        $column
+                    ))
+                })?
             };
-            let owner_name: Option<String> = corrupt_get!(row, Option<String>, "owner_name");
-            let owner_type: Option<String> = corrupt_get!(row, Option<String>, "owner_type");
-            if owner_name
+        }
+        let raw_device_id = corrupt_get!(row, String, "device_id");
+        let id = DeviceId::parse(raw_device_id.as_str()).map_err(|_| {
+            CheckpointError::Corrupt("device snapshot contains invalid device identifier".into())
+        })?;
+        if raw_device_id != id.to_string() {
+            return Err(CheckpointError::Corrupt(
+                "device snapshot contains noncanonical device identifier".into(),
+            ));
+        }
+        let first = parse_timestamp(
+            &corrupt_get!(row, String, "first_seen_at"),
+            "device first_seen_at",
+            CheckpointError::Corrupt,
+        )?;
+        let last = parse_timestamp(
+            &corrupt_get!(row, String, "last_seen_at"),
+            "device last_seen_at",
+            CheckpointError::Corrupt,
+        )?;
+        if first > last {
+            return Err(CheckpointError::Corrupt(
+                "device first_seen_at is after last_seen_at".into(),
+            ));
+        }
+        let owner_confirmed: i64 = corrupt_get!(row, i64, "owner_confirmed");
+        let owner_confirmed = match owner_confirmed {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(CheckpointError::Corrupt(
+                    "device owner flag is invalid".into(),
+                ));
+            }
+        };
+        let owner_name: Option<String> = corrupt_get!(row, Option<String>, "owner_name");
+        let owner_type: Option<String> = corrupt_get!(row, Option<String>, "owner_type");
+        if owner_name
+            .as_ref()
+            .is_some_and(|v| v.is_empty() || v.len() > self.config.max_string_bytes)
+            || owner_type
                 .as_ref()
                 .is_some_and(|v| v.is_empty() || v.len() > self.config.max_string_bytes)
-                || owner_type
-                    .as_ref()
-                    .is_some_and(|v| v.is_empty() || v.len() > self.config.max_string_bytes)
-            {
-                return Err(CheckpointError::Corrupt(
-                    "owner string exceeds configured bound".into(),
-                ));
-            }
-            let presence_row = sqlx::query("SELECT to_state,occurred_at,trigger_source,trigger_kind FROM presence_transitions WHERE device_id=? ORDER BY CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN 1 ELSE 0 END DESC, occurred_at DESC, CASE WHEN trigger_kind IN ('enforcement_blocked','enforcement_unblocked') THEN transition_id END ASC, transition_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
-            let presence = if let Some(r) = presence_row {
-                Some(StoredPresenceSummary {
+        {
+            return Err(CheckpointError::Corrupt(
+                "owner string exceeds configured bound".into(),
+            ));
+        }
+        let presence = match presence_row {
+            Some(r) => {
+                let p = StoredPresenceSummary {
                     to_state: parse_presence_state(&corrupt_get!(r, String, "to_state"))?,
                     occurred_at: parse_timestamp(
                         &corrupt_get!(r, String, "occurred_at"),
@@ -520,26 +654,23 @@ impl M2StateRepository {
                     )?,
                     trigger_source: corrupt_get!(r, String, "trigger_source"),
                     trigger_kind: corrupt_get!(r, String, "trigger_kind"),
-                })
-                .map(|p| {
-                    if p.trigger_source.is_empty()
-                        || p.trigger_kind.is_empty()
-                        || p.trigger_source.len() > self.config.max_string_bytes
-                        || p.trigger_kind.len() > self.config.max_string_bytes
-                    {
-                        return Err(CheckpointError::Corrupt(
-                            "presence trigger string is invalid".into(),
-                        ));
-                    }
-                    Ok(p)
-                })
-                .transpose()?
-            } else {
-                None
-            };
-            let evidence_row = sqlx::query("SELECT family,source,confidence,observed_at,expires_at FROM evidence WHERE device_id=? ORDER BY confidence DESC,observed_at DESC,evidence_id DESC LIMIT 1").bind(id.to_string()).fetch_optional(&self.pool).await?;
-            let evidence = if let Some(r) = evidence_row {
-                Some(StoredEvidenceSummary {
+                };
+                if p.trigger_source.is_empty()
+                    || p.trigger_kind.is_empty()
+                    || p.trigger_source.len() > self.config.max_string_bytes
+                    || p.trigger_kind.len() > self.config.max_string_bytes
+                {
+                    return Err(CheckpointError::Corrupt(
+                        "presence trigger string is invalid".into(),
+                    ));
+                }
+                Some(p)
+            }
+            None => None,
+        };
+        let evidence = match evidence_row {
+            Some(r) => {
+                let e = StoredEvidenceSummary {
                     family: parse_evidence_family(&corrupt_get!(r, String, "family"))?,
                     source: corrupt_get!(r, String, "source"),
                     confidence: checked_confidence(corrupt_get!(r, f64, "confidence"))?,
@@ -554,75 +685,69 @@ impl M2StateRepository {
                             parse_timestamp(value, "evidence expires_at", CheckpointError::Corrupt)
                         })
                         .transpose()?,
-                })
-                .map(|e| {
-                    if e.source.is_empty() || e.source.len() > self.config.max_string_bytes {
-                        return Err(CheckpointError::Corrupt(
-                            "evidence source is invalid".into(),
-                        ));
-                    }
-                    Ok(e)
-                })
-                .transpose()?
-            } else {
-                None
-            };
-            let flows = sqlx::query("SELECT bucket,upload,download,coverage FROM flow_rollups WHERE device_id=? AND resolution='second' AND bucket=(SELECT MAX(bucket) FROM flow_rollups WHERE device_id=? AND resolution='second')").bind(id.to_string()).bind(id.to_string()).fetch_all(&self.pool).await?;
-            let bandwidth = if flows.is_empty() {
-                None
-            } else {
-                let bucket = parse_timestamp(
-                    &corrupt_get!(flows[0], String, "bucket"),
+                };
+                if e.source.is_empty() || e.source.len() > self.config.max_string_bytes {
+                    return Err(CheckpointError::Corrupt(
+                        "evidence source is invalid".into(),
+                    ));
+                }
+                Some(e)
+            }
+            None => None,
+        };
+        let bandwidth = if flows.is_empty() {
+            None
+        } else {
+            let bucket = parse_timestamp(
+                &corrupt_get!(flows[0], String, "bucket"),
+                "flow bucket",
+                CheckpointError::Corrupt,
+            )?;
+            let mut up = 0u64;
+            let mut down = 0u64;
+            let mut cov = None;
+            for r in flows {
+                let row_bucket = parse_timestamp(
+                    &corrupt_get!(r, String, "bucket"),
                     "flow bucket",
                     CheckpointError::Corrupt,
                 )?;
-                let mut up = 0u64;
-                let mut down = 0u64;
-                let mut cov = None;
-                for r in flows {
-                    let row_bucket = parse_timestamp(
-                        &corrupt_get!(r, String, "bucket"),
-                        "flow bucket",
-                        CheckpointError::Corrupt,
-                    )?;
-                    if row_bucket != bucket {
-                        return Err(CheckpointError::Corrupt(
-                            "flow row is outside selected bucket".into(),
-                        ));
-                    }
-                    up = up
-                        .checked_add(i64_to_u64(corrupt_get!(r, i64, "upload"))?)
-                        .ok_or_else(|| CheckpointError::Corrupt("flow upload overflow".into()))?;
-                    down = down
-                        .checked_add(i64_to_u64(corrupt_get!(r, i64, "download"))?)
-                        .ok_or_else(|| CheckpointError::Corrupt("flow download overflow".into()))?;
-                    let c = parse_coverage(&corrupt_get!(r, String, "coverage"))?;
-                    if cov.is_some_and(|x| x != c) {
-                        cov = Some(Coverage::Estimated)
-                    } else if cov.is_none() {
-                        cov = Some(c)
-                    }
+                if row_bucket != bucket {
+                    return Err(CheckpointError::Corrupt(
+                        "flow row is outside selected bucket".into(),
+                    ));
                 }
-                Some(StoredBandwidthSummary {
-                    upload: up,
-                    download: down,
-                    coverage: cov.unwrap_or(Coverage::Estimated),
-                    observed_at: bucket,
-                })
-            };
-            out.push(StoredDeviceSnapshot {
-                device_id: id,
-                first_seen_at: first,
-                last_seen_at: last,
-                owner_name,
-                owner_type,
-                owner_confirmed,
-                presence,
-                evidence,
-                bandwidth,
-            });
-        }
-        Ok(out)
+                up = up
+                    .checked_add(i64_to_u64(corrupt_get!(r, i64, "upload"))?)
+                    .ok_or_else(|| CheckpointError::Corrupt("flow upload overflow".into()))?;
+                down = down
+                    .checked_add(i64_to_u64(corrupt_get!(r, i64, "download"))?)
+                    .ok_or_else(|| CheckpointError::Corrupt("flow download overflow".into()))?;
+                let c = parse_coverage(&corrupt_get!(r, String, "coverage"))?;
+                if cov.is_some_and(|x| x != c) {
+                    cov = Some(Coverage::Estimated)
+                } else if cov.is_none() {
+                    cov = Some(c)
+                }
+            }
+            Some(StoredBandwidthSummary {
+                upload: up,
+                download: down,
+                coverage: cov.unwrap_or(Coverage::Estimated),
+                observed_at: bucket,
+            })
+        };
+        Ok(StoredDeviceSnapshot {
+            device_id: id,
+            first_seen_at: first,
+            last_seen_at: last,
+            owner_name,
+            owner_type,
+            owner_confirmed,
+            presence,
+            evidence,
+            bandwidth,
+        })
     }
     pub async fn commit(&self, input: CommitInput) -> Result<(), CheckpointError> {
         validate_input(&self.config, &input)?;
@@ -652,7 +777,7 @@ impl M2StateRepository {
         // Reserve the writer before reading the checkpoint. A deferred transaction
         // can fail a read-to-write upgrade immediately when another writer is active,
         // even with busy_timeout configured. IMMEDIATE waits before taking that snapshot.
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = crate::begin_write(&self.pool).await?;
         if let Some(discovery) = &input.discovery {
             let old: Option<Vec<u8>> = sqlx::query_scalar(
                 "SELECT commit_digest FROM discovery_commits WHERE input_hash=?",
@@ -662,7 +787,7 @@ impl M2StateRepository {
             .await?;
             if let Some(old) = old {
                 if old == digest {
-                    verify_idempotent_checkpoint(&mut tx, &self.config, &input).await?;
+                    verify_idempotent_checkpoint(&mut tx, &self.config, &input, discovery).await?;
                     tx.commit().await?;
                     return Ok(());
                 }
@@ -722,7 +847,7 @@ impl M2StateRepository {
         if let Some((flow, changes, now)) = flow {
             flow.apply_in_transaction(&mut tx, changes, now)
                 .await
-                .map_err(|e| CheckpointError::Invalid(e.to_string()))?;
+                .map_err(map_flow_error)?;
         }
         tx.commit().await?;
         Ok(())
@@ -991,12 +1116,26 @@ fn discovery_row_checksum(
     Sha256::digest(serde_json::to_vec(&canonical).expect("JSON value serializes")).to_vec()
 }
 
+/// A genuine write conflict is a uniqueness violation. SQLITE_BUSY / "database
+/// is locked" is contention, not a lost race, and stays a retryable `Storage`
+/// error so callers do not re-derive a sequence from it.
 fn is_write_conflict(error: &sqlx::Error) -> bool {
-    error.as_database_error().is_some_and(|database| {
-        database.is_unique_violation()
-            || database.code().as_deref() == Some("5")
-            || database.message().contains("database is locked")
-    })
+    error
+        .as_database_error()
+        .is_some_and(|database| database.is_unique_violation())
+}
+
+/// Keeps the cause of a flow failure: bad input is `Invalid`, size problems are
+/// `Capacity`, and SQL/IO failures stay `Storage` (retryable) instead of being
+/// reported as invalid input.
+fn map_flow_error(error: crate::FlowStoreError) -> CheckpointError {
+    match error {
+        crate::FlowStoreError::Sql(error) => CheckpointError::Storage(error),
+        crate::FlowStoreError::Capacity | crate::FlowStoreError::Overflow => {
+            CheckpointError::Capacity(error.to_string())
+        }
+        other => CheckpointError::Invalid(other.to_string()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // fields mirror one durable checkpoint envelope
@@ -1103,7 +1242,13 @@ async fn verify_idempotent_checkpoint(
     tx: &mut Transaction<'_, Sqlite>,
     config: &M2StateConfig,
     input: &CommitInput,
+    discovery: &DiscoveryCommit,
 ) -> Result<(), CheckpointError> {
+    let recorded_sequence: i64 =
+        sqlx::query_scalar("SELECT checkpoint_sequence FROM discovery_commits WHERE input_hash=?")
+            .bind(discovery.input_hash.to_vec())
+            .fetch_one(&mut **tx)
+            .await?;
     let row: Option<StoredCheckpointRow> = sqlx::query_as("SELECT format_version,checkpoint_bytes,source_fingerprint,commit_sequence,written_at,sha256 FROM state_checkpoints WHERE singleton=1")
         .fetch_optional(&mut **tx).await?;
     let Some((version, bytes, fingerprint, sequence, timestamp, checksum)) = row else {
@@ -1127,6 +1272,16 @@ async fn verify_idempotent_checkpoint(
         &checksum,
         CheckpointError::Corrupt,
     )?;
+    if sequence < recorded_sequence {
+        return Err(CheckpointError::Corrupt(
+            "discovery commit names a future checkpoint sequence".into(),
+        ));
+    }
+    if sequence > recorded_sequence {
+        // The commit was applied and later commits superseded its checkpoint.
+        // The logical digest matched, so replaying it is a harmless no-op.
+        return Ok(());
+    }
     if version != input.checkpoint.format_version
         || bytes != input.checkpoint.bytes
         || sequence != input.checkpoint.commit_sequence
@@ -1252,7 +1407,7 @@ async fn upsert_device(
     tx: &mut Transaction<'_, Sqlite>,
     d: &DeviceProjection,
 ) -> Result<(), CheckpointError> {
-    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed) VALUES(?,?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET first_seen_at=MIN(devices.first_seen_at,excluded.first_seen_at),last_seen_at=MAX(devices.last_seen_at,excluded.last_seen_at),owner_name=CASE WHEN excluded.owner_confirmed=1 THEN COALESCE(excluded.owner_name,devices.owner_name) ELSE devices.owner_name END,owner_type=CASE WHEN excluded.owner_confirmed=1 THEN COALESCE(excluded.owner_type,devices.owner_type) ELSE devices.owner_type END,owner_confirmed=MAX(devices.owner_confirmed,excluded.owner_confirmed)").bind(d.device_id.to_string()).bind(d.first_seen_at.to_rfc3339()).bind(d.last_seen_at.to_rfc3339()).bind(&d.owner_name).bind(&d.owner_type).bind(d.owner_confirmed).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_name,owner_type,owner_confirmed) VALUES(?,?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET first_seen_at=CASE WHEN unixepoch(excluded.first_seen_at)<unixepoch(devices.first_seen_at) THEN excluded.first_seen_at ELSE devices.first_seen_at END,last_seen_at=CASE WHEN unixepoch(excluded.last_seen_at)>unixepoch(devices.last_seen_at) THEN excluded.last_seen_at ELSE devices.last_seen_at END,owner_name=CASE WHEN excluded.owner_confirmed=1 THEN COALESCE(excluded.owner_name,devices.owner_name) ELSE devices.owner_name END,owner_type=CASE WHEN excluded.owner_confirmed=1 THEN COALESCE(excluded.owner_type,devices.owner_type) ELSE devices.owner_type END,owner_confirmed=MAX(devices.owner_confirmed,excluded.owner_confirmed)").bind(d.device_id.to_string()).bind(d.first_seen_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).bind(d.last_seen_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).bind(&d.owner_name).bind(&d.owner_type).bind(d.owner_confirmed).execute(&mut **tx).await?;
     Ok(())
 }
 async fn insert_evidence(
