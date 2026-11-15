@@ -87,8 +87,10 @@ pub fn clear_marker(path: &Path) -> anyhow::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(anyhow::Error::new(error)
-            .context(format!("remove restore marker {}", path.display()))),
+        Err(error) => {
+            Err(anyhow::Error::new(error)
+                .context(format!("remove restore marker {}", path.display())))
+        }
     }
 }
 
@@ -449,13 +451,7 @@ mod tests {
         assert!(format!("{error:#}").contains("not changed"), "{error:#}");
         assert!(!marker_path(&paths.state_dir).exists());
         let pool = lattice_store::connect_path(&paths.database).await.unwrap();
-        assert!(
-            InstallRepository::new(pool)
-                .load()
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(InstallRepository::new(pool).load().await.unwrap().is_some());
 
         // A marker left by an earlier restore is never deleted by a refusal.
         write_marker(&marker_path(&paths.state_dir), &sample_marker()).unwrap();

@@ -43,7 +43,10 @@ where
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
-    if args.peek().is_some_and(|first| first.as_os_str() == "restore") {
+    if args
+        .peek()
+        .is_some_and(|first| first.as_os_str() == "restore")
+    {
         args.next();
         let backup = lattice_service::restore::parse_restore_args(args)
             .map_err(|message| anyhow::anyhow!(message))?;
