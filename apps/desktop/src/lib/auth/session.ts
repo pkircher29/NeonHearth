@@ -29,7 +29,7 @@ export interface AuthState {
 
 export interface AuthSession extends AuthSource {
   readonly state: AuthState;
-  unauthorized(): void;
+  unauthorized(sentHeader?: string | null): void;
   stepupRequired(): void;
   subscribe(listener: (state: AuthState) => void): () => void;
   signInOwner(token: string, remember: boolean): boolean;
@@ -96,7 +96,10 @@ export function createAuthSession(storage: StorageLike | null = null): AuthSessi
     get state() { return state; },
     subscribe(listener) { listeners.add(listener); listener(state); return () => { listeners.delete(listener); }; },
     header() { return credentialHeader(state.credential); },
-    unauthorized() {
+    unauthorized(sentHeader) {
+      // A refusal of a request that carried a DIFFERENT credential than the one held now (signed in or
+      // out while it was in flight) says nothing about the current one.
+      if (sentHeader !== undefined && sentHeader !== credentialHeader(state.credential)) return;
       // The held credential (if any) was refused: drop it and ask again.
       const failure: AuthFailure = state.credential ? 'rejected' : state.failure;
       persist(null, false);

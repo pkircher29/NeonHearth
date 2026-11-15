@@ -19,11 +19,14 @@ test('owner sees separate household WAN readings and can open the supported Traf
   await page.goto('/#token=fixture-only-pulse-owner-0000000000000000000');
   const household=page.getByRole('region',{name:'Household internet traffic'});
   await expect(household).toContainText('20 Mbps');
-  await expect(household).toContainText('Predator Connect W6');
+  // The card names the configured router source, not a hard-coded model.
+  await expect(household).toContainText('192.168.1.1:8080 · router-reported internet totals');
+  await expect(household).not.toContainText('Predator');
   await expect(page.getByText('Live readings connected',{exact:true})).toBeVisible();
   await expect(page.getByText('No per-device counter source',{exact:true})).toBeVisible();
   await expect(page.getByText('Unavailable until paired',{exact:true})).toHaveCount(0);
-  await expect(page.getByRole('img',{name:/Network flow map:/})).toHaveAttribute('aria-label',/unavailable total/);
+  await expect(page.getByRole('heading',{name:'Network control.'})).toBeVisible();
+  await expect(page.getByRole('group',{name:'Pulse visual'})).toHaveCount(0);
   await page.setViewportSize({width:1440,height:1000});
   await page.screenshot({path:info.outputPath('pulse-desktop.png'),fullPage:true});
   for(const width of [320,390,768,1440]){

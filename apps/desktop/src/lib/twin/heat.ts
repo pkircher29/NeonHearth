@@ -10,7 +10,7 @@ export type HeatTier = 'blue' | 'cyan' | 'gold' | 'pink';
 
 /**
  * Documented thresholds, in BYTES per second (device up + down combined).
- * They mirror the Pulse lung tiers (1 / 10 / 30 megabits per second):
+ * Bandwidth color thresholds (1 / 10 / 30 megabits per second):
  * - blue:  quiet          —            bps <   125_000 (< 1 Mbps)
  * - cyan:  active         —  125_000 <= bps < 1_250_000 (1..10 Mbps)
  * - gold:  busy           — 1_250_000 <= bps < 3_750_000 (10..30 Mbps)

@@ -4,7 +4,18 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>desktop</title>
+    <meta name="referrer" content="no-referrer" />
+    <!--
+      Content Security Policy (meta form; frame-ancestors and report-uri cannot be set here and belong in the
+      service's response headers). Everything is same-origin: fonts and scripts are bundled, the event socket and
+      API are same-origin, camera video is MSE/HLS from blob: URLs, and the Home 3D view needs no eval or workers
+      beyond hls.js' blob worker. Inline style attributes are used by components, hence style-src 'unsafe-inline'.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self' ws: wss:; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'"
+    />
+    <title>NeonHearth</title>
   </head>
   <body>
     <div id="app"></div>

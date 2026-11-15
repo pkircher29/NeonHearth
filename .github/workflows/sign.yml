@@ -1,0 +1,140 @@
+name: Sign files
+
+# Reusable signing job. This is the ONLY place that holds the Azure Artifact
+# Signing identity (environment `release-signing`, `id-token: write`), and it
+# runs nothing but: hash verification, Azure login, the pinned signing client,
+# signtool and the repo's own PowerShell/Python helpers. No cargo, npm, pip,
+# dotnet tool install, WiX or any other third-party build code runs here.
+#
+# Callers pass the artifact produced by an unprivileged build job together with
+# the SHA-256 of that artifact's SHA256SUMS list, taken from the build job's
+# OUTPUTS (a different channel from the artifact store). The job refuses to
+# sign anything that does not match, signs only the named files, verifies every
+# signature against the expected publisher, and publishes the result as a new
+# artifact plus the hash of its list (output `signed`).
+
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        description: Unsigned artifact to download
+        type: string
+        required: true
+      expected:
+        description: SHA-256 of the artifact's SHA256SUMS list (build job output)
+        type: string
+        required: true
+      files:
+        description: Newline-separated paths, relative to the artifact root, to sign
+        type: string
+        required: true
+      signed_artifact:
+        description: Name of the artifact to publish with the signed files
+        type: string
+        required: true
+    outputs:
+      signed:
+        description: SHA-256 of the signed artifact's SHA256SUMS list
+        value: ${{ jobs.sign.outputs.signed }}
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    name: Sign ${{ inputs.signed_artifact }}
+    runs-on: windows-latest
+    # Defence in depth: the release workflow already refuses to call this from
+    # anywhere else, and the environment is restricted to the same refs.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    environment: release-signing
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      signed: ${{ steps.publish.outputs.signed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Download the unsigned artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ runner.temp }}/unsigned
+      - name: Verify the artifact against the build job's hash list
+        shell: pwsh
+        env:
+          EXPECTED: ${{ inputs.expected }}
+          FILES: ${{ inputs.files }}
+        run: |
+          python scripts/ci-hashes.py verify "$env:RUNNER_TEMP/unsigned" --expect $env:EXPECTED
+          if ($LASTEXITCODE -ne 0) { throw 'Unsigned artifact does not match the build job hash list' }
+          foreach ($name in ($env:FILES -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            if ($name -notmatch '^[A-Za-z0-9._/-]+$' -or $name.Contains('..')) { throw "Unsafe file name: $name" }
+            if (-not (Test-Path -LiteralPath (Join-Path "$env:RUNNER_TEMP/unsigned" $name) -PathType Leaf)) { throw "Not in the artifact: $name" }
+          }
+      - name: Require signing configuration
+        shell: pwsh
+        env:
+          CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          PUBLISHER: ${{ vars.ARTIFACT_SIGNING_PUBLISHER }}
+        run: |
+          foreach ($name in 'CLIENT_ID','TENANT_ID','SUBSCRIPTION_ID','ENDPOINT','ACCOUNT','PROFILE','PUBLISHER') {
+            if (-not [Environment]::GetEnvironmentVariable($name)) { throw "Repository variable for $name is not set" }
+          }
+      - name: Sign in to Azure for code signing
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Prepare code signing
+        id: signing
+        shell: pwsh
+        env:
+          ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+        run: ./scripts/windows-signing/setup.ps1 -Endpoint $env:ENDPOINT -Account $env:ACCOUNT -CertificateProfile $env:PROFILE
+      - name: Sign the named files and check the signatures
+        shell: pwsh
+        env:
+          ARTIFACT_SIGNING_DLIB: ${{ steps.signing.outputs.dlib }}
+          ARTIFACT_SIGNING_METADATA: ${{ steps.signing.outputs.metadata }}
+          FILES: ${{ inputs.files }}
+          PUBLISHER: ${{ vars.ARTIFACT_SIGNING_PUBLISHER }}
+        run: |
+          $paths = @()
+          foreach ($name in ($env:FILES -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            $path = Join-Path "$env:RUNNER_TEMP/unsigned" $name
+            ./scripts/windows-signing/sign.ps1 $path
+            if ($LASTEXITCODE -ne 0) { throw "Signing $name failed" }
+            $paths += $path
+          }
+          ./scripts/windows-signing/verify.ps1 -Publisher $env:PUBLISHER @paths
+          if ($LASTEXITCODE -ne 0) { throw 'Signature check failed' }
+      - name: Publish the signed artifact
+        id: publish
+        shell: pwsh
+        run: |
+          $signed = "$env:RUNNER_TEMP/signed"
+          New-Item -ItemType Directory -Force $signed | Out-Null
+          Copy-Item -Recurse -Force "$env:RUNNER_TEMP/unsigned/*" $signed
+          Remove-Item -LiteralPath "$signed/SHA256SUMS"
+          $hash = python scripts/ci-hashes.py create $signed
+          if ($LASTEXITCODE -ne 0 -or $hash -notmatch '^[0-9a-f]{64}$') { throw 'Could not hash the signed artifact' }
+          "signed=$hash" | Add-Content $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.signed_artifact }}
+          path: ${{ runner.temp }}/signed
+          if-no-files-found: error

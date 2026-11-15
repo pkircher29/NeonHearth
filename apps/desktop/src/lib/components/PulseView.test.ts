@@ -32,7 +32,8 @@ it('shows router WAN rates separately without turning household totals into devi
   const household=view.getByRole('region',{name:'Household internet traffic'});
   expect(household.textContent).toContain('20 Mbps');
   expect(household.textContent).toContain('1.0 Mbps');
-  expect(household.textContent).toContain('Predator Connect W6');
+  expect(household.textContent).not.toContain('Predator');
+  expect(household.textContent).toContain('router-reported internet totals');
   expect(view.getByText('No per-device counter source')).toBeTruthy();
   expect(view.getByText('No usage data yet')).toBeTruthy();
   await fireEvent.click(view.getByRole('button',{name:'Open Traffic'}));
@@ -53,45 +54,45 @@ it('keeps a valid measured zero distinct from missing household measurements',()
   expect(view.queryByText(/No fresh router readings/)).toBeNull();
 });
 
-it('shows the Flow Map by default, can switch to the Hearth, and remembers the choice',async()=>{
-  const memory=new Map<string,string>();
-  vi.stubGlobal('localStorage',{getItem:(k:string)=>memory.get(k)??null,setItem:(k:string,v:string)=>{memory.set(k,v);},removeItem:(k:string)=>{memory.delete(k);}});
-  const first=render(PulseView,{state:{...initialLiveState,connected:true}});
-  expect(first.getByRole('img',{name:/Network flow map:/})).toBeTruthy();
-  expect(first.getByRole('complementary',{name:'How to read the flow map'})).toBeTruthy();
-  expect(first.getByText(/The flow map below uses per-device counters/)).toBeTruthy();
-  expect(first.getByRole('heading',{name:'Your network, in motion.'})).toBeTruthy();
-  expect(first.getByRole('button',{name:'Flow'}).getAttribute('aria-pressed')).toBe('true');
-  await fireEvent.click(first.getByRole('button',{name:'Hearth'}));
-  expect(first.getByRole('img',{name:/Network hearth:/})).toBeTruthy();
-  expect(first.getByRole('heading',{name:'Your network, breathing.'})).toBeTruthy();
-  expect(first.getByRole('complementary',{name:'How to read the hearth'})).toBeTruthy();
-  expect(first.getByText(/The hearth below uses per-device counters/)).toBeTruthy();
-  expect(first.queryByRole('img',{name:/Network flow map:/})).toBeNull();
-  first.unmount();
-  const second=render(PulseView,{state:{...initialLiveState,connected:true}});
-  expect(second.getByRole('img',{name:/Network hearth:/})).toBeTruthy();
-  expect(memory.get('neonhearth.pulse.hero')).toBe('hearth');
-  vi.unstubAllGlobals();
+it('shows the angular Pulse overview without a decorative network visualization',()=>{
+  const view=render(PulseView,{state:{...initialLiveState,connected:true}});
+  expect(view.getByRole('heading',{name:'Network control.'})).toBeTruthy();
+  expect(view.getByRole('heading',{name:'Traffic scope'})).toBeTruthy();
+  expect(view.queryByRole('img',{name:/Network (flow map|hearth):/})).toBeNull();
+  expect(view.queryByRole('group',{name:'Pulse visual'})).toBeNull();
 });
 
-it('falls back to the host computer traffic, and says so, when per-device counters are unavailable',async()=>{
-  const host={observed_at:new Date().toISOString(),status:'ready',detail:'This computer only.',interfaces:[],applications:[],connections:[],upload_bytes_per_second:1_000_000,download_bytes_per_second:50_000,app_counters:'sampled_tcp',firewall_available:false,memory_total_bytes:null,memory_available_bytes:null};
-  const hostApi={snapshot:vi.fn(async()=>host)} as never;
-  const automationApi={network:vi.fn(async()=>({status:'ready',observed_at:'',devices:[]}))} as never;
-  const view=render(PulseView,{state:{...initialLiveState,connected:true},hostApi,automationApi});
-  expect(await view.findByText(/showing this computer's live traffic/)).toBeTruthy();
-  expect(view.getByText('This computer')).toBeTruthy();
-  expect(view.getByRole('img',{name:/showing this computer only/})).toBeTruthy();
-  expect(view.getByText(/not whole-home traffic/,{selector:'dd'})).toBeTruthy();
+it('says which side is missing instead of adding a fake zero, and drops the protocol-mix placeholder',()=>{
+  const live={...initialLiveState,connected:true,aggregate:{upload:null,download:5_000_000}};
+  const view=render(PulseView,{state:live});
+  expect(view.getByText('Only download is reported')).toBeTruthy();
+  const throughput=view.container.querySelector('.metrics article')!;
+  expect(throughput.textContent).toContain('unavailable');
+  expect(view.queryByText('PROTOCOL MIX')).toBeNull();
+  expect(view.queryByText(/protocol mix/i)).toBeNull();
   view.unmount();
 });
 
-it('does not poll the host and keeps the per-device wording when per-device counters exist',async()=>{
-  const hostApi={snapshot:vi.fn()} as never;
-  const live={...initialLiveState,connected:true,throughput:[{at:'t',upload:1,download:1}],aggregate:{upload:1,download:1}};
-  const view=render(PulseView,{state:live,hostApi});
-  expect(view.getByText(/The flow map below uses per-device counters/)).toBeTruthy();
-  expect((hostApi as {snapshot:ReturnType<typeof vi.fn>}).snapshot).not.toHaveBeenCalled();
+it('treats a connected stream with no fresh device readings as no throughput, not zero',()=>{
+  const live={...initialLiveState,connected:true,aggregate:{upload:null,download:null},throughput:[{at:'2026-08-23T00:00:00Z',upload:9,download:9}]};
+  const view=render(PulseView,{state:live});
+  expect(view.getByText('No per-device counter source')).toBeTruthy();
+  expect(view.container.querySelector('.metrics strong')!.textContent).toBe('unavailable');
+  view.unmount();
+});
+
+it('lifts the pen across a time gap in the throughput curve instead of drawing over missing data',()=>{
+  const at=(s:number)=>new Date(Date.UTC(2026,7,23,0,0,s)).toISOString();
+  const live={...initialLiveState,connected:true,aggregate:{upload:1,download:1},throughput:[{at:at(0),upload:1,download:1},{at:at(1),upload:2,download:2},{at:at(60),upload:3,download:3},{at:at(61),upload:1,download:1}]};
+  const view=render(PulseView,{state:live});
+  const path=view.container.querySelector('.trace.down')!.getAttribute('d')!;
+  expect(path.match(/M/g)!.length).toBe(2);
+  expect(path.match(/L/g)!.length).toBe(2);
+  view.unmount();
+});
+
+it('names the configured router source instead of a hard-coded model',()=>{
+  const view=render(PulseView,{state:{...initialLiveState,connected:true},network:{...router(),router:{...router().router,source:'Acme AX7000'}},onopentraffic:()=>{}});
+  expect(view.getByRole('region',{name:'Household internet traffic'}).textContent).toContain('Acme AX7000 · router-reported internet totals');
   view.unmount();
 });

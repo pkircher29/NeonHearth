@@ -4,8 +4,8 @@
   // windows a sill line, stairs a dashed run.
   import { DEFAULT_THICKNESS_M, type PlanPoint, type Wall } from '../stores/home';
 
-  let { wall, start, end, scale, selected, label, onclick, onkeydown, onpointerdown }: {
-    wall: Wall; start: PlanPoint; end: PlanPoint; scale: number; selected: boolean; label: string;
+  let { wall, start, end, scale, selected, label, onclick, onkeydown, onpointerdown, tabindex = 0 }: {
+    wall: Wall; start: PlanPoint; end: PlanPoint; scale: number; selected: boolean; label: string; tabindex?: number;
     onclick: (event: MouseEvent) => void; onkeydown: (event: KeyboardEvent) => void; onpointerdown: (event: PointerEvent) => void;
   } = $props();
 
@@ -17,7 +17,7 @@
   const at = (offset: number) => ({ x: (start.x + ux * offset) * scale, y: (start.y + uy * offset) * scale });
 </script>
 
-<g class="wall-group" role="button" tabindex="0" aria-label={label} {onclick} {onkeydown} {onpointerdown}>
+<g class="wall-group" role="button" {tabindex} data-roving={`wall:${wall.wall_id}`} aria-label={label} {onclick} {onkeydown} {onpointerdown}>
   <line class="wall-hit" x1={start.x * scale} y1={start.y * scale} x2={end.x * scale} y2={end.y * scale} stroke-width={Math.max(band, 14)} />
   <line class="wall" class:selected data-wall-id={wall.wall_id}
     x1={start.x * scale} y1={start.y * scale} x2={end.x * scale} y2={end.y * scale} stroke-width={band} />

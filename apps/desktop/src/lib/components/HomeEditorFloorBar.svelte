@@ -23,7 +23,7 @@
 <style>
   .floor-bar{display:flex;flex-wrap:wrap;gap:8px;margin:0}
   .floor-tab{display:grid;gap:2px;min-height:40px;padding:5px 12px;border:1px solid var(--line-mid);border-radius:6px;background:var(--surface);color:var(--ink);text-align:left;cursor:pointer}
-  .floor-tab.active{border-color:var(--accent);box-shadow:inset 0 0 18px var(--accent)14;color:var(--ink)}
+  .floor-tab.active{border-color:var(--accent);box-shadow:inset 0 0 18px color-mix(in srgb, var(--accent) 8%, transparent);color:var(--ink)}
   .floor-tab strong{font:600 13px var(--font-display)}
   .floor-tab small{color:var(--muted);font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.06em}
   .floor-area{text-transform:none;color:var(--accent)}

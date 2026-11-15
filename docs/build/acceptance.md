@@ -14,7 +14,13 @@ that exact commit with `source_dirty:false`. Review the candidate's declared
 signing status. The package verifier checks every listed file's size and SHA-256,
 required components, source metadata, and no unlisted files, path traversal,
 case-insensitive duplicates, symlinks or Windows reparse points. The package
-manifest is an integrity record, not a publisher signature.
+manifest is an integrity record, not a publisher signature. The launcher
+itself now also rejects unlisted files, refuses to run elevated, and refuses a
+package folder other accounts can write (see windows-delivery.md). A hosted CI
+runner is elevated and extracts to a shared drive, so the automated harness
+(`verify-candidate.py`, `soak-candidate.py`) adds `--allow-elevated
+--allow-shared-package` only when `NEONHEARTH_CI_HARNESS=1` is set; do not set
+it for customer-style acceptance on a real machine.
 
 Run from the repository root (Python 3.11+):
 
