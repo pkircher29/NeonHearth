@@ -251,5 +251,7 @@ async fn events_socket(
     upgrade
         .max_message_size(ws::MAX_CLIENT_MESSAGE_BYTES)
         .max_frame_size(ws::MAX_CLIENT_MESSAGE_BYTES)
-        .on_upgrade(move |socket| ws::serve_socket(socket, events, query.after_sequence, query.epoch, guard))
+        .on_upgrade(move |socket| {
+            ws::serve_socket(socket, events, query.after_sequence, query.epoch, guard)
+        })
 }

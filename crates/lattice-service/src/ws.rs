@@ -346,7 +346,10 @@ mod tests {
         let same_run = resume_messages_with_epoch(&restarted, Some(restarted.epoch()), 1).await;
         assert!(matches!(same_run.as_slice(), [ServerMessage::Event(e)] if e.sequence == 2));
         // Clients that do not send an epoch keep the legacy behaviour.
-        assert_eq!(resume_messages_with_epoch(&restarted, None, 2).await.len(), 0);
+        assert_eq!(
+            resume_messages_with_epoch(&restarted, None, 2).await.len(),
+            0
+        );
     }
 
     #[test]

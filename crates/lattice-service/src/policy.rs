@@ -7,8 +7,7 @@ use lattice_domain::{
 };
 use lattice_event_bus::EventBus;
 use lattice_store::{
-    ActuationReservation, ClockStatus, M2StateRepository, PolicyRepository,
-    W6PriorStateRepository,
+    ActuationReservation, ClockStatus, M2StateRepository, PolicyRepository, W6PriorStateRepository,
 };
 use lattice_w6::{
     Connector, DiscoveryStatus, Error as W6Error, RequestedQuarantine, Transport, Verification,
