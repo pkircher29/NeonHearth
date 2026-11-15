@@ -152,8 +152,12 @@ pub struct Measurement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum SkipReason {
-    DependencyFailed { dependency: CheckKind },
-    DependencySkipped { dependency: CheckKind },
+    DependencyFailed {
+        dependency: CheckKind,
+    },
+    DependencySkipped {
+        dependency: CheckKind,
+    },
     BudgetExhausted,
     /// The probe transport cannot perform this check's probe in this build or
     /// on this platform. This is not a fault in the network, so it never
@@ -161,7 +165,9 @@ pub enum SkipReason {
     ProbeUnsupported,
     /// A parent check was unavailable (see [`SkipReason::ProbeUnsupported`]),
     /// so this one could not run either.
-    DependencyUnavailable { dependency: CheckKind },
+    DependencyUnavailable {
+        dependency: CheckKind,
+    },
 }
 
 impl SkipReason {
