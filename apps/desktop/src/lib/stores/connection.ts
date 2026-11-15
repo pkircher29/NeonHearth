@@ -32,6 +32,8 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
   let hydrationGeneration: number | undefined;
   let hydrationAbort: AbortController | undefined;
   let pendingHydration = false;
+  /** Generation of a resync that should stay "connected" until its outcome is known. */
+  let softGeneration: number | undefined;
   const publish = () => onState?.(state);
   const isCurrent = (token: number) => !stopped && token === generation;
   const cancelRetry = () => { if (retryTimer !== undefined) { timers.clearTimeout(retryTimer); retryTimer = undefined; } };
@@ -49,7 +51,10 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
     staleTimer = timers.setTimeout(() => {
       staleTimer = undefined;
       if (!isCurrent(token) || epoch !== socketEpoch) return;
-      resync();
+      // A quiet home sends nothing for long stretches, so this fires routinely.
+      // Stay "connected" while the replacement is fetched and opened; the state
+      // only drops if that snapshot fails or the new socket does not open.
+      resync(true);
     }, staleAfterMs);
   };
 
@@ -63,6 +68,7 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
       const snapshot = await client.snapshotAll({ signal: abort.signal });
       if (!isCurrent(token)) return;
       state = applySnapshot(state, snapshot);
+      if (softGeneration === token) state = { ...state, connected: true };
       publish();
       const epoch = ++socketEpoch;
       const opened = await client.openEvents(state.sequence, handleMessage, (socketState) => handleSocketState(token, epoch, socketState));
@@ -79,14 +85,24 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
         }, openTimeoutMs);
       }
     } catch {
-      if (!abort.signal.aborted) scheduleReconnect(token);
+      if (!abort.signal.aborted) {
+        softGeneration = undefined;
+        if (isCurrent(token) && state.connected) { state = { ...state, connected: false }; publish(); }
+        scheduleReconnect(token);
+      }
     } finally {
       if (hydrationAbort === abort) hydrationAbort = undefined;
       hydrationGeneration = undefined;
       if (pendingHydration) { pendingHydration = false; if (!stopped) void hydrateAndOpen(generation); }
     }
   };
-  const resync = () => { if (stopped) return; generation += 1; cancelRetry(); closeSocket(); state = { ...state, connected: false }; publish(); void hydrateAndOpen(generation); };
+  const resync = (keepConnected = false) => {
+    if (stopped) return;
+    generation += 1; cancelRetry(); closeSocket();
+    softGeneration = keepConnected && state.connected ? generation : undefined;
+    if (softGeneration === undefined) { state = { ...state, connected: false }; publish(); }
+    void hydrateAndOpen(generation);
+  };
   const handleMessage = (message: ServerMessage) => {
     const next = reduceLiveMessage(state, message); state = next; publish();
     if (next.needsResync) { resync(); return; }
@@ -94,6 +110,7 @@ export function createLiveConnection({ client, onState, timers = defaultTimers, 
   };
   const handleSocketState = (token: number, epoch: number, socketState: 'open' | 'closed' | 'error') => {
     if (!isCurrent(token) || epoch !== socketEpoch) return;
+    softGeneration = undefined;
     if (socketState === 'open') {
       if (openTimer !== undefined) { timers.clearTimeout(openTimer); openTimer = undefined; }
       state = { ...state, connected: true }; retry = 0; publish();
