@@ -8,7 +8,14 @@ mod tests;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
+    time::Instant,
+};
 use tokio::sync::{Mutex, watch};
 use utoipa::ToSchema;
 
@@ -88,7 +95,17 @@ pub struct HostMonitor {
     pool: SqlitePool,
     inner: Arc<Mutex<Inner>>,
     pub(crate) firewall_lock: Arc<Mutex<()>>,
+    /// Unix seconds until which a reader is considered to be watching the live view.
+    demand_until: Arc<AtomicI64>,
+    /// Per-connection byte counters (Windows EStats) are off unless explicitly requested.
+    app_counters: Arc<AtomicBool>,
 }
+
+/// How long one live-view request keeps the 2-second collector running.
+const DEMAND_WINDOW_SECONDS: i64 = 30;
+/// Collector period while only history recording (no viewer) needs samples. Stays below the
+/// 15-second gap limit in `sample_delta` so the host totals keep accumulating.
+const IDLE_RECORDING_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
 impl HostMonitor {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
@@ -102,23 +119,59 @@ impl HostMonitor {
                 previous: None,
             })),
             firewall_lock: Arc::new(Mutex::new(())),
+            demand_until: Arc::new(AtomicI64::new(0)),
+            app_counters: Arc::new(AtomicBool::new(
+                std::env::var("LATTICE_HOST_APP_COUNTERS").is_ok_and(|v| v == "1"),
+            )),
         }
+    }
+    /// Marks the live view as in use; the collector runs at full rate for a short window.
+    pub fn touch(&self) {
+        self.demand_until.store(
+            Utc::now().timestamp() + DEMAND_WINDOW_SECONDS,
+            Ordering::Relaxed,
+        );
+    }
+    /// Enables per-connection TCP byte counters. On Windows this switches on kernel EStats
+    /// collection for every connection of the machine, so it is opt-in.
+    pub fn set_app_counters(&self, enabled: bool) {
+        self.app_counters.store(enabled, Ordering::Relaxed);
+    }
+    fn demanded(&self) -> bool {
+        self.demand_until.load(Ordering::Relaxed) >= Utc::now().timestamp()
     }
     pub fn start(&self, mut shutdown: watch::Receiver<bool>) {
         let this = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_collect: Option<Instant> = None;
+            let mut recording: (Instant, bool) = (Instant::now(), true);
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => { if *shutdown.borrow() || shutdown.has_changed().is_err() { break; } }
-                    _ = interval.tick() => { this.collect().await; }
+                    _ = interval.tick() => {
+                        // Nobody watching and nothing recording: skip the socket-table and
+                        // per-process work entirely. Recording alone runs at a slower period.
+                        if !this.demanded() {
+                            if last_collect.is_none() || recording.0.elapsed() >= std::time::Duration::from_secs(30) {
+                                recording = (Instant::now(), this.settings().await.map(|s| s.record_history).unwrap_or(true));
+                            }
+                            let due = last_collect.is_none_or(|at| at.elapsed() >= IDLE_RECORDING_PERIOD);
+                            if !recording.1 || !due {
+                                continue;
+                            }
+                        }
+                        last_collect = Some(Instant::now());
+                        this.collect().await;
+                    }
                 }
             }
         });
     }
     async fn collect(&self) {
-        let result = tokio::task::spawn_blocking(platform::snapshot).await;
+        let app_counters = self.app_counters.load(Ordering::Relaxed);
+        let result = tokio::task::spawn_blocking(move || platform::snapshot(app_counters)).await;
         let now = Instant::now();
         let mut inner = self.inner.lock().await;
         let mut snapshot = match result {
@@ -164,6 +217,7 @@ impl HostMonitor {
         }
     }
     pub async fn snapshot(&self) -> HostSnapshot {
+        self.touch();
         self.inner.lock().await.snapshot.clone()
     }
 }
