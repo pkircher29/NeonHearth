@@ -79,3 +79,33 @@ before commit; the M5 gate is proven in a real browser.
 - A draft autosaved before the first committed save is keyed under the
   placeholder home id and is not re-offered after that first commit.
 - Conflict-resolution reload does not re-offer an existing draft.
+
+## Home tools v2 (2026-11-15)
+
+Implements `m5-home-tools-v2-spec.md` sections A–F and replaces the Pulse
+hearth with a Flow Map (the hearth stays available behind a Flow / Hearth
+switch).
+
+Verified on the integration branch `feat/home-tools-v2`:
+
+- `npm run check` — 0 errors, 0 warnings.
+- `npx vitest run --exclude 'e2e/**'` — 44 files, 506 tests passed.
+- `npx playwright test` — 15 passed, 7 skipped (the Flow Map screenshot
+  scenarios only run with `FLOW_SHOTS=1`), real WebGL path.
+- A scripted walkthrough: rectangle room, a partition wall landing on two
+  wall bodies (both split), Detect rooms → Add all, save, open the 3D view.
+  The saved plan carried seven walls with `thickness_m` and the two half
+  rooms; the 3D view rendered it.
+- Flow Map with a 150-device synthetic fixture in headless Chromium:
+  average frame 16.67 ms, worst 16.8 ms over 10 s.
+
+Not verified (recorded, not claimed):
+
+- Pinch zoom on a real touch device (synthetic pointer events only).
+- Browsers other than Chromium; the twin detail card on a narrow screen.
+- Flow Map frame time on real collector data or an integrated GPU.
+- Floating room-name labels in the 3D view were not built; names show on
+  hover.
+- Ctrl+D on a room copies the room outline, not its walls.
+- `DeviceSnapshot` carries no room, so Flow Map sectors group by device
+  type (`owner_type`, then `identity.classification`), not by room.

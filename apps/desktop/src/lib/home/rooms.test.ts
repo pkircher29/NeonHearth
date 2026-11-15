@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { MIN_ROOM_AREA_M2, detectRoomCycles, floorArea, newRoomCandidates, polygonArea, polygonCentroid, samePolygon, signedArea } from './rooms';
+import { MIN_ROOM_AREA_M2, detectRoomCycles, floorArea, newRoomCandidates, polygonArea, polygonCentroid, samePolygon, signedArea, dividedRooms, pointInPolygon } from './rooms';
 
 let counter = 0;
 const wall = (sx: number, sy: number, ex: number, ey: number) => ({ wall_id: `w${counter++}`, start: { x: sx, y: sy }, end: { x: ex, y: ey } });
@@ -112,5 +112,29 @@ describe('newRoomCandidates', () => {
     const candidates = newRoomCandidates(walls, [{ polygon: [{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 4, y: 3 }, { x: 0, y: 3 }] }]);
     expect(candidates).toHaveLength(1);
     expect(candidates[0].area).toBe(9);
+  });
+});
+
+describe('dividedRooms', () => {
+  const wall = (id: string, x1: number, y1: number, x2: number, y2: number) => ({ wall_id: id, start: { x: x1, y: y1 }, end: { x: x2, y: y2 } });
+  const whole = { polygon: [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 6 }, { x: 0, y: 6 }] };
+  const left = { polygon: [{ x: 0, y: 0 }, { x: 5, y: 0 }, { x: 5, y: 6 }, { x: 0, y: 6 }] };
+  const right = { polygon: [{ x: 5, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 6 }, { x: 5, y: 6 }] };
+  const split = [wall('a', 0, 0, 5, 0), wall('b', 5, 0, 10, 0), wall('c', 10, 0, 10, 6), wall('d', 10, 6, 5, 6), wall('e', 5, 6, 0, 6), wall('f', 0, 6, 0, 0), wall('p', 5, 0, 5, 6)];
+
+  it('reports a room once a partition has divided it and both halves are rooms', () => {
+    expect(dividedRooms(split, [whole, left, right])).toEqual([whole]);
+  });
+  it('keeps the room while a half is still missing', () => {
+    expect(dividedRooms(split, [whole, left])).toEqual([]);
+  });
+  it('keeps an undivided room and a room with no walls around it', () => {
+    const outline = split.filter((entry) => entry.wall_id !== 'p');
+    expect(dividedRooms(outline, [whole])).toEqual([]);
+    expect(dividedRooms([], [whole])).toEqual([]);
+  });
+  it('pointInPolygon separates inside from outside', () => {
+    expect(pointInPolygon({ x: 2, y: 2 }, whole.polygon)).toBe(true);
+    expect(pointInPolygon({ x: 12, y: 2 }, whole.polygon)).toBe(false);
   });
 });

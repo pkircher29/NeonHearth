@@ -14,7 +14,7 @@
     DEFAULT_SCALE, boundsOf, defaultView, fitView, panBy, pinchView, scaleBar, toPlan, viewBox, zoomAt, zoomTo, type Size, type TouchPair, type ViewState
   } from '../home/view';
   import { SNAP_LABELS, angleDegrees, computeSnap, constrainAngle, pointAtLength, type SnapResult } from '../home/snap';
-  import { newRoomCandidates, polygonArea, polygonCentroid, type RoomCandidate } from '../home/rooms';
+  import { dividedRooms, newRoomCandidates, polygonArea, polygonCentroid, type RoomCandidate } from '../home/rooms';
   import { blockedOpening, blockedOpeningNotice, parseLengthEntry, planRectangleBatch, planWallBatch } from '../home/draft';
   import { DEFAULT_CANVAS_SIZE, floorPoints, initialFloorView, readFloorView, saveFloorView } from '../home/viewStore';
 
@@ -633,22 +633,27 @@
     roomNameEdits = {};
     roomOfferOpen = true;
   }
+  // A wall drawn across an existing room leaves that room stale: once every
+  // piece of it is a room, the old outline is removed in the same undo step.
+  function addRooms(additions: Array<{ name: string; polygon: PlanPoint[] }>): { added: number; replaced: string[] } | null {
+    if (!activeFloor || additions.length === 0) return null;
+    const floor = activeFloor;
+    const adds = additions.map((addition) => ({ type: 'add_room' as const, floor_id: floor.floor_id, room_id: newId(), name: addition.name, polygon: addition.polygon, exact: true }));
+    const after = [...floor.rooms, ...adds.map((add) => ({ room_id: add.room_id, name: add.name, polygon: add.polygon }))];
+    const stale = dividedRooms(floor.walls, after).filter((room) => floor.rooms.some((existing) => existing.room_id === room.room_id));
+    const removals = stale.map((room) => ({ type: 'delete_room' as const, floor_id: floor.floor_id, room_id: room.room_id }));
+    if (!dispatch({ type: 'batch', actions: [...adds, ...removals] })) return null;
+    return { added: adds.length, replaced: stale.map((room) => room.name) };
+  }
+  const replacedNote = (replaced: string[]) => replaced.length ? ` ${replaced.join(', ')} was divided by a wall and has been replaced.` : '';
   function addCandidate(candidate: RoomCandidate, index: number) {
-    if (!activeFloor) return;
     const name = roomNameFor(candidate, index).trim() || defaultRoomName(index);
-    if (dispatch({ type: 'add_room', floor_id: activeFloor.floor_id, room_id: newId(), name, polygon: candidate.polygon, exact: true })) {
-      notice = `Added ${name}.`;
-    } else notice = 'That room could not be added.';
+    const result = addRooms([{ name, polygon: candidate.polygon }]);
+    notice = result ? `Added ${name}.${replacedNote(result.replaced)}` : 'That room could not be added.';
   }
   function addAllCandidates() {
-    if (!activeFloor) return;
-    const floor = activeFloor;
-    const actions = candidates.map((candidate, index) => ({
-      type: 'add_room' as const, floor_id: floor.floor_id, room_id: newId(),
-      name: roomNameFor(candidate, index).trim() || defaultRoomName(index), polygon: candidate.polygon, exact: true
-    }));
-    if (actions.length > 0 && dispatch({ type: 'batch', actions })) notice = `Added ${actions.length} ${actions.length === 1 ? 'room' : 'rooms'}.`;
-    else notice = 'Those rooms could not be added.';
+    const result = addRooms(candidates.map((candidate, index) => ({ name: roomNameFor(candidate, index).trim() || defaultRoomName(index), polygon: candidate.polygon })));
+    notice = result ? `Added ${result.added} ${result.added === 1 ? 'room' : 'rooms'}.${replacedNote(result.replaced)}` : 'Those rooms could not be added.';
   }
 
   // ---- Clicks ----
