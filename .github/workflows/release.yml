@@ -619,6 +619,12 @@ jobs:
           mkdir -p release-assets
           find artifacts -type f \( -name '*.zip' -o -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
           cd release-assets
+          # GitHub replaces "~" with "." in uploaded asset names, so a prerelease deb/rpm
+          # (0.1.0~beta.1) would not match its SHA256SUMS line. Rename first, then hash.
+          for f in *~*; do
+            [ -e "$f" ] || continue
+            mv -- "$f" "${f//\~/.}"
+          done
           ls -la
           [ -n "$(ls NeonHearth-Home-Hub-*-windows-x64.zip 2>/dev/null)" ] || { echo 'no x64 Home Hub artifact' >&2; exit 1; }
           [ -n "$(ls NeonHearth-Home-Hub-*-windows-arm64.zip 2>/dev/null)" ] || { echo 'no ARM64 Home Hub artifact' >&2; exit 1; }
