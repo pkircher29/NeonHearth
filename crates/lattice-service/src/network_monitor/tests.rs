@@ -1,4 +1,5 @@
 use super::*;
+use std::net::Ipv4Addr;
 use lattice_sensor::{
     Address, Interface, InterfaceClass, InterfaceId, InterfaceInventory, InterfaceRole,
 };
@@ -213,4 +214,65 @@ async fn discovery_waits_for_other_database_writers_before_reading_previous_stat
         .await
         .unwrap();
     assert_eq!(event, "responding_again");
+}
+#[tokio::test]
+async fn sweep_snapshots_and_plans_once_and_probes_every_target_once() {
+    use std::sync::atomic::AtomicUsize;
+    let hub = NetworkMonitor::new(lattice_store::connect_memory().await.unwrap());
+    *hub.discovery.lock().await = Some(Discovery::default());
+    let snapshots = Arc::new(AtomicUsize::new(0));
+    let plans = Arc::new(AtomicUsize::new(0));
+    let probed: Arc<std::sync::Mutex<Vec<Ipv4Addr>>> = Arc::default();
+    let batches = Arc::new(AtomicUsize::new(0));
+    let snapshot = {
+        let snapshots = Arc::clone(&snapshots);
+        move || {
+            snapshots.fetch_add(1, Ordering::SeqCst);
+            Ok(InterfaceInventory::new(Vec::new()))
+        }
+    };
+    let planner = {
+        let plans = Arc::clone(&plans);
+        move |_: &InterfaceInventory| {
+            plans.fetch_add(1, Ordering::SeqCst);
+            lan::Plan {
+                targets: (1..=200u8)
+                    .map(|n| lan::Target {
+                        interface: 1,
+                        source: Ipv4Addr::new(192, 168, 1, 250),
+                        ip: Ipv4Addr::new(192, 168, 1, n),
+                    })
+                    .collect(),
+                skipped: 0,
+            }
+        }
+    };
+    let prober = {
+        let probed = Arc::clone(&probed);
+        let batches = Arc::clone(&batches);
+        move |batch: Vec<lan::Target>, _names: Arc<BTreeMap<u32, String>>| {
+            let probed = Arc::clone(&probed);
+            batches.fetch_add(1, Ordering::SeqCst);
+            async move {
+                probed
+                    .lock()
+                    .unwrap()
+                    .extend(batch.iter().map(|target| target.ip));
+                batch
+                    .iter()
+                    .map(|_| Ok::<Option<lan::Sighting>, ()>(None))
+                    .collect::<Vec<_>>()
+            }
+        }
+    };
+    hub.run_sweep(snapshot, planner, prober).await.unwrap();
+    assert_eq!(snapshots.load(Ordering::SeqCst), 1, "one interface snapshot per sweep");
+    assert_eq!(plans.load(Ordering::SeqCst), 1, "one plan per sweep");
+    assert!(batches.load(Ordering::SeqCst) > 1, "the sweep must span several batches");
+    let mut probed = probed.lock().unwrap().clone();
+    probed.sort();
+    let expected: Vec<Ipv4Addr> = (1..=200u8).map(|n| Ipv4Addr::new(192, 168, 1, n)).collect();
+    assert_eq!(probed, expected, "every planned target is probed exactly once");
+    let status = hub.discovery.lock().await.clone().unwrap();
+    assert_eq!((status.total, status.completed, status.errors), (200, 200, 0));
 }

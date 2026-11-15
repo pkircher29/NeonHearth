@@ -6,10 +6,11 @@ mod router;
 mod tests;
 use chrono::Utc;
 use futures_util::StreamExt;
+use lattice_sensor::InterfaceInventory;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -245,12 +246,27 @@ impl NetworkMonitor {
         Ok(())
     }
     async fn run_discovery(&self) -> Result<(), ()> {
-        let inventory =
-            tokio::task::spawn_blocking(|| lattice_sensor::SystemInterfaceManager.snapshot())
-                .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?;
-        let plan = lan::plan(&inventory);
+        self.run_sweep(
+            || lattice_sensor::SystemInterfaceManager.snapshot().map_err(|_| ()),
+            lan::plan,
+            |batch, names| async move { lan::probe_batch(&batch, &names).await },
+        )
+        .await
+    }
+    /// One sweep: a single interface snapshot, a single plan, then every planned target probed
+    /// exactly once in batches. The three inputs are the only seams (OS snapshot, planner,
+    /// prober); production passes the real ones from `run_discovery`.
+    async fn run_sweep<S, P, B, F>(&self, snapshot: S, plan_fn: P, probe: B) -> Result<(), ()>
+    where
+        S: FnOnce() -> Result<InterfaceInventory, ()> + Send + 'static,
+        P: Fn(&InterfaceInventory) -> lan::Plan,
+        B: Fn(Vec<lan::Target>, Arc<BTreeMap<u32, String>>) -> F,
+        F: std::future::Future<Output = Vec<Result<Option<lan::Sighting>, ()>>>,
+    {
+        let inventory = tokio::task::spawn_blocking(snapshot)
+            .await
+            .map_err(|_| ())??;
+        let plan = plan_fn(&inventory);
         if let Some(status) = self.discovery.lock().await.as_mut() {
             status.total = plan.targets.len();
             status.skipped_networks = plan.skipped;
@@ -263,15 +279,17 @@ impl NetworkMonitor {
         let mut errors = 0;
         // The plan is validated once for the sweep; probes run in batches that share one
         // neighbor snapshot (previously every target re-planned the whole network).
-        let names: std::collections::BTreeMap<u32, String> = inventory
-            .interfaces()
-            .map(|i| (i.id.get(), i.name.clone()))
-            .collect();
+        let names: Arc<BTreeMap<u32, String>> = Arc::new(
+            inventory
+                .interfaces()
+                .map(|i| (i.id.get(), i.name.clone()))
+                .collect(),
+        );
         for batch in plan.targets.chunks(lan::BATCH) {
             if self.cancel.load(Ordering::Acquire) {
                 break;
             }
-            for result in lan::probe_batch(batch, &names).await {
+            for result in probe(batch.to_vec(), Arc::clone(&names)).await {
                 let mut status = self.discovery.lock().await;
                 if let Some(status) = status.as_mut() {
                     status.completed += 1;
