@@ -1,5 +1,13 @@
 # Live flow and durable retention
 
+> **Status: implemented and tested, not fed by any production source.** The flow engine
+> that produces the rollups this document consumes (`lattice_sensor::flow::FlowEngine`)
+> is never constructed by the service, and discovery passes an empty change list to the
+> live adapter and store, so no per-device flow rows are written and per-device
+> bandwidth is always unavailable. The missing piece is a traffic source with per-device
+> counters. Flow retention and compaction does run (as part of the service's maintenance
+> pass) but currently has nothing to act on.
+
 `FlowLiveAdapter` consumes validated cumulative one-second rollup replacements. It retains every
 dimension of each device's latest second and prunes that device's superseded seconds. Emitted
 baselines are keyed by the full rollup key, so a replacement from 100 to 150 bytes reports only

@@ -61,8 +61,10 @@ between other devices is invisible to it. *Estimated* means inference or
 mixed-quality sources; whenever sources of different quality overlap, the
 label is conservatively downgraded. "Complete" appears only when a verified
 gateway/bridge/mirror source observes the traffic; no such source is
-configured in this build, so local-only and estimated are the honest
-normal.
+configured in this build, so any figure you do see is local-only or
+estimated. A device with no bandwidth figure at all is expected: this build
+has no source of per-device traffic counters, so per-device bandwidth is
+unavailable for every device.
 
 ## Camera live view will not open
 
