@@ -12,8 +12,28 @@ use lattice_store::{
 use lattice_w6::{
     Connector, DiscoveryStatus, Error as W6Error, RequestedQuarantine, Transport, Verification,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use tokio::sync::Mutex;
+
+/// Process-wide per-device serialization of policy evaluation and owner
+/// actions. Coordinators are built per request (API) and per discovery loop,
+/// so the lock cannot live inside one: the API's Approve and the sweep's
+/// evaluation of the same device must exclude each other no matter which
+/// instance runs them, or both can reserve and drive an irreversible action.
+fn device_lock(device: DeviceId) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<DeviceId, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if locks.len() > 1024 {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    locks.entry(device).or_default().clone()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorOutcome {
@@ -384,14 +404,51 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
     }
     /// Evaluate every persisted policy on a runtime tick.  Deadlines advance
     /// with wall clock time even when no neighbor observations arrive.
+    ///
+    /// One failing device never starves the others: every device is attempted,
+    /// each from a freshly reloaded policy (an owner action that landed since
+    /// the list was read must be honoured), and the failures are reported
+    /// together afterwards.
     pub async fn sweep(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<AuditedDecision>> {
         let mut decisions = Vec::new();
-        for policy in self.repo.list().await? {
-            decisions.push(self.evaluate(policy, now).await?);
+        let mut failures: Vec<String> = Vec::new();
+        for listed in self.repo.list().await? {
+            let device = listed.device_id;
+            let outcome = async {
+                let Some(current) = self.repo.load(device).await? else {
+                    return Ok(None);
+                };
+                self.evaluate(current, now).await.map(Some)
+            }
+            .await;
+            match outcome {
+                Ok(Some(decision)) => decisions.push(decision),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(device = %device, "policy sweep failed for one device: {error:#}");
+                    failures.push(format!("{device}: {error:#}"));
+                }
+            }
         }
-        Ok(decisions)
+        if failures.is_empty() {
+            Ok(decisions)
+        } else {
+            anyhow::bail!(
+                "policy sweep failed for {} device(s); first: {}",
+                failures.len(),
+                failures[0]
+            )
+        }
     }
     pub async fn evaluate(
+        &self,
+        p: DevicePolicy,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<AuditedDecision> {
+        let _guard = device_lock(p.device_id).lock_owned().await;
+        self.evaluate_locked(p, now).await
+    }
+    async fn evaluate_locked(
         &self,
         p: DevicePolicy,
         now: DateTime<Utc>,
@@ -600,7 +657,11 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                                 evaluation.requested_action,
                             )
                             .await?;
-                        self.repo
+                        // Only the caller that actually wins the fresh
+                        // reservation may drive the actuator; anyone else
+                        // would replay an irreversible action.
+                        match self
+                            .repo
                             .reserve_actuation_with_decision(
                                 p.device_id,
                                 evaluation.policy_version,
@@ -613,10 +674,15 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
                                     false,
                                 )),
                             )
-                            .await?;
-                        self.actuator
-                            .enforce(p.device_id, evaluation.requested_action)
-                            .await
+                            .await?
+                        {
+                            ActuationReservation::Reserved => {
+                                self.actuator
+                                    .enforce(p.device_id, evaluation.requested_action)
+                                    .await
+                            }
+                            ActuationReservation::Existing => EnforcementResult::ManualRequired,
+                        }
                     }
                     ActuationReconciliation::Indeterminate
                     | ActuationReconciliation::ManualRequired => EnforcementResult::ManualRequired,
@@ -743,6 +809,14 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         d: DeviceId,
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
+        let _guard = device_lock(d).lock_owned().await;
+        self.approve_locked(d, now).await
+    }
+    async fn approve_locked(
+        &self,
+        d: DeviceId,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<AuditedDecision> {
         if self.repo.load(d).await?.is_none() {
             return Err(PolicyActionError::NotEnrolled.into());
         }
@@ -815,7 +889,7 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             .set_owner_decision(d, OwnerDecision::Approved)
             .await?;
         let p = self.repo.load(d).await?.context("policy disappeared")?;
-        self.evaluate(p, now).await
+        self.evaluate_locked(p, now).await
     }
     async fn approve_verified_action(
         &self,
@@ -871,6 +945,7 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         .await
     }
     pub async fn reject(&self, d: DeviceId, now: DateTime<Utc>) -> anyhow::Result<AuditedDecision> {
+        let _guard = device_lock(d).lock_owned().await;
         self.set_owner_decision_after_release_guard(d, OwnerDecision::Rejected, now)
             .await
     }
@@ -879,6 +954,7 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         d: DeviceId,
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
+        let _guard = device_lock(d).lock_owned().await;
         self.set_owner_decision_after_release_guard(d, OwnerDecision::Quarantined, now)
             .await
     }
@@ -933,7 +1009,7 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
             }
         }
         self.repo.set_owner_decision(d, owner).await?;
-        self.evaluate(self.repo.load(d).await?.context("policy disappeared")?, now)
+        self.evaluate_locked(self.repo.load(d).await?.context("policy disappeared")?, now)
             .await
     }
     pub async fn extend_once(
@@ -942,12 +1018,13 @@ impl<A: PolicyActuator + 'static> PolicyCoordinator<A> {
         until: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> anyhow::Result<AuditedDecision> {
+        let _guard = device_lock(d).lock_owned().await;
         if self.repo.load(d).await?.is_none() {
             return Err(PolicyActionError::NotEnrolled.into());
         }
         self.repo.extend_once(d, until).await?;
         let p = self.repo.load(d).await?.context("policy disappeared")?;
-        self.evaluate(p, now).await
+        self.evaluate_locked(p, now).await
     }
     pub async fn needs_recovery(&self, device: DeviceId) -> anyhow::Result<bool> {
         Ok(self.repo.load(device).await?.is_none())

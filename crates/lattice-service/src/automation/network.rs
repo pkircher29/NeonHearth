@@ -90,6 +90,18 @@ fn enrich(devices: &mut [NetworkDeviceDetails], imported: &[Device]) {
     }
 }
 
+/// Overall answer quality: no neighbor source beats everything, then a cut
+/// evidence set, otherwise complete.
+fn network_status(neighbors_available: bool, evidence_truncated: bool) -> &'static str {
+    if !neighbors_available {
+        "unavailable"
+    } else if evidence_truncated {
+        "partial"
+    } else {
+        "ready"
+    }
+}
+
 impl AutomationHub {
     pub async fn network_details(&self) -> Result<NetworkDetails, StatusCode> {
         let mut cache = self.network_cache.lock().await;
@@ -98,12 +110,13 @@ impl AutomationHub {
         {
             return Ok(cached.details.clone());
         }
-        let evidence: Vec<(String, String, String)> = sqlx::query_as(
+        let mut evidence: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT DISTINCT device_id,source,fact_value FROM evidence WHERE family='link_layer' AND fact_key='mac' AND length(fact_value)=17 AND length(source)<128 AND length(device_id)=36 LIMIT 4097"
         ).fetch_all(&self.pool).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if evidence.len() > 4096 {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
+        // More evidence than the bound degrades to a partial answer, flagged
+        // in `status`, instead of making the whole endpoint unavailable.
+        let evidence_truncated = evidence.len() > 4096;
+        evidence.truncate(4096);
         let mut devices: BTreeMap<String, NetworkDeviceDetails> = BTreeMap::new();
         let mut identities: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         for (id, source, address) in evidence {
@@ -149,11 +162,7 @@ impl AutomationHub {
                 .ok(),
             None => None,
         };
-        let status = if neighbors.is_some() {
-            "ready"
-        } else {
-            "unavailable"
-        };
+        let status = network_status(neighbors.is_some(), evidence_truncated);
         for row in neighbors.into_iter().flatten() {
             let source = format!("neighbor-interface-{}", row.interface().get());
             let Some(mac) = canonical_mac(&row.link_address().to_string()) else {
@@ -209,6 +218,12 @@ pub(crate) async fn network_route(_: LocalOwner, State(state): State<AppState>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn truncated_evidence_is_reported_as_partial_not_ready() {
+        assert_eq!(network_status(true, true), "partial");
+        assert_eq!(network_status(true, false), "ready");
+        assert_eq!(network_status(false, true), "unavailable");
+    }
     #[test]
     fn mac_matching_requires_one_device_and_never_manufactures_identity() {
         let imported: Device = serde_json::from_value(serde_json::json!({

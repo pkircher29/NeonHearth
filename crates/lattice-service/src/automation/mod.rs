@@ -5,8 +5,8 @@ pub mod network;
 use crate::AppState;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, FromRequestParts, State},
-    http::{StatusCode, request::Parts},
+    extract::{DefaultBodyLimit, FromRequestParts, State, rejection::JsonRejection},
+    http::{HeaderValue, StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
@@ -146,6 +146,8 @@ struct Session {
     cancel: CancellationToken,
     commands: Option<mpsc::Sender<QueuedCommand>>,
     last_connect: Option<tokio::time::Instant>,
+    /// Set when the last import had to drop records to stay within bounds.
+    truncated: Option<String>,
 }
 #[derive(Clone)]
 pub struct AutomationHub {
@@ -153,6 +155,7 @@ pub struct AutomationHub {
     session: Arc<Mutex<Session>>,
     configuration: Arc<Mutex<()>>,
     network_cache: Arc<Mutex<Option<network::CachedNetwork>>>,
+    command_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 impl AutomationHub {
     pub fn new(pool: SqlitePool) -> Self {
@@ -164,15 +167,33 @@ impl AutomationHub {
                 cancel: CancellationToken::new(),
                 commands: None,
                 last_connect: None,
+                truncated: None,
             })),
             configuration: Arc::new(Mutex::new(())),
             network_cache: Arc::new(Mutex::new(None)),
+            command_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(20_000)),
         }
     }
+    /// How long a caller waits for an appliance command before giving up. A
+    /// command whose caller gave up is dropped, never sent late.
+    #[doc(hidden)]
+    pub fn set_command_timeout(&self, timeout: std::time::Duration) {
+        let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.command_timeout_ms
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
     pub async fn snapshot(&self) -> Result<Snapshot, StatusCode> {
-        let state = self.session.lock().await;
-        let mut snapshot = state.snapshot.clone();
+        let (mut snapshot, permissions, truncated) = {
+            let state = self.session.lock().await;
+            (
+                state.snapshot.clone(),
+                state.permissions.clone(),
+                state.truncated.clone(),
+            )
+        };
         if snapshot.devices.is_empty() && snapshot.source.is_none() {
+            // The stored-inventory fallback is read without the session lock
+            // so a slow database never stalls live state events or commands.
             let rows = sqlx::query(
                 "SELECT metadata FROM automation_inventory ORDER BY last_seen_at DESC LIMIT 4096",
             )
@@ -180,8 +201,12 @@ impl AutomationHub {
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             for row in rows {
-                let mut device: Device = serde_json::from_str(row.get::<&str, _>("metadata"))
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                // One unreadable stored row must not hide the rest.
+                let Ok(mut device) = serde_json::from_str::<Device>(row.get::<&str, _>("metadata"))
+                else {
+                    tracing::warn!("skipping unreadable stored automation inventory row");
+                    continue;
+                };
                 for entity in &mut device.entities {
                     entity.control_enabled = false;
                 }
@@ -193,10 +218,13 @@ impl AutomationHub {
                         .into();
             }
         }
+        if let Some(note) = truncated {
+            snapshot.detail = format!("{} {note}", snapshot.detail);
+        }
         for device in &mut snapshot.devices {
             for entity in &mut device.entities {
                 entity.control_enabled =
-                    snapshot.status == "connected" && state.permissions.contains(&entity.entity_id);
+                    snapshot.status == "connected" && permissions.contains(&entity.entity_id);
             }
         }
         Ok(snapshot)
@@ -212,19 +240,25 @@ impl AutomationHub {
             .configuration
             .try_lock()
             .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
-        let mut state = self.session.lock().await;
-        if state
+        if self
+            .session
+            .lock()
+            .await
             .last_connect
             .is_some_and(|last| last.elapsed().as_secs() < 5)
         {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
+        // Granting authority is audit-first, and the audit write happens
+        // without the session lock held. The configuration lock keeps other
+        // connect/disconnect/permission changes out meanwhile.
         self.audit(
             "automation.connect",
             None,
             json!({"transport":"home_assistant"}),
         )
         .await?;
+        let mut state = self.session.lock().await;
         state.cancel.cancel();
         let cancel = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(16);
@@ -236,9 +270,11 @@ impl AutomationHub {
             ..Snapshot::default()
         };
         state.permissions.clear();
+        state.truncated = None;
         state.commands = Some(sender);
         state.cancel = cancel.clone();
         state.last_connect = Some(tokio::time::Instant::now());
+        drop(state);
         tokio::spawn(ha::run(
             self.clone(),
             url,
@@ -248,16 +284,38 @@ impl AutomationHub {
         ));
         Ok(())
     }
-    pub async fn disconnect(&self) -> Result<(), StatusCode> {
+    /// Disconnects and revokes every appliance permission. Revocation is
+    /// applied first and unconditionally; the audit entry is best-effort so an
+    /// unhealthy audit store can never keep control authority alive. Returns
+    /// whether the audit entry was recorded.
+    pub async fn disconnect_audited(&self) -> bool {
         let _configuration = self.configuration.lock().await;
-        let mut state = self.session.lock().await;
-        self.audit("automation.disconnect", None, json!({})).await?;
-        state.cancel.cancel();
-        state.commands = None;
-        state.permissions.clear();
-        state.snapshot.status = "disconnected".into();
-        state.snapshot.detail =
-            "Disconnected. Last imported values are historical; availability is unknown.".into();
+        {
+            let mut state = self.session.lock().await;
+            state.cancel.cancel();
+            state.commands = None;
+            state.permissions.clear();
+            state.snapshot.status = "disconnected".into();
+            state.snapshot.detail =
+                "Disconnected. Last imported values are historical; availability is unknown."
+                    .into();
+        }
+        let recorded = self
+            .audit("automation.disconnect", None, json!({}))
+            .await
+            .is_ok();
+        if !recorded {
+            tracing::error!(
+                "automation disconnect applied but its audit entry could not be recorded"
+            );
+            self.session.lock().await.snapshot.detail =
+                "Disconnected. The audit entry for this change could not be recorded; check the audit log health."
+                    .into();
+        }
+        recorded
+    }
+    pub async fn disconnect(&self) -> Result<(), StatusCode> {
+        self.disconnect_audited().await;
         Ok(())
     }
     pub async fn mqtt_status(&self, status: &str, detail: &str) {
@@ -267,29 +325,63 @@ impl AutomationHub {
         };
     }
     pub async fn permissions(&self, request: PermissionRequest) -> Result<(), StatusCode> {
+        self.permissions_audited(request).await.map(|_| ())
+    }
+    /// Replaces the set of controllable entities. Narrowing (or clearing) the
+    /// set is applied first and audited best-effort; granting any new entity
+    /// is audit-first. Returns whether the audit entry was recorded.
+    pub async fn permissions_audited(
+        &self,
+        request: PermissionRequest,
+    ) -> Result<bool, StatusCode> {
         let _configuration = self.configuration.lock().await;
         if request.entity_ids.len() > 256 {
             return Err(StatusCode::BAD_REQUEST);
         }
-        let mut state = self.session.lock().await;
-        if state.snapshot.status != "connected" {
-            return Err(StatusCode::CONFLICT);
-        }
         let next: BTreeSet<_> = request.entity_ids.into_iter().collect();
-        if !next.iter().all(|id| {
-            state
-                .snapshot
-                .devices
-                .iter()
-                .flat_map(|d| &d.entities)
-                .any(|e| &e.entity_id == id && e.power_capable)
-        }) {
-            return Err(StatusCode::BAD_REQUEST);
+        let validate = |state: &Session| -> Result<bool, StatusCode> {
+            if state.snapshot.status != "connected" {
+                return Err(StatusCode::CONFLICT);
+            }
+            if !next.iter().all(|id| {
+                state
+                    .snapshot
+                    .devices
+                    .iter()
+                    .flat_map(|d| &d.entities)
+                    .any(|e| &e.entity_id == id && e.power_capable)
+            }) {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok(next.iter().all(|id| state.permissions.contains(id)))
+        };
+        let narrowing = {
+            let mut state = self.session.lock().await;
+            let narrowing = validate(&state)?;
+            if narrowing {
+                state.permissions = next.clone();
+            }
+            narrowing
+        };
+        if narrowing {
+            let recorded = self
+                .audit("automation.permissions", None, json!({"entities":next}))
+                .await
+                .is_ok();
+            if !recorded {
+                tracing::error!(
+                    "automation permissions narrowed but the audit entry could not be recorded"
+                );
+            }
+            return Ok(recorded);
         }
         self.audit("automation.permissions", None, json!({"entities":next}))
             .await?;
+        let mut state = self.session.lock().await;
+        // The inventory may have refreshed while the audit entry was written.
+        validate(&state)?;
         state.permissions = next;
-        Ok(())
+        Ok(true)
     }
     pub async fn command(&self, request: CommandRequest) -> Result<Receipt, StatusCode> {
         let age = Utc::now()
@@ -312,10 +404,16 @@ impl AutomationHub {
         sender
             .try_send(QueuedCommand { request, result })
             .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
-        tokio::time::timeout(std::time::Duration::from_secs(20), receive)
-            .await
-            .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        tokio::time::timeout(
+            std::time::Duration::from_millis(
+                self.command_timeout_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            receive,
+        )
+        .await
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
     }
     pub(crate) async fn audit(
         &self,
@@ -353,14 +451,13 @@ impl AutomationHub {
         source: &str,
         mut devices: Vec<Device>,
         areas: Vec<String>,
+        truncated: Option<String>,
     ) -> Result<(), ()> {
-        if devices.len() > MAX_DEVICES {
+        if devices.len() > MAX_DEVICES || cancel.is_cancelled() {
             return Err(());
         }
-        let mut state = self.session.lock().await;
-        if cancel.is_cancelled() {
-            return Err(());
-        }
+        // Persist first, without the session lock: a slow or busy database
+        // must not stall live state events, snapshots or appliance commands.
         let mut tx = self.pool.begin().await.map_err(|_| ())?;
         for device in &mut devices {
             let previous: Option<(String, String)> = sqlx::query_as("SELECT device_id,first_seen_at FROM automation_inventory WHERE source=? AND upstream_id=?").bind(source).bind(&device.upstream_id).fetch_optional(&mut *tx).await.map_err(|_| ())?;
@@ -372,6 +469,10 @@ impl AutomationHub {
                 .bind(source).bind(&device.upstream_id).bind(&device.device_id).bind(&device.first_seen_at).bind(&device.last_seen_at).bind(serde_json::to_string(device).map_err(|_| ())?).execute(&mut *tx).await.map_err(|_| ())?;
         }
         tx.commit().await.map_err(|_| ())?;
+        let mut state = self.session.lock().await;
+        if cancel.is_cancelled() {
+            return Err(());
+        }
         // A registry remap must not carry an old permission to a new device.
         let safe_permissions: BTreeSet<String> = state
             .permissions
@@ -397,6 +498,7 @@ impl AutomationHub {
         state.snapshot.devices = devices;
         state.snapshot.areas = areas;
         state.snapshot.updated_at = Some(Utc::now().to_rfc3339());
+        state.truncated = truncated;
         Ok(())
     }
     pub(crate) async fn state_event(&self, cancel: &CancellationToken, event: &Value) {
@@ -500,45 +602,76 @@ pub(crate) async fn snapshot_route(_: LocalOwner, State(state): State<AppState>)
         Err(status) => status.into_response(),
     }
 }
+/// Problem body for a request body the extractor refused (bad JSON, wrong
+/// content type, oversize): the rejection's own status with a stable shape.
+pub(crate) fn body_rejection(rejection: &JsonRejection) -> Response {
+    (
+        rejection.status(),
+        Json(json!({"error": "the request body was rejected"})),
+    )
+        .into_response()
+}
+
+/// Response header set when a revoking change was applied but its audit entry
+/// could not be recorded.
+pub const AUDIT_WARNING_HEADER: &str = "x-audit-warning";
+
+fn with_audit_warning(status: StatusCode, recorded: bool) -> Response {
+    let mut response = status.into_response();
+    if !recorded {
+        response.headers_mut().insert(
+            AUDIT_WARNING_HEADER,
+            HeaderValue::from_static("change-applied-audit-unavailable"),
+        );
+    }
+    response
+}
+
 #[utoipa::path(post, path = "/api/v1/automation/connect", request_body=ConnectRequest, responses((status=202),(status=400),(status=401),(status=429)), security(("bearer_auth"=[])))]
 pub(crate) async fn connect_route(
     _: LocalOwner,
     State(state): State<AppState>,
-    Json(request): Json<ConnectRequest>,
+    body: Result<Json<ConnectRequest>, JsonRejection>,
 ) -> Response {
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(rejection) => return body_rejection(&rejection),
+    };
     match state.automation().connect(request).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(status) => status.into_response(),
     }
 }
 #[utoipa::path(post, path = "/api/v1/automation/disconnect", responses((status=204),(status=401)), security(("bearer_auth"=[])))]
-pub(crate) async fn disconnect_route(_: LocalOwner, State(state): State<AppState>) -> StatusCode {
-    state
-        .automation()
-        .disconnect()
-        .await
-        .map(|_| StatusCode::NO_CONTENT)
-        .unwrap_or_else(|status| status)
+pub(crate) async fn disconnect_route(_: LocalOwner, State(state): State<AppState>) -> Response {
+    let recorded = state.automation().disconnect_audited().await;
+    with_audit_warning(StatusCode::NO_CONTENT, recorded)
 }
 #[utoipa::path(put, path = "/api/v1/automation/permissions", request_body=PermissionRequest, responses((status=204),(status=400),(status=401),(status=409)), security(("bearer_auth"=[])))]
 pub(crate) async fn permissions_route(
     _: LocalOwner,
     State(state): State<AppState>,
-    Json(request): Json<PermissionRequest>,
-) -> StatusCode {
-    state
-        .automation()
-        .permissions(request)
-        .await
-        .map(|_| StatusCode::NO_CONTENT)
-        .unwrap_or_else(|status| status)
+    body: Result<Json<PermissionRequest>, JsonRejection>,
+) -> Response {
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(rejection) => return body_rejection(&rejection),
+    };
+    match state.automation().permissions_audited(request).await {
+        Ok(recorded) => with_audit_warning(StatusCode::NO_CONTENT, recorded),
+        Err(status) => status.into_response(),
+    }
 }
 #[utoipa::path(post, path = "/api/v1/automation/commands", request_body=CommandRequest, responses((status=200,body=Receipt),(status=400),(status=401),(status=403),(status=409)), security(("bearer_auth"=[])))]
 pub(crate) async fn command_route(
     _: LocalOwner,
     State(state): State<AppState>,
-    Json(request): Json<CommandRequest>,
+    body: Result<Json<CommandRequest>, JsonRejection>,
 ) -> Response {
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(rejection) => return body_rejection(&rejection),
+    };
     match state.automation().command(request).await {
         Ok(value) => Json(value).into_response(),
         Err(status) => status.into_response(),

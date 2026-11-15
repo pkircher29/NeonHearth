@@ -13,7 +13,7 @@ use std::{
 use tokio::{net::TcpStream, sync::mpsc, time::timeout};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
-    tungstenite::{Message, protocol::WebSocketConfig},
+    tungstenite::{Error as WsError, Message, protocol::WebSocketConfig},
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -22,12 +22,17 @@ use uuid::Uuid;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const IO_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_RECORDS: usize = 4096;
+/// Largest single WebSocket message accepted from Home Assistant. A full
+/// `get_states` for a large installation is several MiB of attributes.
+const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Debug)]
 pub enum AdapterError {
     Invalid,
     Connection,
     Authentication,
     Protocol,
+    /// Home Assistant sent a message larger than [`MAX_MESSAGE_BYTES`].
+    TooLarge,
 }
 
 pub fn validate_url(value: &str) -> Result<Url, AdapterError> {
@@ -103,8 +108,8 @@ async fn dial(url: &Url) -> Result<Socket, AdapterError> {
     // Pin the resolved private address. TLS still validates the original hostname;
     // the handshake never follows redirects or resolves the hostname a second time.
     let config = WebSocketConfig::default()
-        .max_message_size(Some(4 * 1024 * 1024))
-        .max_frame_size(Some(4 * 1024 * 1024));
+        .max_message_size(Some(MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_MESSAGE_BYTES));
     timeout(
         IO_TIMEOUT,
         client_async_tls_with_config(url.as_str(), tcp, Some(config), None),
@@ -129,7 +134,10 @@ async fn receive(socket: &mut Socket) -> Result<Value, AdapterError> {
             .next()
             .await
             .ok_or(AdapterError::Connection)?
-            .map_err(|_| AdapterError::Connection)?;
+            .map_err(|error| match error {
+                WsError::Capacity(_) => AdapterError::TooLarge,
+                _ => AdapterError::Connection,
+            })?;
         match message {
             Message::Text(text) => {
                 return serde_json::from_str(&text).map_err(|_| AdapterError::Protocol);
@@ -163,10 +171,12 @@ async fn request(
             let mut value = receive(socket).await?;
             if value["type"] == "event" {
                 if importing {
-                    if buffered.len() >= MAX_RECORDS {
-                        return Err(AdapterError::Protocol);
+                    // Buffered events only replay deltas that raced the
+                    // snapshot; past the cap they are dropped (the periodic
+                    // refresh converges), never a reason to fail the import.
+                    if buffered.len() < MAX_RECORDS {
+                        buffered.push(value);
                     }
-                    buffered.push(value);
                 } else {
                     hub.state_event(cancel, &value).await;
                 }
@@ -201,11 +211,23 @@ pub fn valid_entity_id(value: &str) -> bool {
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         })
 }
-fn records(value: &Value) -> Result<&Vec<Value>, AdapterError> {
-    value
-        .as_array()
-        .filter(|items| items.len() <= MAX_RECORDS)
-        .ok_or(AdapterError::Protocol)
+/// The array behind `value`, capped at [`MAX_RECORDS`]; a longer array is cut
+/// and the cut recorded in `notes` instead of failing the whole import.
+fn records<'a>(
+    value: &'a Value,
+    label: &str,
+    notes: &mut Vec<String>,
+) -> Result<&'a [Value], AdapterError> {
+    let items = value.as_array().ok_or(AdapterError::Protocol)?;
+    if items.len() > MAX_RECORDS {
+        notes.push(format!(
+            "{label}: showing the first {MAX_RECORDS} of {}",
+            items.len()
+        ));
+        Ok(&items[..MAX_RECORDS])
+    } else {
+        Ok(items)
+    }
 }
 fn mac(value: &Value) -> Option<String> {
     let value = value.as_str()?.replace([':', '-'], "");
@@ -228,17 +250,37 @@ pub fn project(
     states: &Value,
     services: &Value,
 ) -> Result<(Vec<Device>, Vec<String>), AdapterError> {
-    let areas: BTreeMap<_, _> = records(areas)?
+    let projection = project_bounded(areas, devices, registry, states, services)?;
+    Ok((projection.devices, projection.areas))
+}
+
+/// An inventory projection plus a description of anything cut to stay within
+/// bounds.
+pub struct Projection {
+    pub devices: Vec<Device>,
+    pub areas: Vec<String>,
+    pub truncated: Option<String>,
+}
+
+pub fn project_bounded(
+    areas: &Value,
+    devices: &Value,
+    registry: &Value,
+    states: &Value,
+    services: &Value,
+) -> Result<Projection, AdapterError> {
+    let mut notes = Vec::new();
+    let areas: BTreeMap<_, _> = records(areas, "areas", &mut notes)?
         .iter()
         .filter_map(|a| Some((text(&a["area_id"], 128)?, text(&a["name"], 128)?)))
         .collect();
-    let registry: BTreeMap<_, _> = records(registry)?
+    let registry: BTreeMap<_, _> = records(registry, "entity registry", &mut notes)?
         .iter()
         .filter_map(|e| Some((e["entity_id"].as_str()?, e)))
         .collect();
     let now = Utc::now().to_rfc3339();
     let mut output: BTreeMap<String, Device> = BTreeMap::new();
-    for d in records(devices)? {
+    for d in records(devices, "devices", &mut notes)? {
         let Some(id) = text(&d["id"], 128) else {
             continue;
         };
@@ -269,7 +311,26 @@ pub fn project(
             },
         );
     }
-    for s in records(states)? {
+    // When states must be cut, keep the controllable domains first so the
+    // entities the owner can actually switch are the ones that survive.
+    let mut all_states: Vec<&Value> = states
+        .as_array()
+        .ok_or(AdapterError::Protocol)?
+        .iter()
+        .collect();
+    if all_states.len() > MAX_RECORDS {
+        notes.push(format!(
+            "states: showing the first {MAX_RECORDS} of {}",
+            all_states.len()
+        ));
+        all_states.sort_by_key(|state| {
+            !state["entity_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("light.") || id.starts_with("switch."))
+        });
+        all_states.truncate(MAX_RECORDS);
+    }
+    for s in all_states {
         let Some(id) = text(&s["entity_id"], 255).filter(|id| valid_entity_id(id)) else {
             continue;
         };
@@ -314,17 +375,29 @@ pub fn project(
             control_enabled: false,
         });
     }
-    if output.len() > MAX_RECORDS {
-        return Err(AdapterError::Protocol);
+    let mut devices: Vec<Device> = output.into_values().collect();
+    if devices.len() > MAX_RECORDS {
+        notes.push(format!(
+            "devices: showing the first {MAX_RECORDS} of {}",
+            devices.len()
+        ));
+        devices.sort_by_key(|device| !device.entities.iter().any(|entity| entity.power_capable));
+        devices.truncate(MAX_RECORDS);
     }
-    Ok((
-        output.into_values().collect(),
-        areas
+    Ok(Projection {
+        devices,
+        areas: areas
             .into_values()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
-    ))
+        truncated: (!notes.is_empty()).then(|| {
+            format!(
+                "Inventory truncated to stay within limits ({}).",
+                notes.join("; ")
+            )
+        }),
+    })
 }
 
 async fn import(
@@ -356,16 +429,22 @@ async fn import(
             .await?,
         );
     }
-    let (devices, areas) = project(
+    let projection = project_bounded(
         &results[0],
         &results[1],
         &results[2],
         &results[3],
         &results[4],
     )?;
-    hub.import(cancel, url.as_str(), devices, areas)
-        .await
-        .map_err(|_| AdapterError::Protocol)?;
+    hub.import(
+        cancel,
+        url.as_str(),
+        projection.devices,
+        projection.areas,
+        projection.truncated,
+    )
+    .await
+    .map_err(|_| AdapterError::Protocol)?;
     for event in buffered {
         hub.state_event(cancel, &event).await;
     }
@@ -379,6 +458,13 @@ async fn execute(
     cancel: &CancellationToken,
     command: QueuedCommand,
 ) {
+    if command.result.is_closed() {
+        // The caller already gave up (timeout or disconnect) and was told the
+        // command failed; sending it now would act on a request the owner
+        // believes did not happen.
+        tracing::info!("dropping queued appliance command: its caller is gone");
+        return;
+    }
     let result = execute_inner(socket, next_id, hub, cancel, &command.request).await;
     let _ = command.result.send(result);
 }
@@ -544,6 +630,7 @@ pub(crate) async fn run(
         match outcome {
             Ok(()) => return,
             Err(AdapterError::Authentication) => { hub.set_status(&cancel, "authentication_failed", "Home Assistant rejected the credential. Reconnect with a valid token.").await; return; },
+            Err(AdapterError::TooLarge) => { hub.set_status(&cancel, "inventory_too_large", "Home Assistant sent an inventory larger than the 32 MiB limit. Reduce the number of exposed entities or integrations; the connection will not be retried automatically.").await; return; },
             Err(AdapterError::Invalid) => { hub.set_status(&cancel, "connection_failed", "Only a private network or Tailscale destination is allowed. Use HTTPS; HTTP is limited to loopback.").await; return; },
             Err(_) => hub.set_status(&cancel, "reconnecting", "Connection interrupted or inventory rejected. Retrying; all power permissions have been cleared.").await,
         }

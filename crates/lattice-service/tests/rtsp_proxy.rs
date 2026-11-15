@@ -429,7 +429,7 @@ async fn basic_auth_is_injected_and_sdp_and_location_are_rewritten_to_the_lease(
         HlsSessionId::new(),
         token.clone(),
         SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
-        approved([192, 168, 4, 22]),
+        approved([192, 168, 4, 22]).with_basic_auth_allowed(true),
         connector.clone(),
         limits(),
         ProxyConsumer::Process(std::process::id()),
@@ -474,7 +474,7 @@ async fn basic_scheme_is_cached_per_connection_after_the_first_challenge() {
         HlsSessionId::new(),
         LoopbackSourceToken::new(),
         SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
-        approved([192, 168, 4, 22]),
+        approved([192, 168, 4, 22]).with_basic_auth_allowed(true),
         connector.clone(),
         limits(),
         ProxyConsumer::Process(std::process::id()),
@@ -1396,4 +1396,36 @@ async fn sdp_host_rewrite_is_delimited_and_same_host_control_paths_round_trip() 
         String::from_utf8_lossy(&requests[1])
             .starts_with("SETUP rtsp://192.168.4.22:8554/stream1/trackID=1 RTSP/1.0")
     );
+}
+
+#[tokio::test]
+async fn basic_challenge_is_refused_unless_the_camera_explicitly_allows_basic() {
+    // A host impersonating the camera answers 401 with only a Basic
+    // challenge. By default the proxy must not volunteer the password.
+    let challenge = b"RTSP/1.0 401 Unauthorized\r\nCSeq: 7\r\nWWW-Authenticate: Basic realm=\"camera\"\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![challenge]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+        ProxyConsumer::Process(std::process::id()),
+    )
+    .await
+    .unwrap();
+    let uri = proxy.endpoint();
+    let response = request(
+        proxy.local_addr().port(),
+        format!("DESCRIBE {uri} RTSP/1.0\r\nCSeq: 7\r\n\r\n").as_bytes(),
+    )
+    .await;
+    let text = String::from_utf8(response).unwrap();
+    assert!(text.starts_with("RTSP/1.0 401"), "{text}");
+    let requests = connector.requests().await;
+    assert_eq!(requests.len(), 1, "no second, credentialed request");
+    let all = String::from_utf8_lossy(&requests[0]).to_string();
+    assert!(!all.contains("Authorization"));
+    assert!(!all.contains(PASSWORD) && !text.contains(PASSWORD));
 }

@@ -293,6 +293,10 @@ async fn estimate_upsert_never_touches_owner_placement() -> anyhow::Result<()> {
     let pool = connect_memory().await?;
     let repository = HomeRepository::new(pool);
 
+    // Placements are validated against the saved plan.
+    repository
+        .save_plan(0, &plan("Home"), at(1_700_000_000))
+        .await?;
     let owner = placement();
     repository.upsert_placement(&owner).await?;
     repository.upsert_estimate(&estimate(0.95)).await?;
@@ -374,5 +378,127 @@ async fn invalid_plan_is_rejected_before_any_write() -> anyhow::Result<()> {
         .fetch_one(&pool)
         .await?;
     assert_eq!(count, 0);
+    Ok(())
+}
+
+fn other_floor_id() -> FloorId {
+    FloorId::parse("018f0000-0000-7000-8000-0000000000c1").unwrap()
+}
+
+#[tokio::test]
+async fn saving_a_plan_with_a_different_home_id_is_refused_and_leaves_history_intact()
+-> anyhow::Result<()> {
+    let repository = HomeRepository::new(connect_memory().await?);
+    repository
+        .save_plan(0, &plan("Home"), at(1_700_000_000))
+        .await?;
+    let mut stranger = plan("Home");
+    stranger.home_id = HomeId::parse("018f0000-0000-7000-8000-0000000000bb").unwrap();
+    assert_eq!(
+        repository
+            .save_plan(1, &stranger, at(1_700_000_001))
+            .await
+            .unwrap_err(),
+        HomeStoreError::HomeIdChanged
+    );
+    let loaded = repository.load_plan().await?.unwrap();
+    assert_eq!(loaded.plan.home_id, home_id());
+    assert_eq!(loaded.plan.version, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_first_save_discards_the_unreachable_placeholder_draft() -> anyhow::Result<()> {
+    let repository = HomeRepository::new(connect_memory().await?);
+    let unset = HomeId::parse("00000000-0000-0000-0000-000000000000").unwrap();
+    repository
+        .put_draft(unset, "{\"draft\":true}", at(1_700_000_000))
+        .await?;
+    repository
+        .save_plan(0, &plan("Home"), at(1_700_000_001))
+        .await?;
+    assert_eq!(repository.get_draft(unset).await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn placements_need_a_saved_plan_with_that_floor_and_are_capped() -> anyhow::Result<()> {
+    let repository = HomeRepository::new(connect_memory().await?);
+    // No plan at all.
+    assert_eq!(
+        repository.upsert_placement(&placement()).await.unwrap_err(),
+        HomeStoreError::Invalid
+    );
+    repository
+        .save_plan(0, &plan("Home"), at(1_700_000_000))
+        .await?;
+    // A floor the plan does not have.
+    let mut dangling = placement();
+    dangling.floor_id = other_floor_id();
+    assert_eq!(
+        repository.upsert_placement(&dangling).await.unwrap_err(),
+        HomeStoreError::Invalid
+    );
+    assert!(repository.list_placements().await?.is_empty());
+    repository.upsert_placement(&placement()).await?;
+    assert_eq!(repository.list_placements().await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn placement_count_is_capped() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    let repository = HomeRepository::new(pool.clone());
+    repository
+        .save_plan(0, &plan("Home"), at(1_700_000_000))
+        .await?;
+    // Fill to the cap directly, then prove the next new device is refused
+    // while an existing device may still be moved.
+    for index in 0..lattice_store::MAX_PLACEMENTS {
+        sqlx::query(
+            "INSERT INTO owner_placements(device_id, placement_id, floor_id, x, y) VALUES(?, ?, ?, 0, 0)",
+        )
+        .bind(format!("018f0000-0000-7000-8000-{index:012x}"))
+        .bind(format!("018f0001-0000-7000-8000-{index:012x}"))
+        .bind("018f0000-0000-7000-8000-0000000000ac")
+        .execute(&pool)
+        .await?;
+    }
+    let mut extra = placement();
+    extra.device_id = DeviceId::parse("018f0002-0000-7000-8000-000000000001").unwrap();
+    assert_eq!(
+        repository.upsert_placement(&extra).await.unwrap_err(),
+        HomeStoreError::Invalid
+    );
+    let mut existing = placement();
+    existing.device_id = DeviceId::parse("018f0000-0000-7000-8000-000000000001").unwrap();
+    repository.upsert_placement(&existing).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn saving_a_plan_that_drops_a_floor_with_placements_is_refused_and_deletes_nothing()
+-> anyhow::Result<()> {
+    let repository = HomeRepository::new(connect_memory().await?);
+    repository
+        .save_plan(0, &plan("Home"), at(1_700_000_000))
+        .await?;
+    let owner = placement();
+    repository.upsert_placement(&owner).await?;
+    let mut emptied = plan("Home");
+    emptied.floors.clear();
+    let error = repository
+        .save_plan(1, &emptied, at(1_700_000_001))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        HomeStoreError::FloorsHoldPlacements(vec![owner.floor_id.to_string()])
+    );
+    assert_eq!(repository.list_placements().await?.len(), 1);
+    assert_eq!(repository.load_plan().await?.unwrap().plan.version, 1);
+    // Once the device is removed the floor can go.
+    repository.delete_placement(owner.device_id).await?;
+    repository.save_plan(1, &emptied, at(1_700_000_002)).await?;
     Ok(())
 }

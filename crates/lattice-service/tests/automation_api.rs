@@ -85,6 +85,8 @@ fn services() -> Value {
 struct HaFixture {
     url: String,
     calls: Arc<Mutex<Vec<Value>>>,
+    /// Permits released here let held `call_service` requests complete.
+    gate: Arc<tokio::sync::Semaphore>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for HaFixture {
@@ -93,14 +95,24 @@ impl Drop for HaFixture {
     }
 }
 async fn ha_fixture() -> HaFixture {
+    ha_fixture_with(false, true, false).await
+}
+/// `hold_calls` makes every `call_service` wait for a permit on the fixture's
+/// gate (no timing involved); `mutate` says whether the call changes the
+/// entity (and so its `last_changed`); `huge_states` answers `get_states`
+/// with a message over the adapter's size cap.
+async fn ha_fixture_with(hold_calls: bool, mutate: bool, huge_states: bool) -> HaFixture {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let calls = Arc::new(Mutex::new(vec![]));
     let saved = calls.clone();
+    let gate_outer = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate_saved = gate_outer.clone();
     let task = tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let calls = saved.clone();
+            let gate = gate_saved.clone();
             tokio::spawn(async move {
                 let mut socket = accept_async(stream).await.unwrap();
                 socket
@@ -135,10 +147,27 @@ async fn ha_fixture() -> HaFixture {
                         "config/area_registry/list" => areas(),
                         "config/device_registry/list" => devices(),
                         "config/entity_registry/list" => registry(),
+                        "get_states" if huge_states => {
+                            // One message past the adapter's 32 MiB cap.
+                            json!([{"entity_id":"sensor.big","state":"1","last_changed":TIME,"last_updated":TIME,"attributes":{"blob":"a".repeat(33 * 1024 * 1024)}}])
+                        }
                         "get_states" => current.clone(),
                         "get_services" => services(),
                         "call_service" => {
                             calls.lock().unwrap().push(request.clone());
+                            if hold_calls {
+                                gate.acquire().await.unwrap().forget();
+                            }
+                            if !mutate {
+                                if socket
+                                    .send(Message::Text(json!({"id":request["id"],"type":"result","success":true,"result":{"context":{"id":"fixture"}}}).to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
                             current[0]["state"] = json!(if request["service"] == "turn_on" {
                                 "on"
                             } else {
@@ -175,7 +204,12 @@ async fn ha_fixture() -> HaFixture {
             });
         }
     });
-    HaFixture { url, calls, task }
+    HaFixture {
+        url,
+        calls,
+        gate: gate_outer,
+        task,
+    }
 }
 async fn setup() -> (Router, AppState) {
     let state = AppState::new(
@@ -483,4 +517,388 @@ async fn invalid_credentials_never_import_or_enable_controls() {
             .is_empty()
     );
     assert!(ha.calls.lock().unwrap().is_empty());
+}
+
+async fn setup_with_pool() -> (Router, AppState, sqlx::SqlitePool) {
+    let pool = connect_memory().await.unwrap();
+    let state = AppState::new(OWNER, M2StateRepository::new(pool.clone())).unwrap();
+    (app(state.clone()), state, pool)
+}
+
+async fn break_audit(pool: &sqlx::SqlitePool) {
+    sqlx::query(
+        "CREATE TRIGGER fail_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn grant_desk(router: &Router) {
+    assert_eq!(
+        call(
+            router,
+            "PUT",
+            "/permissions",
+            Some(json!({"entity_ids":["light.desk"]})),
+            Some(OWNER)
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+}
+
+async fn response_with_headers(
+    router: &Router,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, bool) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(format!("/api/v1/automation{path}"))
+        .header("authorization", format!("Bearer {OWNER}"));
+    if body.is_some() {
+        request = request.header("content-type", "application/json");
+    }
+    let response = router
+        .clone()
+        .oneshot(
+            request
+                .body(Body::from(body.map(|v| v.to_string()).unwrap_or_default()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    (
+        response.status(),
+        response.headers().contains_key("x-audit-warning"),
+    )
+}
+
+#[tokio::test]
+async fn disconnect_takes_effect_even_when_the_audit_log_is_down() {
+    let ha = ha_fixture().await;
+    let (router, state, pool) = setup_with_pool().await;
+    connect(&router, &state, &ha).await;
+    grant_desk(&router).await;
+    break_audit(&pool).await;
+    let (status, warned) = response_with_headers(&router, "POST", "/disconnect", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        warned,
+        "the unrecorded revocation is surfaced to the caller"
+    );
+    let snapshot = state.automation().snapshot().await.unwrap();
+    assert_eq!(snapshot.status, "disconnected");
+    assert!(
+        snapshot
+            .devices
+            .iter()
+            .flat_map(|d| &d.entities)
+            .all(|e| !e.control_enabled)
+    );
+    assert_eq!(
+        call(&router, "POST", "/commands", Some(command()), Some(OWNER))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn clearing_permissions_takes_effect_but_granting_stays_audit_first() {
+    let ha = ha_fixture().await;
+    let (router, state, pool) = setup_with_pool().await;
+    connect(&router, &state, &ha).await;
+    grant_desk(&router).await;
+    break_audit(&pool).await;
+    // Narrowing to nothing is applied and audited best-effort.
+    let (status, warned) = response_with_headers(
+        &router,
+        "PUT",
+        "/permissions",
+        Some(json!({"entity_ids":[]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(warned);
+    assert!(
+        state
+            .automation()
+            .snapshot()
+            .await
+            .unwrap()
+            .devices
+            .iter()
+            .flat_map(|d| &d.entities)
+            .all(|e| !e.control_enabled)
+    );
+    // Granting authority is refused while it cannot be recorded.
+    let (status, _) = response_with_headers(
+        &router,
+        "PUT",
+        "/permissions",
+        Some(json!({"entity_ids":["light.desk"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        state
+            .automation()
+            .snapshot()
+            .await
+            .unwrap()
+            .devices
+            .iter()
+            .flat_map(|d| &d.entities)
+            .all(|e| !e.control_enabled)
+    );
+}
+
+#[tokio::test]
+async fn a_queued_command_whose_caller_gave_up_is_never_sent_to_home_assistant() {
+    // Every call_service is held at HA until the gate is opened.
+    let ha = ha_fixture_with(true, false, false).await;
+    let (router, state) = setup().await;
+    connect(&router, &state, &ha).await;
+    grant_desk(&router).await;
+    let hub = state.automation().clone();
+    hub.set_command_timeout(Duration::from_millis(250));
+    let first: lattice_service::automation::CommandRequest =
+        serde_json::from_value(command()).unwrap();
+    let second: lattice_service::automation::CommandRequest =
+        serde_json::from_value(command()).unwrap();
+    let first_hub = hub.clone();
+    let first_task = tokio::spawn(async move { first_hub.command(first).await });
+    // Wait until the first command is actually held at HA.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while ha.calls.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Queued behind the held command; its caller gives up.
+    assert_eq!(
+        hub.command(second).await.unwrap_err(),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+    assert_eq!(
+        first_task.await.unwrap().unwrap_err(),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+    // Open the gate, then send a fresh command: it queues behind the abandoned
+    // one, so once it completes the abandoned one has been handled (dropped).
+    ha.gate.add_permits(16);
+    hub.set_command_timeout(Duration::from_secs(60));
+    let third: lattice_service::automation::CommandRequest =
+        serde_json::from_value(command()).unwrap();
+    hub.command(third).await.unwrap();
+    assert_eq!(
+        ha.calls.lock().unwrap().len(),
+        2,
+        "the abandoned command must not be sent after its caller was told it failed"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_database_never_stalls_the_session_lock() {
+    let (_, state, pool) = setup_with_pool().await;
+    // Take every pooled connection so the stored-inventory read has to wait.
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.unwrap());
+    }
+    let hub = state.automation().clone();
+    let reader = tokio::spawn(async move { hub.snapshot().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(
+        // Generous: the failure mode is blocking until the pool is released.
+        Duration::from_secs(20),
+        state.automation().mqtt_status("connected", "probe"),
+    )
+    .await
+    .expect("a snapshot waiting on the database must not hold the session lock");
+    drop(held);
+    reader.await.unwrap().unwrap();
+}
+
+fn many_states(count: usize) -> Value {
+    let mut states: Vec<Value> = (0..count)
+        .map(|index| {
+            json!({"entity_id":format!("sensor.s{index}"),"state":"1","last_changed":TIME,"last_updated":TIME,"attributes":{}})
+        })
+        .collect();
+    // The controllable entity sits past the cut.
+    states.push(
+        json!({"entity_id":"light.desk","state":"off","last_changed":TIME,"last_updated":TIME,"attributes":{"friendly_name":"Desk lamp"}}),
+    );
+    Value::Array(states)
+}
+
+#[test]
+fn an_oversized_inventory_is_truncated_and_flagged_instead_of_rejected() {
+    use lattice_service::automation::ha::project_bounded;
+    let states = many_states(5000);
+    // The legacy entry point no longer fails either.
+    let (devices, _) = project(&areas(), &devices(), &registry(), &states, &services()).unwrap();
+    assert!(devices.len() <= 4096);
+    let projection = project_bounded(
+        &areas(),
+        &devices_value(),
+        &registry(),
+        &states,
+        &services(),
+    )
+    .unwrap();
+    assert!(projection.devices.len() <= 4096);
+    let note = projection.truncated.expect("truncation is reported");
+    assert!(note.contains("4096") && note.contains("5001"), "{note}");
+    // Controllable entities survive the cut.
+    assert!(
+        projection
+            .devices
+            .iter()
+            .flat_map(|d| &d.entities)
+            .any(|e| e.entity_id == "light.desk" && e.power_capable)
+    );
+}
+
+fn devices_value() -> Value {
+    devices()
+}
+
+#[tokio::test]
+async fn an_inventory_over_the_message_cap_stops_with_a_specific_status_and_no_retry_loop() {
+    let ha = ha_fixture_with(false, true, true).await;
+    let (router, state) = setup().await;
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/connect",
+            Some(json!({"url":ha.url,"access_token":SECRET})),
+            Some(OWNER)
+        )
+        .await
+        .0,
+        StatusCode::ACCEPTED
+    );
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if state.automation().snapshot().await.unwrap().status == "inventory_too_large" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the oversized inventory is reported, not retried as a generic failure");
+    let snapshot = state.automation().snapshot().await.unwrap();
+    assert!(snapshot.detail.contains("32 MiB"), "{}", snapshot.detail);
+    assert!(
+        snapshot
+            .devices
+            .iter()
+            .flat_map(|d| &d.entities)
+            .all(|e| !e.control_enabled)
+    );
+}
+
+#[tokio::test]
+async fn more_than_the_evidence_bound_no_longer_makes_the_network_endpoint_unavailable() {
+    let (router, _, pool) = setup_with_pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    for index in 0..4097_u32 {
+        let device = format!("018f0000-0000-7000-8000-{index:012x}");
+        let mac = format!("02:00:00:00:{:02x}:{:02x}", index >> 8, index & 0xff);
+        sqlx::query(
+            "INSERT INTO devices(device_id,first_seen_at,last_seen_at,owner_confirmed) VALUES(?,?,?,0)",
+        )
+        .bind(&device)
+        .bind(TIME)
+        .bind(TIME)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO evidence(device_id,family,source,fact_key,fact_value,confidence,observed_at) VALUES(?,'link_layer','test','mac',?,1.0,?)",
+        )
+        .bind(&device)
+        .bind(&mac)
+        .bind(TIME)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let (status, body) = call(&router, "GET", "/network", None, Some(OWNER)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["devices"].as_array().unwrap().len(), 4096);
+    assert_ne!(
+        body["status"], "ready",
+        "a cut answer is never reported as complete"
+    );
+}
+
+#[tokio::test]
+async fn rejected_request_bodies_get_the_problem_shape_and_their_own_status() {
+    let (router, _) = setup().await;
+    for (method, path) in [
+        ("POST", "/connect"),
+        ("PUT", "/permissions"),
+        ("POST", "/commands"),
+    ] {
+        // Syntactically broken JSON.
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("/api/v1/automation{path}"))
+            .header("authorization", format!("Bearer {OWNER}"))
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["error"].is_string(), "{path}: {body}");
+        // Missing content type.
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("/api/v1/automation{path}"))
+            .header("authorization", format!("Bearer {OWNER}"))
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn connect_audits_without_holding_the_session_lock() {
+    let ha = ha_fixture().await;
+    let (_, state, pool) = setup_with_pool().await;
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.unwrap());
+    }
+    let hub = state.automation().clone();
+    let request: lattice_service::automation::ConnectRequest =
+        serde_json::from_value(json!({"url":ha.url,"access_token":SECRET})).unwrap();
+    let connecting = tokio::spawn(async move { hub.connect(request).await });
+    // The connect audit is now waiting for a database connection.
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        state.automation().mqtt_status("connected", "probe"),
+    )
+    .await
+    .expect("a connect waiting on the audit write must not hold the session lock");
+    drop(held);
+    connecting.await.unwrap().unwrap();
 }

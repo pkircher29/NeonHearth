@@ -119,3 +119,45 @@ async fn broker_rejects_anonymous_enforces_topics_and_delivers_bridge_inventory(
     reader_task.abort();
     device_task.abort();
 }
+
+#[tokio::test]
+async fn a_credential_file_that_appears_late_is_picked_up_without_a_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("client.json");
+    let state = AppState::new(
+        "mqtt-test-owner-0123456789abcdefghijkl",
+        M2StateRepository::new(connect_memory().await.unwrap()),
+    )
+    .unwrap();
+    let (stop, shutdown) = watch::channel(false);
+    let bridge = mqtt::start_with_retry_interval(
+        state.clone(),
+        path.clone(),
+        shutdown,
+        Duration::from_millis(50),
+    );
+    let status = async || state.automation().snapshot().await.unwrap().mqtt.status;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while status().await != "configuration_failed" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a missing credential file is reported");
+    // The launcher finishes provisioning after the service started. The port
+    // is closed, so the bridge ends up reconnecting rather than disabled.
+    std::fs::write(
+        &path,
+        json!({"port": 47999, "username": "neonhearth", "password": "p".repeat(40)}).to_string(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while matches!(status().await.as_str(), "configuration_failed" | "disabled") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the bridge must start once the credentials exist");
+    stop.send(true).unwrap();
+    bridge.await.unwrap();
+}

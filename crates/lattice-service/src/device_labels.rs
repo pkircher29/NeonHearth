@@ -1,7 +1,7 @@
 use crate::{AppState, automation::LocalOwner};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, put},
@@ -39,8 +39,12 @@ async fn confirm(
     _: LocalOwner,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(input): Json<ConfirmDeviceName>,
+    body: Result<Json<ConfirmDeviceName>, JsonRejection>,
 ) -> Response {
+    let input = match body {
+        Ok(Json(input)) => input,
+        Err(rejection) => return crate::automation::body_rejection(&rejection),
+    };
     let Ok(id) = DeviceId::parse(&id) else {
         return StatusCode::BAD_REQUEST.into_response();
     };

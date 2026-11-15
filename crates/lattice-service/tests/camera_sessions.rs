@@ -246,6 +246,14 @@ async fn manager_fixture(
     config: CameraSessionConfig,
     factory: Arc<dyn MediaProcessFactory>,
 ) -> ManagerFixture {
+    manager_fixture_in(config, factory, tempfile::tempdir().unwrap()).await
+}
+
+async fn manager_fixture_in(
+    config: CameraSessionConfig,
+    factory: Arc<dyn MediaProcessFactory>,
+    directory: TempDir,
+) -> ManagerFixture {
     let pool = connect_memory().await.unwrap();
     let repository = CameraRepository::new(pool);
     let camera = camera_id(11);
@@ -289,7 +297,6 @@ async fn manager_fixture(
             .unwrap(),
         )
         .await;
-    let directory = tempfile::tempdir().unwrap();
     let manager = Arc::new(
         CameraSessionManager::new(
             repository,
@@ -906,4 +913,165 @@ async fn shutdown_waits_for_a_paused_snapshot_to_release_transient_resources() {
     assert_eq!(fixture.manager.pending_cleanup_count().await, 0);
     assert_eq!(factory.process.live.load(Ordering::SeqCst), 0);
     assert!(fixture.manager.output_entries().await.unwrap().is_empty());
+}
+
+/// Process whose close takes a while, so a handler can be cancelled mid-cleanup.
+#[derive(Clone)]
+struct SlowCloseFactory {
+    live: Arc<AtomicUsize>,
+    delay: Duration,
+}
+
+#[async_trait]
+impl MediaProcessFactory for SlowCloseFactory {
+    async fn spawn(&self, _spec: MediaProcessSpec) -> Result<Box<dyn MediaProcess>, MediaError> {
+        self.live.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(SlowCloseProcess {
+            live: self.live.clone(),
+            delay: self.delay,
+        }))
+    }
+}
+
+struct SlowCloseProcess {
+    live: Arc<AtomicUsize>,
+    delay: Duration,
+}
+
+impl Drop for SlowCloseProcess {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl MediaProcess for SlowCloseProcess {
+    async fn kill(&mut self) -> Result<(), MediaError> {
+        Ok(())
+    }
+    async fn wait(&mut self) -> Result<MediaProcessExit, MediaError> {
+        Ok(MediaProcessExit { success: true })
+    }
+    fn try_wait(&mut self) -> Result<Option<MediaProcessExit>, MediaError> {
+        Ok(None)
+    }
+    async fn close(&mut self) -> Result<(), MediaError> {
+        tokio::time::sleep(self.delay).await;
+        Ok(())
+    }
+}
+
+async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !check().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+#[tokio::test]
+async fn cancelling_a_request_mid_reap_still_cleans_the_session_directory() {
+    let mut bounded = config();
+    bounded.max_sessions = 1;
+    bounded.idle_timeout = Duration::from_millis(20);
+    bounded.total_timeout = Duration::from_millis(100);
+    let factory = SlowCloseFactory {
+        live: Arc::new(AtomicUsize::new(0)),
+        delay: Duration::from_millis(300),
+    };
+    let fixture = manager_fixture(bounded, Arc::new(factory.clone())).await;
+    fixture
+        .manager
+        .start_session(fixture.camera, fixture.stream)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // The handler is cancelled while the expired session's process is still
+    // closing (client disconnect / request timeout).
+    let cancelled =
+        tokio::time::timeout(Duration::from_millis(50), fixture.manager.active_count()).await;
+    assert!(cancelled.is_err(), "cleanup should still have been running");
+    eventually("directory removal after cancellation", async || {
+        fixture.manager.output_entries().await.unwrap().is_empty()
+            && factory.live.load(Ordering::SeqCst) == 0
+    })
+    .await;
+    // Capacity came back too: a new session can start.
+    fixture
+        .manager
+        .start_session(fixture.camera, fixture.stream)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_a_start_mid_spawn_cleans_up_instead_of_leaking_the_directory() {
+    let mut bounded = config();
+    bounded.max_sessions = 1;
+    bounded.process_start_timeout = Duration::from_secs(30);
+    let factory = PausedSpawnFactory::new();
+    let fixture = manager_fixture(bounded, Arc::new(factory.clone())).await;
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(100),
+        fixture
+            .manager
+            .start_session(fixture.camera, fixture.stream),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the spawn is paused, so the start is cancelled"
+    );
+    eventually("abandoned start to be cleaned up", async || {
+        fixture.manager.output_entries().await.unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(fixture.manager.active_count().await, 0);
+}
+
+#[tokio::test]
+async fn startup_sweeps_session_and_snapshot_directories_left_by_a_crash() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_path_buf();
+    for name in ["session-0001", "snapshot-0002"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+        std::fs::write(root.join(name).join("segment-000001.ts"), b"camera video").unwrap();
+    }
+    std::fs::create_dir(root.join("unrelated")).unwrap();
+    std::fs::write(root.join("keep.txt"), b"not ours").unwrap();
+    let fixture = manager_fixture_in(
+        config(),
+        Arc::new(FakeMediaProcessFactory::new()),
+        directory,
+    )
+    .await;
+    let mut names: Vec<_> = fixture
+        .manager
+        .output_entries()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["keep.txt", "unrelated"]);
+}
+
+#[tokio::test]
+async fn a_session_that_outgrows_its_disk_budget_is_closed_and_removed() {
+    let mut bounded = config();
+    bounded.max_segment_bytes = 64 * 1024; // budget: 8 segments = 512 KiB
+    let fixture = fixture(bounded).await;
+    let (status, body) = start(&fixture).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = body["session_id"].as_str().unwrap().to_owned();
+    let directory = fixture.manager.session_output_path(&id).await.unwrap();
+    std::fs::write(directory.join("runaway.bin"), vec![0_u8; 600 * 1024]).unwrap();
+    eventually("the watchdog to close the oversized session", async || {
+        fixture.manager.session_output_path(&id).await.is_none()
+            && fixture.manager.output_entries().await.unwrap().is_empty()
+    })
+    .await;
 }

@@ -519,12 +519,14 @@ async fn safe_automatic_repair_executes_without_approval_and_is_audited() {
     assert_eq!(verification.before.value, 0.0);
     assert_eq!(verification.after.value, 1.0);
 
+    // Intent is recorded before the repair runs, the result after it.
     let rows = doctor_audit_rows(&fixture.pool).await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].action, "repair_executed");
-    assert_eq!(rows[0].subject.as_deref(), Some("router_fault"));
-    assert_eq!(rows[0].detail["outcome"]["outcome"], "completed");
-    assert_eq!(rows[0].detail["rollback"]["outcome"], "not_attempted");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].action, "repair_intent");
+    assert_eq!(rows[1].action, "repair_executed");
+    assert_eq!(rows[1].subject.as_deref(), Some("router_fault"));
+    assert_eq!(rows[1].detail["outcome"]["outcome"], "completed");
+    assert_eq!(rows[1].detail["rollback"]["outcome"], "not_attempted");
 }
 
 #[tokio::test]
@@ -743,13 +745,17 @@ async fn mint_and_execution_both_append_doctor_action_audit_rows() {
 
     let rows = doctor_audit_rows(&fixture.pool).await;
     let actions: Vec<_> = rows.iter().map(|row| row.action.as_str()).collect();
-    assert_eq!(actions, ["approval_minted", "repair_executed"]);
+    assert_eq!(
+        actions,
+        ["approval_minted", "repair_intent", "repair_executed"]
+    );
     for row in &rows {
         assert_eq!(row.category, AuditCategory::DoctorAction);
         assert_eq!(row.subject.as_deref(), Some("mtu_blackhole"));
     }
     assert_eq!(rows[1].detail["approval_id"], approval["approval_id"]);
-    assert!(rows[1].detail["rollback"].is_object());
+    assert_eq!(rows[2].detail["approval_id"], approval["approval_id"]);
+    assert!(rows[2].detail["rollback"].is_object());
 }
 
 #[tokio::test]
@@ -1137,4 +1143,205 @@ async fn repairs_are_single_flight() {
     // The flag is released afterwards: a later repair is admitted again.
     let response = repair().await;
     assert_ne!(response.status(), StatusCode::CONFLICT);
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes: cancellation safety, intent-first audit, settings atomicity.
+// ---------------------------------------------------------------------------
+
+use lattice_doctor::{
+    check::CheckKind,
+    executor::{RepairTransport, RepairTransportError, StateEntry},
+    repair::{ExecutableRepair, StateKey},
+};
+
+/// Repair transport whose `apply` takes a while, so a request can be dropped
+/// while the repair is in flight.
+struct SlowRepair {
+    inner: FakeRepairTransport,
+    delay: std::time::Duration,
+}
+
+impl RepairTransport for SlowRepair {
+    async fn snapshot(&self, keys: &[StateKey]) -> Result<Vec<StateEntry>, RepairTransportError> {
+        self.inner.snapshot(keys).await
+    }
+    async fn apply(&self, repair: &ExecutableRepair) -> Result<(), RepairTransportError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.apply(repair).await
+    }
+    async fn restore(&self, entries: &[StateEntry]) -> Result<(), RepairTransportError> {
+        self.inner.restore(entries).await
+    }
+    async fn measure(&self, check: CheckKind) -> Result<Vec<Measurement>, RepairTransportError> {
+        self.inner.measure(check).await
+    }
+}
+
+async fn break_audit(pool: &SqlitePool) {
+    sqlx::query(
+        "CREATE TRIGGER fail_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn repair_audit_actions(pool: &SqlitePool) -> Vec<String> {
+    doctor_audit_rows(pool)
+        .await
+        .into_iter()
+        .map(|row| row.action)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_repair_is_not_abandoned_when_its_request_is_dropped() {
+    let repairs = SlowRepair {
+        inner: FakeRepairTransport::new()
+            .push_measurements(vec![measurement(Metric::RouterResponsive, 0.0)])
+            .push_measurements(vec![measurement(Metric::RouterResponsive, 1.0)]),
+        delay: std::time::Duration::from_millis(400),
+    };
+    let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(repairs)).await;
+    let run = run_doctor(&fixture.router).await;
+    let kind = finding_kind(&run, "router_fault");
+    let body = serde_json::json!({ "diagnosis_kind": kind });
+    // The client goes away mid-repair (disconnect or request timeout).
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        send(
+            &fixture.router,
+            "POST",
+            "/api/v1/doctor/repair",
+            Some(body.clone()),
+            true,
+        ),
+    )
+    .await;
+    assert!(dropped.is_err(), "the repair outlives the request");
+    // The repair is still running: nothing else may interleave with it.
+    let second = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/repair",
+        Some(body),
+        true,
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    // It runs to completion and its result is audited after the intent.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if repair_audit_actions(&fixture.pool).await.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the detached repair must still audit its result");
+    assert_eq!(
+        repair_audit_actions(&fixture.pool).await,
+        ["repair_intent", "repair_executed"]
+    );
+}
+
+#[tokio::test]
+async fn an_unrecordable_intent_refuses_the_repair_and_keeps_the_approval() {
+    let repairs = FakeRepairTransport::new()
+        .push_measurements(vec![measurement(Metric::ConflictingMacCount, 2.0)])
+        .push_measurements(vec![measurement(Metric::ConflictingMacCount, 1.0)]);
+    let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(repairs)).await;
+    let run = run_doctor(&fixture.router).await;
+    let kind = finding_kind(&run, "duplicate_ip");
+    let approval = json_body(
+        send(
+            &fixture.router,
+            "POST",
+            "/api/v1/doctor/approvals",
+            Some(serde_json::json!({ "diagnosis_kind": kind })),
+            true,
+        )
+        .await,
+    )
+    .await;
+    let body = serde_json::json!({
+        "diagnosis_kind": kind,
+        "approval_id": approval["approval_id"],
+    });
+    break_audit(&fixture.pool).await;
+    let refused = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/repair",
+        Some(body.clone()),
+        true,
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // Nothing ran, so the approval was not spent: once audit works it is usable.
+    sqlx::query("DROP TRIGGER fail_audit")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let accepted = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/repair",
+        Some(body),
+        true,
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_failed_settings_audit_leaves_the_settings_untouched_and_unsafe_interface_names_are_refused()
+ {
+    let fixture = mixed_fixture().await;
+    let before = json_body(
+        send(
+            &fixture.router,
+            "GET",
+            "/api/v1/doctor/settings",
+            None,
+            true,
+        )
+        .await,
+    )
+    .await;
+    for bad in ["-I", "--option", "eth 0", "", "a/b"] {
+        let response = send(
+            &fixture.router,
+            "PUT",
+            "/api/v1/doctor/settings",
+            Some(serde_json::json!({ "interface": bad })),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+    }
+    break_audit(&fixture.pool).await;
+    let response = send(
+        &fixture.router,
+        "PUT",
+        "/api/v1/doctor/settings",
+        Some(serde_json::json!({ "interface": "eth7" })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let after = json_body(
+        send(
+            &fixture.router,
+            "GET",
+            "/api/v1/doctor/settings",
+            None,
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(before, after);
 }

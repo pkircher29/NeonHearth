@@ -23,20 +23,24 @@ use lattice_store::CameraRepository;
 use md5_digest::{Digest, Md5};
 use percent_encoding::percent_decode_str;
 use secrecy::{ExposeSecret, SecretString};
+#[cfg(any(test, feature = "test-support"))]
+use std::{collections::VecDeque, sync::atomic::AtomicUsize};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet},
     fmt, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 use thiserror::Error;
+#[cfg(any(test, feature = "test-support"))]
+use tokio::io::{DuplexStream, duplex};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, duplex, split},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
     net::{TcpListener, TcpSocket, TcpStream},
     sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, watch},
     task::JoinHandle,
@@ -134,6 +138,7 @@ pub trait CameraTargetRegistry: Send + Sync {
 pub struct ApprovedRtspTarget {
     binding: AuthorizedBinding,
     port: u16,
+    allow_basic: bool,
 }
 
 impl fmt::Debug for ApprovedRtspTarget {
@@ -147,8 +152,29 @@ impl ApprovedRtspTarget {
         if port == 0 {
             Err(CameraSessionError::Invalid)
         } else {
-            Ok(Self { binding, port })
+            Ok(Self {
+                binding,
+                port,
+                allow_basic: false,
+            })
         }
+    }
+
+    /// Permits answering an RTSP `Basic` challenge for this camera. Off by
+    /// default: Basic sends the password in cleartext, and a LAN attacker
+    /// impersonating the camera could otherwise force that downgrade.
+    ///
+    /// The flag lives only in memory with the registered target; it is not
+    /// persisted, so whatever registers a camera must set it again each start.
+    #[must_use]
+    pub const fn with_basic_auth_allowed(mut self, allowed: bool) -> Self {
+        self.allow_basic = allowed;
+        self
+    }
+
+    #[must_use]
+    pub const fn basic_auth_allowed(self) -> bool {
+        self.allow_basic
     }
 
     #[must_use]
@@ -162,11 +188,13 @@ impl ApprovedRtspTarget {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
 pub struct FakeCameraTargetRegistry {
     bindings: Arc<Mutex<HashMap<(CameraId, StreamId), ApprovedRtspTarget>>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl FakeCameraTargetRegistry {
     #[must_use]
     pub fn new() -> Self {
@@ -180,6 +208,7 @@ impl FakeCameraTargetRegistry {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl CameraTargetRegistry for FakeCameraTargetRegistry {
     async fn authorized_binding(
@@ -205,7 +234,7 @@ pub struct GuardedCameraTargetRegistry {
     targets: Arc<Mutex<GuardedTargets>>,
 }
 
-type GuardedTargets = HashMap<(CameraId, StreamId), (InterfaceId, IpAddr, u16)>;
+type GuardedTargets = HashMap<(CameraId, StreamId), (InterfaceId, IpAddr, u16, bool)>;
 
 impl GuardedCameraTargetRegistry {
     #[must_use]
@@ -233,8 +262,17 @@ impl GuardedCameraTargetRegistry {
         self.targets
             .lock()
             .await
-            .insert((camera, stream), (interface, target, port));
+            .insert((camera, stream), (interface, target, port, false));
         Ok(())
+    }
+
+    /// Opts one registered stream in to cleartext RTSP Basic authentication.
+    /// In-memory only: it is not persisted and is lost when the target is
+    /// unregistered or the process restarts.
+    pub async fn allow_basic_auth(&self, camera: CameraId, stream: StreamId, allowed: bool) {
+        if let Some(entry) = self.targets.lock().await.get_mut(&(camera, stream)) {
+            entry.3 = allowed;
+        }
     }
 
     pub async fn unregister(&self, camera: CameraId, stream: StreamId) {
@@ -249,7 +287,7 @@ impl CameraTargetRegistry for GuardedCameraTargetRegistry {
         camera: CameraId,
         stream: StreamId,
     ) -> Result<ApprovedRtspTarget, CameraSessionError> {
-        let (interface, target, port) = self
+        let (interface, target, port, allow_basic) = self
             .targets
             .lock()
             .await
@@ -260,7 +298,7 @@ impl CameraTargetRegistry for GuardedCameraTargetRegistry {
             .guard
             .authorized_binding(interface, target)
             .map_err(|_| CameraSessionError::Unavailable)?;
-        ApprovedRtspTarget::new(binding, port)
+        Ok(ApprovedRtspTarget::new(binding, port)?.with_basic_auth_allowed(allow_basic))
     }
 }
 
@@ -275,11 +313,20 @@ struct ManagedSession {
     _permit: OwnedSemaphorePermit,
 }
 
+/// Everything a session or snapshot owns. Dropping it with resources still
+/// held hands them to a detached, retrying cleanup task, so a handler future
+/// cancelled at any await point (client disconnect, request timeout) can never
+/// leak a media process, a proxy listener, a capacity permit, or an output
+/// directory containing camera video.
 struct CleanupResources {
     process: Option<Box<dyn MediaProcess>>,
     proxy: Option<LoopbackRtspProxy>,
     output_dir: Option<PathBuf>,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
+    /// Set on the copy handed to a detached cleanup task. Dropping such a copy
+    /// must never spawn again: when the runtime is shutting down the spawned
+    /// future is dropped immediately, which would re-enter `Drop` forever.
+    detached: bool,
 }
 
 impl CleanupResources {
@@ -289,7 +336,8 @@ impl CleanupResources {
             process: Some(value.process),
             proxy: Some(value.proxy),
             output_dir: Some(value.output_dir),
-            _permit: value._permit,
+            permit: Some(value._permit),
+            detached: false,
         }
     }
 
@@ -303,8 +351,83 @@ impl CleanupResources {
             process,
             proxy,
             output_dir: Some(output_dir),
-            _permit: permit,
+            permit: Some(permit),
+            detached: false,
         }
+    }
+
+    /// Converts a fully launched set of resources into a managed session.
+    fn into_session(
+        mut self,
+        camera: CameraId,
+        stream: StreamId,
+    ) -> Result<ManagedSession, Box<Self>> {
+        if self.process.is_none() || self.proxy.is_none() || self.output_dir.is_none() {
+            return Err(Box::new(self));
+        }
+        let now = Instant::now();
+        match (
+            self.process.take(),
+            self.proxy.take(),
+            self.output_dir.take(),
+            self.permit.take(),
+        ) {
+            (Some(process), Some(proxy), Some(output_dir), Some(permit)) => Ok(ManagedSession {
+                camera,
+                stream,
+                created: now,
+                last_access: now,
+                output_dir,
+                process,
+                proxy,
+                _permit: permit,
+            }),
+            (process, proxy, output_dir, permit) => Err(Box::new(Self {
+                process,
+                proxy,
+                output_dir,
+                permit,
+                detached: false,
+            })),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.process.is_none() && self.proxy.is_none() && self.output_dir.is_none()
+    }
+}
+
+impl Drop for CleanupResources {
+    fn drop(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+        if self.detached {
+            // The cleanup task never ran to completion (runtime shutting
+            // down). Do not spawn again; at least remove the camera video.
+            if let Some(directory) = self.output_dir.take() {
+                let _ = std::fs::remove_dir_all(directory);
+            }
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut taken = Self {
+            process: self.process.take(),
+            proxy: self.proxy.take(),
+            output_dir: self.output_dir.take(),
+            permit: self.permit.take(),
+            detached: true,
+        };
+        runtime.spawn(async move {
+            let mut attempts = 0_u32;
+            while cleanup_attempt(&mut taken).await.is_err() {
+                attempts = attempts.saturating_add(1);
+                tracing::warn!(attempts, "abandoned camera resources: cleanup retrying");
+                tokio::time::sleep(cleanup_retry_delay(attempts)).await;
+            }
+        });
     }
 }
 
@@ -312,6 +435,14 @@ struct PendingCleanup {
     resources: CleanupResources,
     attempts: u32,
     next_retry: Instant,
+}
+
+type PendingMap = Arc<Mutex<HashMap<HlsSessionId, PendingCleanup>>>;
+
+#[derive(Clone, Copy)]
+enum LaunchKind {
+    Hls,
+    Snapshot,
 }
 
 pub struct CameraSessionManager {
@@ -324,7 +455,7 @@ pub struct CameraSessionManager {
     config: CameraSessionConfig,
     capacity: Arc<Semaphore>,
     sessions: Mutex<HashMap<HlsSessionId, ManagedSession>>,
-    pending_cleanup: Mutex<HashMap<HlsSessionId, PendingCleanup>>,
+    pending_cleanup: PendingMap,
     lifecycle: RwLock<()>,
     accepting: AtomicBool,
     reaper_started: AtomicBool,
@@ -333,6 +464,112 @@ pub struct CameraSessionManager {
 impl fmt::Debug for CameraSessionManager {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CameraSessionManager")
+    }
+}
+
+/// Removes `session-*` and `snapshot-*` directories left behind by a crash,
+/// power loss or kill: they can hold camera video that nothing tracks any more.
+fn sweep_output_root(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with("session-") || name.starts_with("snapshot-")) {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() && !kind.is_symlink() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Total size of the regular files directly inside `directory`.
+async fn directory_bytes(directory: &Path) -> u64 {
+    let Ok(mut reader) = tokio::fs::read_dir(directory).await else {
+        return 0;
+    };
+    let mut total = 0_u64;
+    let mut seen = 0_u32;
+    while let Ok(Some(entry)) = reader.next_entry().await {
+        seen += 1;
+        if seen > 1024 {
+            return u64::MAX;
+        }
+        if let Ok(metadata) = entry.metadata().await
+            && metadata.is_file()
+        {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
+}
+
+/// One cleanup pass over `resources`, then retention in `pending` when any
+/// component is still held. Free-standing and `'static` so it can run as a
+/// detached task that no request cancellation can interrupt.
+async fn cleanup_task(
+    pending: PendingMap,
+    owner: HlsSessionId,
+    mut resources: CleanupResources,
+    previous_attempts: u32,
+) -> Result<(), CameraSessionError> {
+    if cleanup_attempt(&mut resources).await.is_ok() {
+        return Ok(());
+    }
+    let attempts = previous_attempts.saturating_add(1);
+    let next_retry = Instant::now() + cleanup_retry_delay(attempts);
+    tracing::warn!(
+        session = %owner,
+        attempts,
+        process_pending = resources.process.is_some(),
+        proxy_pending = resources.proxy.is_some(),
+        output_dir_pending = resources.output_dir.is_some(),
+        "camera session cleanup failed; retained for retry"
+    );
+    pending.lock().await.insert(
+        owner,
+        PendingCleanup {
+            resources,
+            attempts,
+            next_retry,
+        },
+    );
+    Err(CameraSessionError::Unavailable)
+}
+
+async fn cleanup_attempt(resources: &mut CleanupResources) -> Result<(), CameraSessionError> {
+    let mut failed = false;
+    if let Some(process) = resources.process.as_mut() {
+        match timeout(CLEANUP_COMPONENT_TIMEOUT, process.close()).await {
+            Ok(Ok(())) => resources.process = None,
+            Ok(Err(_)) | Err(_) => failed = true,
+        }
+    }
+    if let Some(proxy) = resources.proxy.as_ref() {
+        match timeout(CLEANUP_COMPONENT_TIMEOUT, proxy.shutdown(&proxy.owner)).await {
+            Ok(Ok(())) => resources.proxy = None,
+            Ok(Err(_)) | Err(_) => failed = true,
+        }
+    }
+    if let Some(output_dir) = resources.output_dir.as_ref() {
+        match timeout(CLEANUP_COMPONENT_TIMEOUT, remove_output_dir(output_dir)).await {
+            Ok(Ok(())) => resources.output_dir = None,
+            Ok(Err(_)) | Err(_) => failed = true,
+        }
+    }
+    if failed {
+        Err(CameraSessionError::Unavailable)
+    } else {
+        // Capacity is only released once every component is gone.
+        resources.permit = None;
+        Ok(())
     }
 }
 
@@ -358,6 +595,7 @@ impl CameraSessionManager {
         }
         let output_root =
             std::fs::canonicalize(output_root).map_err(|_| CameraSessionError::Invalid)?;
+        sweep_output_root(&output_root);
         Ok(Self {
             repository,
             vault,
@@ -368,7 +606,7 @@ impl CameraSessionManager {
             config,
             capacity: Arc::new(Semaphore::new(config.max_sessions)),
             sessions: Mutex::new(HashMap::new()),
-            pending_cleanup: Mutex::new(HashMap::new()),
+            pending_cleanup: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: RwLock::new(()),
             accepting: AtomicBool::new(true),
             reaper_started: AtomicBool::new(false),
@@ -395,9 +633,15 @@ impl CameraSessionManager {
                 let Some(manager) = manager.upgrade() else {
                     break;
                 };
-                manager.reap(true).await;
+                manager.reap_with(true, true).await;
             }
         });
+    }
+
+    /// Hard ceiling on the bytes one HLS session may keep on disk. HLS keeps a
+    /// handful of segments, each at most `max_segment_bytes` when served.
+    fn session_byte_limit(&self) -> u64 {
+        (self.config.max_segment_bytes as u64).saturating_mul(8)
     }
 
     pub async fn start_session(
@@ -415,11 +659,6 @@ impl CameraSessionManager {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(CameraSessionError::Unavailable);
         }
-        let permit = self
-            .capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| CameraSessionError::Capacity)?;
         let session = HlsSessionId::new();
         let created_at = Utc::now();
         let expires_at = created_at
@@ -427,17 +666,56 @@ impl CameraSessionManager {
                 .map_err(|_| CameraSessionError::Invalid)?;
         let contract = HlsSession::new(session.clone(), camera, stream, created_at, expires_at)
             .map_err(|_| CameraSessionError::Invalid)?;
+        // Boxed: keeps the launch state machine off the caller's (test) stack.
+        let resources = Box::pin(self.launch(&session, source, binding, LaunchKind::Hls)).await?;
+        let mut sessions = self.sessions.lock().await;
+        if !self.accepting.load(Ordering::Acquire) {
+            drop(sessions);
+            tracing::debug!(session = %session, "camera session refused: manager shutting down");
+            let _ = self.cleanup_or_retain(session, resources, 0).await;
+            return Err(CameraSessionError::Unavailable);
+        }
+        match resources.into_session(camera, stream) {
+            Ok(value) => {
+                sessions.insert(session, value);
+                Ok(contract)
+            }
+            Err(resources) => {
+                drop(sessions);
+                let _ = self.cleanup_or_retain(session, *resources, 0).await;
+                Err(CameraSessionError::Unavailable)
+            }
+        }
+    }
+
+    /// Acquires capacity, creates the output directory, starts the loopback
+    /// proxy and the media process. Every acquired resource lives in a
+    /// [`CleanupResources`] that is either returned or dropped, so cancellation
+    /// or failure at any step still ends in cleanup.
+    async fn launch(
+        &self,
+        owner: &HlsSessionId,
+        source: SecretString,
+        binding: ApprovedRtspTarget,
+        kind: LaunchKind,
+    ) -> Result<CleanupResources, CameraSessionError> {
+        let permit = self
+            .capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CameraSessionError::Capacity)?;
+        let (prefix, lease_ttl) = match kind {
+            LaunchKind::Hls => ("session", self.config.total_timeout),
+            LaunchKind::Snapshot => ("snapshot", self.config.snapshot_timeout),
+        };
         let token = LoopbackSourceToken::new();
-        let output_dir = match self
-            .create_output_dir("session", &session.to_string())
-            .await
-        {
+        let output_dir = match self.create_output_dir(prefix, &owner.to_string()).await {
             Ok(output_dir) => output_dir,
             Err(Some(output_dir)) => {
-                note_session_failure(&session, "output_dir", &CameraSessionError::Unavailable);
+                note_session_failure(owner, "output_dir", &CameraSessionError::Unavailable);
                 let _ = self
                     .cleanup_or_retain(
-                        session,
+                        owner.clone(),
                         CleanupResources::transient(None, None, output_dir, permit),
                         0,
                     )
@@ -445,16 +723,17 @@ impl CameraSessionManager {
                 return Err(CameraSessionError::Unavailable);
             }
             Err(None) => {
-                note_session_failure(&session, "output_dir", &CameraSessionError::Unavailable);
+                note_session_failure(owner, "output_dir", &CameraSessionError::Unavailable);
                 return Err(CameraSessionError::Unavailable);
             }
         };
+        let mut resources = CleanupResources::transient(None, None, output_dir.clone(), permit);
         let proxy_limits = RtspProxyLimits {
-            lease_ttl: self.config.total_timeout,
+            lease_ttl,
             ..RtspProxyLimits::default()
         };
         let proxy = match LoopbackRtspProxy::start(
-            session.clone(),
+            owner.clone(),
             token.clone(),
             source,
             binding,
@@ -466,29 +745,23 @@ impl CameraSessionManager {
         {
             Ok(proxy) => proxy,
             Err(error) => {
-                note_session_failure(&session, "proxy_start", &error);
-                let _ = self
-                    .cleanup_or_retain(
-                        session.clone(),
-                        CleanupResources::transient(None, None, output_dir, permit),
-                        0,
-                    )
-                    .await;
-                return Err(CameraSessionError::Unavailable);
+                return Err(self
+                    .abort_launch(owner, "proxy_start", &error, resources)
+                    .await);
             }
         };
-        let spec = match MediaProcessSpec::hls(proxy.local_addr().port(), &token, &output_dir) {
+        let port = proxy.local_addr().port();
+        resources.proxy = Some(proxy);
+        let spec = match kind {
+            LaunchKind::Hls => MediaProcessSpec::hls(port, &token, &output_dir),
+            LaunchKind::Snapshot => MediaProcessSpec::snapshot(port, &token, &output_dir),
+        };
+        let spec = match spec {
             Ok(spec) => spec,
             Err(error) => {
-                note_session_failure(&session, "media_spec", &error);
-                let _ = self
-                    .cleanup_or_retain(
-                        session.clone(),
-                        CleanupResources::transient(None, Some(proxy), output_dir, permit),
-                        0,
-                    )
-                    .await;
-                return Err(CameraSessionError::Unavailable);
+                return Err(self
+                    .abort_launch(owner, "media_spec", &error, resources)
+                    .await);
             }
         };
         let spawned = timeout(
@@ -496,8 +769,8 @@ impl CameraSessionManager {
             self.process_factory.spawn(spec),
         )
         .await;
-        let process = match spawned {
-            Ok(Ok(process)) => process,
+        match spawned {
+            Ok(Ok(process)) => resources.process = Some(process),
             failed => {
                 let stage = if failed.is_err() {
                     "media_spawn_timeout"
@@ -508,58 +781,33 @@ impl CameraSessionManager {
                     Ok(Err(error)) => error,
                     _ => MediaError::ProcessUnavailable,
                 };
-                note_session_failure(&session, stage, &error);
-                let _ = self
-                    .cleanup_or_retain(
-                        session.clone(),
-                        CleanupResources::transient(None, Some(proxy), output_dir, permit),
-                        0,
-                    )
-                    .await;
-                return Err(CameraSessionError::Unavailable);
+                return Err(self.abort_launch(owner, stage, &error, resources).await);
             }
-        };
-        if let Some(pid) = process.pid()
-            && let Err(error) = proxy.authorize_consumer(&session, pid)
+        }
+        let pid = resources.process.as_ref().and_then(|process| process.pid());
+        if let Some(pid) = pid
+            && let Some(Err(error)) = resources
+                .proxy
+                .as_ref()
+                .map(|proxy| proxy.authorize_consumer(owner, pid))
         {
-            note_session_failure(&session, "proxy_consumer", &error);
-            let _ = self
-                .cleanup_or_retain(
-                    session.clone(),
-                    CleanupResources::transient(Some(process), Some(proxy), output_dir, permit),
-                    0,
-                )
-                .await;
-            return Err(CameraSessionError::Unavailable);
+            return Err(self
+                .abort_launch(owner, "proxy_consumer", &error, resources)
+                .await);
         }
-        let now = Instant::now();
-        let value = ManagedSession {
-            camera,
-            stream,
-            created: now,
-            last_access: now,
-            output_dir,
-            process,
-            proxy,
-            _permit: permit,
-        };
-        let value = {
-            let mut sessions = self.sessions.lock().await;
-            if self.accepting.load(Ordering::Acquire) {
-                sessions.insert(session.clone(), value);
-                None
-            } else {
-                Some(value)
-            }
-        };
-        if let Some(value) = value {
-            tracing::debug!(session = %session, "camera session refused: manager shutting down");
-            let _ = self
-                .cleanup_or_retain(session.clone(), CleanupResources::from_session(value), 0)
-                .await;
-            return Err(CameraSessionError::Unavailable);
-        }
-        Ok(contract)
+        Ok(resources)
+    }
+
+    async fn abort_launch(
+        &self,
+        owner: &HlsSessionId,
+        stage: &'static str,
+        error: &(dyn fmt::Debug + Send + Sync),
+        resources: CleanupResources,
+    ) -> CameraSessionError {
+        note_session_failure(owner, stage, error);
+        let _ = self.cleanup_or_retain(owner.clone(), resources, 0).await;
+        CameraSessionError::Unavailable
     }
 
     pub async fn playlist(&self, session: &HlsSessionId) -> Result<Vec<u8>, CameraSessionError> {
@@ -602,18 +850,30 @@ impl CameraSessionManager {
             let mut current = self.sessions.lock().await;
             current.drain().collect::<Vec<_>>()
         };
-        for (session, value) in sessions {
-            let _ = self
-                .cleanup_or_retain(session, CleanupResources::from_session(value), 0)
-                .await;
+        let handles: Vec<_> = sessions
+            .into_iter()
+            .map(|(session, value)| {
+                self.spawn_cleanup(session, CleanupResources::from_session(value), 0)
+            })
+            .collect();
+        for handle in handles {
+            let _ = handle.await;
         }
         let _ = self.retry_pending(true).await;
-        if !self.pending_cleanup.lock().await.is_empty()
-            || self.capacity.available_permits() != self.config.max_sessions
+        if !self.pending_cleanup.lock().await.is_empty() {
+            return Err(CameraSessionError::Unavailable);
+        }
+        // Detached cleanups (reaper, abandoned handlers) release their permit
+        // when they finish; wait briefly for them to settle.
+        let all = u32::try_from(self.config.max_sessions).unwrap_or(u32::MAX);
+        match timeout(
+            CLEANUP_COMPONENT_TIMEOUT * 3,
+            self.capacity.clone().acquire_many_owned(all),
+        )
+        .await
         {
-            Err(CameraSessionError::Unavailable)
-        } else {
-            Ok(())
+            Ok(Ok(_all_permits)) if self.pending_cleanup.lock().await.is_empty() => Ok(()),
+            _ => Err(CameraSessionError::Unavailable),
         }
     }
 
@@ -645,116 +905,17 @@ impl CameraSessionManager {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(CameraSessionError::Unavailable);
         }
-        let permit = self
-            .capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| CameraSessionError::Capacity)?;
         let owner = HlsSessionId::new();
-        let token = LoopbackSourceToken::new();
-        let output_dir = match self.create_output_dir("snapshot", &owner.to_string()).await {
-            Ok(output_dir) => output_dir,
-            Err(Some(output_dir)) => {
-                note_session_failure(&owner, "output_dir", &CameraSessionError::Unavailable);
-                let _ = self
-                    .cleanup_or_retain(
-                        owner,
-                        CleanupResources::transient(None, None, output_dir, permit),
-                        0,
-                    )
-                    .await;
-                return Err(CameraSessionError::Unavailable);
-            }
-            Err(None) => {
-                note_session_failure(&owner, "output_dir", &CameraSessionError::Unavailable);
-                return Err(CameraSessionError::Unavailable);
-            }
-        };
-        let proxy_limits = RtspProxyLimits {
-            lease_ttl: self.config.snapshot_timeout,
-            ..RtspProxyLimits::default()
-        };
-        let proxy = match LoopbackRtspProxy::start(
-            owner.clone(),
-            token.clone(),
-            source,
-            binding,
-            self.connector.clone(),
-            proxy_limits,
-            ProxyConsumer::Pending,
-        )
-        .await
-        {
-            Ok(proxy) => proxy,
-            Err(error) => {
-                note_session_failure(&owner, "proxy_start", &error);
-                let _ = self
-                    .cleanup_or_retain(
-                        owner.clone(),
-                        CleanupResources::transient(None, None, output_dir, permit),
-                        0,
-                    )
-                    .await;
-                return Err(CameraSessionError::Unavailable);
-            }
-        };
-        let spec = match MediaProcessSpec::snapshot(proxy.local_addr().port(), &token, &output_dir)
-        {
-            Ok(spec) => spec,
-            Err(error) => {
-                note_session_failure(&owner, "media_spec", &error);
-                let _ = self
-                    .cleanup_or_retain(
-                        owner.clone(),
-                        CleanupResources::transient(None, Some(proxy), output_dir, permit),
-                        0,
-                    )
-                    .await;
-                return Err(CameraSessionError::Unavailable);
-            }
-        };
-        let spawned = timeout(
-            self.config.process_start_timeout,
-            self.process_factory.spawn(spec),
-        )
-        .await;
-        let mut process = match spawned {
-            Ok(Ok(process)) => process,
-            failed => {
-                let stage = if failed.is_err() {
-                    "media_spawn_timeout"
-                } else {
-                    "media_spawn"
-                };
-                let error = match failed {
-                    Ok(Err(error)) => error,
-                    _ => MediaError::ProcessUnavailable,
-                };
-                note_session_failure(&owner, stage, &error);
-                let _ = self
-                    .cleanup_or_retain(
-                        owner.clone(),
-                        CleanupResources::transient(None, Some(proxy), output_dir, permit),
-                        0,
-                    )
-                    .await;
-                return Err(CameraSessionError::Unavailable);
-            }
-        };
-        if let Some(pid) = process.pid()
-            && let Err(error) = proxy.authorize_consumer(&owner, pid)
-        {
-            note_session_failure(&owner, "proxy_consumer", &error);
-            let _ = self
-                .cleanup_or_retain(
-                    owner.clone(),
-                    CleanupResources::transient(Some(process), Some(proxy), output_dir, permit),
-                    0,
-                )
-                .await;
+        let mut resources =
+            Box::pin(self.launch(&owner, source, binding, LaunchKind::Snapshot)).await?;
+        let Some(output_dir) = resources.output_dir.clone() else {
             return Err(CameraSessionError::Unavailable);
-        }
-        let result = match timeout(self.config.snapshot_timeout, process.wait()).await {
+        };
+        let waited = match resources.process.as_mut() {
+            Some(process) => timeout(self.config.snapshot_timeout, process.wait()).await,
+            None => return Err(CameraSessionError::Unavailable),
+        };
+        let result = match waited {
             Ok(Ok(exit)) if exit.success => {
                 let bytes =
                     read_bounded_file(&output_dir, "snapshot.jpg", self.config.max_snapshot_bytes)
@@ -792,15 +953,7 @@ impl CameraSessionManager {
                 Err(CameraSessionError::Unavailable)
             }
         };
-        if self
-            .cleanup_or_retain(
-                owner,
-                CleanupResources::transient(Some(process), Some(proxy), output_dir, permit),
-                0,
-            )
-            .await
-            .is_err()
-        {
+        if self.cleanup_or_retain(owner, resources, 0).await.is_err() {
             Err(CameraSessionError::Unavailable)
         } else {
             result
@@ -918,7 +1071,12 @@ impl CameraSessionManager {
         name: &str,
         limit: usize,
     ) -> Result<Vec<u8>, CameraSessionError> {
-        self.reap(false).await;
+        // Cleanup runs in spawned tasks, so cancelling this request cannot
+        // abandon it; on the normal path the request waits for them, so an
+        // expired session is gone from disk before it is reported missing.
+        for handle in self.expire_sessions(false, false).await {
+            let _ = handle.await;
+        }
         let (output, crashed) = {
             let mut sessions = self.sessions.lock().await;
             let value = sessions
@@ -947,7 +1105,44 @@ impl CameraSessionManager {
     }
 
     async fn reap(&self, include_crashed: bool) {
+        self.reap_with(include_crashed, false).await;
+    }
+
+    async fn reap_with(&self, include_crashed: bool, check_size: bool) {
         let _ = self.retry_pending(false).await;
+        for handle in self.expire_sessions(include_crashed, check_size).await {
+            let _ = handle.await;
+        }
+    }
+
+    /// Moves expired, crashed and (optionally) oversized sessions out of the
+    /// map and straight into detached cleanup tasks. After the map lock is
+    /// released there is no `.await`, so cancelling the caller cannot drop a
+    /// removed session on the floor.
+    async fn expire_sessions(
+        &self,
+        include_crashed: bool,
+        check_size: bool,
+    ) -> Vec<JoinHandle<Result<(), CameraSessionError>>> {
+        let oversized: HashSet<HlsSessionId> = if check_size {
+            let directories: Vec<(HlsSessionId, PathBuf)> = {
+                let sessions = self.sessions.lock().await;
+                sessions
+                    .iter()
+                    .map(|(id, value)| (id.clone(), value.output_dir.clone()))
+                    .collect()
+            };
+            let limit = self.session_byte_limit();
+            let mut over = HashSet::new();
+            for (id, directory) in directories {
+                if directory_bytes(&directory).await > limit {
+                    over.insert(id);
+                }
+            }
+            over
+        } else {
+            HashSet::new()
+        };
         let now = Instant::now();
         let expired = {
             let mut sessions = self.sessions.lock().await;
@@ -960,55 +1155,56 @@ impl CameraSessionManager {
                     let crashed = include_crashed
                         && !timed_out
                         && matches!(value.process.try_wait(), Ok(Some(_)) | Err(_));
-                    (timed_out || crashed).then_some(id.clone())
+                    (timed_out || crashed || oversized.contains(id)).then_some(id.clone())
                 })
                 .collect();
             ids.into_iter()
                 .filter_map(|id| sessions.remove(&id).map(|value| (id, value)))
                 .collect::<Vec<_>>()
         };
-        for (session, value) in expired {
-            tracing::debug!(session = %session, "camera session reaped (expired or exited)");
-            let _ = self
-                .cleanup_or_retain(session, CleanupResources::from_session(value), 0)
-                .await;
-        }
+        expired
+            .into_iter()
+            .map(|(session, value)| {
+                if oversized.contains(&session) {
+                    tracing::warn!(session = %session, "camera session exceeded its disk budget; closed");
+                } else {
+                    tracing::debug!(session = %session, "camera session reaped (expired or exited)");
+                }
+                self.spawn_cleanup(session, CleanupResources::from_session(value), 0)
+            })
+            .collect()
     }
 
+    fn spawn_cleanup(
+        &self,
+        owner: HlsSessionId,
+        resources: CleanupResources,
+        previous_attempts: u32,
+    ) -> JoinHandle<Result<(), CameraSessionError>> {
+        tokio::spawn(cleanup_task(
+            self.pending_cleanup.clone(),
+            owner,
+            resources,
+            previous_attempts,
+        ))
+    }
+
+    /// Runs cleanup in a detached task and waits for it. Dropping this future
+    /// detaches the task; it still runs to completion and retains whatever it
+    /// could not release.
     async fn cleanup_or_retain(
         &self,
         owner: HlsSessionId,
-        mut resources: CleanupResources,
+        resources: CleanupResources,
         previous_attempts: u32,
     ) -> Result<(), CameraSessionError> {
-        if self.cleanup_attempt(&mut resources).await.is_ok() {
-            return Ok(());
-        }
-        let attempts = previous_attempts.saturating_add(1);
-        let next_retry = Instant::now() + cleanup_retry_delay(attempts);
-        tracing::warn!(
-            session = %owner,
-            attempts,
-            process_pending = resources.process.is_some(),
-            proxy_pending = resources.proxy.is_some(),
-            output_dir_pending = resources.output_dir.is_some(),
-            "camera session cleanup failed; retained for retry"
-        );
-        let mut pending = self.pending_cleanup.lock().await;
-        debug_assert!(pending.len() < self.config.max_sessions || pending.contains_key(&owner));
-        pending.insert(
-            owner,
-            PendingCleanup {
-                resources,
-                attempts,
-                next_retry,
-            },
-        );
-        Err(CameraSessionError::Unavailable)
+        self.spawn_cleanup(owner, resources, previous_attempts)
+            .await
+            .map_err(|_| CameraSessionError::Unavailable)?
     }
 
     async fn retry_pending(&self, force: bool) -> Result<(), CameraSessionError> {
-        let due = {
+        let handles: Vec<_> = {
             let now = Instant::now();
             let mut pending = self.pending_cleanup.lock().await;
             let owners = pending
@@ -1020,44 +1216,12 @@ impl CameraSessionManager {
             owners
                 .into_iter()
                 .filter_map(|owner| pending.remove(&owner).map(|value| (owner, value)))
-                .collect::<Vec<_>>()
+                .map(|(owner, value)| self.spawn_cleanup(owner, value.resources, value.attempts))
+                .collect()
         };
         let mut failed = false;
-        for (owner, value) in due {
-            failed |= self
-                .cleanup_or_retain(owner, value.resources, value.attempts)
-                .await
-                .is_err();
-        }
-        if failed {
-            Err(CameraSessionError::Unavailable)
-        } else {
-            Ok(())
-        }
-    }
-
-    async fn cleanup_attempt(
-        &self,
-        resources: &mut CleanupResources,
-    ) -> Result<(), CameraSessionError> {
-        let mut failed = false;
-        if let Some(process) = resources.process.as_mut() {
-            match timeout(CLEANUP_COMPONENT_TIMEOUT, process.close()).await {
-                Ok(Ok(())) => resources.process = None,
-                Ok(Err(_)) | Err(_) => failed = true,
-            }
-        }
-        if let Some(proxy) = resources.proxy.as_ref() {
-            match timeout(CLEANUP_COMPONENT_TIMEOUT, proxy.shutdown(&proxy.owner)).await {
-                Ok(Ok(())) => resources.proxy = None,
-                Ok(Err(_)) | Err(_) => failed = true,
-            }
-        }
-        if let Some(output_dir) = resources.output_dir.as_ref() {
-            match timeout(CLEANUP_COMPONENT_TIMEOUT, remove_output_dir(output_dir)).await {
-                Ok(Ok(())) => resources.output_dir = None,
-                Ok(Err(_)) | Err(_) => failed = true,
-            }
+        for handle in handles {
+            failed |= !matches!(handle.await, Ok(Ok(())));
         }
         if failed {
             Err(CameraSessionError::Unavailable)
@@ -1325,7 +1489,7 @@ pub(crate) async fn start_session_route(
     body: Result<Json<crate::api::CameraSessionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return media_disabled();
     };
     let (Ok(AxumPath(camera)), Ok(Json(body))) = (path, body) else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1362,7 +1526,7 @@ pub(crate) async fn segment_route(
     path: Result<AxumPath<(String, String)>, axum::extract::rejection::PathRejection>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return media_disabled();
     };
     let Ok(AxumPath((session, segment))) = path else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1382,7 +1546,7 @@ async fn file_route(
     _unused: Option<()>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return media_disabled();
     };
     let Ok(AxumPath(session)) = path else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1403,7 +1567,7 @@ pub(crate) async fn close_session_route(
     path: Result<AxumPath<String>, axum::extract::rejection::PathRejection>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return media_disabled();
     };
     let Ok(AxumPath(session)) = path else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1425,7 +1589,7 @@ pub(crate) async fn snapshot_route(
     query: Result<Query<SnapshotQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return media_disabled();
     };
     let (Ok(AxumPath(camera)), Ok(Query(query))) = (path, query) else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1441,6 +1605,16 @@ pub(crate) async fn snapshot_route(
         Ok(bytes) => media_response(bytes, "image/jpeg"),
         Err(error) => status(error).into_response(),
     }
+}
+
+/// Body for camera routes when no session manager is configured, so a caller
+/// can tell "not built in" apart from a transient media failure.
+fn media_disabled() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "camera media is not enabled in this build"})),
+    )
+        .into_response()
 }
 
 fn media_response(bytes: Vec<u8>, content_type: &'static str) -> Response {
@@ -1660,7 +1834,9 @@ impl LoopbackRtspProxy {
         consumer: ProxyConsumer,
     ) -> Result<Self, RtspProxyError> {
         let limits = limits.validate()?;
-        let upstream = Arc::new(Upstream::parse(source)?);
+        let mut upstream = Upstream::parse(source)?;
+        upstream.allow_basic = approved.allow_basic;
+        let upstream = Arc::new(upstream);
         if upstream.host != approved.binding.target || upstream.port != approved.port {
             return Err(RtspProxyError::TargetMismatch);
         }
@@ -1770,6 +1946,7 @@ struct Upstream {
     uri: SecretString,
     username: Option<String>,
     password: Option<SecretString>,
+    allow_basic: bool,
 }
 
 impl Upstream {
@@ -1832,10 +2009,14 @@ impl Upstream {
             uri: SecretString::from(url.to_string()),
             username,
             password,
+            allow_basic: false,
         })
     }
 
     fn basic_header(&self) -> Option<Zeroizing<String>> {
+        if !self.allow_basic {
+            return None;
+        }
         let username = self.username.as_ref()?;
         let password = self.password.as_ref()?;
         let credential = Zeroizing::new(format!("{username}:{}", password.expose_secret()));
@@ -3094,17 +3275,20 @@ fn push_header(output: &mut Vec<u8>, name: &str, value: &str) -> Result<(), Rtsp
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
 pub struct FakeAuthorizedRtspConnector {
     inner: Arc<FakeConnectorState>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct FakeConnectorState {
     responses: Mutex<VecDeque<Vec<u8>>>,
     requests: Mutex<Vec<Vec<u8>>>,
     connections: AtomicUsize,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl FakeAuthorizedRtspConnector {
     #[must_use]
     pub fn new(responses: Vec<Vec<u8>>) -> Self {
@@ -3124,6 +3308,7 @@ impl FakeAuthorizedRtspConnector {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl AuthorizedRtspConnector for FakeAuthorizedRtspConnector {
     async fn connect(
@@ -3139,6 +3324,7 @@ impl AuthorizedRtspConnector for FakeAuthorizedRtspConnector {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 async fn run_fake_fixture(mut fixture: DuplexStream, state: Arc<FakeConnectorState>) {
     loop {
         let Some(first) = read_one(&mut fixture).await.ok().flatten() else {
