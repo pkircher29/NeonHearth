@@ -54,3 +54,21 @@ describe('CamerasView', () => {
     expect(view.container.querySelector('.camera-actions button')?.className).toBeTruthy();
   });
 });
+
+describe('CamerasView camera media status', () => {
+  const off = { enabled: false, reason: 'ffmpeg_not_found', detail: 'ffmpeg was expected at /usr/bin/ffmpeg but is not there. Install ffmpeg.', setup_available: false, setup_detail: 'No camera can be added yet.' };
+
+  it('tells the owner why live view is off and what to do', async () => {
+    render(CamerasView, { client: clientStub({ cameraMedia: vi.fn(async () => off) as unknown as ApiClient['cameraMedia'] }) });
+    expect(await screen.findByText(/Live view is off because ffmpeg is not installed/i)).toBeTruthy();
+    expect(screen.getByText(/Install ffmpeg\./)).toBeTruthy();
+    expect(await screen.findByText(/Live view is off on this machine/i)).toBeTruthy();
+  });
+
+  it('says plainly that no camera can be added yet when the list is empty', async () => {
+    const ready = { ...off, enabled: true, reason: 'ready' };
+    render(CamerasView, { client: clientStub({ cameras: vi.fn(async () => ({ items: [], next_after: null })), cameraMedia: vi.fn(async () => ready) as unknown as ApiClient['cameraMedia'] }) });
+    expect(await screen.findByText('No verified cameras yet')).toBeTruthy();
+    expect(await screen.findByText('No camera can be added yet.')).toBeTruthy();
+  });
+});

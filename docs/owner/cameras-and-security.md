@@ -20,7 +20,9 @@ against explicitly approved private targets on your own network.
 
 Camera credentials live in the platform secret store — Windows Credential
 Manager on Windows, the Secret Service keyring on Linux — and nowhere else.
-The database holds only opaque references. Credentials are never displayed,
+(The Linux service runs as a system user with no desktop session, so there it
+normally uses an encrypted file in its own state directory instead; Windows
+never falls back to a file.) The database holds only opaque references. Credentials are never displayed,
 never logged, never included in errors or exports, and never sent to the
 desktop app. When a stream needs authentication, a local loopback proxy
 inside the privileged service injects the credential; the raw camera URL and
@@ -36,6 +38,52 @@ password never reach your browser window.
 - Sessions are deliberately temporary: closing the view, or about 30
   seconds of idle, ends the session, stops the media process, and removes
   its temporary files. Nothing is recorded by default.
+
+### What this machine needs
+
+Live view and snapshots start with the service and are on only when every one
+of these holds. If one does not, the rest of NeonHearth is unaffected, and the
+Cameras view says in plain words which one failed and what to do (the same
+answer is at `GET /api/v1/camera-media`).
+
+- **Windows or Linux.** Other systems cannot verify which process is reading
+  the local stream, so camera media stays off there (`unsupported_platform`).
+- **ffmpeg at one exact place.** NeonHearth never searches `PATH` for it. It
+  looks at the absolute path in the `NEONHEARTH_FFMPEG` setting of the
+  service, otherwise at `C:\Program Files\NeonHearth\ffmpeg.exe` on Windows
+  or `/usr/bin/ffmpeg` on Linux. The Linux packages install ffmpeg as a
+  dependency. The Windows installer includes ffmpeg only when it was built
+  with the optional bundled-ffmpeg component; if yours was not, install an
+  `ffmpeg.exe` at that path (or set `NEONHEARTH_FFMPEG`) and restart the
+  service (`ffmpeg_not_found`, or `ffmpeg_not_executable` on Linux when the
+  file lacks the executable bit).
+- **A usable credential store** (`vault_unavailable` otherwise).
+- **A writable service state directory**, where the temporary video folder
+  `camera-media` lives (`output_dir_unavailable` otherwise). Anything left in
+  it by a crash or power loss is deleted at every service start, and a single
+  live session is closed if it grows beyond its disk budget.
+
+Camera passwords are only ever sent over the network to a camera address that
+you have approved, on the interface you approved it for. Loopback, unspecified
+and multicast addresses are always refused. HTTP-style Basic login to a camera
+is refused unless explicitly allowed per camera.
+
+### Supported camera types
+
+Only cameras that speak RTSP (most IP cameras, including ONVIF cameras that
+publish an RTSP stream) can be viewed. The video must be one ffmpeg can remux
+(H.264 or MJPEG). There is no support for cloud-only cameras, USB or
+doorbell-app cameras, or encrypted RTSP.
+
+### Adding a camera is not possible yet
+
+The viewing half of the pipeline is built and runs when the list above holds,
+but this build has **no way to add a camera**: no screen or route for entering
+a camera's address and password, for approving that address as a stream
+target, or for reading the camera's ONVIF profiles. Cameras the network
+monitor recognizes are not turned into viewable cameras automatically.
+Until that is built, the Cameras view stays empty and says so. It is not a
+setup you can finish by hand.
 
 ## Advisory findings
 
@@ -82,12 +130,13 @@ presents information for you to act on yourself.
 
 ## Not yet available
 
-- Real-camera acceptance is still pending: the whole camera pipeline
-  (detection, inventory, vault, streaming, cleanup) is verified end-to-end
-  against fixtures, but no owner-supplied physical camera has been through
-  the documented acceptance procedure yet.
-- An in-app flow for entering camera credentials (credentials are supplied
-  through the operating-system vault; a guided prompt is planned).
+- Real-camera acceptance is still pending: the viewing pipeline (vault,
+  streaming, snapshots, cleanup) is verified end-to-end against fixtures and
+  is now built into the running service, but no owner-supplied physical
+  camera has been through the documented acceptance procedure yet.
+- Any way to add a camera: entering its address and credentials, approving it
+  as a stream target, ONVIF profile discovery, and turning a recognized
+  camera into a viewable one (see "Adding a camera is not possible yet").
 - A findings/advisories panel in the app (findings are served by the
   authenticated per-device advisory API; the on-screen surface is pending),
   and scheduled advisory-feed refresh with staleness labeling.

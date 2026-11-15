@@ -123,3 +123,45 @@ describe('createCameraStore', () => {
     expect(store.state.snapshotUrl).toBeNull();
   });
 });
+
+import { cameraError, describeCameraMedia } from './cameras';
+const off = { enabled: false, reason: 'ffmpeg_not_found', detail: 'ffmpeg was expected at C:\Program Files\NeonHearth\ffmpeg.exe but is not there. Install it.', setup_available: false, setup_detail: 'No camera can be added yet.' };
+
+describe('camera media status', () => {
+  it('explains a missing ffmpeg in plain words and says nothing while media runs', () => {
+    expect(describeCameraMedia(null)).toBeNull();
+    expect(describeCameraMedia({ ...off, enabled: true, reason: 'ready' })).toBeNull();
+    const described = describeCameraMedia(off);
+    expect(described?.title).toMatch(/ffmpeg is not installed/i);
+    expect(described?.action).toBe(off.detail);
+    expect(describeCameraMedia({ ...off, reason: 'something_new' })?.title).toMatch(/off on this machine/i);
+  });
+
+  it('turns a 503 into the specific reason when media is off, and keeps the generic text otherwise', () => {
+    const failure = new Error('Request failed with status 503');
+    expect(cameraError(failure, off)).toMatch(/ffmpeg is not installed.*Install it/i);
+    expect(cameraError(failure)).toMatch(/Collector is unavailable/);
+    expect(cameraError(failure, { ...off, enabled: true, reason: 'ready' })).toMatch(/Collector is unavailable/);
+  });
+
+  it('loads the status beside the cameras and tolerates a service without the route', async () => {
+    const withRoute = createCameraStore(clientStub({ cameraMedia: vi.fn(async () => off) as unknown as ApiClient['cameraMedia'] }));
+    await withRoute.load();
+    await vi.waitFor(() => expect(withRoute.state.media).toEqual(off));
+    const without = createCameraStore(clientStub());
+    await without.load();
+    expect(without.state.media).toBeNull();
+    expect(without.state.items).toEqual([item]);
+  });
+
+  it('shows the specific reason when a snapshot is refused because media is off', async () => {
+    const store = createCameraStore(clientStub({
+      cameraMedia: vi.fn(async () => off) as unknown as ApiClient['cameraMedia'],
+      cameraSnapshot: vi.fn(async () => { throw new Error('Request failed with status 503'); }) as unknown as ApiClient['cameraSnapshot']
+    }));
+    await store.load();
+    await vi.waitFor(() => expect(store.state.media).toEqual(off));
+    await store.snapshot(cameraId);
+    expect(store.state.error).toMatch(/ffmpeg is not installed/i);
+  });
+});

@@ -1,6 +1,7 @@
 //! Authenticated camera media sessions and the credential-injecting RTSP loopback.
 
 mod peer;
+pub mod production;
 
 use async_trait::async_trait;
 use axum::{
@@ -1489,7 +1490,7 @@ pub(crate) async fn start_session_route(
     body: Result<Json<crate::api::CameraSessionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
-        return media_disabled();
+        return media_disabled(&state);
     };
     let (Ok(AxumPath(camera)), Ok(Json(body))) = (path, body) else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1526,7 +1527,7 @@ pub(crate) async fn segment_route(
     path: Result<AxumPath<(String, String)>, axum::extract::rejection::PathRejection>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
-        return media_disabled();
+        return media_disabled(&state);
     };
     let Ok(AxumPath((session, segment))) = path else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1546,7 +1547,7 @@ async fn file_route(
     _unused: Option<()>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
-        return media_disabled();
+        return media_disabled(&state);
     };
     let Ok(AxumPath(session)) = path else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1567,7 +1568,7 @@ pub(crate) async fn close_session_route(
     path: Result<AxumPath<String>, axum::extract::rejection::PathRejection>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
-        return media_disabled();
+        return media_disabled(&state);
     };
     let Ok(AxumPath(session)) = path else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1589,7 +1590,7 @@ pub(crate) async fn snapshot_route(
     query: Result<Query<SnapshotQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let Some(manager) = state.camera_sessions() else {
-        return media_disabled();
+        return media_disabled(&state);
     };
     let (Ok(AxumPath(camera)), Ok(Query(query))) = (path, query) else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1607,14 +1608,33 @@ pub(crate) async fn snapshot_route(
     }
 }
 
-/// Body for camera routes when no session manager is configured, so a caller
-/// can tell "not built in" apart from a transient media failure.
-fn media_disabled() -> Response {
+/// Body for camera routes when no session manager is configured. It names the
+/// specific reason recorded at startup (`reason`, plus a plain `detail`), so a
+/// caller can tell "ffmpeg is missing" from "the vault is unavailable" from a
+/// transient media failure. A state that was never given a startup result keeps
+/// the historical message.
+fn media_disabled(state: &AppState) -> Response {
+    let status = state.camera_media_status();
+    let error = if status.reason == production::REASON_NOT_CONFIGURED {
+        "camera media is not enabled in this build"
+    } else {
+        "camera media is not available on this machine"
+    };
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({"error": "camera media is not enabled in this build"})),
+        Json(serde_json::json!({
+            "error": error,
+            "reason": status.reason,
+            "detail": status.detail,
+        })),
     )
         .into_response()
+}
+
+/// What the owner needs to know about camera media: whether it is running on
+/// this machine and, if not, the specific reason and what to do about it.
+pub(crate) async fn camera_media_route(_: Authorized, State(state): State<AppState>) -> Response {
+    Json(state.camera_media_status().clone()).into_response()
 }
 
 fn media_response(bytes: Vec<u8>, content_type: &'static str) -> Response {

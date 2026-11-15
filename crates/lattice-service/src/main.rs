@@ -295,6 +295,12 @@ pub(crate) async fn serve(
         .context("initialize install state")?;
     let state =
         AppState::new(token, M2StateRepository::new(pool.clone()))?.with_token_file(token_file);
+    // Camera media (ffmpeg, vault, output root) is constructed here and never
+    // fails the service: a missing prerequisite is recorded as a specific
+    // reason that the camera routes and `/api/v1/camera-media` report.
+    let state = state.with_camera_media(
+        lattice_service::cameras::production::build(pool.clone(), &paths.state_dir).await,
+    );
     // After an offline restore, enforcement state is re-derived before any
     // worker (and so any actuation) starts. On failure the marker stays and the
     // service is degraded; see lattice_service::restore.

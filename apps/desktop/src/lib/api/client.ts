@@ -1,4 +1,4 @@
-import type { Bandwidth, BandwidthFrame, CameraDetail, ClockStatus, CameraHealth, CameraInventoryProjection, CameraList, CameraSessionResponse, DeviceSnapshot, EnforcementStatus, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
+import type { Bandwidth, BandwidthFrame, CameraDetail, ClockStatus, CameraHealth, CameraInventoryProjection, CameraList, CameraMediaStatus, CameraSessionResponse, DeviceSnapshot, EnforcementStatus, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
@@ -293,6 +293,8 @@ export interface ApiClient {
   startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse>;
   closeCameraSession(sessionId: string): Promise<void>;
   authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): void;
+  /** Whether camera media runs on this machine and why not; null when the service predates the route or the reply is unreadable. */
+  cameraMedia(): Promise<CameraMediaStatus | null>;
   policyAction(deviceId: string, action: OwnerActionInput): Promise<PolicyActionResult>;
   /** Owner-only: accept the current system clock after the service flagged a jump. */
   acknowledgeClock(): Promise<ClockStatus>;
@@ -808,6 +810,20 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
   async function cameraInventory(id: string): Promise<CameraInventoryProjection|null> { if(!isOpaqueId(id))throw new Error('Invalid camera id'); const v=await request(`/api/v1/cameras/${id}/inventory`,authorized('GET')); if(v!==null&&!isInventory(v))throw new Error('Invalid camera inventory'); return v as CameraInventoryProjection|null; }
   async function cameraSnapshot(id: string, streamId?: string): Promise<Blob> { if(!isOpaqueId(id)||(streamId!==undefined&&!isOpaqueId(streamId)))throw new Error('Invalid camera id'); const response=await send(`/api/v1/cameras/${id}/snapshot${streamId?`?stream_id=${encodeURIComponent(streamId)}`:''}`,authorized('GET')); if(!response.ok)throw new ApiError(response.status); if(response.headers.get('content-type')?.split(';')[0] !== 'image/jpeg') throw new Error('Invalid camera snapshot media type'); const blob=await response.blob(); if(blob.size > 8*1024*1024) throw new Error('Camera snapshot exceeds safety bound'); return blob; }
   async function startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse> { if(!isOpaqueId(id)||!isOpaqueId(streamId))throw new Error('Invalid camera session id'); const v=await request(`/api/v1/cameras/${id}/sessions`,authorized('POST',{stream_id:streamId})); if(!isSession(v))throw new Error('Invalid camera session'); return v; }
+  // Compatible parse: extra keys are ignored and the setup fields are optional, so an older or newer service never breaks the Cameras view.
+  async function cameraMedia(): Promise<CameraMediaStatus | null> {
+    try {
+      const v = await request('/api/v1/camera-media', authorized('GET'));
+      if (!isRecord(v) || typeof v.enabled !== 'boolean' || typeof v.reason !== 'string' || v.reason.length === 0 || v.reason.length > 64) return null;
+      return {
+        enabled: v.enabled,
+        reason: v.reason,
+        detail: typeof v.detail === 'string' ? v.detail.slice(0, 1024) : '',
+        setup_available: typeof v.setup_available === 'boolean' ? v.setup_available : true,
+        setup_detail: typeof v.setup_detail === 'string' ? v.setup_detail.slice(0, 1024) : ''
+      };
+    } catch { return null; }
+  }
   async function closeCameraSession(sessionId: string): Promise<void> { if(!isSessionId(sessionId))throw new Error('Invalid camera session id'); const response=await send(`/api/v1/camera-sessions/${sessionId}`,authorized('DELETE')); if(!response.ok)throw new ApiError(response.status); }
   async function acknowledgeClock(): Promise<ClockStatus> {
     const value = await request('/api/v1/clock/acknowledge', authorized('POST'));
@@ -947,5 +963,5 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
     return { expires_at: value.expires_at };
   }
 
-  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, acknowledgeClock, doctorRun, doctorReport, doctorApprove, doctorRepair, auditPage, auditVerify, doctorSettings, updateDoctorSettings, remoteStatus, remoteServe, remoteSessions, revokePhoneSession, integrationTokens, mintIntegrationToken, revokeIntegrationToken, pairPhone, stepUp };
+  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, cameraMedia, policyAction, acknowledgeClock, doctorRun, doctorReport, doctorApprove, doctorRepair, auditPage, auditVerify, doctorSettings, updateDoctorSettings, remoteStatus, remoteServe, remoteSessions, revokePhoneSession, integrationTokens, mintIntegrationToken, revokeIntegrationToken, pairPhone, stepUp };
 }
