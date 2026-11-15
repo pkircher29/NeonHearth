@@ -4,6 +4,7 @@
 import type { DeviceSnapshot, PresenceState } from '../api/types';
 import { emptyHomePlan, type HomeApi, type HomeDeviceRef, type HomeSnapshot } from '../stores/home';
 import type { TwinDevice } from '../twin/geometry';
+import type { TwinDeviceInfo } from '../twin/twinCard';
 
 /** Editor tray refs: the owner's name when set, otherwise null (the tray labels it). */
 export function toHomeDeviceRefs(devices: Record<string, DeviceSnapshot>): HomeDeviceRef[] {
@@ -36,6 +37,18 @@ export function sameTwinDevices(previous: TwinDevice[], next: TwinDevice[]): boo
     if (a.device_id !== b.device_id || a.label !== b.label || Boolean(a.is_camera) !== Boolean(b.is_camera)) return false;
   }
   return true;
+}
+
+/** Detail-card facts per device: the evidence behind its identity and when it was last seen. */
+export function toTwinDeviceInfo(devices: Record<string, DeviceSnapshot>): Record<string, TwinDeviceInfo> {
+  const map: Record<string, TwinDeviceInfo> = {};
+  for (const device of Object.values(devices)) {
+    const evidence = device.evidence
+      ? [`${device.evidence.family} via ${device.evidence.source} (${Math.round(device.evidence.confidence * 100)}%)`]
+      : null;
+    map[device.device_id] = { evidence, last_seen_at: device.last_seen_at };
+  }
+  return map;
 }
 
 export function toPresenceMap(devices: Record<string, DeviceSnapshot>): Record<string, PresenceState> {

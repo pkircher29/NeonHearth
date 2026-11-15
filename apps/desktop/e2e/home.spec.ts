@@ -363,3 +363,107 @@ test('3D twin: rotate by drag-orbit, isolate floors, and list placed devices (or
     await expect(planCanvas(page).locator(`g.placement[data-device-id="${CAMERA_DEVICE_ID}"]`)).toBeVisible();
   }
 });
+
+
+// --- Twin v2 (spec E): camera presets, pin detail card, room hover ---------
+
+/** Opens the 3D tab; returns false (and notes the fallback) when WebGL is unavailable. */
+async function openTwin(page: Page): Promise<boolean> {
+  await installHomeFixture(page, { plan: seededTwinPlan(), placements: [seededCameraPlacement()] });
+  await page.goto('/');
+  await openHome(page);
+  await page.getByRole('tab', { name: '3D view' }).click();
+  const twin = page.locator('.twin');
+  await expect.poll(() => twin.getAttribute('data-mode')).not.toBe('pending');
+  return (await twin.getAttribute('data-mode')) === '3d';
+}
+
+test('3D twin v2: camera presets switch the view and mark the active preset', async ({ page }) => {
+  test.skip(!(await openTwin(page)), 'WebGL unavailable here; the fallback path is covered by the first twin test');
+  const twin = page.locator('.twin');
+  const stage = page.locator('.twin-stage');
+  const controls = page.getByRole('toolbar', { name: '3D view controls' });
+  await expect(twin).toHaveAttribute('data-camera-preset', 'iso');
+  const iso = await stage.screenshot();
+
+  await controls.getByRole('button', { name: 'Top' }).click();
+  await expect(twin).toHaveAttribute('data-camera-preset', 'top');
+  await expect(controls.getByRole('button', { name: 'Top' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(controls.getByRole('button', { name: 'Isometric' })).toHaveAttribute('aria-pressed', 'false');
+  const top = await stage.screenshot();
+  expect(Buffer.compare(top, iso)).not.toBe(0);
+
+  await controls.getByRole('button', { name: 'Front' }).click();
+  await expect(twin).toHaveAttribute('data-camera-preset', 'front');
+  const front = await stage.screenshot();
+  expect(Buffer.compare(front, top)).not.toBe(0);
+
+  // Reduced motion: the switch is instant, so Isometric restores the exact first frame.
+  await controls.getByRole('button', { name: 'Isometric' }).click();
+  await expect(twin).toHaveAttribute('data-camera-preset', 'iso');
+  expect(Buffer.compare(await stage.screenshot(), iso)).toBe(0);
+
+  // Dragging leaves every preset (the camera is no longer on one).
+  const box = (await stage.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + 90, box.y + box.height / 2 + 40, { steps: 6 });
+  await page.mouse.up();
+  await expect(twin).toHaveAttribute('data-camera-preset', '');
+});
+
+test('3D twin v2: a selected pin opens a glass detail card with Show in Devices', async ({ page }) => {
+  test.skip(!(await openTwin(page)), 'WebGL unavailable here; the fallback path is covered by the first twin test');
+  const twin = page.locator('.twin');
+  await expect(page.locator('.twin-card')).toHaveCount(0);
+
+  // Select the way the device list's audience does (focus + Enter).
+  const deviceButton = page.locator(`.twin-devices button[data-device-id="${CAMERA_DEVICE_ID}"]`);
+  await deviceButton.focus();
+  await page.keyboard.press('Enter');
+  await expect(twin).toHaveAttribute('data-selected', CAMERA_DEVICE_ID);
+
+  const card = page.getByRole('complementary', { name: 'Device details' });
+  await expect(card).toBeVisible();
+  await expect(card.getByRole('heading', { name: CAMERA_DEVICE_NAME })).toBeVisible();
+  await expect(card.locator('[data-field="presence"]')).toHaveText('Online');
+  await expect(card.locator('[data-field="room"]')).toHaveText('Den');
+  await expect(card.locator('[data-field="evidence"]')).toHaveText('—'); // no evidence recorded: honest dash
+  await expect(card.locator('[data-field="last-seen"]')).not.toHaveText('—');
+
+  await card.getByRole('button', { name: 'Show in Devices' }).click();
+  await expect(page.locator('nav[aria-label="Primary"] button[aria-current="page"]')).toContainText('Devices');
+});
+
+test('3D twin v2: the close button dismisses the detail card; hovering a room names it with its area', async ({ page }) => {
+  test.skip(!(await openTwin(page)), 'WebGL unavailable here; the fallback path is covered by the first twin test');
+  const twin = page.locator('.twin');
+  const stage = page.locator('.twin-stage');
+  const card = page.getByRole('complementary', { name: 'Device details' });
+
+  const deviceButton = page.locator(`.twin-devices button[data-device-id="${CAMERA_DEVICE_ID}"]`);
+  await deviceButton.focus();
+  await page.keyboard.press('Enter');
+  await expect(card).toBeVisible();
+  await card.getByRole('button', { name: 'Close device details' }).click();
+  await expect(card).toHaveCount(0);
+
+  // The Den room (2.5 m x 2.5 m) sits left of the model centre: scan for it.
+  const box = (await stage.boundingBox())!;
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  let found = false;
+  for (const dx of [-60, -100, -140, -30, -180, 0]) {
+    for (const dy of [0, 40, -40, 80]) {
+      await page.mouse.move(cx + dx, cy + dy);
+      if ((await twin.getAttribute('data-hover-room')) !== '') { found = true; break; }
+    }
+    if (found) break;
+  }
+  expect(found).toBe(true);
+  const tip = page.locator('.twin-room-tip');
+  await expect(tip).toContainText('Den');
+  await expect(tip).toContainText(/6\.\d m²/);
+  await page.mouse.move(box.x + 4, box.y + 4); // off the room: the tip goes away
+  await expect(tip).toHaveCount(0);
+});
