@@ -106,7 +106,7 @@ async fn snapshot_requires_exact_bearer_token() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         body(response).await,
-        serde_json::json!({"sequence":0,"events_epoch":events_epoch,"devices":[],"next_after":null,"service_status":"ready"})
+        serde_json::json!({"sequence":0,"events_epoch":events_epoch,"clock":{"status":"trusted","detail":null},"devices":[],"next_after":null,"service_status":"ready"})
     );
 }
 

@@ -1,4 +1,4 @@
-import type { Coverage, DeviceSnapshot, EnforcementStatus, PolicyEvaluation, RequestedAction, ServerMessage, Snapshot } from '../api/types';
+import type { ClockStatus, Coverage, DeviceSnapshot, EnforcementStatus, PolicyEvaluation, RequestedAction, ServerMessage, Snapshot } from '../api/types';
 import { heatTier } from '../twin/heat';
 
 export interface ThroughputPoint { at: string; upload: number; download: number }
@@ -24,6 +24,8 @@ export interface LiveState {
   /** Sum of the fresh per-device readings; a direction is null when no fresh device reports it (never a fake zero). */
   aggregate: { upload: number | null; download: number | null };
   policies: Record<string, GuardPolicy>;
+  /** Policy clock gate from the latest snapshot; absent against an older service. */
+  clock?: ClockStatus;
 }
 
 export const initialLiveState: LiveState = { sequence: 0, connected: false, needsResync: false, serviceStatus: 'unknown', devices: {}, deviceOrder: [], throughput: [], timeline: [], coverage: 'unavailable', aggregate: { upload: null, download: null }, policies: {} };
@@ -99,7 +101,7 @@ export function applySnapshot(previous: LiveState, snapshot: Snapshot): LiveStat
   // thread and throughput curve survive routine stale-watchdog refreshes. A
   // lower sequence means the service restarted, so the old history is dropped.
   const continuous = previous.sequence > 0 && snapshot.sequence >= previous.sequence;
-  const next = { sequence: snapshot.sequence, connected: false, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: continuous ? previous.throughput : [], timeline: continuous ? previous.timeline : [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: null, download: null }, policies };
+  const next = { sequence: snapshot.sequence, connected: false, needsResync: false, serviceStatus: snapshot.service_status, devices, deviceOrder, throughput: continuous ? previous.throughput : [], timeline: continuous ? previous.timeline : [], coverage: 'unavailable' as CoverageSummary, aggregate: { upload: null, download: null }, policies, ...(snapshot.clock ? { clock: snapshot.clock } : {}) };
   return summarize(next);
 }
 

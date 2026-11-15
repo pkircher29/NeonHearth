@@ -1,4 +1,4 @@
-import type { Bandwidth, BandwidthFrame, CameraDetail, CameraHealth, CameraInventoryProjection, CameraList, CameraSessionResponse, DeviceSnapshot, EnforcementStatus, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
+import type { Bandwidth, BandwidthFrame, CameraDetail, ClockStatus, CameraHealth, CameraInventoryProjection, CameraList, CameraSessionResponse, DeviceSnapshot, EnforcementStatus, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
@@ -281,6 +281,8 @@ export interface ApiClient {
   closeCameraSession(sessionId: string): Promise<void>;
   authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): void;
   policyAction(deviceId: string, action: OwnerActionInput): Promise<PolicyActionResult>;
+  /** Owner-only: accept the current system clock after the service flagged a jump. */
+  acknowledgeClock(): Promise<ClockStatus>;
   doctorRun(): Promise<DoctorRunOutcome>;
   doctorReport(): Promise<DoctorRun | null>;
   doctorApprove(diagnosisKind: DiagnosisKind): Promise<DoctorApproval>;
@@ -432,7 +434,12 @@ function isDeviceSnapshot(value: unknown): value is DeviceSnapshot {
 function isSnapshot(value: unknown): value is Snapshot {
   return isRecord(value) && isSequence(value.sequence) && Array.isArray(value.devices)
     && value.devices.every(isDeviceSnapshot) && (value.next_after === null || isDeviceId(value.next_after))
-    && typeof value.service_status === 'string';
+    && typeof value.service_status === 'string'
+    && (value.clock === undefined || isClockStatus(value.clock));
+}
+function isClockStatus(value: unknown): value is ClockStatus {
+  return isRecord(value) && (value.status === 'trusted' || value.status === 'suspect')
+    && (value.detail === null || value.detail === undefined || typeof value.detail === 'string');
 }
 function isCameraSummary(value: unknown): value is import('./types').CameraSummary { return isRecord(value) && exact(value,['camera_id','classification','confidence','health','observed_at']) && isOpaqueId(value.camera_id) && typeof value.classification === 'string' && cameraClassifications.has(value.classification) && isConfidence(value.confidence) && typeof value.health === 'string' && cameraHealths.has(value.health) && isDate(value.observed_at); }
 function isCameraList(value: unknown): value is CameraList { return isRecord(value) && exact(value,['items','next_after']) && Array.isArray(value.items) && value.items.length <= 256 && value.items.every(isCameraSummary) && (value.next_after === null || isOpaqueId(value.next_after)); }
@@ -728,6 +735,7 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
       const devices: DeviceSnapshot[] = [];
       let after: string | undefined;
       let sequence: number | undefined;
+      let clock: ClockStatus | undefined;
       let serviceStatus = 'unknown';
       let moved = false;
       const cursors = new Set<string>();
@@ -740,9 +748,10 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
           break;
         }
         serviceStatus = current.service_status;
+        clock = current.clock;
         devices.push(...current.devices);
         if (devices.length > maxRecords) throw new Error('Snapshot exceeds safety bound');
-        if (current.next_after === null) return { sequence, devices, next_after: null, service_status: serviceStatus };
+        if (current.next_after === null) return { sequence, devices, next_after: null, service_status: serviceStatus, ...(clock ? { clock } : {}) };
         if (cursors.has(current.next_after)) throw new Error('Snapshot cursor cycle');
         cursors.add(current.next_after);
         after = current.next_after;
@@ -786,6 +795,11 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
   async function cameraSnapshot(id: string, streamId?: string): Promise<Blob> { if(!isOpaqueId(id)||(streamId!==undefined&&!isOpaqueId(streamId)))throw new Error('Invalid camera id'); const response=await send(`/api/v1/cameras/${id}/snapshot${streamId?`?stream_id=${encodeURIComponent(streamId)}`:''}`,authorized('GET')); if(!response.ok)throw new ApiError(response.status); if(response.headers.get('content-type')?.split(';')[0] !== 'image/jpeg') throw new Error('Invalid camera snapshot media type'); const blob=await response.blob(); if(blob.size > 8*1024*1024) throw new Error('Camera snapshot exceeds safety bound'); return blob; }
   async function startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse> { if(!isOpaqueId(id)||!isOpaqueId(streamId))throw new Error('Invalid camera session id'); const v=await request(`/api/v1/cameras/${id}/sessions`,authorized('POST',{stream_id:streamId})); if(!isSession(v))throw new Error('Invalid camera session'); return v; }
   async function closeCameraSession(sessionId: string): Promise<void> { if(!isSessionId(sessionId))throw new Error('Invalid camera session id'); const response=await send(`/api/v1/camera-sessions/${sessionId}`,authorized('DELETE')); if(!response.ok)throw new ApiError(response.status); }
+  async function acknowledgeClock(): Promise<ClockStatus> {
+    const value = await request('/api/v1/clock/acknowledge', authorized('POST'));
+    if (!isClockStatus(value)) throw new Error('Invalid clock response');
+    return { status: value.status, detail: value.detail ?? null };
+  }
   async function policyAction(deviceId: string, action: OwnerActionInput): Promise<PolicyActionResult> {
     if (!isDeviceId(deviceId) || !isOwnerActionInput(action)) throw new Error('Invalid policy action');
     const value = await request('/api/v1/policy/action', authorized('POST', { device_id: deviceId, action }));
@@ -915,5 +929,5 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
     return { expires_at: value.expires_at };
   }
 
-  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, doctorRun, doctorReport, doctorApprove, doctorRepair, auditPage, auditVerify, doctorSettings, updateDoctorSettings, remoteStatus, remoteServe, remoteSessions, revokePhoneSession, integrationTokens, mintIntegrationToken, revokeIntegrationToken, pairPhone, stepUp };
+  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, policyAction, acknowledgeClock, doctorRun, doctorReport, doctorApprove, doctorRepair, auditPage, auditVerify, doctorSettings, updateDoctorSettings, remoteStatus, remoteServe, remoteSessions, revokePhoneSession, integrationTokens, mintIntegrationToken, revokeIntegrationToken, pairPhone, stepUp };
 }
