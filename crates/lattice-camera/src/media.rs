@@ -754,7 +754,11 @@ mod fake {
             let output = spec.args().last().map(PathBuf::from);
             state.specs.push(spec);
             if let Some(diagnostic) = state.fail_next.take() {
-                state.last_diagnostic = Some(sanitized_diagnostic(diagnostic.len()));
+                // The fake keeps only a redacted size note, never the text.
+                let bounded = diagnostic.len().min(MAX_DIAGNOSTIC_BYTES);
+                state.last_diagnostic = Some(
+                    format!("media process diagnostic redacted ({bounded} bytes)").into_bytes(),
+                );
                 return Err(MediaError::ProcessFailed);
             }
             let index = state.observations.len();
