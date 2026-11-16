@@ -133,6 +133,7 @@ describe('CamerasView add a camera', () => {
     ['unreachable', 502, null, null, /could not reach the camera/i],
     ['sign_in_refused', 422, null, null, /refused that user name or password/i],
     ['streams_elsewhere', 422, null, null, /points its video somewhere else/i],
+    ['onvif_not_enabled', 422, null, null, /ONVIF does not appear to be enabled/i],
     ['video_unavailable', 503, 'ffmpeg_not_found', 'Install ffmpeg at the expected path.', /Video support is not available: Install ffmpeg at the expected path\./],
     ['rate_limited', 429, null, null, /too many tries/i],
     ['already_added', 409, null, null, /already added at that address/i]

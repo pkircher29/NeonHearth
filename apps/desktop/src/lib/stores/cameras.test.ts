@@ -243,7 +243,7 @@ describe('adding and removing a camera', () => {
     const cases: Array<[unknown, RegExp]> = [
       [new ApiError(422, 'not_on_your_network'), /not on your network/i], [new ApiError(502, 'unreachable'), /could not reach the camera/i],
       [new ApiError(422, 'sign_in_refused'), /refused that user name or password/i], [new ApiError(422, 'streams_elsewhere'), /points its video somewhere else/i],
-      [new ApiError(422, 'unexpected_answer'), /did not answer like a camera/i], [new ApiError(422, 'no_streams'), /no video stream/i],
+      [new ApiError(422, 'unexpected_answer'), /did not answer like a camera/i], [new ApiError(422, 'onvif_not_enabled'), /ONVIF does not appear to be enabled.*Turn ONVIF on/i], [new ApiError(422, 'no_streams'), /no video stream/i],
       [new ApiError(409, 'already_added'), /already added/i], [new ApiError(429, 'rate_limited'), /too many tries/i], [new ApiError(400, 'invalid_request'), /check the address/i],
       [new ApiError(503, 'video_unavailable', 'ffmpeg_not_found', 'Install ffmpeg.'), /Video support is not available: Install ffmpeg\./],
       [new ApiError(503, 'video_unavailable', 'ffmpeg_not_found', null), /Video support is not available: Live view is off because ffmpeg is not installed/],

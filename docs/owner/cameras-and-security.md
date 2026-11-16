@@ -110,7 +110,9 @@ Then, in this order:
    packet is sent. The log records the address and the adapter, never the user
    name or the password.
 3. NeonHearth asks the camera for its details and its video streams over
-   ONVIF, at exactly that address and port (80 unless you change it), through
+   ONVIF (a few cameras answer with an empty SOAP header and no
+   WS-Addressing; that is accepted, while a header that is present but wrong is
+   not), at exactly that address and port (80 unless you change it), through
    the adapter the address was approved on. It follows no redirects and ignores
    proxy settings, signs in with a one-time digest so the password itself is
    not sent, and refuses answers larger than a fixed limit.
@@ -124,7 +126,9 @@ Then, in this order:
 
 Each failure has its own plain message: the address is not on your network, the
 camera could not be reached, it refused the user name or password, it points its
-video somewhere else, it did not answer like a camera, it has no video stream,
+video somewhere else, ONVIF does not appear to be enabled on it (the camera
+answered "no such page" to the first ONVIF request, which is what a camera does
+when ONVIF is switched off in its settings), it did not answer like a camera, it has no video stream,
 a camera is already added at that address, or video support is not available on
 this machine (with the reason).
 
@@ -167,13 +171,16 @@ the app says the removal is not finished; removing it again retries.
 - The camera's names, models and other details come from the camera and are
   shown as the camera reports them; the optional name you type is stored but is
   not yet shown in the list.
-- It speaks plain-HTTP ONVIF only (no encrypted ONVIF), sends every ONVIF
-  request to the single address and path `/onvif/device_service`, and follows
-  none of the other service addresses a camera advertises. A camera that serves
-  its media service only from a different path cannot be added yet.
-- The camera's user name may contain only letters, digits, dot, underscore and
-  hyphen (so an email-style user name cannot be used yet). The password may
-  contain anything, up to 256 bytes.
+- It speaks plain-HTTP ONVIF only (no encrypted ONVIF). It starts at
+  `/onvif/device_service` on the address and port you gave. If the camera then
+  names its media service on that same address and port (for example
+  `/onvif/media_service`), the profile and stream steps are sent there; a
+  service address on any other host, port or scheme is never contacted, and a
+  camera advertising one is refused.
+- The camera's user name may be 1 to 128 characters and may contain only
+  letters, digits, dot, underscore and hyphen, so a plain `admin` works but an
+  email-style user name (with `@`) or one with a space cannot be used yet. The
+  password may contain anything, up to 256 bytes.
 
 ## Advisory findings
 

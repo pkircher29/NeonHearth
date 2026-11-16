@@ -850,21 +850,27 @@ fn parse_envelope(
     let body = &root.children[1];
     require_name(header, SOAP, "Header")?;
     require_name(body, SOAP, "Body")?;
-    // Real devices add MessageID, To, security and vendor header blocks; only
-    // the correlated Action and RelatesTo are required, each exactly once.
+    // Real devices add MessageID, To, security and vendor header blocks; when
+    // the header carries anything, the correlated Action and RelatesTo are
+    // required, each exactly once. Some real cameras (Dahua-family firmware)
+    // answer with an empty `<s:Header/>` and no WS-Addressing at all. That is
+    // accepted: over HTTP the reply is already tied to its request, and the
+    // response element must still be exactly the one this action expects. A
+    // header with only one of the two, or with either one wrong, is refused.
     if !header.attributes.is_empty()
         || !header.text.trim().is_empty()
-        || header.children.len() < 2
         || header.children.len() > limits.max_facts
     {
         return Err(OnvifError::InvalidResponse);
     }
-    let action = unique_child(header, WSA, "Action")?;
-    let relates_to = unique_child(header, WSA, "RelatesTo")?;
-    if leaf_text(action, 256)? != request.action.response_action()
-        || leaf_text(relates_to, 128)? != request.message_id.as_str()
-    {
-        return Err(OnvifError::InvalidResponse);
+    if !header.children.is_empty() {
+        let action = unique_child(header, WSA, "Action")?;
+        let relates_to = unique_child(header, WSA, "RelatesTo")?;
+        if leaf_text(action, 256)? != request.action.response_action()
+            || leaf_text(relates_to, 128)? != request.message_id.as_str()
+        {
+            return Err(OnvifError::InvalidResponse);
+        }
     }
     if !body.attributes.is_empty() || !body.text.trim().is_empty() || body.children.len() != 1 {
         return Err(OnvifError::InvalidResponse);
