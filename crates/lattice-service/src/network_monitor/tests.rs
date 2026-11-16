@@ -59,6 +59,120 @@ fn router_parser_handles_split_sse_and_rejects_unbounded_or_invalid_rates() {
     assert!(feed.rate.is_none());
     assert!(feed.push(&vec![b'x'; 65537]).is_err());
 }
+/// The events a real W6 sends to an unauthenticated reader, in order, with no vnstat event.
+const W6_UNAUTHENTICATED: &str = concat!(
+    "data: {\"Message\":\"keep-alive\"}\n\n",
+    "data: {\"Message\":\"CMD_WIFI_GET_connectionStatusGet\",\"Field\":{\"ConnectionStatus\":\"1\"}}\n\n",
+    "data: {\"Message\":\"CMD_WIFI_GET_dashBoardPage\",\"Field\":{\"Host1ConnectedDevice\":\"3\",\"Host2ConnectedDevice\":\"2\",\"Host3ConnectedDevice\":\"0\",\"Guest1ConnectedDevice\":\"1\",\"Guest2ConnectedDevice\":\"0\",\"Guest3ConnectedDevice\":\"0\",\"Smart1ConnectedDevice\":\"4\",\"Smart2ConnectedDevice\":\"0\",\"Smart3ConnectedDevice\":\"0\",\"LanConnectedDevice\":\"2\",\"Uptime\":\"12345\",\"PortList\":[]}}\n\n",
+    "data: {\"Message\":\"CMD_WIFI_GET_homeWifiSettingGet\",\"Field\":{\"Ssid\":\"not retained\"}}\n\n",
+);
+fn sample_time(secs: i64) -> chrono::DateTime<Utc> {
+    chrono::DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()
+}
+#[test]
+fn a_router_that_sends_device_counts_but_no_rates_reads_connected() {
+    let mut feed = router::Feed::default();
+    feed.push(W6_UNAUTHENTICATED.as_bytes()).unwrap();
+    assert!(feed.rate.is_none());
+    assert!(feed.dashboard);
+    assert_eq!(feed.connected, Some(12));
+    let reading = router::next_reading(
+        &RouterReading::default(),
+        sample_time(0),
+        "192.168.1.1:8080",
+        feed.rate.take(),
+        feed.connected,
+    );
+    assert_eq!(reading.status, "connected");
+    assert_eq!(reading.connected_devices, Some(12));
+    assert_eq!((reading.download, reading.upload), (None, None));
+    assert_eq!(reading.source.as_deref(), Some("192.168.1.1:8080"));
+    assert!(reading.observed_at.is_some());
+}
+#[test]
+fn a_later_rate_makes_the_reading_ready_and_lapsed_rates_fall_back_to_connected() {
+    let source = "192.168.1.1:8080";
+    let connected = router::next_reading(
+        &RouterReading::default(),
+        sample_time(0),
+        source,
+        None,
+        Some(12),
+    );
+    let ready = router::next_reading(
+        &connected,
+        sample_time(5),
+        source,
+        Some((100.0, 7.0)),
+        Some(12),
+    );
+    assert_eq!(ready.status, "ready");
+    assert_eq!((ready.download, ready.upload), (Some(100.0), Some(7.0)));
+    // A dashboard event while rates are fresh keeps the rates and refreshes the count.
+    let still_ready = router::next_reading(&ready, sample_time(10), source, None, Some(13));
+    assert_eq!(still_ready.status, "ready");
+    assert_eq!(still_ready.download, Some(100.0));
+    assert_eq!(still_ready.connected_devices, Some(13));
+    // Rates stopped but dashboard events continue: connected, never stale or zero rates.
+    let lapsed = router::next_reading(&still_ready, sample_time(30), source, None, Some(13));
+    assert_eq!(lapsed.status, "connected");
+    assert_eq!((lapsed.download, lapsed.upload), (None, None));
+    // Between dashboard events a snapshot ages the reading the same way.
+    let aged = router::aged_reading(still_ready.clone(), sample_time(25), None);
+    assert_eq!(aged.status, "connected");
+    assert_eq!((aged.download, aged.upload), (None, None));
+    assert_eq!(aged.connected_devices, Some(13));
+    let fresh = router::aged_reading(ready, sample_time(8), None);
+    assert_eq!(fresh.status, "ready");
+    assert_eq!(fresh.download, Some(100.0));
+}
+#[test]
+fn a_quiet_or_failed_feed_ages_to_unavailable_with_a_reason() {
+    let source = "192.168.1.1:8080";
+    let connected = router::next_reading(
+        &RouterReading::default(),
+        sample_time(0),
+        source,
+        None,
+        Some(4),
+    );
+    let quiet = router::aged_reading(connected.clone(), sample_time(120), None);
+    assert_eq!(quiet.status, "unavailable");
+    assert_eq!(quiet.connected_devices, None);
+    assert_eq!(quiet.reason.as_deref(), Some("feed_quiet"));
+    let failed = router::aged_reading(connected, sample_time(120), Some("feed_not_event_stream"));
+    assert_eq!(failed.reason.as_deref(), Some("feed_not_event_stream"));
+    let never = router::aged_reading(RouterReading::default(), sample_time(0), None);
+    assert_eq!(never.status, "unavailable");
+    assert_eq!(never.reason, None);
+}
+#[test]
+fn router_failures_are_logged_once_per_reason_until_the_debounce_lapses() {
+    let start = std::time::Instant::now();
+    let mut note = router::FailureNote::default();
+    assert!(note.record("client_build", start));
+    assert!(!note.record("client_build", start + Duration::from_secs(3)));
+    assert_eq!(note.reason, Some("client_build"));
+    assert!(note.record("feed_closed", start + Duration::from_secs(6)));
+    assert!(note.record("client_build", start + Duration::from_secs(9)));
+    assert!(note.record("client_build", start + Duration::from_secs(9 + 301)));
+    note.clear();
+    assert_eq!(note.reason, None);
+}
+#[test]
+fn a_connected_reading_serializes_without_internal_fields() {
+    let reading = router::next_reading(
+        &RouterReading::default(),
+        sample_time(0),
+        "s",
+        None,
+        Some(2),
+    );
+    let value = serde_json::to_value(&reading).unwrap();
+    assert_eq!(value["status"], "connected");
+    assert!(value.get("rate_at").is_none());
+    assert!(value.get("reason").is_none());
+}
 #[tokio::test]
 async fn failed_or_partial_scans_cannot_create_departures_and_returns_are_persisted() {
     let hub = NetworkMonitor::new(lattice_store::connect_memory().await.unwrap());

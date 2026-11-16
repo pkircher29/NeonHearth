@@ -3,7 +3,7 @@ export interface NetworkSettings {discovery_enabled:boolean;interval_seconds:num
 export interface NetworkPresence {device_id?:string|null;manufacturer?:string|null;interface:number;mac:string;ip:string;first_seen:string;last_seen:string;missed:number}
 export interface NetworkSnapshot {
   settings:NetworkSettings;
-  router:{status:string;observed_at:string|null;source:string|null;download:number|null;upload:number|null;connected_devices:number|null};
+  router:{status:string;observed_at:string|null;source:string|null;download:number|null;upload:number|null;connected_devices:number|null;reason?:string|null};
   discovery:{state:string;started_at:string|null;finished_at:string|null;total:number;completed:number;responding:number;errors:number;skipped_networks:number};
   devices:NetworkPresence[];events:Array<{id:number;at:string;mac:string;ip:string;kind:string}>;
   points:Array<{at:number;download:number;upload:number;samples:number}>;bucket_seconds:number;
@@ -24,7 +24,7 @@ const isPointRow=(r:unknown)=>record(r)&&pointRow(r);
 export function isNetworkSnapshot(v:unknown):v is NetworkSnapshot {
   if(!record(v)||!settings(v.settings)||!record(v.router)||!record(v.discovery))return false;
   const r=v.router,d=v.discovery;
-  return text(r.status)&&nullable(r.observed_at,text)&&nullable(r.source,text)&&nullable(r.download,number)&&nullable(r.upload,number)&&nullable(r.connected_devices,number)
+  return text(r.status)&&nullable(r.observed_at,text)&&nullable(r.source,text)&&nullable(r.download,number)&&nullable(r.upload,number)&&nullable(r.connected_devices,number)&&(r.reason===undefined||nullable(r.reason,text))
     &&text(d.state)&&nullable(d.started_at,text)&&nullable(d.finished_at,text)&&['total','completed','responding','errors','skipped_networks'].every(k=>number(d[k]))
     &&rows(v.devices,4096,deviceRow)
     &&rows(v.events,200,eventRow)

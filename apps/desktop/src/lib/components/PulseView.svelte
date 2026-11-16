@@ -8,7 +8,7 @@
   import HearthPulse from './HearthPulse.svelte';
   import FlowMap from './FlowMap.svelte';
   import TrafficScope from './TrafficScope.svelte';
-  import { formatThroughput } from './networkFormat';
+  import { formatThroughput, routerConnectedCopy } from './networkFormat';
 
   interface Props { state?: LiveState | null; network?: NetworkSnapshot | null; onselectdevice?: (deviceId: string) => void; onopentraffic?: () => void; hostApi?: HostApi | null; automationApi?: AutomationApi | null; }
   let { state: liveState = null, network = null, onselectdevice, onopentraffic, hostApi = null, automationApi = null }: Props = $props();
@@ -35,6 +35,7 @@
   const flowUpload = $derived(hasThroughput && liveState ? liveState.aggregate.upload : hostSource && hostFlow ? hostFlow.up : null);
   const flowDownload = $derived(hasThroughput && liveState ? liveState.aggregate.download : hostSource && hostFlow ? hostFlow.down : null);
   const makerGrouped = $derived(Boolean(meta) && allDevices.some((device) => !device.owner_type && !device.identity.classification));
+  const routerConnected = $derived(network?.router.status === 'connected');
   const householdReady = $derived(network?.router.status === 'ready' && network.router.download !== null && network.router.upload !== null);
 
   $effect(() => {
@@ -96,6 +97,9 @@
           <h2>Household traffic is available</h2>
           <p class="household-rates"><span>Download <strong>{formatThroughput(network?.router.download)}</strong></span><span>Upload <strong>{formatThroughput(network?.router.upload)}</strong></span></p>
           <p>{routerName} · router-reported internet totals. These readings do not measure individual devices or traffic between LAN devices.</p>
+        {:else if routerConnected}
+          <h2>{routerConnectedCopy(network?.router.connected_devices).headline}</h2>
+          <p>{routerName} · {routerConnectedCopy(network?.router.connected_devices).detail}</p>
         {:else}
           <h2>No fresh router readings</h2>
           <p>Household internet totals require a supported router feed. Open Traffic, then Network preferences to connect it. Device discovery and this computer's monitoring do not require that feed.</p>

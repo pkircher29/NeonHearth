@@ -49,6 +49,14 @@ pub struct Discovery {
     pub errors: usize,
     pub skipped_networks: usize,
 }
+/// Traffic rates older than this are no longer shown.
+pub(crate) const RATE_FRESH_SECS: i64 = 10;
+/// The router sends its dashboard (device counts) about every 10 s; three missed events means
+/// the feed is no longer connected.
+pub(crate) const CONNECTED_FRESH_SECS: i64 = 30;
+/// Router reading. `status`: `not_configured`; `unavailable` (feed not open or went quiet, see
+/// `reason`); `connected` (feed open, device count flowing, no traffic rates); `ready` (rates
+/// flowing); `history_unavailable` (rates flowing but could not be stored).
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct RouterReading {
     pub status: String,
@@ -57,6 +65,13 @@ pub struct RouterReading {
     pub download: Option<f64>,
     pub upload: Option<f64>,
     pub connected_devices: Option<u32>,
+    /// Short machine-readable code for the last feed failure; present only when `status` is
+    /// `unavailable` and a cause is known. Older clients ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// When the last traffic rate arrived (internal; not part of the API).
+    #[serde(skip)]
+    pub(crate) rate_at: Option<chrono::DateTime<Utc>>,
 }
 impl Default for RouterReading {
     fn default() -> Self {
@@ -67,6 +82,8 @@ impl Default for RouterReading {
             download: None,
             upload: None,
             connected_devices: None,
+            reason: None,
+            rate_at: None,
         }
     }
 }
@@ -114,6 +131,7 @@ pub struct NetworkMonitor {
     running: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     settings_lock: Arc<Mutex<()>>,
+    failure: Arc<std::sync::Mutex<router::FailureNote>>,
 }
 impl NetworkMonitor {
     pub fn new(pool: SqlitePool) -> Self {
@@ -124,6 +142,7 @@ impl NetworkMonitor {
             running: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
             settings_lock: Arc::new(Mutex::new(())),
+            failure: Arc::default(),
         }
     }
     pub async fn settings(&self) -> Result<Settings, sqlx::Error> {
@@ -146,6 +165,10 @@ impl NetworkMonitor {
             .bind(serde_json::to_string(&value).map_err(|_| sqlx::Error::Protocol("settings encoding".into()))?).execute(&self.pool).await?;
         if old.router_ip != value.router_ip || old.router_port != value.router_port {
             *self.router.lock().await = RouterReading::default();
+            self.failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
         }
         if !value.discovery_enabled && old.discovery_enabled {
             self.cancel.store(true, Ordering::Release);
@@ -397,17 +420,13 @@ impl NetworkMonitor {
     pub async fn snapshot(&self, minutes: u32) -> Result<Snapshot, sqlx::Error> {
         let settings = self.settings().await?;
         let mut router = self.router.lock().await.clone();
-        if settings.router_ip.is_some()
-            && router.observed_at.as_ref().is_none_or(|at| {
-                chrono::DateTime::parse_from_rfc3339(at).map_or(true, |at| {
-                    (Utc::now() - at.with_timezone(&Utc)).num_seconds() > 10
-                })
-            })
-        {
-            router.status = "unavailable".into();
-            router.download = None;
-            router.upload = None;
-            router.connected_devices = None;
+        if settings.router_ip.is_some() {
+            let failure = self
+                .failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reason;
+            router = router::aged_reading(router, Utc::now(), failure);
         }
         let discovery = if let Some(value) = self.discovery.lock().await.clone() {
             value

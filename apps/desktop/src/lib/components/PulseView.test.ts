@@ -168,3 +168,15 @@ it('names the configured router source instead of a hard-coded model',()=>{
   expect(view.getByRole('region',{name:'Household internet traffic'}).textContent).toContain('Acme AX7000 · router-reported internet totals');
   view.unmount();
 });
+
+it('says plainly that a connected router sends no speed totals yet, without rates or zeros',()=>{
+  const network={...router('connected'),router:{status:'connected',observed_at:new Date().toISOString(),source:'192.168.1.1:8080',download:null,upload:null,connected_devices:12}};
+  const view=render(PulseView,{state:{...initialLiveState,connected:true},network,onopentraffic:vi.fn()});
+  const household=view.getByRole('region',{name:'Household internet traffic'});
+  expect(household.textContent).toContain('Router connected, no internet speed yet');
+  expect(household.textContent).toContain('reports 12 devices');
+  expect(household.textContent).toContain('admin page is open and signed in');
+  expect(household.textContent).not.toContain('Household traffic is available');
+  expect(household.textContent).not.toContain('No fresh router readings');
+  expect(household.textContent).not.toMatch(/kbps|Mbps|Gbps/);
+});
