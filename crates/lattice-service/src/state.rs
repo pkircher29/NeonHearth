@@ -125,6 +125,7 @@ pub struct AppState {
     service_status: Arc<Mutex<ServiceRuntimeStatus>>,
     camera_sessions: Option<Arc<crate::cameras::CameraSessionManager>>,
     camera_media: crate::cameras::production::CameraMediaStatus,
+    worker_control: crate::runtime::WorkerControl,
 }
 impl AppState {
     pub fn new(
@@ -153,7 +154,12 @@ impl AppState {
             service_status: Arc::new(Mutex::new(ServiceRuntimeStatus::Ready)),
             camera_sessions: None,
             camera_media: crate::cameras::production::CameraMediaStatus::not_configured(),
+            worker_control: crate::runtime::WorkerControl::new(),
         })
+    }
+    /// The handle the Doctor uses to restart the discovery worker in place.
+    pub fn worker_control(&self) -> &crate::runtime::WorkerControl {
+        &self.worker_control
     }
     #[must_use]
     pub fn with_camera_sessions(

@@ -316,7 +316,19 @@ async fn run_envelope_matches_the_contract_and_round_trips_the_domain_types() {
     let findings = run["findings"].as_array().unwrap();
     for finding in findings {
         let keys: Vec<_> = finding.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys, ["diagnosis", "plan"]);
+        // The reason fields exist only for a plan that cannot run.
+        let expected: &[&str] = if finding["executable"] == true {
+            &["diagnosis", "executable", "plan"]
+        } else {
+            &[
+                "diagnosis",
+                "executable",
+                "plan",
+                "unavailable_detail",
+                "unavailable_reason",
+            ]
+        };
+        assert_eq!(keys, expected, "{finding}");
         let _: Diagnosis = serde_json::from_value(finding["diagnosis"].clone()).unwrap();
         let _: RepairPlan = serde_json::from_value(finding["plan"].clone()).unwrap();
     }
@@ -953,6 +965,8 @@ async fn openapi_documents_all_doctor_routes_and_schemas() {
     assert!(doc["paths"]["/api/v1/doctor/approvals"]["post"]["responses"]["404"].is_object());
     assert!(doc["paths"]["/api/v1/doctor/repair"]["post"]["responses"]["403"].is_object());
     assert!(doc["paths"]["/api/v1/doctor/repair"]["post"]["responses"]["400"].is_object());
+    assert!(doc["paths"]["/api/v1/doctor/repair"]["post"]["responses"]["422"].is_object());
+    assert!(doc["paths"]["/api/v1/doctor/approvals"]["post"]["responses"]["422"].is_object());
     let schemas = &doc["components"]["schemas"];
     for name in [
         "DoctorRun",
@@ -1541,4 +1555,204 @@ async fn the_production_probe_transport_measures_the_host_and_never_fails_a_chec
         let text = finding["diagnosis"].to_string();
         assert!(!text.contains("unsupported"), "{text}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Capability: a plan this build cannot execute is refused up front.
+// ---------------------------------------------------------------------------
+
+use lattice_doctor::repair::UnavailableReason;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Delegates to a fake but can be told, at any moment, to declare every plan
+/// unexecutable (as the production transport does when the worker stops).
+struct Switchable {
+    inner: Arc<FakeRepairTransport>,
+    unavailable: Arc<AtomicBool>,
+}
+
+impl RepairTransport for Switchable {
+    fn unavailable_reason(&self, _plan: &RepairPlan) -> Option<UnavailableReason> {
+        self.unavailable
+            .load(Ordering::SeqCst)
+            .then_some(UnavailableReason::NeedsRouterApi)
+    }
+    async fn snapshot(&self, keys: &[StateKey]) -> Result<Vec<StateEntry>, RepairTransportError> {
+        self.inner.snapshot(keys).await
+    }
+    async fn apply(&self, repair: &ExecutableRepair) -> Result<(), RepairTransportError> {
+        self.inner.apply(repair).await
+    }
+    async fn restore(&self, entries: &[StateEntry]) -> Result<(), RepairTransportError> {
+        self.inner.restore(entries).await
+    }
+    async fn measure(&self, check: CheckKind) -> Result<Vec<Measurement>, RepairTransportError> {
+        self.inner.measure(check).await
+    }
+}
+
+#[tokio::test]
+async fn every_finding_says_whether_this_build_can_execute_its_plan() {
+    // A transport that can run everything: only advice stays unexecutable.
+    let fixture = mixed_fixture().await;
+    let run = run_doctor(&fixture.router).await;
+    for finding in run["findings"].as_array().unwrap() {
+        let class = finding["plan"]["class"].as_str().unwrap();
+        if class == "guided_physical" || class == "observation_only" {
+            assert_eq!(finding["executable"], false, "{finding}");
+            assert_eq!(finding["unavailable_reason"], "guidance_only", "{finding}");
+            assert!(finding["unavailable_detail"].as_str().is_some());
+        } else {
+            assert_eq!(finding["executable"], true, "{finding}");
+            assert!(finding.get("unavailable_reason").is_none(), "{finding}");
+        }
+    }
+
+    // A transport that cannot: every actionable plan carries the reason, and
+    // the report route agrees with the run.
+    let repairs = FakeRepairTransport::new().with_unavailable(UnavailableReason::NeedsRouterApi);
+    let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(repairs)).await;
+    let run = run_doctor(&fixture.router).await;
+    for finding in run["findings"].as_array().unwrap() {
+        let class = finding["plan"]["class"].as_str().unwrap();
+        assert_eq!(finding["executable"], false, "{finding}");
+        let expected = if class == "guided_physical" || class == "observation_only" {
+            "guidance_only"
+        } else {
+            "needs_router_api"
+        };
+        assert_eq!(finding["unavailable_reason"], expected, "{finding}");
+    }
+    let report =
+        json_body(send(&fixture.router, "GET", "/api/v1/doctor/report", None, true).await).await;
+    assert_eq!(report, run);
+}
+
+#[tokio::test]
+async fn an_approval_is_not_minted_for_a_plan_the_build_cannot_execute() {
+    let repairs = Arc::new(FakeRepairTransport::new());
+    let unavailable = Arc::new(AtomicBool::new(true));
+    let switchable = Switchable {
+        inner: Arc::clone(&repairs),
+        unavailable: Arc::clone(&unavailable),
+    };
+    let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(switchable)).await;
+    let run = run_doctor(&fixture.router).await;
+    let kind = finding_kind(&run, "duplicate_ip");
+    let response = mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = json_body(response).await;
+    assert_eq!(body["error"], "repair_unavailable");
+    assert_eq!(body["reason"], "needs_router_api");
+    assert!(body["detail"].as_str().is_some_and(|d| !d.is_empty()));
+    // Nothing was minted or audited.
+    assert!(doctor_audit_rows(&fixture.pool).await.is_empty());
+
+    // Once the build can execute it, the same request mints.
+    unavailable.store(false, Ordering::SeqCst);
+    let response = mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_refused_repair_is_not_audited_does_not_run_and_keeps_the_approval() {
+    let repairs = Arc::new(
+        FakeRepairTransport::new()
+            .push_measurements(vec![measurement(Metric::ConflictingMacCount, 2.0)])
+            .push_measurements(vec![measurement(Metric::ConflictingMacCount, 0.0)]),
+    );
+    let unavailable = Arc::new(AtomicBool::new(false));
+    let switchable = Switchable {
+        inner: Arc::clone(&repairs),
+        unavailable: Arc::clone(&unavailable),
+    };
+    let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(switchable)).await;
+    let run = run_doctor(&fixture.router).await;
+    let kind = finding_kind(&run, "duplicate_ip");
+    let approval =
+        json_body(mint_duplicate_ip_approval(&fixture, &kind, Some(CLAIMANT_A)).await).await;
+    let repair_body = serde_json::json!({
+        "diagnosis_kind": kind,
+        "approval_id": approval["approval_id"],
+        "chosen": CLAIMANT_A,
+    });
+    let rows_before = doctor_audit_rows(&fixture.pool).await.len();
+    assert_eq!(rows_before, 1, "only the approval was audited");
+
+    // The capability disappears after the approval was minted.
+    unavailable.store(true, Ordering::SeqCst);
+    let refused = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/repair",
+        Some(repair_body.clone()),
+        true,
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json_body(refused).await["error"], "repair_unavailable");
+    // No intent row, no execution.
+    assert_eq!(doctor_audit_rows(&fixture.pool).await.len(), rows_before);
+    assert!(repairs.calls().is_empty());
+
+    // The approval was not spent: it still works once the capability is back.
+    unavailable.store(false, Ordering::SeqCst);
+    let accepted = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/repair",
+        Some(repair_body),
+        true,
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let body = json_body(accepted).await;
+    assert_eq!(body["repair"]["outcome"]["outcome"], "completed");
+}
+
+#[tokio::test]
+async fn a_safe_repair_the_build_cannot_run_is_refused_before_the_intent_audit() {
+    let repairs = Arc::new(FakeRepairTransport::new());
+    let switchable = Switchable {
+        inner: Arc::clone(&repairs),
+        unavailable: Arc::new(AtomicBool::new(true)),
+    };
+    let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(switchable)).await;
+    let run = run_doctor(&fixture.router).await;
+    let kind = finding_kind(&run, "router_fault");
+    let response = send(
+        &fixture.router,
+        "POST",
+        "/api/v1/doctor/repair",
+        Some(serde_json::json!({ "diagnosis_kind": kind })),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json_body(response).await["reason"], "needs_router_api");
+    assert!(doctor_audit_rows(&fixture.pool).await.is_empty());
+    assert!(repairs.calls().is_empty());
+}
+
+#[tokio::test]
+async fn the_production_repair_transport_offers_only_what_it_can_perform() {
+    let pool = connect_memory().await.unwrap();
+    let state = AppState::new(TOKEN, M2StateRepository::new(pool)).unwrap();
+    let doctor = DoctorState::for_service(&state);
+    let router = app_with_doctor(state.clone(), doctor);
+    let run = run_doctor(&router).await;
+    // Whatever network this machine has, no finding may offer a repair that
+    // needs the OS network stack or a router API: those are guidance only.
+    for finding in run["findings"].as_array().unwrap() {
+        let plan = &finding["plan"];
+        if plan["class"] == "approval_required_reversible" {
+            assert_eq!(finding["executable"], false, "{finding}");
+        }
+        if plan["class"] == "safe_automatic" && plan["action"] != "restart_collector_worker" {
+            assert_eq!(finding["executable"], false, "{finding}");
+        }
+    }
+    // The collector restart needs a running worker; none is attached here, so
+    // it is refused up front rather than approved and failed.
+    assert!(!state.worker_control().is_attached());
 }
