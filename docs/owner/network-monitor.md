@@ -12,6 +12,12 @@ In **Network preferences**, enter the W6's numeric LAN IPv4 address and web port
 
 The graph shows router-reported download/upload rates for household internet traffic. Its device count is labeled as a router report and can differ from the observed inventory, especially with downstream switches, access points, sleeping devices, or isolated networks. Graph gaps indicate missing measurements. A stale feed loses its live rates and device count after ten seconds. Averages are available for 5 minutes, 1 hour, and 24 hours; raw rates are retained locally for one day, up to 50,000 samples. Pausing freezes the graph while collection continues.
 
+### What the router card can say
+
+- **Ready** — the router is sending internet speed totals. Download and upload are shown and stored for the graph.
+- **Connected** — the router answered and reports how many devices are connected, but it is not sending speed totals. NeonHearth says so and shows no rates (never zero). The W6 only sends speed totals while its own admin page is open and signed in, and NeonHearth never signs in to the router, so the totals appear whenever you have that page open and disappear after about ten seconds without them. The connected state is not stored in the graph history.
+- **Unavailable** — NeonHearth could not open the router's feed, or it went quiet for more than about thirty seconds. The snapshot may carry a short `reason` code (for example `no_local_interface`, `feed_not_event_stream`, `client_build`, `session_byte_cap`, `parse_error`, `feed_closed`, `feed_quiet`); the same reason is written to the service log at most once every five minutes, never with any router response content.
+
 The inspected W6 feed supplies aggregate WAN rates and connected-client counts. **It does not supply per-device byte counts or traffic between LAN devices.** Those measurements remain unavailable. Measuring them requires counters from a suitable gateway or collection at a mirrored switch port. This build does not claim to capture that traffic.
 
 ## Finding previously unseen devices

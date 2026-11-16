@@ -41,3 +41,17 @@ it('correlates saved device IDs before slow address enrichment arrives without d
   expect(rows).toHaveLength(1);expect(rows[0]?.name).toBe('Confirmed lamp');expect(rows[0]?.ips).toEqual(['192.168.1.10']);expect(rows[0]?.maker).toBe('Test maker');
   expect(device.presence.state).toBe('quiet');expect(device.owner_confirmed).toBe(true);
 });
+
+it('shows a connected router with its device count and no rates, and the validator accepts the new state',async()=>{
+  const value=fixture();value.router={status:'connected',observed_at:new Date().toISOString(),source:'192.168.1.1:8080',download:null,upload:null,connected_devices:12};
+  const api:NetworkApi={snapshot:vi.fn(async()=>value),settings:vi.fn(async v=>v),discover:vi.fn(async()=>{}),cancel:vi.fn(async()=>{})};
+  const view=render(NetworkTrafficView,{api,hostApi:{snapshot:vi.fn()} as unknown as HostApi,liveState:initialLiveState,onselectdevice:vi.fn()});
+  const note=await view.findByText(/Router connected, no internet speed yet/);
+  expect(note.parentElement?.textContent).toContain('reports 12 devices');
+  expect(note.parentElement?.textContent).toContain('admin page is open and signed in');
+  expect(view.container.querySelector('.metrics')?.textContent).not.toMatch(/bps/);
+  expect(isNetworkSnapshot(value)).toBe(true);
+  expect(isNetworkSnapshot({...value,router:{...value.router,status:'unavailable',connected_devices:null,reason:'feed_quiet'}})).toBe(true);
+  expect(isNetworkSnapshot({...value,router:{...value.router,reason:7}})).toBe(false);
+  expect(isNetworkSnapshot(fixture())).toBe(true);
+});
