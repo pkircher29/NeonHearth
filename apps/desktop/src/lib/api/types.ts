@@ -151,6 +151,9 @@ export interface CameraInventoryProjection { manufacturer: string | null; model:
 export interface CameraSessionResponse { session_id: string }
 /** Whether camera media (live view, snapshots) runs on this machine; `reason` is a stable code, `detail` plain words. */
 export interface CameraMediaStatus { enabled: boolean; reason: string; detail: string; setup_available: boolean; setup_detail: string }
+/** What the owner types to add a camera. The password is sent once and never kept by the app. */
+export interface AddCameraInput { address: string; username: string; password: string; name?: string; onvif_port?: number; allow_basic?: boolean }
+export interface AddedCamera { camera_id: string; name: string | null; streams: Array<{ stream_id: string }> }
 
 export interface EventTicket {
   ticket: string;

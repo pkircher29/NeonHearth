@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createApiClient, isSequence, type AuthSource, type DiagnosisKind } from './client';
+import { ApiError, createApiClient, isSequence, type AuthSource, type DiagnosisKind } from './client';
 
 describe('createApiClient credentials (M-25)', () => {
   it('omits the Authorization header entirely when no credential is held, never sending an empty bearer', async () => {
@@ -826,5 +826,67 @@ describe('createApiClient camera media status', () => {
     await expect(minimal.cameraMedia()).resolves.toEqual({ enabled: true, reason: 'ready', detail: '', setup_available: true, setup_detail: '' });
     await expect(make(() => new Response(null, { status: 404 })).cameraMedia()).resolves.toBeNull();
     await expect(make(() => new Response(JSON.stringify({ enabled: 'yes' }), { status: 200, headers: { 'content-type': 'application/json' } })).cameraMedia()).resolves.toBeNull();
+  });
+});
+
+describe('createApiClient adding and removing a camera', () => {
+  const cameraId = '018f47a0-9b5c-7a22-8a33-112233445599';
+  const streamId = '018f47a0-9b5c-4a22-8a33-112233445599';
+  const added = { camera_id: cameraId, name: 'Porch', streams: [{ stream_id: streamId }] };
+  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  const make = (response: () => Response) => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => response());
+    return { fetchImpl, client: createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl }) };
+  };
+
+  it('posts the details once as JSON, trims them, leaves out what was not chosen, and parses the answer', async () => {
+    const { fetchImpl, client } = make(() => json(added, 201));
+    await expect(client.addCamera({ address: ' 192.168.1.50 ', username: 'admin', password: 'sup3r-secret!', name: ' Porch ' })).resolves.toEqual(added);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(String(url)).toBe('https://collector.example/api/v1/cameras');
+    expect((init as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((init as RequestInit).body))).toEqual({ address: '192.168.1.50', username: 'admin', password: 'sup3r-secret!', name: 'Porch' });
+    await client.addCamera({ address: '192.168.1.51', username: 'admin', password: 'x', allow_basic: true, onvif_port: 8080 });
+    expect(JSON.parse(String((fetchImpl.mock.calls[1]![1] as RequestInit).body))).toEqual({ address: '192.168.1.51', username: 'admin', password: 'x', onvif_port: 8080, allow_basic: true });
+  });
+
+  it('refuses obviously unusable input before anything is sent', async () => {
+    const { fetchImpl, client } = make(() => json(added, 201));
+    for (const input of [
+      { address: '', username: 'a', password: 'b' }, { address: '192.168.1.50', username: '', password: 'b' }, { address: '192.168.1.50', username: 'a', password: '' },
+      { address: '192.168.1.50', username: 'a', password: 'p'.repeat(257) }, { address: '192.168.1.50', username: 'a', password: 'b', name: 'n'.repeat(65) }, { address: '192.168.1.50', username: 'a', password: 'b', onvif_port: 0 }
+    ]) await expect(client.addCamera(input)).rejects.toThrow('Invalid camera request');
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects an answer that is not exactly the documented shape', async () => {
+    for (const bad of [{ ...added, extra: 1 }, { camera_id: 'nope', name: null, streams: [] }, { camera_id: cameraId, name: null, streams: [{ stream_id: 'x' }] }, { camera_id: cameraId, name: 5, streams: [] }]) {
+      const { client } = make(() => json(bad, 201));
+      await expect(client.addCamera({ address: '192.168.1.50', username: 'a', password: 'b' })).rejects.toThrow('Invalid camera response');
+    }
+  });
+
+  it('keeps the status and the service error code, reason and detail, and nothing else, on a refusal', async () => {
+    const { client } = make(() => json({ error: 'video_unavailable', reason: 'ffmpeg_not_found', detail: 'Install ffmpeg.', message: 'ignored', secret: 'ignored' }, 503));
+    const error = await client.addCamera({ address: '192.168.1.50', username: 'a', password: 'b' }).catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: 503, code: 'video_unavailable', reason: 'ffmpeg_not_found', detail: 'Install ffmpeg.' });
+    expect((error as Error).message).toBe('Request failed with status 503');
+    const plain = await make(() => new Response('not json', { status: 422 })).client.addCamera({ address: '192.168.1.50', username: 'a', password: 'b' }).catch((reason: unknown) => reason);
+    expect(plain).toMatchObject({ status: 422, code: null });
+    const hostile = await make(() => json({ error: '<script>alert(1)</script>' }, 422)).client.addCamera({ address: '192.168.1.50', username: 'a', password: 'b' }).catch((reason: unknown) => reason);
+    expect(hostile).toMatchObject({ status: 422, code: null });
+  });
+
+  it('removes a camera with DELETE and reports a refusal with its code', async () => {
+    const { fetchImpl, client } = make(() => new Response(null, { status: 204 }));
+    await expect(client.removeCamera(cameraId)).resolves.toBeUndefined();
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(String(url)).toBe(`https://collector.example/api/v1/cameras/${cameraId}`);
+    expect((init as RequestInit).method).toBe('DELETE');
+    await expect(client.removeCamera('not-an-id')).rejects.toThrow('Invalid camera id');
+    const failing = make(() => json({ error: 'incomplete' }, 503));
+    await expect(failing.client.removeCamera(cameraId)).rejects.toMatchObject({ status: 503, code: 'incomplete' });
   });
 });
