@@ -68,7 +68,7 @@ describe('CamerasView camera media status', () => {
   it('says plainly that no camera can be added yet when the list is empty', async () => {
     const ready = { ...off, enabled: true, reason: 'ready' };
     render(CamerasView, { client: clientStub({ cameras: vi.fn(async () => ({ items: [], next_after: null })), cameraMedia: vi.fn(async () => ready) as unknown as ApiClient['cameraMedia'] }) });
-    expect(await screen.findByText('No verified cameras yet')).toBeTruthy();
+    expect(await screen.findByText('No cameras yet')).toBeTruthy();
     expect(await screen.findByText('No camera can be added yet.')).toBeTruthy();
   });
 });
