@@ -158,7 +158,15 @@ export type RepairOutcome =
   | { outcome: 'verification_failed'; error: string };
 export interface RepairReport { class: RepairClass; description: string; outcome: RepairOutcome; verification: Verification | null; rollback: RollbackOutcome; events: RepairEvent[] }
 /** Service envelope for POST /doctor/run and GET /doctor/report. */
-export interface DoctorFinding { diagnosis: Diagnosis; plan: RepairPlan }
+/** Why a plan cannot be executed by this build of the service. */
+export type UnavailableReason = 'guidance_only' | 'needs_os_network_change' | 'needs_router_api' | 'not_wired' | 'worker_not_running';
+/**
+ * `executable`, `unavailable_reason` and `unavailable_detail` are optional: an
+ * older service sends none of them, which means "offer the plan as before".
+ * `executable: false` means no approval can be minted and no repair can run,
+ * so the plan is guidance for the owner only.
+ */
+export interface DoctorFinding { diagnosis: Diagnosis; plan: RepairPlan; executable?: boolean; unavailable_reason?: UnavailableReason; unavailable_detail?: string }
 export interface DoctorRun { run_id: string; started_at: string; report: DiagnosticReport; findings: DoctorFinding[] }
 /** A concurrent-run refusal (409) is a typed outcome, not an exception. */
 export type DoctorRunOutcome = { status: 'completed'; run: DoctorRun } | { status: 'already_running' };
@@ -678,8 +686,14 @@ function isRepairReport(value: unknown): value is RepairReport {
     && isRepairOutcome(value.outcome) && (value.verification === null || isVerification(value.verification))
     && isRollbackOutcome(value.rollback) && boundedArray(value.events, 256) && value.events.every(isRepairEvent);
 }
+const unavailableReasons = new Set(['guidance_only', 'needs_os_network_change', 'needs_router_api', 'not_wired', 'worker_not_running']);
+const findingKeys = new Set(['diagnosis', 'plan', 'executable', 'unavailable_reason', 'unavailable_detail']);
 function isDoctorFinding(value: unknown): value is DoctorFinding {
-  return isRecord(value) && exact(value, ['diagnosis', 'plan']) && isDiagnosis(value.diagnosis) && isRepairPlan(value.plan);
+  return isRecord(value) && Object.keys(value).every((key) => findingKeys.has(key))
+    && isDiagnosis(value.diagnosis) && isRepairPlan(value.plan)
+    && (value.executable === undefined || typeof value.executable === 'boolean')
+    && (value.unavailable_reason === undefined || unavailableReasons.has(String(value.unavailable_reason)))
+    && (value.unavailable_detail === undefined || isBoundedText(value.unavailable_detail));
 }
 function isDoctorRun(value: unknown): value is DoctorRun {
   return isRecord(value) && exact(value, ['run_id', 'started_at', 'report', 'findings'])

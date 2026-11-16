@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { isCheckUnavailable } from '../api/client';
-  import type { ApiClient, CheckResult, Confidence, DiagnosisKind, DoctorApproval, DoctorRun, GuidedAction, Measurement, RepairReport, RollbackOutcome } from '../api/client';
+  import type { ApiClient, CheckResult, Confidence, DiagnosisKind, DoctorApproval, DoctorRun, GuidedAction, Measurement, RepairPlan, RepairReport, RollbackOutcome } from '../api/client';
 
   type DoctorClient = Pick<ApiClient, 'doctorRun' | 'doctorReport' | 'doctorApprove' | 'doctorRepair'>;
   // `deviceName` resolves a claimant MAC to the owner's name for that device,
@@ -178,6 +178,33 @@
     ]
   };
 
+  // What the owner does by hand when this build cannot make the change. Only
+  // shown for a plan the service reported as not executable.
+  function manualFix(plan: RepairPlan): string {
+    if (plan.class === 'safe_automatic') {
+      switch (plan.action.action) {
+        case 'restart_collector_worker': return 'Restart the NeonHearth service (or the app), then run the diagnostic again.';
+        case 'refresh_app_caches': return 'Restart NeonHearth so it rebuilds its caches.';
+        case 'renew_collector_lease': return 'Release and renew this computer’s network address from the operating system’s network settings, then run the diagnostic again.';
+        case 'retry_router_session': return 'Open the router’s admin page, sign in again, and confirm it responds.';
+        case 'repair_tailscale_serve': return 'Open Settings, turn remote access off and on again, and check that the status is healthy.';
+      }
+    }
+    if (plan.class === 'approval_required_reversible') {
+      const action = plan.action;
+      switch (action.action) {
+        case 'reset_adapter': return `Disable and re-enable the network adapter “${action.interface}” in the operating system’s network settings.`;
+        case 'change_dns_servers': return `In the adapter’s network settings (or on the router), set the DNS servers to ${action.servers.join(', ')}.`;
+        case 'renew_dhcp_lease': return `Release and renew the address for “${action.interface}” from the operating system’s network settings.`;
+        case 'set_interface_mtu': return `In the adapter’s advanced settings, set the MTU of “${action.interface}” to ${action.mtu}.`;
+        case 'set_dhcp_reservation': return `In the router’s DHCP settings, reserve ${action.address} for the one device that should keep it, then restart the other device’s network connection.`;
+        case 'reboot_router': return 'Power-cycle the router: unplug it for 30 seconds, plug it back in, and wait a few minutes.';
+        case 'block_device': case 'unblock_device': return 'Use the router’s access-control page to change this device’s access.';
+      }
+    }
+    return plan.rationale;
+  }
+
   type Headline = { tone: 'success' | 'neutral' | 'regressed' | 'unverified'; text: string };
   function repairHeadline(report: RepairReport): Headline {
     if (report.outcome.outcome === 'completed') {
@@ -295,6 +322,12 @@
                     <p class="unverified-note">No before-and-after verification is available for this repair.</p>
                   {/if}
                 </div>
+              {:else if finding.executable === false && (plan.class === 'safe_automatic' || plan.class === 'approval_required_reversible')}
+                <div class="guidance-only" aria-label="Guidance for {name}">
+                  <p class="guidance-lead">NeonHearth can’t make this change for you in this build. To fix it yourself:</p>
+                  <p class="guidance-fix">{manualFix(plan)}</p>
+                  {#if finding.unavailable_detail}<p class="muted guidance-reason">{finding.unavailable_detail}</p>{/if}
+                </div>
               {:else if plan.class === 'safe_automatic'}
                 <div class="repair-actions">
                   <button type="button" class="act" aria-label="Repair {name}" disabled={inFlight} onclick={() => void executeRepair(key, finding.diagnosis.kind)}>{inFlight ? 'Repairing…' : 'Repair'}</button>
@@ -387,6 +420,10 @@
   .claimant-choice legend{padding:0 6px;color:var(--ink);font:600 12px var(--font-display)}
   .claimant{display:flex;gap:8px;align-items:center;color:var(--ink);font:12px var(--font-mono);cursor:pointer}
   .claimant-note{margin:4px 0 0;font-size:12px}
+  .guidance-only{margin-top:14px;padding:10px 12px;border:1px dashed var(--line-strong);border-radius:5px}
+  .guidance-lead{margin:0;color:var(--muted-strong);font-size:12px}
+  .guidance-fix{margin:6px 0 0;color:var(--ink);font-size:13px}
+  .guidance-reason{margin:6px 0 0;font-size:11px}
   .guided-steps{margin:14px 0 0;padding-left:22px;display:grid;gap:6px;color:var(--ink);font-size:12px}
   .guided-steps li::marker{color:var(--accent);font-weight:700}
   .observation-note{margin:14px 0 0;padding:9px;border:1px dashed var(--muted);color:var(--muted-strong);font:11px var(--font-mono)}

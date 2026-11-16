@@ -681,6 +681,22 @@ describe('createApiClient', () => {
     }
   });
 
+  it('accepts the optional capability fields on a finding and still parses older responses', async () => {
+    const unavailable = { ...gatewayFinding, executable: false, unavailable_reason: 'needs_router_api', unavailable_detail: 'NeonHearth has no way to manage this router; the change must be made on the router itself' };
+    const withCapability = { ...runEnvelope, findings: [unavailable, { ...gatewayFinding, executable: true }, gatewayFinding] };
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(withCapability), { status: 200 }));
+    const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl });
+    await expect(client.doctorRun()).resolves.toEqual({ status: 'completed', run: withCapability });
+    for (const malformed of [
+      { ...runEnvelope, findings: [{ ...gatewayFinding, executable: 'no' }] },
+      { ...runEnvelope, findings: [{ ...gatewayFinding, executable: false, unavailable_reason: 'invented' }] },
+      { ...runEnvelope, findings: [{ ...gatewayFinding, unavailable_detail: 7 }] }
+    ]) {
+      const bad = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 })) });
+      await expect(bad.doctorRun()).rejects.toThrow('Invalid doctor run response');
+    }
+  });
+
   it('returns a typed empty report on 204 and the validated envelope on 200', async () => {
     const empty = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(null, { status: 204 })) });
     await expect(empty.doctorReport()).resolves.toBeNull();

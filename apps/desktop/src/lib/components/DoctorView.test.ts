@@ -293,3 +293,59 @@ describe('DoctorView', () => {
     expect((screen.getByRole('button', { name: 'Run diagnostic' }) as HTMLButtonElement).disabled).toBe(false);
   });
 });
+
+describe('DoctorView capability', () => {
+  const cannotRun = { executable: false, unavailable_reason: 'needs_router_api' as const, unavailable_detail: 'NeonHearth has no way to manage this router; the change must be made on the router itself' };
+
+  it('shows guidance and no Approve or Repair button for a plan this build cannot execute', async () => {
+    const client = fakeClient({
+      doctorReport: vi.fn(async () => envelope([{ ...gatewayFinding, ...cannotRun }, { ...routerFinding, ...cannotRun }]))
+    });
+    render(DoctorView, { client });
+
+    await waitFor(() => screen.getByText('Gateway unreachable'));
+    expect(screen.getAllByText(/NeonHearth can’t make this change for you in this build/)).toHaveLength(2);
+    expect(screen.getByText(/Power-cycle the router/)).toBeTruthy();
+    expect(screen.getByText(/Open the router’s admin page/)).toBeTruthy();
+    expect(screen.getAllByText(/has no way to manage this router/)).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: /Request approval/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Confirm repair/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Repair / })).toBeNull();
+    expect(client.doctorApprove).not.toHaveBeenCalled();
+    expect(client.doctorRepair).not.toHaveBeenCalled();
+  });
+
+  it('offers no claimant choice for a duplicate address this build cannot reserve', async () => {
+    const client = fakeClient({ doctorReport: vi.fn(async () => envelope([{ ...duplicateFinding, ...cannotRun }])) });
+    render(DoctorView, { client });
+
+    await waitFor(() => screen.getByText('Duplicate ip'));
+    expect(screen.queryByRole('radio')).toBeNull();
+    expect(screen.queryByText(/Which device should keep/)).toBeNull();
+    expect(screen.getByText(/reserve 10\.0\.0\.5 for the one device that should keep it/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Request approval/ })).toBeNull();
+  });
+
+  it('keeps the buttons and the claimant choice where the repair is executable', async () => {
+    const client = fakeClient({
+      doctorReport: vi.fn(async () => envelope([
+        { ...routerFinding, executable: true },
+        { ...duplicateFinding, executable: true }
+      ]))
+    });
+    render(DoctorView, { client });
+
+    await waitFor(() => screen.getByRole('button', { name: 'Repair Router fault' }));
+    expect(screen.getAllByRole('radio')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: 'Request approval for Duplicate ip' })).toBeTruthy();
+    expect(screen.queryByText(/NeonHearth can’t make this change/)).toBeNull();
+  });
+
+  it('treats a finding without capability fields (an older service) as executable', async () => {
+    const client = fakeClient({ doctorReport: vi.fn(async () => envelope([routerFinding])) });
+    render(DoctorView, { client });
+
+    await waitFor(() => screen.getByRole('button', { name: 'Repair Router fault' }));
+    expect(screen.queryByText(/NeonHearth can’t make this change/)).toBeNull();
+  });
+});
