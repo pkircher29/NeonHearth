@@ -99,7 +99,13 @@ fn a_later_rate_makes_the_reading_ready_and_lapsed_rates_fall_back_to_connected(
         None,
         Some(12),
     );
-    let ready = router::next_reading(&connected, sample_time(5), source, Some((100.0, 7.0)), Some(12));
+    let ready = router::next_reading(
+        &connected,
+        sample_time(5),
+        source,
+        Some((100.0, 7.0)),
+        Some(12),
+    );
     assert_eq!(ready.status, "ready");
     assert_eq!((ready.download, ready.upload), (Some(100.0), Some(7.0)));
     // A dashboard event while rates are fresh keeps the rates and refreshes the count.
@@ -123,7 +129,13 @@ fn a_later_rate_makes_the_reading_ready_and_lapsed_rates_fall_back_to_connected(
 #[test]
 fn a_quiet_or_failed_feed_ages_to_unavailable_with_a_reason() {
     let source = "192.168.1.1:8080";
-    let connected = router::next_reading(&RouterReading::default(), sample_time(0), source, None, Some(4));
+    let connected = router::next_reading(
+        &RouterReading::default(),
+        sample_time(0),
+        source,
+        None,
+        Some(4),
+    );
     let quiet = router::aged_reading(connected.clone(), sample_time(120), None);
     assert_eq!(quiet.status, "unavailable");
     assert_eq!(quiet.connected_devices, None);
@@ -149,7 +161,13 @@ fn router_failures_are_logged_once_per_reason_until_the_debounce_lapses() {
 }
 #[test]
 fn a_connected_reading_serializes_without_internal_fields() {
-    let reading = router::next_reading(&RouterReading::default(), sample_time(0), "s", None, Some(2));
+    let reading = router::next_reading(
+        &RouterReading::default(),
+        sample_time(0),
+        "s",
+        None,
+        Some(2),
+    );
     let value = serde_json::to_value(&reading).unwrap();
     assert_eq!(value["status"], "connected");
     assert!(value.get("rate_at").is_none());
