@@ -171,6 +171,9 @@ the app says the removal is not finished; removing it again retries.
   request to the single address and path `/onvif/device_service`, and follows
   none of the other service addresses a camera advertises. A camera that serves
   its media service only from a different path cannot be added yet.
+- The camera's user name may contain only letters, digits, dot, underscore and
+  hyphen (so an email-style user name cannot be used yet). The password may
+  contain anything, up to 256 bytes.
 
 ## Advisory findings
 

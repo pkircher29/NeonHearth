@@ -111,8 +111,10 @@ impl HttpOnvifTransport {
 
     fn url(&self, target: &TargetAddress) -> String {
         #[cfg(any(test, feature = "test-support"))]
-        if let Some(endpoint) = self.endpoint_override {
-            return format!("http://{endpoint}{}", target.path());
+        {
+            if let Some(endpoint) = self.endpoint_override {
+                return format!("http://{endpoint}{}", target.path());
+            }
         }
         format!("http://{}:{}{}", self.approved, target.port(), target.path())
     }
