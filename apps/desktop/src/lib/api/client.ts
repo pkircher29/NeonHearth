@@ -110,6 +110,8 @@ export function isCheckNeedsConsent(check: { status: CheckStatus }): boolean {
 }
 export type LeaseState = 'static' | 'valid' | 'expired' | 'missing';
 export type DnsFailureReason = 'timeout' | 'refused' | 'serv_fail' | 'no_answer';
+/** ICMP payload sizes that did and did not pass with fragmentation forbidden; not link MTUs. */
+export type MtuPayloadBounds = { largest_passing_payload_bytes: number | null; smallest_failing_payload_bytes: number | null; ip_version: 'v4' | 'v6' };
 export interface RouteEntry { interface: string; gateway: string; is_vpn: boolean; metric: number }
 export type ResolverOutcome =
   | { outcome: 'answered'; latency_ms: number }
@@ -127,7 +129,7 @@ export type CheckDetail =
   | { detail: 'gateway_ping'; sent: number; received: number }
   | { detail: 'router'; responsive: boolean }
   | { detail: 'loss_latency'; loss_percent: number; median_rtt_ms: number | null }
-  | { detail: 'mtu'; largest_passing_bytes: number | null; smallest_failing_bytes: number | null }
+  | ({ detail: 'mtu' } & MtuPayloadBounds)
   | { detail: 'dns'; resolvers: ResolverEvidence[] }
   | { detail: 'route'; default_routes: RouteEntry[]; vpn_conflict: boolean }
   | { detail: 'internet'; reachable: boolean; lan_ok: boolean };
@@ -143,7 +145,7 @@ export type DiagnosisKind =
   | { kind: 'gateway_unreachable' }
   | { kind: 'router_fault' }
   | { kind: 'loss_latency_degraded'; loss_percent: number; median_rtt_ms: number | null }
-  | { kind: 'mtu_blackhole'; largest_passing_bytes: number | null; smallest_failing_bytes: number | null }
+  | ({ kind: 'mtu_blackhole' } & MtuPayloadBounds)
   | { kind: 'dns_failure'; resolvers: ResolverEvidence[] }
   | { kind: 'route_vpn_conflict'; default_routes: RouteEntry[] }
   | { kind: 'internet_unreachable'; lan_ok: boolean }
@@ -571,6 +573,12 @@ function isCheckStatus(value: unknown): value is CheckStatus {
   if (value.state === 'passed' || value.state === 'failed') return exact(value, ['state']);
   return value.state === 'skipped' && exact(value, ['state', 'because']) && isSkipReason(value.because);
 }
+function isMtuPayloadBounds(value: Record<string, unknown>, tag: 'detail' | 'kind'): boolean {
+  return exact(value, [tag, 'largest_passing_payload_bytes', 'smallest_failing_payload_bytes', 'ip_version'])
+    && (value.largest_passing_payload_bytes === null || isU16(value.largest_passing_payload_bytes))
+    && (value.smallest_failing_payload_bytes === null || isU16(value.smallest_failing_payload_bytes))
+    && (value.ip_version === 'v4' || value.ip_version === 'v6');
+}
 function isRouteEntry(value: unknown): value is RouteEntry {
   return isRecord(value) && exact(value, ['interface', 'gateway', 'is_vpn', 'metric'])
     && isBoundedText(value.interface, 128) && isBoundedText(value.gateway, 128)
@@ -605,9 +613,7 @@ function isCheckDetail(value: unknown): value is CheckDetail {
     case 'router': return exact(value, ['detail', 'responsive']) && typeof value.responsive === 'boolean';
     case 'loss_latency': return exact(value, ['detail', 'loss_percent', 'median_rtt_ms'])
       && isFiniteNumber(value.loss_percent) && (value.median_rtt_ms === null || isFiniteNumber(value.median_rtt_ms));
-    case 'mtu': return exact(value, ['detail', 'largest_passing_bytes', 'smallest_failing_bytes'])
-      && (value.largest_passing_bytes === null || isU16(value.largest_passing_bytes))
-      && (value.smallest_failing_bytes === null || isU16(value.smallest_failing_bytes));
+    case 'mtu': return isMtuPayloadBounds(value, 'detail');
     case 'dns': return exact(value, ['detail', 'resolvers']) && boundedArray(value.resolvers, 64) && value.resolvers.every(isResolverEvidence);
     case 'route': return exact(value, ['detail', 'default_routes', 'vpn_conflict'])
       && boundedArray(value.default_routes, 64) && value.default_routes.every(isRouteEntry) && typeof value.vpn_conflict === 'boolean';
@@ -645,9 +651,7 @@ function isDiagnosisKind(value: unknown): value is DiagnosisKind {
     case 'weak_wifi_quality': return exact(value, ['kind', 'rssi_dbm']) && isI16(value.rssi_dbm);
     case 'loss_latency_degraded': return exact(value, ['kind', 'loss_percent', 'median_rtt_ms'])
       && isFiniteNumber(value.loss_percent) && (value.median_rtt_ms === null || isFiniteNumber(value.median_rtt_ms));
-    case 'mtu_blackhole': return exact(value, ['kind', 'largest_passing_bytes', 'smallest_failing_bytes'])
-      && (value.largest_passing_bytes === null || isU16(value.largest_passing_bytes))
-      && (value.smallest_failing_bytes === null || isU16(value.smallest_failing_bytes));
+    case 'mtu_blackhole': return isMtuPayloadBounds(value, 'kind');
     case 'dns_failure': return exact(value, ['kind', 'resolvers']) && boundedArray(value.resolvers, 64) && value.resolvers.every(isResolverEvidence);
     case 'route_vpn_conflict': return exact(value, ['kind', 'default_routes']) && boundedArray(value.default_routes, 64) && value.default_routes.every(isRouteEntry);
     case 'internet_unreachable': return exact(value, ['kind', 'lan_ok']) && typeof value.lan_ok === 'boolean';

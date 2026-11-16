@@ -1,0 +1,339 @@
+{
+ "run_id": "9d8c8e81-f6b7-4780-bac5-cdbfd2024b81",
+ "started_at": "2026-11-16T01:17:14.106929200Z",
+ "report": {
+  "started_at": "2026-11-16T01:17:14.106929200Z",
+  "finished_at": "2026-11-16T01:17:14.218507400Z",
+  "budget": {
+   "max_probes": 64,
+   "per_probe_timeout_ms": 2000
+  },
+  "probes_used": 25,
+  "budget_exhausted": false,
+  "checks": [
+   {
+    "kind": "collector_health",
+    "status": {
+     "state": "passed"
+    },
+    "evidence": [
+     {
+      "metric": "collector_privileged",
+      "value": 1.0,
+      "unit": "boolean",
+      "observed_at": "2026-11-16T01:17:14.106935Z"
+     },
+     {
+      "metric": "capture_healthy",
+      "value": 1.0,
+      "unit": "boolean",
+      "observed_at": "2026-11-16T01:17:14.106935100Z"
+     },
+     {
+      "metric": "worker_running",
+      "value": 1.0,
+      "unit": "boolean",
+      "observed_at": "2026-11-16T01:17:14.106935100Z"
+     }
+    ],
+    "confidence": {
+     "basis_points": 9500
+    },
+    "detail": {
+     "detail": "collector",
+     "privileged": true,
+     "capture_ok": true,
+     "worker_running": true
+    }
+   },
+   {
+    "kind": "adapter_link",
+    "status": {
+     "state": "passed"
+    },
+    "evidence": [
+     {
+      "metric": "link_up",
+      "value": 1.0,
+      "unit": "boolean",
+      "observed_at": "2026-11-16T01:17:14.114019900Z"
+     },
+     {
+      "metric": "link_speed_mbps",
+      "value": 1000.0,
+      "unit": "megabits_per_second",
+      "observed_at": "2026-11-16T01:17:14.114020400Z"
+     }
+    ],
+    "confidence": {
+     "basis_points": 9500
+    },
+    "detail": {
+     "detail": "link",
+     "up": true
+    }
+   },
+   {
+    "kind": "address_dhcp",
+    "status": {
+     "state": "passed"
+    },
+    "evidence": [
+     {
+      "metric": "address_present",
+      "value": 1.0,
+      "unit": "boolean",
+      "observed_at": "2026-11-16T01:17:14.120999300Z"
+     },
+     {
+      "metric": "lease_valid",
+      "value": 1.0,
+      "unit": "boolean",
+      "observed_at": "2026-11-16T01:17:14.120999600Z"
+     }
+    ],
+    "confidence": {
+     "basis_points": 9500
+    },
+    "detail": {
+     "detail": "address",
+     "address": "192.168.1.29",
+     "lease": "static"
+    }
+   },
+   {
+    "kind": "duplicate_ip",
+    "status": {
+     "state": "skipped",
+     "because": {
+      "reason": "probe_unsupported"
+     }
+    },
+    "evidence": [],
+    "confidence": {
+     "basis_points": 9500
+    },
+    "detail": null
+   },
+   {
+    "kind": "wifi_quality",
+    "status": {
+     "state": "passed"
+    },
+    "evidence": [],
+    "confidence": {
+     "basis_points": 9500
+    },
+    "detail": {
+     "detail": "wifi",
+     "wireless": false,
+     "rssi_dbm": null,
+     "retry_percent": null
+    }
+   },
+   {
+    "kind": "gateway",
+    "status": {
+     "state": "passed"
+    },
+    "evidence": [
+     {
+      "metric": "loss_percent",
+      "value": 0.0,
+      "unit": "percent",
+      "observed_at": "2026-11-16T01:17:14.138003100Z"
+     },
+     {
+      "metric": "rtt_ms",
+      "value": 0.5572,
+      "unit": "milliseconds",
+      "observed_at": "2026-11-16T01:17:14.138003400Z"
+     }
+    ],
+    "confidence": {
+     "basis_points": 9500
+    },
+    "detail": {
+     "detail": "gateway_ping",
+     "sent": 4,
+     "received": 4
+    }
+   },
+   {
+    "kind": "router_health",
+    "status": {
+     "state": "skipped",
+     "because": {
+      "reason": "probe_unsupported"
+     }
+    },
+    "evidence": [],
+    "confidence": {
+     "basis_points": 9500
+    },
+    "detail": null
+   },
+   {
+    "kind": "loss_latency",
+    "status": {
+     "state": "passed"
+    },
+    "evidence": [
+     {
+      "metric": "loss_percent",
+      "value": 0.0,
+      "unit": "percent",
+      "observed_at": "2026-11-16T01:17:14.141208700Z"
+     },
+     {
+      "metric": "rtt_ms",
+      "value": 0.6377,
+      "unit": "milliseconds",
+      "observed_at": "2026-11-16T01:17:14.141208900Z"
+     }
+    ],
+    "confidence": {
+     "basis_points": 7000
+    },
+    "detail": {
+     "detail": "loss_latency",
+     "loss_percent": 0.0,
+     "median_rtt_ms": 0.6377
+    }
+   },
+   {
+    "kind": "mtu",
+    "status": {
+     "state": "passed"
+    },
+    "evidence": [
+     {
+      "metric": "passing_mtu_bytes",
+      "value": 1472.0,
+      "unit": "bytes",
+      "observed_at": "2026-11-16T01:17:14.166635400Z"
+     }
+    ],
+    "confidence": {
+     "basis_points": 7000
+    },
+    "detail": {
+     "detail": "mtu",
+     "largest_passing_payload_bytes": 1472,
+     "smallest_failing_payload_bytes": null,
+     "ip_version": "v4"
+    }
+   },
+   {
+    "kind": "dns",
+    "status": {
+     "state": "passed"
+    },
+    "evidence": [
+     {
+      "metric": "resolver_failure_count",
+      "value": 0.0,
+      "unit": "count",
+      "observed_at": "2026-11-16T01:17:14.205470900Z"
+     },
+     {
+      "metric": "dns_latency_ms",
+      "value": 4.230700000000001,
+      "unit": "milliseconds",
+      "observed_at": "2026-11-16T01:17:14.205471300Z"
+     }
+    ],
+    "confidence": {
+     "basis_points": 9500
+    },
+    "detail": {
+     "detail": "dns",
+     "resolvers": [
+      {
+       "resolver": "1.1.1.1",
+       "independent": false,
+       "outcome": {
+        "outcome": "answered",
+        "latency_ms": 4.230700000000001
+       }
+      },
+      {
+       "resolver": "8.8.8.8",
+       "independent": false,
+       "outcome": {
+        "outcome": "answered",
+        "latency_ms": 25.5401
+       }
+      },
+      {
+       "resolver": "9.9.9.9",
+       "independent": true,
+       "outcome": {
+        "outcome": "answered",
+        "latency_ms": 9.0115
+       }
+      }
+     ]
+    }
+   },
+   {
+    "kind": "route_vpn",
+    "status": {
+     "state": "passed"
+    },
+    "evidence": [
+     {
+      "metric": "default_route_count",
+      "value": 1.0,
+      "unit": "count",
+      "observed_at": "2026-11-16T01:17:14.212967700Z"
+     }
+    ],
+    "confidence": {
+     "basis_points": 9500
+    },
+    "detail": {
+     "detail": "route",
+     "default_routes": [
+      {
+       "interface": "Ethernet",
+       "gateway": "192.168.50.1",
+       "is_vpn": false,
+       "metric": 281
+      }
+     ],
+     "vpn_conflict": false
+    }
+   },
+   {
+    "kind": "internet_reachability",
+    "status": {
+     "state": "passed"
+    },
+    "evidence": [
+     {
+      "metric": "reachability_success",
+      "value": 1.0,
+      "unit": "boolean",
+      "observed_at": "2026-11-16T01:17:14.218505800Z"
+     },
+     {
+      "metric": "rtt_ms",
+      "value": 5.53,
+      "unit": "milliseconds",
+      "observed_at": "2026-11-16T01:17:14.218506400Z"
+     }
+    ],
+    "confidence": {
+     "basis_points": 9500
+    },
+    "detail": {
+     "detail": "internet",
+     "reachable": true,
+     "lan_ok": true
+    }
+   }
+  ]
+ },
+ "findings": []
+}
