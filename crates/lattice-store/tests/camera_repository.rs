@@ -4,9 +4,10 @@ use lattice_camera::{
     CameraHealth, CameraId, CameraProfile, Confidence, OnvifHealth, StreamId, StreamSourceRef,
 };
 use lattice_store::{
-    CameraInventoryRecord, CameraRecord, CameraRepository, CameraStoreError, connect_memory,
-    connect_path,
+    CameraInventoryRecord, CameraRecord, CameraRepository, CameraStoreError, CameraTarget,
+    connect_memory, connect_path,
 };
+use std::net::Ipv4Addr;
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -381,6 +382,244 @@ async fn whole_database_never_contains_rejected_secret_sentinel() -> anyhow::Res
         !bytes
             .windows(SENTINEL.len())
             .any(|window| window == SENTINEL.as_bytes())
+    );
+    Ok(())
+}
+
+fn target() -> CameraTarget {
+    CameraTarget {
+        camera_id: id(),
+        interface: "eth0".into(),
+        address: Ipv4Addr::new(192, 168, 1, 50),
+        onvif_port: 80,
+        rtsp_port: 554,
+        allow_basic: false,
+        approved_at: at(1_700_000_100),
+        name: Some("Porch".into()),
+    }
+}
+
+fn profile(reference: &str) -> CameraProfile {
+    CameraProfile::new(StreamId::new(), StreamSourceRef::new(reference).unwrap())
+}
+
+fn other_id() -> CameraId {
+    CameraId::from_uuid(Uuid::parse_str("018f0000-0000-7000-8000-000000000002").unwrap())
+}
+
+#[tokio::test]
+async fn camera_target_round_trips_and_survives_reopen() -> anyhow::Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("targets.db");
+    let pool = connect_path(&path).await?;
+    let repository = CameraRepository::new(pool.clone());
+    repository.upsert_camera(&camera()).await?;
+    repository.put_camera_target(&target()).await?;
+    pool.close().await;
+    let repository = CameraRepository::new(connect_path(&path).await?);
+    assert_eq!(repository.load_camera_target(id()).await?, Some(target()));
+    assert_eq!(repository.list_camera_targets().await?, vec![target()]);
+    let mut basic = target();
+    basic.allow_basic = true;
+    basic.name = None;
+    assert!(repository.delete_camera_target(id()).await?);
+    assert!(!repository.delete_camera_target(id()).await?);
+    repository.put_camera_target(&basic).await?;
+    assert_eq!(repository.load_camera_target(id()).await?, Some(basic));
+    Ok(())
+}
+
+#[tokio::test]
+async fn camera_target_needs_a_camera_and_one_row_per_camera_and_address() -> anyhow::Result<()> {
+    let repository = CameraRepository::new(connect_memory().await?);
+    assert_eq!(
+        repository.put_camera_target(&target()).await,
+        Err(CameraStoreError::Constraint)
+    );
+    repository.upsert_camera(&camera()).await?;
+    repository.put_camera_target(&target()).await?;
+    assert_eq!(
+        repository.put_camera_target(&target()).await,
+        Err(CameraStoreError::Conflict)
+    );
+    repository
+        .upsert_camera(&CameraRecord {
+            id: other_id(),
+            ..camera()
+        })
+        .await?;
+    // The same host cannot be approved for two cameras.
+    let same_host = CameraTarget {
+        camera_id: other_id(),
+        ..target()
+    };
+    assert_eq!(
+        repository.put_camera_target(&same_host).await,
+        Err(CameraStoreError::Conflict)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn camera_target_rejects_invalid_values_and_cascades_on_camera_delete() -> anyhow::Result<()>
+{
+    let repository = CameraRepository::new(connect_memory().await?);
+    repository.upsert_camera(&camera()).await?;
+    for broken in [
+        CameraTarget {
+            interface: String::new(),
+            ..target()
+        },
+        CameraTarget {
+            interface: "x".repeat(257),
+            ..target()
+        },
+        CameraTarget {
+            onvif_port: 0,
+            ..target()
+        },
+        CameraTarget {
+            rtsp_port: 0,
+            ..target()
+        },
+        CameraTarget {
+            name: Some(String::new()),
+            ..target()
+        },
+        CameraTarget {
+            name: Some("n".repeat(65)),
+            ..target()
+        },
+        CameraTarget {
+            name: Some("line\nbreak".into()),
+            ..target()
+        },
+    ] {
+        assert_eq!(
+            repository.put_camera_target(&broken).await,
+            Err(CameraStoreError::Invalid)
+        );
+    }
+    repository.put_camera_target(&target()).await?;
+    assert!(repository.delete_camera(id()).await?);
+    assert_eq!(repository.load_camera_target(id()).await?, None);
+    assert!(repository.list_camera_targets().await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn corrupt_camera_target_rows_are_reported_not_trusted() -> anyhow::Result<()> {
+    let pool = connect_memory().await?;
+    let repository = CameraRepository::new(pool.clone());
+    repository.upsert_camera(&camera()).await?;
+    repository.put_camera_target(&target()).await?;
+    // The schema itself refuses a hostname in the address column.
+    assert!(
+        sqlx::query("UPDATE camera_targets SET address = 'camera.local'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    // A non-canonical address spelling (leading zero) was never written by us.
+    sqlx::query("UPDATE camera_targets SET address = '192.168.001.050'")
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        repository.load_camera_target(id()).await,
+        Err(CameraStoreError::Corrupt)
+    );
+    assert_eq!(
+        repository.list_camera_targets().await,
+        Err(CameraStoreError::Corrupt)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn onboarded_camera_is_written_all_or_nothing() -> anyhow::Result<()> {
+    let repository = CameraRepository::new(connect_memory().await?);
+    let profiles = vec![profile("opaque-a"), profile("opaque-b")];
+    repository
+        .insert_onboarded_camera(&camera(), &inventory_record(), &profiles, &target())
+        .await?;
+    assert_eq!(repository.load_camera(id()).await?, Some(camera()));
+    assert_eq!(
+        repository.load_inventory(id()).await?,
+        Some(inventory_record())
+    );
+    assert_eq!(repository.load_stream_refs(id()).await?.len(), 2);
+    assert_eq!(repository.load_camera_target(id()).await?, Some(target()));
+
+    // A second camera at the same address fails at the last statement and
+    // leaves nothing behind: no camera, inventory, capability or stream row.
+    let second = CameraRecord {
+        id: other_id(),
+        ..camera()
+    };
+    let second_target = CameraTarget {
+        camera_id: other_id(),
+        ..target()
+    };
+    assert_eq!(
+        repository
+            .insert_onboarded_camera(
+                &second,
+                &inventory_record(),
+                &[profile("opaque-c")],
+                &second_target
+            )
+            .await,
+        Err(CameraStoreError::Conflict)
+    );
+    assert_eq!(repository.load_camera(other_id()).await?, None);
+    assert_eq!(repository.load_inventory(other_id()).await?, None);
+    assert!(repository.load_stream_refs(other_id()).await?.is_empty());
+
+    // A target for a different camera than the record is refused up front.
+    assert_eq!(
+        repository
+            .insert_onboarded_camera(&second, &inventory_record(), &[], &target())
+            .await,
+        Err(CameraStoreError::Invalid)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn camera_targets_are_capped() -> anyhow::Result<()> {
+    let repository = CameraRepository::new(connect_memory().await?);
+    for n in 0..lattice_store::MAX_CAMERA_TARGETS {
+        let camera_id = CameraId::from_uuid(Uuid::from_u128(0x1000 + n as u128));
+        repository
+            .upsert_camera(&CameraRecord {
+                id: camera_id,
+                ..camera()
+            })
+            .await?;
+        repository
+            .put_camera_target(&CameraTarget {
+                camera_id,
+                address: Ipv4Addr::new(10, 0, (n / 200) as u8, (n % 200) as u8 + 1),
+                ..target()
+            })
+            .await?;
+    }
+    let extra = CameraId::from_uuid(Uuid::from_u128(0x9999));
+    repository
+        .upsert_camera(&CameraRecord {
+            id: extra,
+            ..camera()
+        })
+        .await?;
+    assert_eq!(
+        repository
+            .put_camera_target(&CameraTarget {
+                camera_id: extra,
+                address: Ipv4Addr::new(10, 9, 9, 9),
+                ..target()
+            })
+            .await,
+        Err(CameraStoreError::Capacity)
     );
     Ok(())
 }
