@@ -1450,7 +1450,8 @@ async fn exchange(client: &mut TcpStream, request: &str) -> (String, String) {
 /// section beside the video.
 #[tokio::test]
 async fn a_dahua_style_camera_without_a_challenge_and_a_query_base_streams_through_the_proxy() {
-    const STREAM: &str = "rtsp://192.168.4.22:8554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif";
+    const STREAM: &str =
+        "rtsp://192.168.4.22:8554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif";
     let options = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nServer: Rtsp Server/3.0\r\nPublic: OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, RECORD, PAUSE, TEARDOWN, SET_PARAMETER, GET_PARAMETER\r\n\r\n".to_vec();
     let sdp = "v=0\r\no=RTSP Session 0 0 IN IP4 0.0.0.0\r\ns=Media Server\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\na=control:*\r\na=packetization-supported:DH\r\na=range:npt=now-\r\nm=video 0 RTP/AVP 96\r\na=control:trackID=0\r\na=framerate:10.000000\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=64001E\r\na=recvonly\r\nm=application 0 RTP/AVP 107\r\na=control:trackID=4\r\na=rtpmap:107 vnd.onvif.metadata/90000\r\na=recvonly\r\n";
     let describe = format!(
@@ -1510,8 +1511,14 @@ async fn a_dahua_style_camera_without_a_challenge_and_a_query_base_streams_throu
     for dropped in ["x-Accept-Dynamic-Rate", "Cache-Control", "Server"] {
         assert!(!head.contains(dropped), "{dropped} leaked: {head}");
     }
-    assert!(body.contains(&format!("a=control:{uri}/trackID=0")), "{body}");
-    assert!(body.contains(&format!("a=control:{uri}/trackID=4")), "{body}");
+    assert!(
+        body.contains(&format!("a=control:{uri}/trackID=0")),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!("a=control:{uri}/trackID=4")),
+        "{body}"
+    );
     assert!(body.contains("m=application 0 RTP/AVP 107"), "{body}");
     assert!(body.contains("c=IN IP4 127.0.0.1"), "{body}");
     assert!(body.contains("a=control:*"), "{body}");
@@ -1534,7 +1541,10 @@ async fn a_dahua_style_camera_without_a_challenge_and_a_query_base_streams_throu
     )
     .await;
     assert!(head.starts_with("RTSP/1.0 200"), "{head}");
-    assert!(head.contains(&format!("RTP-Info: url={uri}/trackID=0;seq=1")), "{head}");
+    assert!(
+        head.contains(&format!("RTP-Info: url={uri}/trackID=0;seq=1")),
+        "{head}"
+    );
     assert!(!head.contains("192.168.4.22"), "{head}");
 
     let requests: Vec<String> = connector
@@ -1546,7 +1556,10 @@ async fn a_dahua_style_camera_without_a_challenge_and_a_query_base_streams_throu
     assert_eq!(requests.len(), 5);
     // The camera never asked for credentials, so it is never sent any.
     for request in &requests {
-        assert!(!request.to_ascii_lowercase().contains("authorization"), "{request}");
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization"),
+            "{request}"
+        );
         assert!(!request.contains(PASSWORD), "{request}");
         assert!(!request.contains("viewer"), "{request}");
     }
@@ -1576,13 +1589,18 @@ async fn a_rejected_metadata_track_does_not_end_the_video_session() {
         describe_sdp.len()
     )
     .into_bytes();
-    let refused = b"RTSP/1.0 461 Unsupported Transport\r\nCSeq: 2\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let refused =
+        b"RTSP/1.0 461 Unsupported Transport\r\nCSeq: 2\r\nContent-Length: 0\r\n\r\n".to_vec();
     let setup = b"RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: 7\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nContent-Length: 0\r\n\r\n".to_vec();
-    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![describe, refused, setup]));
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
+        describe, refused, setup,
+    ]));
     let proxy = LoopbackRtspProxy::start(
         HlsSessionId::new(),
         LoopbackSourceToken::new(),
-        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/cam/realmonitor?channel=1&subtype=0")),
+        SecretString::from(format!(
+            "rtsp://viewer:{PASSWORD}@192.168.4.22:8554/cam/realmonitor?channel=1&subtype=0"
+        )),
         approved([192, 168, 4, 22]),
         connector.clone(),
         limits(),
@@ -1592,7 +1610,11 @@ async fn a_rejected_metadata_track_does_not_end_the_video_session() {
     .unwrap();
     let uri = proxy.endpoint();
     let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
-    exchange(&mut client, &format!("DESCRIBE {uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n")).await;
+    exchange(
+        &mut client,
+        &format!("DESCRIBE {uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n"),
+    )
+    .await;
     // The camera refuses the metadata track; that status is relayed, and the
     // same connection still sets up the video track afterwards.
     let (head, _) = exchange(
@@ -1632,7 +1654,11 @@ async fn a_base_without_a_query_still_extends_by_path() {
     .unwrap();
     let uri = proxy.endpoint();
     let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
-    exchange(&mut client, &format!("DESCRIBE {uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n")).await;
+    exchange(
+        &mut client,
+        &format!("DESCRIBE {uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n"),
+    )
+    .await;
     exchange(
         &mut client,
         &format!("SETUP {uri}/trackID=1 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"),

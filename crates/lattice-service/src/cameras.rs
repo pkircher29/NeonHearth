@@ -3015,7 +3015,10 @@ fn upstream_target(
         // Rebuilding it through the path would move the suffix in front of the
         // query and name a resource the camera does not have. The suffix came
         // from a validated URL path, so it holds no query, fragment or space.
-        if suffix.bytes().any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'?' | b'#')) {
+        if suffix
+            .bytes()
+            .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'?' | b'#'))
+        {
             return Err(RtspProxyError::Protocol);
         }
         return Ok(format!("{}{suffix}", url.as_str().trim_end_matches('/')));

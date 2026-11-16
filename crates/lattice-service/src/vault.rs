@@ -472,7 +472,10 @@ pub async fn platform_vault(
         Ok(_) => keyring_round_trips().await,
         Err(_) => false,
     };
-    match (choose_backend(platform.as_ref().map(|_| ()), probe_ok), platform) {
+    match (
+        choose_backend(platform.as_ref().map(|_| ()), probe_ok),
+        platform,
+    ) {
         (BackendChoice::Keyring, Ok(vault)) => Ok((Arc::new(vault), VaultBackend::Keyring)),
         (BackendChoice::EncryptedFile, _) => {
             let vault = FileVault::open(state_dir.join("vault")).await?;

@@ -29,9 +29,6 @@ const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const INPUT_PROTOCOLS: &str = "rtsp,tcp,rtp,udp";
 /// Socket read timeout in microseconds (15 s): a stalled source ends the process.
 const READ_TIMEOUT_MICROS: &str = "15000000";
-/// One HLS segment may not exceed 8 MiB, so a source that never sends a
-/// keyframe cannot grow a single segment without bound.
-const MAX_SEGMENT_BYTES: &str = "8388608";
 /// Hard media-time ceiling for an HLS job: the 10 minute lease plus margin.
 const MAX_HLS_SECONDS: &str = "660";
 const MAX_SNAPSHOT_BYTES: &str = "4194304";
@@ -376,7 +373,7 @@ pub fn hls_args(
         "tcp",
         "-protocol_whitelist",
         INPUT_PROTOCOLS,
-        "-rw_timeout",
+        "-timeout",
         READ_TIMEOUT_MICROS,
         "-i",
         &source,
@@ -393,8 +390,6 @@ pub fn hls_args(
         "2",
         "-hls_list_size",
         "4",
-        "-hls_segment_size",
-        MAX_SEGMENT_BYTES,
         "-hls_flags",
         "delete_segments+append_list+omit_endlist+independent_segments",
         "-hls_segment_filename",
@@ -423,7 +418,7 @@ pub fn snapshot_args(
         "tcp",
         "-protocol_whitelist",
         INPUT_PROTOCOLS,
-        "-rw_timeout",
+        "-timeout",
         READ_TIMEOUT_MICROS,
         "-i",
         &source,
