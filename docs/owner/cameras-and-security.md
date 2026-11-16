@@ -22,7 +22,7 @@ Camera credentials live in the platform secret store — Windows Credential
 Manager on Windows, the Secret Service keyring on Linux — and nowhere else.
 (The Linux service runs as a system user with no desktop session, so there it
 normally uses an encrypted file in its own state directory instead; Windows
-never falls back to a file.) The database holds only opaque references. Credentials are never displayed,
+never falls back to a file.) The database holds only opaque references. (See "Where the password is kept" below for what happens to a password you type into the add-camera form.) Credentials are never displayed,
 never logged, never included in errors or exports, and never sent to the
 desktop app. When a stream needs authentication, a local loopback proxy
 inside the privileged service injects the credential; the raw camera URL and
@@ -66,7 +66,7 @@ answer is at `GET /api/v1/camera-media`).
 Camera passwords are only ever sent over the network to a camera address that
 you have approved, on the interface you approved it for. Loopback, unspecified
 and multicast addresses are always refused. HTTP-style Basic login to a camera
-is refused unless explicitly allowed per camera.
+is refused unless explicitly allowed for that camera when you add it.
 
 ### Supported camera types
 
@@ -75,15 +75,102 @@ publish an RTSP stream) can be viewed. The video must be one ffmpeg can remux
 (H.264 or MJPEG). There is no support for cloud-only cameras, USB or
 doorbell-app cameras, or encrypted RTSP.
 
-### Adding a camera is not possible yet
+## Adding and removing a camera
 
-The viewing half of the pipeline is built and runs when the list above holds,
-but this build has **no way to add a camera**: no screen or route for entering
-a camera's address and password, for approving that address as a stream
-target, or for reading the camera's ONVIF profiles. Cameras the network
-monitor recognizes are not turned into viewable cameras automatically.
-Until that is built, the Cameras view stays empty and says so. It is not a
-setup you can finish by hand.
+Open **Cameras** as the owner and use **Add a camera**. The form only appears
+when camera media is running on this machine (see "What this machine needs"
+above) and only to the owner: a paired phone cannot add or remove a camera, and
+neither can an integration token.
+
+You enter the camera's **address**, the **user name and password** you use to
+sign in to the camera, and optionally a name. The address must be an IPv4
+address such as `192.168.1.50`, not a hostname. Leave **Allow less secure
+sign-in (Basic)** off unless the camera cannot sign in any other way; Basic
+sends the camera's password without protection on your home network.
+
+### What is checked
+
+Before anything is sent to the camera, the address must be:
+
+- a private IPv4 address (`10.x.x.x`, `172.16.x.x` to `172.31.x.x`, or
+  `192.168.x.x`), never a public, loopback, link-local, multicast, broadcast,
+  unspecified or IPv6 address, and never a hostname (so there is no name lookup
+  an attacker could change later);
+- inside the subnet of a network adapter that is up and is a real wired or
+  Wi-Fi adapter (not a VPN or tunnel, virtual machine or container adapter, or
+  one you marked as a corporate connection);
+- not one of this computer's own addresses, and not the network or broadcast
+  address of that subnet.
+
+Then, in this order:
+
+1. At most six attempts per minute are accepted, so the form cannot be used to
+   try passwords against devices on your network.
+2. The attempt is written to the audit log (`camera_add_requested`) before any
+   packet is sent. The log records the address and the adapter, never the user
+   name or the password.
+3. NeonHearth asks the camera for its details and its video streams over
+   ONVIF, at exactly that address and port (80 unless you change it), through
+   the adapter the address was approved on. It follows no redirects and ignores
+   proxy settings, signs in with a one-time digest so the password itself is
+   not sent, and refuses answers larger than a fixed limit.
+4. **Every video address the camera reports must point at the same host you
+   entered**, and so must any service address it advertises. A camera that
+   points its video somewhere else is refused.
+5. Only then is anything kept: the password and the stream addresses go to the
+   credential store, and one database transaction records the camera, its
+   streams and your approval of that one address. If a step after the
+   credential was written fails, what was written is removed again.
+
+Each failure has its own plain message: the address is not on your network, the
+camera could not be reached, it refused the user name or password, it points its
+video somewhere else, it did not answer like a camera, it has no video stream,
+a camera is already added at that address, or video support is not available on
+this machine (with the reason).
+
+### Where the password is kept
+
+The password is not stored in the NeonHearth database or in any log, audit
+entry, error or response. It is held in memory only while the camera is being
+added, and is then kept in the same place as every other camera secret: the
+operating-system credential store (Windows Credential Manager, or the Secret
+Service keyring on Linux), or, where the service has no keyring session, an
+encrypted file in the service's own state directory. It is kept inside each
+stream's saved address, which only the local media proxy reads when a live view
+starts; the browser never receives it. The app clears the password field as
+soon as you submit the form.
+
+### Your approval is re-checked every time
+
+The approval of one address for one camera is stored with the camera. At every
+service start the list of approved cameras is rebuilt from it, and every live
+view or snapshot re-checks the address against the network adapters as they are
+at that moment. If the adapter went down, was renamed or moved to another
+subnet, or the address now belongs to this computer, the camera simply cannot be
+viewed until the network matches again. Nothing falls back to another adapter.
+
+### Removing a camera
+
+Select the camera and choose **Remove camera**, then confirm. Because removing
+is a revocation, it acts first: open live views are closed and the approval is
+withdrawn before anything else, then the stored password and streams and the
+database records are deleted, and the removal is written to the audit log. If
+the credential store cannot delete something, the camera stays switched off and
+the app says the removal is not finished; removing it again retries.
+
+### What adding a camera does not do
+
+- It does not detect cameras for you. Cameras the network monitor recognizes are
+  not turned into viewable cameras automatically; you add each one yourself.
+- It does not bundle ffmpeg on Windows (see "What this machine needs").
+- It does not set up a camera's Wi-Fi or any other setting on the camera.
+- The camera's names, models and other details come from the camera and are
+  shown as the camera reports them; the optional name you type is stored but is
+  not yet shown in the list.
+- It speaks plain-HTTP ONVIF only (no encrypted ONVIF), sends every ONVIF
+  request to the single address and path `/onvif/device_service`, and follows
+  none of the other service addresses a camera advertises. A camera that serves
+  its media service only from a different path cannot be added yet.
 
 ## Advisory findings
 
@@ -131,12 +218,16 @@ presents information for you to act on yourself.
 ## Not yet available
 
 - Real-camera acceptance is still pending: the viewing pipeline (vault,
-  streaming, snapshots, cleanup) is verified end-to-end against fixtures and
-  is now built into the running service, but no owner-supplied physical
-  camera has been through the documented acceptance procedure yet.
-- Any way to add a camera: entering its address and credentials, approving it
-  as a stream target, ONVIF profile discovery, and turning a recognized
-  camera into a viewable one (see "Adding a camera is not possible yet").
+  streaming, snapshots, cleanup) and adding and removing a camera are verified
+  end-to-end against fixtures and a stand-in device on this computer, and are
+  built into the running service, but no physical camera has been through the
+  documented acceptance procedure yet. Cameras differ in how they answer
+  ONVIF, so expect some to need fixes.
+- Automatic camera detection that creates a viewable camera: you add each
+  camera yourself (see "Adding and removing a camera"), and nothing the network
+  monitor recognizes becomes a camera on its own.
+- ffmpeg bundled with the Windows installer, camera Wi-Fi setup, encrypted
+  (HTTPS) ONVIF, and showing the name you give a camera in the list.
 - A findings/advisories panel in the app (findings are served by the
   authenticated per-device advisory API; the on-screen surface is pending),
   and scheduled advisory-feed refresh with staleness labeling.
