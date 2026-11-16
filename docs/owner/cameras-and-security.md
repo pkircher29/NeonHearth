@@ -164,6 +164,27 @@ database records are deleted, and the removal is written to the audit log. If
 the credential store cannot delete something, the camera stays switched off and
 the app says the removal is not finished; removing it again retries.
 
+### What has been proven on real hardware
+
+One camera family has been tried end to end: a FLIR PE133F (Dahua-family
+firmware) on a home network, with NeonHearth on Windows and ffmpeg 8.1. Adding
+it over ONVIF, reading its details, taking snapshots and watching live view
+through ffmpeg all work. Two things that camera does are handled because of
+it: it answers ONVIF with an empty SOAP header, and it gives its stream address
+with a query string (`...?channel=1&subtype=1...`) that is kept exactly.
+
+Cameras whose RTSP stream needs no login are supported. If the camera never
+asks for credentials, none are ever sent to it (this is safer than sending them
+unasked); the stored address still carries them for the cameras that do ask,
+and only answers a challenge the camera itself makes. HTTP Basic login stays
+off unless you allowed it for that camera.
+
+Only that one camera family has been tried. Other makes differ in how they
+speak ONVIF and RTSP, so expect some to need fixes; if adding or viewing fails,
+the service log now says which step failed and why, and for a failed ffmpeg run
+it includes a short excerpt of ffmpeg's own message with every address, token
+and credential masked.
+
 ### What adding a camera does not do
 
 - It does not detect cameras for you. Cameras the network monitor recognizes are
@@ -232,9 +253,11 @@ presents information for you to act on yourself.
 - Real-camera acceptance is still pending: the viewing pipeline (vault,
   streaming, snapshots, cleanup) and adding and removing a camera are verified
   end-to-end against fixtures and a stand-in device on this computer, and are
-  built into the running service, but no physical camera has been through the
-  documented acceptance procedure yet. Cameras differ in how they answer
-  ONVIF, so expect some to need fixes.
+  built into the running service. Adding, snapshots and live view have been
+  proven on one real camera (see "What has been proven on real hardware"); the
+  documented acceptance procedure has not been run across other makes, and
+  cameras differ in how they answer ONVIF and RTSP, so expect some to need
+  fixes.
 - Automatic camera detection that creates a viewable camera: you add each
   camera yourself (see "Adding and removing a camera"), and nothing the network
   monitor recognizes becomes a camera on its own.

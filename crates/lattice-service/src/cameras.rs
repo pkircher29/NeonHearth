@@ -62,6 +62,19 @@ fn note_session_failure(session: &HlsSessionId, stage: &'static str, error: &dyn
     tracing::warn!(session = %session, stage, error = ?error, "camera session stage failed");
 }
 
+/// Logs that the media process ended badly, with the short sanitised excerpt of
+/// what it wrote to stderr (masked URLs, tokens and credentials; see
+/// `lattice_camera::sanitize_diagnostic`) so the reason is not lost.
+fn note_media_exit(session: &HlsSessionId, stage: &'static str, excerpt: Option<String>) {
+    tracing::warn!(
+        session = %session,
+        stage,
+        error = ?MediaError::ProcessFailed,
+        ffmpeg = excerpt.as_deref().unwrap_or(""),
+        "camera session stage failed"
+    );
+}
+
 const CLEANUP_COMPONENT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_RETRY_BASE: Duration = Duration::from_millis(25);
 const CLEANUP_RETRY_MAX: Duration = Duration::from_secs(1);
@@ -972,7 +985,11 @@ impl CameraSessionManager {
                 }
             }
             Ok(Ok(_)) => {
-                note_session_failure(&owner, "snapshot_exit", &MediaError::ProcessFailed);
+                note_media_exit(
+                    &owner,
+                    "snapshot_exit",
+                    resources.process.as_ref().and_then(|process| process.diagnostic()),
+                );
                 Err(CameraSessionError::Unavailable)
             }
             Ok(Err(error)) => {
@@ -1123,8 +1140,12 @@ impl CameraSessionManager {
             (value.output_dir.clone(), crashed)
         };
         if crashed {
-            note_session_failure(session, "media_process_exited", &MediaError::ProcessFailed);
             let crashed = { self.sessions.lock().await.remove(session) };
+            note_media_exit(
+                session,
+                "media_process_exited",
+                crashed.as_ref().and_then(|value| value.process.diagnostic()),
+            );
             if let Some(value) = crashed {
                 let _ = self
                     .cleanup_or_retain(session.clone(), CleanupResources::from_session(value), 0)
@@ -1468,6 +1489,48 @@ fn run_file_open_hook(directory: &Path) {
     };
     if let Some(action) = action {
         action();
+    }
+}
+
+#[cfg(test)]
+mod proxy_end_tests {
+    use super::*;
+
+    fn trace(method: &str, status: Option<u16>, playing: bool) -> ProxyTrace {
+        ProxyTrace {
+            stage: "test",
+            method: method.to_owned(),
+            status,
+            rule: "",
+            playing,
+        }
+    }
+
+    #[test]
+    fn a_hang_up_after_play_or_teardown_is_normal_and_everything_else_is_not() {
+        let hung_up = RtspProxyError::Unavailable;
+        // After PLAY succeeded (ffmpeg stopped, or the camera closed): normal.
+        assert!(is_normal_end(&hung_up, &trace("PLAY", Some(200), true)));
+        assert!(is_normal_end(&hung_up, &trace("GET_PARAMETER", Some(200), true)));
+        // The camera hangs up after TEARDOWN without answering: normal.
+        assert!(is_normal_end(&hung_up, &trace("TEARDOWN", None, false)));
+        // Before PLAY succeeded, a hang-up is a failure at that step.
+        for method in ["OPTIONS", "DESCRIBE", "SETUP", "PLAY"] {
+            assert!(!is_normal_end(&hung_up, &trace(method, None, false)), "{method}");
+        }
+        assert!(!is_normal_end(&hung_up, &trace("PLAY", Some(454), false)));
+        // Only a hang-up is excused: timeouts while media should flow, protocol
+        // errors and limits stay warnings even after PLAY.
+        for error in [
+            RtspProxyError::Timeout,
+            RtspProxyError::Protocol,
+            RtspProxyError::Limit,
+            RtspProxyError::Consumer,
+            RtspProxyError::TargetMismatch,
+        ] {
+            assert!(!is_normal_end(&error, &trace("PLAY", Some(200), true)), "{error:?}");
+            assert!(!is_normal_end(&error, &trace("TEARDOWN", None, false)), "{error:?}");
+        }
     }
 }
 
@@ -2242,6 +2305,11 @@ async fn run_listener(
                     let mut trace = ProxyTrace::default();
                     match serve_connection(stream, token, upstream, binding, connector, limits, expires, &mut trace).await {
                         Ok(()) => tracing::debug!("rtsp proxy connection closed"),
+                        // A stream that ends after PLAY succeeded, or a camera
+                        // that hangs up after TEARDOWN, is a normal end.
+                        Err(error) if is_normal_end(&error, &trace) => {
+                            tracing::debug!(error = ?error, method = %trace.method, "rtsp proxy connection closed");
+                        }
                         // Which RTSP method and stage, the camera's status code
                         // and the rule that refused; never a URL, header or body.
                         Err(error) => tracing::warn!(
@@ -2305,6 +2373,17 @@ struct ProxyTrace {
     method: String,
     status: Option<u16>,
     rule: &'static str,
+    /// A PLAY was answered with a success status: media is (or was) flowing.
+    playing: bool,
+}
+
+/// Whether a connection that ended with `error` simply came to its natural end:
+/// either side hung up (`Unavailable`) after PLAY succeeded, or the session was
+/// being torn down. Everything else (a hang-up mid-handshake, a rule refusal,
+/// a timeout, a protocol error) is a real failure and stays a warning.
+fn is_normal_end(error: &RtspProxyError, trace: &ProxyTrace) -> bool {
+    matches!(error, RtspProxyError::Unavailable)
+        && (trace.playing || trace.method == "TEARDOWN")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2429,6 +2508,9 @@ async fn serve_connection(
             read_upstream_response(reader, &mut client_write, limits, expires).await?;
         trace.status = response.status_code();
         trace.stage = "relaying the camera's reply";
+        if validated.method == "PLAY" && trace.status.is_some_and(|code| (200..300).contains(&code)) {
+            trace.playing = true;
+        }
         if response.status_code() == Some(401)
             && let Some(answer) =
                 auth.answer(&response, &upstream, &validated.method, &upstream_uri)?
