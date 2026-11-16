@@ -654,7 +654,10 @@ pub mod fake_device {
         /// The request path of every request received, in order.
         #[must_use]
         pub fn request_paths(&self) -> Vec<String> {
-            self.paths.lock().expect("fake device paths poisoned").clone()
+            self.paths
+                .lock()
+                .expect("fake device paths poisoned")
+                .clone()
         }
 
         #[must_use]

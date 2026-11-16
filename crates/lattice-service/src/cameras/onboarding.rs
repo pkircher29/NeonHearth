@@ -967,13 +967,12 @@ fn classify(error: OnvifError, foreign: &ForeignServiceFlag, sink: &StagingSink)
         OnvifError::Authentication => AddFailure::SignInRefused,
         OnvifError::Transport | OnvifError::Timeout | OnvifError::Tls => AddFailure::Unreachable,
         OnvifError::Sink if sink.mismatch() => AddFailure::StreamsElsewhere,
-        OnvifError::InvalidResponse if foreign.foreign_service() => {
-            AddFailure::StreamsElsewhere
-        }
+        OnvifError::InvalidResponse if foreign.foreign_service() => AddFailure::StreamsElsewhere,
         // The device answered the very first ONVIF request as "no such page":
         // a camera with ONVIF switched off does exactly this.
         OnvifError::InvalidResponse
-            if foreign.at_first_step() && matches!(foreign.http_status(), Some(404 | 405 | 501)) =>
+            if foreign.at_first_step()
+                && matches!(foreign.http_status(), Some(404 | 405 | 501)) =>
         {
             AddFailure::OnvifNotEnabled
         }

@@ -1092,7 +1092,11 @@ async fn a_recorded_real_camera_is_added_with_both_streams_and_its_query_intact(
         inventory.firmware.unwrap().as_str(),
         "2.400.FLIR 00.6.R, build: 2017-01-23"
     );
-    let target = repository.load_camera_target(camera).await.unwrap().unwrap();
+    let target = repository
+        .load_camera_target(camera)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(target.address.to_string(), DAHUA_HOST);
     assert_eq!(target.interface, "eth2");
     assert_eq!(target.rtsp_port, 554);
@@ -1210,7 +1214,12 @@ async fn a_device_with_onvif_switched_off_is_told_apart_from_one_that_is_not_a_c
         (status, body["error"].as_str()),
         (StatusCode::UNPROCESSABLE_ENTITY, Some("onvif_not_enabled"))
     );
-    assert!(body["message"].as_str().unwrap().contains("ONVIF does not appear to be enabled"));
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("ONVIF does not appear to be enabled")
+    );
     assert_eq!(device.requests(), 1);
     rig.nothing_stored().await;
     assert_no_secret("response", &body.to_string());
