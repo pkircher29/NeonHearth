@@ -472,8 +472,8 @@ impl StagingSink {
         url.set_username(&self.username).map_err(|_| false)?;
         // `Url` leaves a literal `%` alone, so encode everything but
         // alphanumerics ourselves; the proxy percent-decodes it back exactly.
-        let password = utf8_percent_encode(self.password.expose_secret(), NON_ALPHANUMERIC)
-            .to_string();
+        let password =
+            utf8_percent_encode(self.password.expose_secret(), NON_ALPHANUMERIC).to_string();
         url.set_password(Some(&password)).map_err(|_| false)?;
         let composed = SecretString::from(url.to_string());
         // The same parser the media proxy uses at session start: a source it
@@ -660,8 +660,8 @@ impl CameraOnboarding {
             .snapshot()
             .await
             .map_err(|_| AddFailure::Unavailable)?;
-        let host = approve_address(&input.address, &inventory)
-            .map_err(AddFailure::NotOnYourNetwork)?;
+        let host =
+            approve_address(&input.address, &inventory).map_err(AddFailure::NotOnYourNetwork)?;
         if self.book.address_in_use(host.address).await {
             return Err(AddFailure::AlreadyAdded);
         }
@@ -779,7 +779,11 @@ impl CameraOnboarding {
         } = plan;
         let mut written: Vec<(StreamId, StreamSourceRef)> = Vec::with_capacity(staged.len());
         for (stream, source) in staged {
-            match self.vault.put_stream_source(camera_id, stream, source).await {
+            match self
+                .vault
+                .put_stream_source(camera_id, stream, source)
+                .await
+            {
                 Ok(reference) => written.push((stream, reference)),
                 Err(_) => {
                     self.discard(camera_id, &written).await;
@@ -1182,7 +1186,13 @@ mod tests {
     use super::*;
     use lattice_sensor::{Interface, InterfaceClass};
 
-    fn interface(id: u32, name: &str, class: InterfaceClass, up: bool, ips: &[(&str, u8)]) -> Interface {
+    fn interface(
+        id: u32,
+        name: &str,
+        class: InterfaceClass,
+        up: bool,
+        ips: &[(&str, u8)],
+    ) -> Interface {
         Interface {
             id: InterfaceId::new(id),
             name: name.to_owned(),
@@ -1246,8 +1256,14 @@ mod tests {
         let wired = approve_address("192.168.1.50", &inventory()).unwrap();
         assert_eq!(wired.interface_name, "eth0");
         assert_eq!(wired.address, Ipv4Addr::new(192, 168, 1, 50));
-        assert_eq!(wired.binding.source, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)));
-        assert_eq!(wired.binding.target, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)));
+        assert_eq!(
+            wired.binding.source,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))
+        );
+        assert_eq!(
+            wired.binding.target,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))
+        );
         // Surrounding whitespace is not part of the literal.
         assert_eq!(
             approve_address(" 192.168.1.50 ", &inventory()).unwrap(),
@@ -1345,7 +1361,11 @@ mod tests {
     }
 
     fn sink(host: Ipv4Addr) -> StagingSink {
-        StagingSink::new(host, "admin".to_owned(), SecretString::from("pa:ss/w@rd%41#?"))
+        StagingSink::new(
+            host,
+            "admin".to_owned(),
+            SecretString::from("pa:ss/w@rd%41#?"),
+        )
     }
 
     fn stream(uri: &str) -> Vec<(StreamId, SecretString)> {
@@ -1370,7 +1390,10 @@ mod tests {
             parsed.password.as_ref().unwrap().expose_secret(),
             "pa:ss/w@rd%41#?"
         );
-        assert!(!source.contains("pa:ss/w@rd%41#?"), "password is percent-encoded");
+        assert!(
+            !source.contains("pa:ss/w@rd%41#?"),
+            "password is percent-encoded"
+        );
     }
 
     #[test]
@@ -1414,8 +1437,14 @@ mod tests {
         // Two ports under one approval are refused too.
         let sink = self::sink(host);
         let ports = vec![
-            (StreamId::new(), SecretString::from("rtsp://192.168.1.50:554/a")),
-            (StreamId::new(), SecretString::from("rtsp://192.168.1.50:8554/b")),
+            (
+                StreamId::new(),
+                SecretString::from("rtsp://192.168.1.50:554/a"),
+            ),
+            (
+                StreamId::new(),
+                SecretString::from("rtsp://192.168.1.50:8554/b"),
+            ),
         ];
         assert!(sink.store_all(ports).is_err());
         assert!(sink.mismatch());
@@ -1543,14 +1572,15 @@ mod tests {
 
     #[test]
     fn input_validation_cleans_the_name_and_bounds_the_fields() {
-        let input = |name: Option<&str>, username: &str, password: &str, port: u16| AddCameraInput {
-            address: "192.168.1.50".to_owned(),
-            username: username.to_owned(),
-            password: SecretString::from(password),
-            name: name.map(str::to_owned),
-            onvif_port: port,
-            allow_basic: false,
-        };
+        let input =
+            |name: Option<&str>, username: &str, password: &str, port: u16| AddCameraInput {
+                address: "192.168.1.50".to_owned(),
+                username: username.to_owned(),
+                password: SecretString::from(password),
+                name: name.map(str::to_owned),
+                onvif_port: port,
+                allow_basic: false,
+            };
         assert_eq!(validate_input(&input(None, "u", "p", 80)), Ok(None));
         assert_eq!(validate_input(&input(Some("  "), "u", "p", 80)), Ok(None));
         assert_eq!(

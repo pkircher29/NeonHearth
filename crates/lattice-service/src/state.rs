@@ -126,6 +126,7 @@ pub struct AppState {
     camera_sessions: Option<Arc<crate::cameras::CameraSessionManager>>,
     camera_media: crate::cameras::production::CameraMediaStatus,
     camera_onboarding: Option<Arc<crate::cameras::onboarding::CameraOnboarding>>,
+    worker_control: crate::runtime::WorkerControl,
 }
 impl AppState {
     pub fn new(
@@ -155,6 +156,7 @@ impl AppState {
             camera_sessions: None,
             camera_media: crate::cameras::production::CameraMediaStatus::not_configured(),
             camera_onboarding: None,
+            worker_control: crate::runtime::WorkerControl::new(),
         })
     }
     /// Installs the part that adds and removes cameras and reports that a
@@ -169,6 +171,10 @@ impl AppState {
             "Camera media and camera setup were supplied by the host process.",
         );
         self
+    }
+    /// The handle the Doctor uses to restart the discovery worker in place.
+    pub fn worker_control(&self) -> &crate::runtime::WorkerControl {
+        &self.worker_control
     }
     #[must_use]
     pub fn with_camera_sessions(

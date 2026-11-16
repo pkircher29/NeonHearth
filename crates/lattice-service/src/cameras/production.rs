@@ -12,8 +12,7 @@
 use super::{
     CameraSessionConfig, CameraSessionManager, SystemAuthorizedRtspConnector,
     onboarding::{
-        CameraOnboarding, CameraTargetBook, InterfaceSource, SystemInterfaces,
-        SystemOnvifConnector,
+        CameraOnboarding, CameraTargetBook, InterfaceSource, SystemInterfaces, SystemOnvifConnector,
     },
 };
 use crate::vault::{Vault, VaultBackend, platform_vault};
@@ -53,7 +52,8 @@ pub const OUTPUT_DIR_NAME: &str = "camera-media";
 const VAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
 const SETUP_NEEDS_MEDIA: &str = "A camera cannot be added while video support is off on this machine. Fix the problem above first; adding a camera needs the same pieces as watching one.";
-const SETUP_NOT_WIRED: &str = "This service process was started without the part that adds cameras.";
+const SETUP_NOT_WIRED: &str =
+    "This service process was started without the part that adds cameras.";
 
 /// What the owner needs to know about camera media on this machine. Served by
 /// `GET /api/v1/camera-media` and embedded (as `reason` and `detail`) in the
@@ -466,10 +466,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_production_registry_starts_empty_and_refuses_loopback_even_if_a_row_says_otherwise()
-    {
-        use lattice_sensor::{
-            Address, Interface, InterfaceClass, InterfaceId, InterfaceInventory,
-        };
+     {
+        use lattice_sensor::{Address, Interface, InterfaceClass, InterfaceId, InterfaceInventory};
         let inventory = InterfaceInventory::new(vec![
             Interface {
                 id: InterfaceId::new(1),

@@ -51,10 +51,8 @@ const WSSE: &str =
     "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
 const WSU: &str =
     "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd";
-const PASSWORD_DIGEST: &str =
-    "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest";
-const BASE64_BINARY: &str =
-    "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary";
+const PASSWORD_DIGEST: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest";
+const BASE64_BINARY: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary";
 
 /// Set by the transport when the camera advertised a service on another host,
 /// so the caller can tell that refusal from an ordinary protocol error.
@@ -116,7 +114,12 @@ impl HttpOnvifTransport {
                 return format!("http://{endpoint}{}", target.path());
             }
         }
-        format!("http://{}:{}{}", self.approved, target.port(), target.path())
+        format!(
+            "http://{}:{}{}",
+            self.approved,
+            target.port(),
+            target.path()
+        )
     }
 }
 
@@ -243,7 +246,9 @@ fn service_addresses(xml: &[u8]) -> Vec<String> {
             continue;
         }
         let start = index + "XAddr>".len();
-        let end = text[start..].find('<').map_or(text.len(), |end| start + end);
+        let end = text[start..]
+            .find('<')
+            .map_or(text.len(), |end| start + end);
         found.push(text[start..end].trim().to_owned());
     }
     found
@@ -422,11 +427,7 @@ pub mod fake_device {
 
     impl Config {
         #[must_use]
-        pub fn new(
-            username: &str,
-            password: &str,
-            stream_uri: &str,
-        ) -> Self {
+        pub fn new(username: &str, password: &str, stream_uri: &str) -> Self {
             Self {
                 username: username.to_owned(),
                 password: password.to_owned(),
@@ -452,7 +453,9 @@ pub mod fake_device {
     impl FakeOnvifDevice {
         /// Starts listening on an ephemeral loopback port.
         pub async fn start(config: Config) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake device");
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake device");
             let addr = listener.local_addr().expect("fake device address");
             let requests = Arc::new(AtomicUsize::new(0));
             let counter = requests.clone();
@@ -536,8 +539,7 @@ pub mod fake_device {
         let Ok(nonce) = BASE64.decode(nonce) else {
             return false;
         };
-        username == config.username
-            && digest == password_digest(&nonce, created, &config.password)
+        username == config.username && digest == password_digest(&nonce, created, &config.password)
     }
 
     async fn serve(
@@ -605,15 +607,32 @@ pub mod fake_device {
                 || "<tt:Media/>".to_owned(),
                 |xaddr| format!("<tt:Media><tt:XAddr>{xaddr}</tt:XAddr></tt:Media>"),
             );
-            ("http://www.onvif.org/ver10/device/wsdl/GetCapabilitiesResponse", format!("<tds:GetCapabilitiesResponse><tds:Capabilities>{media}</tds:Capabilities></tds:GetCapabilitiesResponse>"))
+            (
+                "http://www.onvif.org/ver10/device/wsdl/GetCapabilitiesResponse",
+                format!(
+                    "<tds:GetCapabilitiesResponse><tds:Capabilities>{media}</tds:Capabilities></tds:GetCapabilitiesResponse>"
+                ),
+            )
         } else if request.contains("<trt:GetProfiles/>") {
-            ("http://www.onvif.org/ver10/media/wsdl/GetProfilesResponse", "<trt:GetProfilesResponse><trt:Profiles token=\"main\"/></trt:GetProfilesResponse>".to_owned())
+            (
+                "http://www.onvif.org/ver10/media/wsdl/GetProfilesResponse",
+                "<trt:GetProfilesResponse><trt:Profiles token=\"main\"/></trt:GetProfilesResponse>"
+                    .to_owned(),
+            )
         } else if request.contains("<trt:GetStreamUri>") {
-            ("http://www.onvif.org/ver10/media/wsdl/GetStreamUriResponse", format!("<trt:GetStreamUriResponse><trt:MediaUri><tt:Uri>{}</tt:Uri></trt:MediaUri></trt:GetStreamUriResponse>", config.stream_uri))
+            (
+                "http://www.onvif.org/ver10/media/wsdl/GetStreamUriResponse",
+                format!(
+                    "<trt:GetStreamUriResponse><trt:MediaUri><tt:Uri>{}</tt:Uri></trt:MediaUri></trt:GetStreamUriResponse>",
+                    config.stream_uri
+                ),
+            )
         } else {
             ("http://www.onvif.org/ver10/device/wsdl/GetSystemDateAndTimeResponse", "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime><tt:DateTimeType>NTP</tt:DateTimeType><tt:DaylightSavings>false</tt:DaylightSavings><tt:UTCDateTime><tt:Time><tt:Hour>12</tt:Hour><tt:Minute>34</tt:Minute><tt:Second>56</tt:Second></tt:Time><tt:Date><tt:Year>2026</tt:Year><tt:Month>8</tt:Month><tt:Day>24</tt:Day></tt:Date></tt:UTCDateTime></tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>".to_owned())
         };
-        format!("<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:wsa=\"http://www.w3.org/2005/08/addressing\" xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\" xmlns:tt=\"http://www.onvif.org/ver10/schema\"><s:Header><wsa:Action>{action}</wsa:Action><wsa:RelatesTo>{message_id}</wsa:RelatesTo></s:Header><s:Body>{body}</s:Body></s:Envelope>")
+        format!(
+            "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:wsa=\"http://www.w3.org/2005/08/addressing\" xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\" xmlns:tt=\"http://www.onvif.org/ver10/schema\"><s:Header><wsa:Action>{action}</wsa:Action><wsa:RelatesTo>{message_id}</wsa:RelatesTo></s:Header><s:Body>{body}</s:Body></s:Envelope>"
+        )
     }
 }
 
@@ -632,8 +651,16 @@ mod tests {
 
     #[test]
     fn sha1_matches_the_published_test_vectors() {
-        let hex = |digest: [u8; 20]| digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        assert_eq!(hex(sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        let hex = |digest: [u8; 20]| {
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            hex(sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
         assert_eq!(hex(sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
         assert_eq!(
             hex(sha1(
@@ -788,7 +815,8 @@ mod tests {
     async fn a_redirect_is_refused_and_never_followed() {
         let elsewhere = FakeOnvifDevice::start(config("rtsp://192.168.1.50/main")).await;
         let mut fake = config("rtsp://192.168.1.50/main");
-        fake.behavior = Behavior::Redirect(format!("http://{}/onvif/device_service", elsewhere.addr()));
+        fake.behavior =
+            Behavior::Redirect(format!("http://{}/onvif/device_service", elsewhere.addr()));
         let device = FakeOnvifDevice::start(fake).await;
         assert_eq!(
             run(&device, &ForeignServiceFlag::default(), PASSWORD)
@@ -836,7 +864,11 @@ mod tests {
         let mut fake = config("rtsp://192.168.1.50/main");
         fake.capabilities_xaddr = Some("http://192.168.1.50/onvif/media".to_owned());
         let device = FakeOnvifDevice::start(fake).await;
-        assert!(run(&device, &ForeignServiceFlag::default(), PASSWORD).await.is_ok());
+        assert!(
+            run(&device, &ForeignServiceFlag::default(), PASSWORD)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -848,9 +880,8 @@ mod tests {
             ForeignServiceFlag::default(),
         )
         .unwrap();
-        let other =
-            TargetAddress::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 51)), 80, false, "/x")
-                .unwrap();
+        let other = TargetAddress::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 51)), 80, false, "/x")
+            .unwrap();
         let tls = TargetAddress::new(IpAddr::V4(APPROVED), 443, true, "/x").unwrap();
         for target in [other, tls] {
             let error = inventory(

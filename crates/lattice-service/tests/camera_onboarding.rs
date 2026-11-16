@@ -20,7 +20,8 @@ use lattice_sensor::{Address, Interface, InterfaceClass, InterfaceId, InterfaceI
 use lattice_service::{
     AppState, FakeVault, Vault, app,
     cameras::{
-        CameraSessionError, CameraSessionManager, CameraTargetRegistry, FakeAuthorizedRtspConnector,
+        CameraSessionError, CameraSessionManager, CameraTargetRegistry,
+        FakeAuthorizedRtspConnector,
         onboarding::{
             ApprovedHost, CameraOnboarding, CameraTargetBook, FixedInterfaces, OnvifConnector,
         },
@@ -355,7 +356,10 @@ fn good_camera() -> Script {
 
 fn assert_no_secret(label: &str, text: &str) {
     for forbidden in [PASSWORD, USER, "p%40ss", "p@ss"] {
-        assert!(!text.contains(forbidden), "{label} leaked {forbidden}: {text}");
+        assert!(
+            !text.contains(forbidden),
+            "{label} leaked {forbidden}: {text}"
+        );
     }
 }
 
@@ -377,13 +381,20 @@ async fn adding_a_camera_stores_the_camera_its_streams_its_approval_and_its_secr
 
     let repository = CameraRepository::new(rig.pool.clone());
     let stored = repository.load_camera(camera).await.unwrap().unwrap();
-    assert_eq!(stored.classification, lattice_camera::CameraClassification::Camera);
+    assert_eq!(
+        stored.classification,
+        lattice_camera::CameraClassification::Camera
+    );
     let inventory = repository.load_inventory(camera).await.unwrap().unwrap();
     assert_eq!(inventory.manufacturer.unwrap().as_str(), "FixtureCam");
     let profiles = repository.load_stream_refs(camera).await.unwrap();
     assert_eq!(profiles.len(), 1);
     assert_eq!(profiles[0].stream_id(), stream);
-    let target = repository.load_camera_target(camera).await.unwrap().unwrap();
+    let target = repository
+        .load_camera_target(camera)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(target.address, Ipv4Addr::new(192, 168, 1, 50));
     assert_eq!(target.interface, "eth0");
     assert_eq!(target.onvif_port, 80);
@@ -431,7 +442,10 @@ async fn adding_a_camera_stores_the_camera_its_streams_its_approval_and_its_secr
     let (actions, text) = rig.audit_dump().await;
     assert_eq!(actions, ["camera_add_requested", "camera_added"]);
     assert_no_secret("audit", &text);
-    assert!(text.contains("principal") && text.contains("owner"), "{text}");
+    assert!(
+        text.contains("principal") && text.contains("owner"),
+        "{text}"
+    );
     assert!(text.contains(ADDRESS), "the approved host is on the record");
     // Five exchanges: device information, capabilities, profiles, one stream
     // address, date and time.
@@ -445,8 +459,10 @@ async fn the_basic_sign_in_choice_and_a_custom_port_are_stored_with_the_approval
         .owner(
             Method::POST,
             "/api/v1/cameras",
-            Some(json!({"address": ADDRESS, "username": USER, "password": PASSWORD,
-                        "onvif_port": 8080, "allow_basic": true})),
+            Some(
+                json!({"address": ADDRESS, "username": USER, "password": PASSWORD,
+                        "onvif_port": 8080, "allow_basic": true}),
+            ),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -460,7 +476,11 @@ async fn the_basic_sign_in_choice_and_a_custom_port_are_stored_with_the_approval
     assert_eq!(target.onvif_port, 8080);
     assert!(target.allow_basic);
     let stream = StreamId::from_uuid(
-        body["streams"][0]["stream_id"].as_str().unwrap().parse().unwrap(),
+        body["streams"][0]["stream_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
     );
     assert!(
         rig.book
@@ -474,7 +494,11 @@ async fn the_basic_sign_in_choice_and_a_custom_port_are_stored_with_the_approval
 #[tokio::test]
 async fn each_failure_has_its_own_answer_and_leaves_nothing_behind() {
     let cases = [
-        (Script::RefusesSignIn, StatusCode::UNPROCESSABLE_ENTITY, "sign_in_refused"),
+        (
+            Script::RefusesSignIn,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "sign_in_refused",
+        ),
         (Script::Silent, StatusCode::BAD_GATEWAY, "unreachable"),
         (
             Script::Camera {
@@ -512,7 +536,11 @@ async fn each_failure_has_its_own_answer_and_leaves_nothing_behind() {
     for (script, status, code) in cases {
         let rig = Rig::scripted(script).await;
         let (got, body) = rig.add(ADDRESS, PASSWORD).await;
-        assert_eq!((got, body["error"].as_str().unwrap()), (status, code), "{body}");
+        assert_eq!(
+            (got, body["error"].as_str().unwrap()),
+            (status, code),
+            "{body}"
+        );
         assert!(body["message"].as_str().unwrap().len() > 10);
         assert_no_secret("failure response", &body.to_string());
         assert!(!body.to_string().contains(ADDRESS), "no address in {body}");
@@ -521,7 +549,11 @@ async fn each_failure_has_its_own_answer_and_leaves_nothing_behind() {
         assert!(rig.vault.labels().await.is_empty(), "{code}: vault touched");
         // The attempt and its refusal are on the record, without secrets.
         let (actions, text) = rig.audit_dump().await;
-        assert_eq!(actions, ["camera_add_requested", "camera_add_refused"], "{code}");
+        assert_eq!(
+            actions,
+            ["camera_add_requested", "camera_add_refused"],
+            "{code}"
+        );
         assert_no_secret("audit", &text);
         assert!(rig.audited_before_contact.load(Ordering::SeqCst), "{code}");
     }
@@ -595,12 +627,19 @@ async fn addresses_that_may_not_be_approved_are_refused_before_anything_is_sent(
         "",
     ] {
         let (status, body) = rig.add(address, PASSWORD).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{address:?}: {body}");
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{address:?}: {body}"
+        );
         assert_eq!(body["error"], "not_on_your_network", "{address:?}");
     }
     assert_eq!(rig.calls.load(Ordering::SeqCst), 0);
     let (actions, _) = rig.audit_dump().await;
-    assert!(actions.is_empty(), "a refused address is not an attempt: {actions:?}");
+    assert!(
+        actions.is_empty(),
+        "a refused address is not an attempt: {actions:?}"
+    );
     rig.nothing_stored().await;
     // A down interface cannot carry a camera either.
     rig.interfaces.set(network(false));
@@ -621,11 +660,20 @@ async fn malformed_requests_are_refused() {
         json!({"address": ADDRESS, "username": USER, "password": PASSWORD, "extra": 1}),
         json!({"address": ADDRESS, "username": USER}),
     ] {
-        let (status, response) = rig.owner(Method::POST, "/api/v1/cameras", Some(body.clone())).await;
+        let (status, response) = rig
+            .owner(Method::POST, "/api/v1/cameras", Some(body.clone()))
+            .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
         assert_eq!(response["error"], "invalid_request");
     }
-    let (status, _) = rig.call(Method::POST, "/api/v1/cameras", None, Some(format!("Bearer {TOKEN}"))).await;
+    let (status, _) = rig
+        .call(
+            Method::POST,
+            "/api/v1/cameras",
+            None,
+            Some(format!("Bearer {TOKEN}")),
+        )
+        .await;
     assert!(status.is_client_error());
     assert_eq!(rig.calls.load(Ordering::SeqCst), 0);
 }
@@ -643,7 +691,12 @@ async fn an_unauthenticated_request_is_refused() {
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = rig
-        .call(Method::DELETE, &format!("/api/v1/cameras/{}", uuid::Uuid::nil()), None, None)
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/cameras/{}", uuid::Uuid::nil()),
+            None,
+            None,
+        )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(rig.calls.load(Ordering::SeqCst), 0);
@@ -692,7 +745,11 @@ async fn attempts_are_rate_limited_so_the_route_cannot_spray_the_lan() {
     let rig = Rig::scripted(Script::RefusesSignIn).await;
     for attempt in 0..6 {
         let (status, body) = rig.add(ADDRESS, PASSWORD).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "attempt {attempt}: {body}");
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "attempt {attempt}: {body}"
+        );
     }
     assert_eq!(rig.calls.load(Ordering::SeqCst), 6);
     let (status, body) = rig.add(ADDRESS, PASSWORD).await;
@@ -707,7 +764,8 @@ async fn openapi_documents_adding_and_removing() {
     let (status, doc) = rig.owner(Method::GET, "/api/v1/openapi.json", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        doc["paths"]["/api/v1/cameras"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        doc["paths"]["/api/v1/cameras"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
         "#/components/schemas/AddCameraBody"
     );
     assert!(doc["paths"]["/api/v1/cameras"]["get"].is_object());
@@ -722,7 +780,13 @@ async fn added(rig: &Rig) -> (CameraId, StreamId) {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     (
         CameraId::from_uuid(body["camera_id"].as_str().unwrap().parse().unwrap()),
-        StreamId::from_uuid(body["streams"][0]["stream_id"].as_str().unwrap().parse().unwrap()),
+        StreamId::from_uuid(
+            body["streams"][0]["stream_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+        ),
     )
 }
 
@@ -766,7 +830,9 @@ async fn removing_a_camera_closes_its_views_and_deletes_every_trace() {
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
-    let (status, _) = rig.owner(Method::DELETE, "/api/v1/cameras/not-an-id", None).await;
+    let (status, _) = rig
+        .owner(Method::DELETE, "/api/v1/cameras/not-an-id", None)
+        .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -787,7 +853,13 @@ async fn a_removal_the_vault_cannot_finish_still_revokes_and_can_be_retried() {
     // Revoked even though cleanup is unfinished: the host is no longer
     // approved, in memory or in the store, and no view can start.
     assert!(rig.book.is_empty().await);
-    assert!(repository.load_camera_target(camera).await.unwrap().is_none());
+    assert!(
+        repository
+            .load_camera_target(camera)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         rig.manager.start_session(camera, stream).await.unwrap_err(),
         CameraSessionError::Unavailable
@@ -800,7 +872,10 @@ async fn a_removal_the_vault_cannot_finish_still_revokes_and_can_be_retried() {
     rig.nothing_stored().await;
     let (actions, _) = rig.audit_dump().await;
     assert_eq!(
-        actions.iter().filter(|action| *action == "camera_removed").count(),
+        actions
+            .iter()
+            .filter(|action| *action == "camera_removed")
+            .count(),
         2
     );
 }
@@ -850,7 +925,13 @@ async fn adding_over_the_real_http_transport_to_a_loopback_fake_device() {
     assert_eq!(device.requests(), 5);
     assert_no_secret("response", &body.to_string());
     let camera = CameraId::from_uuid(body["camera_id"].as_str().unwrap().parse().unwrap());
-    let stream = StreamId::from_uuid(body["streams"][0]["stream_id"].as_str().unwrap().parse().unwrap());
+    let stream = StreamId::from_uuid(
+        body["streams"][0]["stream_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
     let profiles = CameraRepository::new(rig.pool.clone())
         .load_stream_refs(camera)
         .await
@@ -869,14 +950,20 @@ async fn the_real_transport_failures_map_to_the_owner_facing_answers() {
     let wrong_password = FakeOnvifDevice::start(device_config(RTSP)).await;
     let rig = Rig::loopback(wrong_password.addr()).await;
     let (status, body) = rig.add(ADDRESS, "not-the-password").await;
-    assert_eq!((status, body["error"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("sign_in_refused")));
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("sign_in_refused"))
+    );
     rig.nothing_stored().await;
     rig.vault_is_clean().await;
 
     let elsewhere = FakeOnvifDevice::start(device_config("rtsp://192.168.1.77/main")).await;
     let rig = Rig::loopback(elsewhere.addr()).await;
     let (status, body) = rig.add(ADDRESS, PASSWORD).await;
-    assert_eq!((status, body["error"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("streams_elsewhere")));
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("streams_elsewhere"))
+    );
     rig.nothing_stored().await;
     assert!(rig.vault.labels().await.is_empty());
 
@@ -885,16 +972,23 @@ async fn the_real_transport_failures_map_to_the_owner_facing_answers() {
     let advertises_elsewhere = FakeOnvifDevice::start(config).await;
     let rig = Rig::loopback(advertises_elsewhere.addr()).await;
     let (status, body) = rig.add(ADDRESS, PASSWORD).await;
-    assert_eq!((status, body["error"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("streams_elsewhere")));
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("streams_elsewhere"))
+    );
     rig.nothing_stored().await;
 
     let untouched = FakeOnvifDevice::start(device_config(RTSP)).await;
     let mut config = device_config(RTSP);
-    config.behavior = Behavior::Redirect(format!("http://{}/onvif/device_service", untouched.addr()));
+    config.behavior =
+        Behavior::Redirect(format!("http://{}/onvif/device_service", untouched.addr()));
     let redirecting = FakeOnvifDevice::start(config).await;
     let rig = Rig::loopback(redirecting.addr()).await;
     let (status, body) = rig.add(ADDRESS, PASSWORD).await;
-    assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_GATEWAY, Some("unreachable")));
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::BAD_GATEWAY, Some("unreachable"))
+    );
     assert_eq!(untouched.requests(), 0, "the redirect was followed");
     rig.nothing_stored().await;
 
@@ -903,7 +997,10 @@ async fn the_real_transport_failures_map_to_the_owner_facing_answers() {
     let oversized = FakeOnvifDevice::start(config).await;
     let rig = Rig::loopback(oversized.addr()).await;
     let (status, body) = rig.add(ADDRESS, PASSWORD).await;
-    assert_eq!((status, body["error"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("unexpected_answer")));
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("unexpected_answer"))
+    );
     rig.nothing_stored().await;
 }
 
@@ -923,7 +1020,9 @@ async fn without_camera_media_adding_says_video_support_is_not_available() {
         .unwrap();
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["error"], "video_unavailable");
     assert_eq!(body["reason"], "not_configured");

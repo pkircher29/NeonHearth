@@ -708,6 +708,186 @@ async fn unsupported_dns_queries_make_dns_unavailable_but_a_real_error_still_fai
     );
 }
 
+// ---------------------------------------------------------------------------
+// Owner consent: a probe the owner has not allowed is "needs permission",
+// never a failure and never a finding.
+// ---------------------------------------------------------------------------
+
+fn is_external(target: &str) -> bool {
+    !target.starts_with("192.168.")
+}
+
+/// A healthy network whose probes to public addresses are refused for want of
+/// the owner's permission, the way the service's consent gate refuses them.
+fn consent_gated(request: &ProbeRequest) -> Result<ProbeResponse, ProbeError> {
+    let target = match request {
+        ProbeRequest::Ping { target, .. } => Some(target.as_str()),
+        ProbeRequest::DnsQuery { resolver, .. } => Some(resolver.as_str()),
+        ProbeRequest::ReachIp { address, .. } => Some(address.as_str()),
+        _ => None,
+    };
+    match target {
+        Some(target) if is_external(target) => Err(ProbeError::ConsentRequired),
+        _ => healthy(request),
+    }
+}
+
+fn consent_skip() -> CheckStatus {
+    CheckStatus::Skipped {
+        because: SkipReason::ConsentRequired,
+    }
+}
+
+#[tokio::test]
+async fn withheld_consent_skips_the_outside_checks_without_a_finding() {
+    let transport = FakeProbeTransport::new(consent_gated);
+    let report = engine_with(64).run(&transport).await;
+
+    for kind in [CheckKind::Mtu, CheckKind::InternetReachability] {
+        assert_eq!(
+            report.check(kind).unwrap().status,
+            consent_skip(),
+            "{kind:?}"
+        );
+    }
+    // One configured resolver is on the home network and answered; the public
+    // ones were not asked. DNS passes on what could be checked.
+    let dns = report.check(CheckKind::Dns).unwrap();
+    assert_eq!(dns.status, CheckStatus::Passed);
+    let evidence = match &dns.detail {
+        Some(lattice_doctor::check::CheckDetail::Dns { resolvers }) => resolvers,
+        other => panic!("unexpected detail {other:?}"),
+    };
+    assert_eq!(
+        evidence
+            .iter()
+            .filter(|r| r.outcome == ResolverOutcome::ConsentRequired)
+            .count(),
+        2
+    );
+    assert_eq!(
+        report.check(CheckKind::RouteVpn).unwrap().status,
+        CheckStatus::Passed
+    );
+    assert_eq!(
+        report.check(CheckKind::Gateway).unwrap().status,
+        CheckStatus::Passed
+    );
+    assert!(diagnose(&report).is_empty(), "{:?}", diagnose(&report));
+}
+
+#[tokio::test]
+async fn dns_with_no_askable_resolver_is_skipped_for_consent_and_its_dependents_follow() {
+    let mut config = config();
+    config.configured_resolvers = vec!["8.8.8.8".into(), "1.1.1.1".into()];
+    let engine = DiagnosticEngine::with_clock(
+        config,
+        DiagnosticBudget::new(64, 1_000).unwrap(),
+        FixedClock(Utc.with_ymd_and_hms(2026, 8, 24, 12, 0, 0).unwrap()),
+    )
+    .unwrap();
+    let transport = FakeProbeTransport::new(consent_gated);
+    let report = engine.run(&transport).await;
+
+    assert_eq!(report.check(CheckKind::Dns).unwrap().status, consent_skip());
+    assert_eq!(
+        report.check(CheckKind::RouteVpn).unwrap().status,
+        CheckStatus::Skipped {
+            because: SkipReason::DependencyConsentRequired {
+                dependency: CheckKind::Dns
+            }
+        }
+    );
+    assert!(diagnose(&report).is_empty(), "{:?}", diagnose(&report));
+}
+
+#[tokio::test]
+async fn a_genuine_dns_failure_is_still_reported_beside_resolvers_that_were_not_asked() {
+    // The home resolver is asked and fails; the public ones need permission.
+    let transport = FakeProbeTransport::new(|request| match request {
+        ProbeRequest::DnsQuery { resolver, .. } if resolver == "192.168.1.1" => {
+            Ok(ProbeResponse::DnsFailure {
+                reason: DnsFailureReason::Timeout,
+            })
+        }
+        other => consent_gated(other),
+    });
+    let report = engine_with(64).run(&transport).await;
+
+    assert_eq!(
+        report.check(CheckKind::Dns).unwrap().status,
+        CheckStatus::Failed
+    );
+    let diagnoses = diagnose(&report);
+    let evidence = diagnoses
+        .iter()
+        .find_map(|d| match &d.kind {
+            DiagnosisKind::DnsFailure { resolvers } => Some(resolvers),
+            _ => None,
+        })
+        .expect("a dns finding");
+    assert!(
+        evidence
+            .iter()
+            .any(|r| r.outcome == ResolverOutcome::ConsentRequired)
+    );
+    // Only the resolver that was really asked counts as failed.
+    let count = report
+        .check(CheckKind::Dns)
+        .unwrap()
+        .evidence
+        .iter()
+        .find(|m| m.metric == Metric::ResolverFailureCount)
+        .unwrap()
+        .value;
+    assert_eq!(count, 1.0);
+    // The consent-gated checks still produce no finding of their own.
+    assert!(
+        diagnoses
+            .iter()
+            .all(|d| !matches!(d.kind, DiagnosisKind::DiagnosticProbeFailure { .. }))
+    );
+}
+
+#[tokio::test]
+async fn only_the_independent_resolver_askable_decides_dns() {
+    let mut config = config();
+    config.configured_resolvers = vec!["8.8.8.8".into()];
+    config.independent_resolver = "192.168.1.9".into();
+    let engine = DiagnosticEngine::with_clock(
+        config.clone(),
+        DiagnosticBudget::new(64, 1_000).unwrap(),
+        FixedClock(Utc.with_ymd_and_hms(2026, 8, 24, 12, 0, 0).unwrap()),
+    )
+    .unwrap();
+    let report = engine.run(&FakeProbeTransport::new(consent_gated)).await;
+    assert_eq!(
+        report.check(CheckKind::Dns).unwrap().status,
+        CheckStatus::Passed
+    );
+
+    // If that one resolver fails, there is a measured failure to report.
+    let failing = FakeProbeTransport::new(|request| match request {
+        ProbeRequest::DnsQuery { resolver, .. } if resolver == "192.168.1.9" => {
+            Ok(ProbeResponse::DnsFailure {
+                reason: DnsFailureReason::Timeout,
+            })
+        }
+        other => consent_gated(other),
+    });
+    let engine = DiagnosticEngine::with_clock(
+        config,
+        DiagnosticBudget::new(64, 1_000).unwrap(),
+        FixedClock(Utc.with_ymd_and_hms(2026, 8, 24, 12, 0, 0).unwrap()),
+    )
+    .unwrap();
+    let report = engine.run(&failing).await;
+    assert_eq!(
+        report.check(CheckKind::Dns).unwrap().status,
+        CheckStatus::Failed
+    );
+}
+
 #[test]
 fn engine_rejects_invalid_configuration() {
     let budget = DiagnosticBudget::new(10, 100).unwrap();

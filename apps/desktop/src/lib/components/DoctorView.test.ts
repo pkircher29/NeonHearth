@@ -293,3 +293,98 @@ describe('DoctorView', () => {
     expect((screen.getByRole('button', { name: 'Run diagnostic' }) as HTMLButtonElement).disabled).toBe(false);
   });
 });
+
+describe('DoctorView capability', () => {
+  const cannotRun = { executable: false, unavailable_reason: 'needs_router_api' as const, unavailable_detail: 'NeonHearth has no way to manage this router; the change must be made on the router itself' };
+
+  it('shows guidance and no Approve or Repair button for a plan this build cannot execute', async () => {
+    const client = fakeClient({
+      doctorReport: vi.fn(async () => envelope([{ ...gatewayFinding, ...cannotRun }, { ...routerFinding, ...cannotRun }]))
+    });
+    render(DoctorView, { client });
+
+    await waitFor(() => screen.getByText('Gateway unreachable'));
+    expect(screen.getAllByText(/NeonHearth can’t make this change for you in this build/)).toHaveLength(2);
+    expect(screen.getByText(/Power-cycle the router/)).toBeTruthy();
+    expect(screen.getByText(/Open the router’s admin page/)).toBeTruthy();
+    expect(screen.getAllByText(/has no way to manage this router/)).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: /Request approval/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Confirm repair/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Repair / })).toBeNull();
+    expect(client.doctorApprove).not.toHaveBeenCalled();
+    expect(client.doctorRepair).not.toHaveBeenCalled();
+  });
+
+  it('offers no claimant choice for a duplicate address this build cannot reserve', async () => {
+    const client = fakeClient({ doctorReport: vi.fn(async () => envelope([{ ...duplicateFinding, ...cannotRun }])) });
+    render(DoctorView, { client });
+
+    await waitFor(() => screen.getByText('Duplicate ip'));
+    expect(screen.queryByRole('radio')).toBeNull();
+    expect(screen.queryByText(/Which device should keep/)).toBeNull();
+    expect(screen.getByText(/reserve 10\.0\.0\.5 for the one device that should keep it/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Request approval/ })).toBeNull();
+  });
+
+  it('keeps the buttons and the claimant choice where the repair is executable', async () => {
+    const client = fakeClient({
+      doctorReport: vi.fn(async () => envelope([
+        { ...routerFinding, executable: true },
+        { ...duplicateFinding, executable: true }
+      ]))
+    });
+    render(DoctorView, { client });
+
+    await waitFor(() => screen.getByRole('button', { name: 'Repair Router fault' }));
+    expect(screen.getAllByRole('radio')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: 'Request approval for Duplicate ip' })).toBeTruthy();
+    expect(screen.queryByText(/NeonHearth can’t make this change/)).toBeNull();
+  });
+
+  it('treats a finding without capability fields (an older service) as executable', async () => {
+    const client = fakeClient({ doctorReport: vi.fn(async () => envelope([routerFinding])) });
+    render(DoctorView, { client });
+
+    await waitFor(() => screen.getByRole('button', { name: 'Repair Router fault' }));
+    expect(screen.queryByText(/NeonHearth can’t make this change/)).toBeNull();
+  });
+});
+
+describe('DoctorView permission notice', () => {
+  const consentCheck: CheckResult = { kind: 'mtu', status: { state: 'skipped', because: { reason: 'consent_required' } }, evidence: [], confidence: { basis_points: 10000 }, detail: null };
+  const waitingCheck: CheckResult = { kind: 'route_vpn', status: { state: 'skipped', because: { reason: 'dependency_consent_required', dependency: 'dns' } }, evidence: [], confidence: { basis_points: 10000 }, detail: null };
+  const settings = { interface: 'eth0', gateway: '192.168.1.1', gateway_source: 'platform', configured_resolvers: ['1.1.1.1', '8.8.8.8'], independent_resolver: '9.9.9.9', internet_probe_address: '1.1.1.1', internet_probe_port: 443, dns_probe_name: 'example.com', external_probes_confirmed: false };
+
+  it('reads as neutral "Needs your permission" and explains it once, naming the configured targets', async () => {
+    const onOpenSettings = vi.fn();
+    const client = { ...fakeClient({ doctorReport: vi.fn(async () => envelope([], [passedCheck, consentCheck, waitingCheck])) }), doctorSettings: vi.fn(async () => settings) };
+    render(DoctorView, { client, onOpenSettings });
+
+    await waitFor(() => screen.getByText('Needs your permission'));
+    expect(screen.getByText(/Needs your permission — waits on: dns/)).toBeTruthy();
+    expect(screen.queryByText('Failed')).toBeNull();
+    // One notice, however many checks wait.
+    const notice = await screen.findByRole('note', { name: 'Permission needed' });
+    expect(screen.getAllByRole('note', { name: 'Permission needed' })).toHaveLength(1);
+    await waitFor(() => expect(notice.textContent).toContain('1.1.1.1, 8.8.8.8, 9.9.9.9'));
+    expect(notice.textContent).toContain('internet test address 1.1.1.1:443');
+    expect(notice.textContent).toContain('Nothing is sent but a standard test request');
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Review Doctor settings' }));
+    expect(onOpenSettings).toHaveBeenCalledOnce();
+    // The UI never grants the permission itself.
+    expect(client.doctorSettings).toHaveBeenCalledOnce();
+  });
+
+  it('still explains the notice when the settings cannot be loaded, and shows nothing when no check waits', async () => {
+    const failing = { ...fakeClient({ doctorReport: vi.fn(async () => envelope([], [consentCheck])) }), doctorSettings: vi.fn(async () => { throw new Error('nope'); }) };
+    const first = render(DoctorView, { client: failing, onOpenSettings: () => {} });
+    const notice = await first.findByRole('note', { name: 'Permission needed' });
+    expect(notice.textContent).toContain('contact servers outside your home network');
+    first.unmount();
+
+    render(DoctorView, { client: fakeClient({ doctorReport: vi.fn(async () => envelope([], [passedCheck])) }) });
+    await waitFor(() => screen.getByRole('heading', { name: 'Diagnostic checks' }));
+    expect(screen.queryByRole('note', { name: 'Permission needed' })).toBeNull();
+  });
+});
