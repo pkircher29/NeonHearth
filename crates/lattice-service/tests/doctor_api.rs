@@ -1612,7 +1612,7 @@ async fn every_finding_says_whether_this_build_can_execute_its_plan() {
     // A transport that cannot: every actionable plan carries the reason, and
     // the report route agrees with the run.
     let repairs = FakeRepairTransport::new().with_unavailable(UnavailableReason::NeedsRouterApi);
-    let fixture = fixture(Arc::new(mixed_fault_probes()), Arc::new(repairs)).await;
+    let fixture = self::fixture(Arc::new(mixed_fault_probes()), Arc::new(repairs)).await;
     let run = run_doctor(&fixture.router).await;
     for finding in run["findings"].as_array().unwrap() {
         let class = finding["plan"]["class"].as_str().unwrap();
