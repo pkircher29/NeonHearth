@@ -1613,6 +1613,8 @@ mod tests {
             (Method::POST, "/api/v1/integrations/tokens", Denied),
             (Method::GET, "/api/v1/integrations/v1/devices", Denied),
             (Method::POST, "/api/v1/cameras/abc/sessions", Denied),
+            (Method::POST, "/api/v1/cameras", Denied),
+            (Method::DELETE, "/api/v1/cameras/abc", Denied),
             (Method::GET, "/api/v1/cameras/abc/snapshot", Denied),
             (Method::GET, "/other", Denied),
         ] {

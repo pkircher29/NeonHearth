@@ -108,8 +108,14 @@ pub fn app_with_parts(
         .merge(network_monitor::api::routes())
         .route("/api/v1/health", get(api::health))
         .route("/api/v1/state", get(api::state))
-        .route("/api/v1/cameras", get(api::cameras))
-        .route("/api/v1/cameras/{id}", get(api::camera))
+        .route(
+            "/api/v1/cameras",
+            get(api::cameras).post(cameras::onboarding::add_camera_route),
+        )
+        .route(
+            "/api/v1/cameras/{id}",
+            get(api::camera).delete(cameras::onboarding::remove_camera_route),
+        )
         .route("/api/v1/cameras/{id}/health", get(api::camera_health))
         .route("/api/v1/cameras/{id}/inventory", get(api::camera_inventory))
         .route(
