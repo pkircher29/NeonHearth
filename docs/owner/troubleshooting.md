@@ -97,9 +97,10 @@ not log files.
 
 ## Not yet available
 
-- Automatic Network Doctor repairs — the Doctor measures and proposes plans
-  (see [Network Doctor](network-doctor.md)) but this build cannot change your
-  network settings for you; this page is the manual.
+- Most automatic Network Doctor repairs — the only repair NeonHearth performs
+  itself is restarting its own discovery worker. Anything that changes your
+  network settings or router is shown as guidance for you to follow (see
+  [Network Doctor](network-doctor.md)); this page is the manual.
 - Automatic UI pairing (see above).
 - In-app surfacing of the degraded/no-interface state beyond the collector
   status and service status events.

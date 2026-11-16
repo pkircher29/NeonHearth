@@ -2,7 +2,7 @@
 
 The Doctor runs a short, bounded set of checks against the computer NeonHearth runs on and tells you what it found. Each check is either **passed**, **failed**, or **not available** — never a guess. A check that the operating system cannot measure is labelled *Not available* and produces no finding; it is not counted as a fault in your network.
 
-The Doctor does not run `ping`, `ipconfig`, `netsh` or any other program. It asks the operating system directly. Repairs are separate and are not described here: in this build the Doctor reports what it measured and proposes a plan, but it has no automatic repair for the checks below.
+The Doctor does not run `ping`, `ipconfig`, `netsh` or any other program. It asks the operating system directly. Repairs are described under [What NeonHearth can repair itself](#what-neonhearth-can-repair-itself): in this build only one repair is something NeonHearth does for you; every other plan is guidance for you to follow.
 
 ## What each check measures
 
@@ -50,7 +50,29 @@ A target that is not set (for example no default gateway could be found) is neve
 - **IPv6** checks on both systems.
 - **Other operating systems**: only Windows and Linux are supported; every probe that needs the operating system is not available elsewhere.
 
+## What NeonHearth can repair itself
+
+Each finding comes with a proposed fix. The Doctor only offers a button for a fix NeonHearth can really carry out on this computer. A fix it cannot carry out is shown as guidance with the steps for you to follow, and it has no Approve or Repair button: you are never asked to approve something that would then fail.
+
+| Fix | NeonHearth does it? | Why |
+| --- | --- | --- |
+| Restart the discovery worker (collector fault) | **Yes**, while the worker is running | NeonHearth rebuilds its own discovery worker in place, without restarting the service. It then re-runs the collector-health check and tells you whether the symptom improved. A restart that changes nothing is reported as "no measurable change". It cannot revive a worker that has already died; restart the service for that. |
+| Refresh app caches | No | No finding proposes it and no check can measure its effect. |
+| Repair Tailscale remote access | No | No finding proposes it and no check can measure its effect. Use the remote-access settings. |
+| Renew the collector's address lease | No | Renewing a lease needs administrator rights on the operating system, which NeonHearth does not hold. |
+| Retry the router session | No | NeonHearth has no router interface to retry. |
+| Reset the network adapter | No | Needs administrator rights on the operating system. |
+| Change DNS servers | No | Needs administrator rights on the operating system. |
+| Renew the DHCP lease | No | Needs administrator rights on the operating system. |
+| Lower the interface MTU | No | Needs administrator rights on the operating system. |
+| Block or unblock a device | No | Needs administrator rights on the operating system. |
+| Reserve an address for one of two devices that share it (duplicate IP) | No | Needs the router's DHCP settings, and NeonHearth has no router interface. |
+| Reboot the router | No | NeonHearth has no router interface. |
+| Move the access point, check cables, contact your provider | No | Physical or outside NeonHearth; the Doctor lists the steps. |
+
+For every "No" the finding still tells you what is wrong, with the evidence and a plain-language "To fix it yourself" step. For the duplicate address the Doctor no longer asks which device should keep it, because it cannot apply your answer; make that choice in your router's DHCP settings.
+
 ## Not yet available
 
-- Automatic repairs: the Doctor proposes plans, but this build has no repair transport that changes your network settings.
+- Repairs that change the operating system's network settings or the router (see the table above). They need administrator rights or a router interface that this build does not have.
 - Choosing which adapter a probe leaves from.
