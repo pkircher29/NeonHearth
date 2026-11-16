@@ -446,29 +446,80 @@ impl Vault for KeyringVault {
 pub enum VaultBackend {
     /// The OS credential store (Windows Credential Manager / Secret Service).
     Keyring,
-    /// The encrypted state-directory file (Linux fallback only).
+    /// The encrypted state-directory file, used when the OS credential store
+    /// cannot be used by this process (a service account has no keyring session).
     EncryptedFile,
 }
 
 /// The production vault for this host.
 ///
-/// The OS keyring is preferred everywhere. On Linux the hardened service unit
-/// runs as a system user with no session D-Bus, so the Secret Service is
-/// unreachable by construction; there the vault falls back to an encrypted
-/// file under `state_dir` (see [`FileVault`]). Windows stays on the
-/// Credential Manager only: an unavailable keyring is an error, not a
-/// fallback.
+/// The OS keyring is preferred everywhere, but only when it really works for
+/// this process: reporting itself present is not enough, so a throwaway
+/// value is written, read back and deleted first. A service account has no
+/// keyring session on either platform: on Linux the hardened unit runs as a
+/// system user with no session D-Bus, and on Windows the Credential Manager
+/// refuses a service logon with `ERROR_NO_SUCH_LOGON_SESSION` (seen on a real
+/// install; the store still reports itself available). In both cases the
+/// vault falls back to an encrypted file under `state_dir` (see
+/// [`FileVault`]), which relies on the state directory being readable only by
+/// the service and administrators.
 pub async fn platform_vault(
     state_dir: &Path,
 ) -> Result<(Arc<dyn Vault>, VaultBackend), VaultError> {
-    match KeyringVault::platform().await {
-        Ok(vault) => Ok((Arc::new(vault), VaultBackend::Keyring)),
-        Err(VaultError::Unavailable) if cfg!(target_os = "linux") => {
+    let platform = KeyringVault::platform().await;
+    // The probe only runs when the store reports itself present.
+    let probe_ok = match &platform {
+        Ok(_) => keyring_round_trips().await,
+        Err(_) => false,
+    };
+    match (choose_backend(platform.as_ref().map(|_| ()), probe_ok), platform) {
+        (BackendChoice::Keyring, Ok(vault)) => Ok((Arc::new(vault), VaultBackend::Keyring)),
+        (BackendChoice::EncryptedFile, _) => {
             let vault = FileVault::open(state_dir.join("vault")).await?;
             Ok((Arc::new(vault), VaultBackend::EncryptedFile))
         }
-        Err(error) => Err(error),
+        (BackendChoice::Fail(error), _) => Err(error),
+        (BackendChoice::Keyring, Err(error)) => Err(error),
     }
+}
+
+/// Which vault to use, decided from what the OS store reported and whether its
+/// write/read/delete probe worked.
+#[derive(Debug, Eq, PartialEq)]
+enum BackendChoice {
+    Keyring,
+    EncryptedFile,
+    Fail(VaultError),
+}
+
+fn choose_backend(platform: Result<(), &VaultError>, probe_ok: bool) -> BackendChoice {
+    match platform {
+        Ok(()) if probe_ok => BackendChoice::Keyring,
+        // Present but unusable by this process (a service logon), or absent.
+        Ok(()) | Err(VaultError::Unavailable) => BackendChoice::EncryptedFile,
+        Err(error) => BackendChoice::Fail(*error),
+    }
+}
+
+/// Whether the OS credential store accepts a write, a read-back and a delete
+/// from this process. The probe value is random and is not a secret.
+async fn keyring_round_trips() -> bool {
+    let mut bytes = [0_u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        return false;
+    }
+    let value: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let slot = format!("probe:{value}");
+    let stored = put_secret(slot.clone(), SecretString::from(value.clone())).await;
+    let read_back = match stored {
+        Ok(()) => get_secret(slot.clone()).await.ok(),
+        Err(_) => None,
+    };
+    // Always try to remove the probe, even when the read failed.
+    let removed = delete_secret(slot).await.is_ok();
+    removed
+        && read_back
+            .is_some_and(|secret| secrecy::ExposeSecret::expose_secret(&secret) == value.as_str())
 }
 
 /// Backups: `lattice-store`'s `backup_to` is `VACUUM INTO` of the SQLite database
@@ -830,7 +881,12 @@ fn map_keyring_error(error: keyring::Error) -> VaultError {
             bytes.zeroize();
             VaultError::Unavailable
         }
-        _ => VaultError::Unavailable,
+        other => {
+            // These variants describe the store or the platform call, never the
+            // secret itself (the two that carry bytes are handled above).
+            tracing::warn!(error = %other, "the OS credential store refused an operation");
+            VaultError::Unavailable
+        }
     }
 }
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -903,6 +959,21 @@ impl KeyringBackend for SystemKeyring {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_backend_choice_falls_back_to_the_file_on_every_platform() {
+        assert_eq!(choose_backend(Ok(()), true), BackendChoice::Keyring);
+        // Reports available, but the probe was refused (service logon).
+        assert_eq!(choose_backend(Ok(()), false), BackendChoice::EncryptedFile);
+        assert_eq!(
+            choose_backend(Err(&VaultError::Unavailable), false),
+            BackendChoice::EncryptedFile
+        );
+        assert_eq!(
+            choose_backend(Err(&VaultError::InvalidReference), false),
+            BackendChoice::Fail(VaultError::InvalidReference)
+        );
+    }
+
     use super::*;
     use secrecy::ExposeSecret;
     use std::{

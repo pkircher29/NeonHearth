@@ -246,7 +246,7 @@ pub async fn build(pool: SqlitePool, state_dir: &Path) -> CameraMediaBuild {
             }
             Ok(Err(_)) | Err(_) => CameraMediaBuild::disabled(CameraMediaStatus::disabled(
                 REASON_VAULT_UNAVAILABLE,
-                "The credential store for camera passwords could not be opened. On Windows the Credential Manager must be available to the service account; on Linux the service falls back to an encrypted file in its state directory, which also failed. Check that the state directory is writable, then restart the service.",
+                "The credential store for camera passwords could not be opened. The service uses the operating-system credential store when this account can really use it, and otherwise (a service account usually cannot, on Windows or Linux) an encrypted file in its state directory; neither could be opened. Check that the state directory is writable, then restart the service.",
             )),
         },
     };

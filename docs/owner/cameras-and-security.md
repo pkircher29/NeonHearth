@@ -20,9 +20,11 @@ against explicitly approved private targets on your own network.
 
 Camera credentials live in the platform secret store — Windows Credential
 Manager on Windows, the Secret Service keyring on Linux — and nowhere else.
-(The Linux service runs as a system user with no desktop session, so there it
-normally uses an encrypted file in its own state directory instead; Windows
-never falls back to a file.) The database holds only opaque references. (See "Where the password is kept" below for what happens to a password you type into the add-camera form.) Credentials are never displayed,
+(The store is tested with a throwaway write, read and delete first. A service
+account usually has no keyring session, on Linux or on Windows, where the
+Credential Manager refuses a service logon; in that case the service uses an
+encrypted file in its own state directory instead, readable only by the
+service and administrators.) The database holds only opaque references. (See "Where the password is kept" below for what happens to a password you type into the add-camera form.) Credentials are never displayed,
 never logged, never included in errors or exports, and never sent to the
 desktop app. When a stream needs authentication, a local loopback proxy
 inside the privileged service injects the credential; the raw camera URL and

@@ -658,11 +658,10 @@ impl CameraOnboarding {
         input: AddCameraInput,
     ) -> Result<AddedCamera, AddFailure> {
         let name = validate_input(&input)?;
-        let inventory = self
-            .interfaces
-            .snapshot()
-            .await
-            .map_err(|_| AddFailure::Unavailable)?;
+        let inventory = self.interfaces.snapshot().await.map_err(|_| {
+            tracing::warn!("camera add failed: the network interface list could not be read");
+            AddFailure::Unavailable
+        })?;
         let host =
             approve_address(&input.address, &inventory).map_err(AddFailure::NotOnYourNetwork)?;
         if self.book.address_in_use(host.address).await {
@@ -804,7 +803,9 @@ impl CameraOnboarding {
                 .await
             {
                 Ok(reference) => written.push((stream, reference)),
-                Err(_) => {
+                Err(error) => {
+                    // The vault error types carry no secret material.
+                    tracing::warn!(%error, "camera add failed: the credential store refused the stream source");
                     self.discard(camera_id, &written).await;
                     return Err(AddFailure::Unavailable);
                 }
@@ -852,6 +853,7 @@ impl CameraOnboarding {
             .insert_onboarded_camera(&record, &inventory, &profiles, &target)
             .await
         {
+            tracing::warn!(%error, "camera add failed: the camera record could not be stored");
             self.discard(camera_id, &written).await;
             return Err(match error {
                 lattice_store::CameraStoreError::Conflict => AddFailure::AlreadyAdded,
