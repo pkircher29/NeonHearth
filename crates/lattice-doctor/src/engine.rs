@@ -483,6 +483,7 @@ impl DiagnosticEngine {
                 Ok(ProbeResponse::PingTimeout) | Err(ProbeError::Timeout) => sample.measured += 1,
                 Ok(_) => sample.error = Some(UNEXPECTED_RESPONSE.to_owned()),
                 Err(ProbeError::Unsupported) => sample.unsupported = true,
+                Err(ProbeError::ConsentRequired) => sample.consent_required = true,
                 Err(error) => sample.error = Some(error.to_string()),
             }
         }
@@ -492,6 +493,9 @@ impl DiagnosticEngine {
     /// Conclusion for a ping series that measured nothing: unavailable when
     /// the only obstacle was an unsupported probe, otherwise a failed probe.
     fn unmeasured_ping(&self, kind: CheckKind, sample: PingSample) -> CheckResult {
+        if sample.consent_required && sample.error.is_none() {
+            return skipped(kind, SkipReason::ConsentRequired);
+        }
         if sample.unsupported && sample.error.is_none() {
             return unavailable(kind);
         }
@@ -643,13 +647,17 @@ impl DiagnosticEngine {
         used: &mut u32,
         resolver: &str,
         independent: bool,
-    ) -> (ResolverEvidence, bool) {
+    ) -> (ResolverEvidence, Queried) {
         let request = ProbeRequest::DnsQuery {
             resolver: resolver.into(),
             name: self.config.dns_probe_name.clone(),
         };
         let result = self.send(t, used, request).await;
-        let unsupported = matches!(result, Err(ProbeError::Unsupported));
+        let queried = match &result {
+            Err(ProbeError::Unsupported) => Queried::Unsupported,
+            Err(ProbeError::ConsentRequired) => Queried::NeedsConsent,
+            _ => Queried::Checked,
+        };
         let outcome = match result {
             Ok(ProbeResponse::DnsAnswer { latency_ms, .. }) => {
                 ResolverOutcome::Answered { latency_ms }
@@ -658,6 +666,7 @@ impl DiagnosticEngine {
             Ok(_) => ResolverOutcome::Unavailable {
                 error: UNEXPECTED_RESPONSE.into(),
             },
+            Err(ProbeError::ConsentRequired) => ResolverOutcome::ConsentRequired,
             Err(error) => ResolverOutcome::Unavailable {
                 error: error.to_string(),
             },
@@ -667,33 +676,51 @@ impl DiagnosticEngine {
             independent,
             outcome,
         };
-        (evidence, unsupported)
+        (evidence, queried)
     }
 
     async fn check_dns<T: ProbeTransport>(&self, t: &T, used: &mut u32) -> CheckResult {
         let kind = CheckKind::Dns;
         let mut resolvers = Vec::new();
         let configured = self.config.configured_resolvers.clone();
-        let mut all_unsupported = true;
+        // Which resolvers were really asked. A resolver the owner has not
+        // allowed us to ask is "not checked": neither a failure nor counted.
+        let mut asked: Vec<Queried> = Vec::new();
         for resolver in &configured {
-            let (evidence, unsupported) = self.query_resolver(t, used, resolver, false).await;
-            all_unsupported &= unsupported;
+            let (evidence, queried) = self.query_resolver(t, used, resolver, false).await;
+            asked.push(queried);
             resolvers.push(evidence);
         }
         let independent = self.config.independent_resolver.clone();
-        let (evidence, unsupported) = self.query_resolver(t, used, &independent, true).await;
-        all_unsupported &= unsupported;
+        let (evidence, queried) = self.query_resolver(t, used, &independent, true).await;
+        asked.push(queried);
         resolvers.push(evidence);
-        if all_unsupported {
-            return unavailable(kind);
+        if !asked.contains(&Queried::Checked) {
+            // Nothing could be measured: either the owner has to allow it, or
+            // this platform cannot do it at all.
+            return if asked.contains(&Queried::NeedsConsent) {
+                skipped(kind, SkipReason::ConsentRequired)
+            } else {
+                unavailable(kind)
+            };
         }
 
-        let configured_total = configured.len();
-        let configured_failures = resolvers
+        let configured_checked: Vec<&ResolverEvidence> = resolvers
             .iter()
-            .filter(|r| !r.independent)
+            .zip(&asked)
+            .filter(|(r, queried)| !r.independent && **queried == Queried::Checked)
+            .map(|(r, _)| r)
+            .collect();
+        let configured_total = configured_checked.len();
+        let configured_failures = configured_checked
+            .iter()
             .filter(|r| !matches!(r.outcome, ResolverOutcome::Answered { .. }))
             .count();
+        // With no configured resolver askable, the independent control is the
+        // only measurement there is.
+        let independent_answered = resolvers
+            .iter()
+            .any(|r| r.independent && matches!(r.outcome, ResolverOutcome::Answered { .. }));
         let mut evidence = vec![self.measurement(
             Metric::ResolverFailureCount,
             configured_failures as f64,
@@ -716,7 +743,11 @@ impl DiagnosticEngine {
         };
         self.conclude(
             kind,
-            configured_failures < configured_total,
+            if configured_total == 0 {
+                independent_answered
+            } else {
+                configured_failures < configured_total
+            },
             evidence,
             confidence,
             CheckDetail::Dns { resolvers },
@@ -831,6 +862,7 @@ impl DiagnosticEngine {
     fn probe_error(&self, kind: CheckKind, error: ProbeError) -> CheckResult {
         match error {
             ProbeError::Unsupported => unavailable(kind),
+            ProbeError::ConsentRequired => skipped(kind, SkipReason::ConsentRequired),
             other => self.failed_probe(kind, other.to_string()),
         }
     }
@@ -854,6 +886,16 @@ struct PingSample {
     error: Option<String>,
     /// At least one echo was refused as unsupported by the transport.
     unsupported: bool,
+    /// At least one echo needs the owner's permission to leave the network.
+    consent_required: bool,
+}
+
+/// How one resolver query ended, for the DNS check's accounting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Queried {
+    Checked,
+    Unsupported,
+    NeedsConsent,
 }
 
 fn dependency_skip(kind: CheckKind, checks: &[CheckResult]) -> Option<SkipReason> {
@@ -862,6 +904,11 @@ fn dependency_skip(kind: CheckKind, checks: &[CheckResult]) -> Option<SkipReason
             Some(CheckStatus::Passed) => {}
             Some(CheckStatus::Failed) => {
                 return Some(SkipReason::DependencyFailed {
+                    dependency: *dependency,
+                });
+            }
+            Some(CheckStatus::Skipped { because }) if because.needs_consent() => {
+                return Some(SkipReason::DependencyConsentRequired {
                     dependency: *dependency,
                 });
             }

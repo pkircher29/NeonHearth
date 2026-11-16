@@ -36,8 +36,8 @@ use lattice_doctor::{
     },
     probe::{LeaseState, Probe, ProbeError, ProbeRequest, ProbeResponse, ProbeTransport},
     repair::{
-        ApprovalId, ApprovedRepair, ExecutableRepair, RepairContext, RepairPlan, StateKey,
-        plan_dhcp_reservation, plan_repair,
+        ApprovalAction, ApprovalId, ApprovedRepair, ExecutableRepair, RepairContext, RepairPlan,
+        SafeAction, StateKey, UnavailableReason, plan_dhcp_reservation, plan_repair,
     },
     types::MacAddr,
 };
@@ -79,6 +79,66 @@ const MAX_RESOLVERS: usize = 8;
 pub struct DoctorFinding {
     pub diagnosis: Diagnosis,
     pub plan: RepairPlan,
+    /// Whether this build can really execute `plan`. When false, no approval
+    /// is minted and no repair runs; the plan is guidance for the owner.
+    pub executable: bool,
+    /// Machine-readable reason `executable` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<UnavailableReason>,
+    /// One owner-facing sentence for `unavailable_reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_detail: Option<String>,
+}
+
+impl DoctorFinding {
+    fn assess(diagnosis: Diagnosis, plan: RepairPlan, transport: &dyn DynRepairTransport) -> Self {
+        let mut finding = Self {
+            diagnosis,
+            plan,
+            executable: false,
+            unavailable_reason: None,
+            unavailable_detail: None,
+        };
+        finding.reassess(transport);
+        finding
+    }
+
+    /// Recomputes capability against the live transport.
+    fn reassess(&mut self, transport: &dyn DynRepairTransport) {
+        let reason = plan_unavailable_reason(&self.plan, transport);
+        self.executable = reason.is_none();
+        self.unavailable_reason = reason;
+        self.unavailable_detail = reason.map(|reason| reason.detail().to_owned());
+    }
+}
+
+/// Why `plan` cannot run on this build, or `None` when it can. Advice-only
+/// plans are never executable; the rest ask the transport.
+fn plan_unavailable_reason(
+    plan: &RepairPlan,
+    transport: &dyn DynRepairTransport,
+) -> Option<UnavailableReason> {
+    match plan {
+        RepairPlan::GuidedPhysical { .. } | RepairPlan::ObservationOnly { .. } => {
+            Some(UnavailableReason::GuidanceOnly)
+        }
+        RepairPlan::SafeAutomatic { .. } | RepairPlan::ApprovalRequiredReversible { .. } => {
+            transport.dyn_unavailable_reason(plan)
+        }
+    }
+}
+
+/// The 422 body for a plan this build cannot execute.
+fn repair_unavailable(reason: UnavailableReason) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "error": "repair_unavailable",
+            "reason": reason,
+            "detail": reason.detail(),
+        })),
+    )
+        .into_response()
 }
 
 /// Envelope for `POST /doctor/run` and `GET /doctor/report`.
@@ -526,9 +586,9 @@ impl ProbeTransport for GatedProbes<'_> {
                 ));
             }
             if !self.allow_external && !is_private_target(target) {
-                return Err(ProbeError::Transport(
-                    "external probe targets are not confirmed by the owner".to_owned(),
-                ));
+                // Withheld consent is not a transport failure: the engine
+                // reports the check as needing the owner's permission.
+                return Err(ProbeError::ConsentRequired);
             }
         }
         self.inner.dyn_probe(probe).await
@@ -555,6 +615,7 @@ impl<T: ProbeTransport> DynProbeTransport for T {
 
 /// Object-safe mirror of [`RepairTransport`] for storage in service state.
 pub trait DynRepairTransport: Send + Sync {
+    fn dyn_unavailable_reason(&self, plan: &RepairPlan) -> Option<UnavailableReason>;
     fn dyn_snapshot<'a>(
         &'a self,
         keys: &'a [StateKey],
@@ -574,6 +635,9 @@ pub trait DynRepairTransport: Send + Sync {
 }
 
 impl<T: RepairTransport> DynRepairTransport for T {
+    fn dyn_unavailable_reason(&self, plan: &RepairPlan) -> Option<UnavailableReason> {
+        RepairTransport::unavailable_reason(self, plan)
+    }
     fn dyn_snapshot<'a>(
         &'a self,
         keys: &'a [StateKey],
@@ -667,18 +731,69 @@ impl ProbeTransport for ServiceProbeTransport {
     }
 }
 
-/// Repair transport limited to what the service can genuinely do today.
+/// How long a worker restart may take to rebuild before it is reported failed.
+const WORKER_RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Repair transport limited to what the service can genuinely do.
 ///
-/// No repair action has a local execution hook yet, so `apply` always returns
-/// a typed error — execution is reported as failed, never pretended
-/// successful. Snapshot/restore/measure work only for the service-local state
-/// keys and the collector-health check; everything else is a typed error.
+/// One repair has a real local hook: `RestartCollectorWorker` asks the running
+/// discovery worker (through [`crate::runtime::WorkerControl`]) to rebuild its
+/// capture in place, without restarting the process, and waits for the answer.
+/// Every other action is declared unexecutable by
+/// [`RepairTransport::unavailable_reason`] so it is refused before any
+/// approval is minted or spent, and `apply` still returns a typed error for
+/// it as a second line of defence. Snapshot/restore/measure work only for the
+/// service-local state keys and the collector-health check.
 pub struct ServiceRepairTransport {
     state: AppState,
     clock: Arc<dyn Clock>,
 }
 
+impl ServiceRepairTransport {
+    /// The single source of truth for what this build can execute.
+    fn unavailable_for(&self, plan: &RepairPlan) -> Option<UnavailableReason> {
+        match plan {
+            RepairPlan::SafeAutomatic { action, .. } => match action {
+                SafeAction::RestartCollectorWorker => {
+                    if self.state.worker_control().is_attached() {
+                        None
+                    } else {
+                        Some(UnavailableReason::WorkerNotRunning)
+                    }
+                }
+                // No finding proposes these and no check measures their
+                // effect, so there is nothing to verify a run against.
+                SafeAction::RefreshAppCaches | SafeAction::RepairTailscaleServe => {
+                    Some(UnavailableReason::NotWired)
+                }
+                SafeAction::RenewCollectorLease => Some(UnavailableReason::NeedsOsNetworkChange),
+                SafeAction::RetryRouterSession => Some(UnavailableReason::NeedsRouterApi),
+            },
+            RepairPlan::ApprovalRequiredReversible { action, .. } => match action {
+                ApprovalAction::ResetAdapter { .. }
+                | ApprovalAction::ChangeDnsServers { .. }
+                | ApprovalAction::RenewDhcpLease { .. }
+                | ApprovalAction::SetInterfaceMtu { .. }
+                | ApprovalAction::BlockDevice { .. }
+                | ApprovalAction::UnblockDevice { .. } => {
+                    Some(UnavailableReason::NeedsOsNetworkChange)
+                }
+                ApprovalAction::SetDhcpReservation { .. } | ApprovalAction::RebootRouter => {
+                    Some(UnavailableReason::NeedsRouterApi)
+                }
+            },
+            RepairPlan::GuidedPhysical { .. } | RepairPlan::ObservationOnly { .. } => {
+                Some(UnavailableReason::GuidanceOnly)
+            }
+        }
+    }
+}
+
 impl RepairTransport for ServiceRepairTransport {
+    fn unavailable_reason(&self, plan: &RepairPlan) -> Option<UnavailableReason> {
+        self.unavailable_for(plan)
+    }
+
     async fn snapshot(&self, keys: &[StateKey]) -> Result<Vec<StateEntry>, RepairTransportError> {
         let mut entries = Vec::with_capacity(keys.len());
         for key in keys {
@@ -698,15 +813,26 @@ impl RepairTransport for ServiceRepairTransport {
     }
 
     async fn apply(&self, repair: &ExecutableRepair) -> Result<(), RepairTransportError> {
-        Err(RepairTransportError::Apply(format!(
-            "{} has no local execution hook in this service build",
-            repair.describe()
-        )))
+        match repair {
+            ExecutableRepair::Safe {
+                action: SafeAction::RestartCollectorWorker,
+            } => self
+                .state
+                .worker_control()
+                .restart(WORKER_RESTART_TIMEOUT)
+                .await
+                .map_err(|error| RepairTransportError::Apply(error.to_string())),
+            other => Err(RepairTransportError::Apply(format!(
+                "{} has no local execution hook in this service build",
+                other.describe()
+            ))),
+        }
     }
 
     async fn restore(&self, entries: &[StateEntry]) -> Result<(), RepairTransportError> {
-        // `apply` never changes anything in this build, so restoring the
-        // service-local snapshots it took is vacuously complete; keys this
+        // A worker restart leaves nothing to undo (the worker is rebuilt from
+        // its persisted checkpoints and is not `reversible`, so the executor
+        // never asks), and no other action can reach `apply`. Keys this
         // transport could not have snapshotted are refused, not ignored.
         for entry in entries {
             match entry.key {
@@ -1002,7 +1128,7 @@ pub(crate) async fn run_route(
         .into_iter()
         .map(|diagnosis| {
             let plan = plan_repair(&diagnosis.kind, &context);
-            DoctorFinding { diagnosis, plan }
+            DoctorFinding::assess(diagnosis, plan, shared.repairs.as_ref())
         })
         .collect();
     let run = DoctorRun {
@@ -1028,12 +1154,20 @@ pub(crate) async fn report_route(
 ) -> Response {
     let inner = doctor.shared.inner.lock().await;
     match &inner.latest {
-        Some(run) => Json(run.clone()).into_response(),
+        Some(run) => {
+            // Capability is live (the worker may have stopped since the run),
+            // so the owner is never shown a button the routes would refuse.
+            let mut run = run.clone();
+            for finding in &mut run.findings {
+                finding.reassess(doctor.shared.repairs.as_ref());
+            }
+            Json(run).into_response()
+        }
         None => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
-#[utoipa::path(post, path = "/api/v1/doctor/approvals", request_body = DoctorApprovalRequest, responses((status = 200, body = DoctorApproval), (status = 400, description = "the chosen device is not a claimant of this finding"), (status = 401), (status = 404, description = "the latest run has no approval-required plan for this diagnosis"), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(post, path = "/api/v1/doctor/approvals", request_body = DoctorApprovalRequest, responses((status = 200, body = DoctorApproval), (status = 400, description = "the chosen device is not a claimant of this finding"), (status = 401), (status = 404, description = "the latest run has no approval-required plan for this diagnosis"), (status = 422, description = "this build cannot execute the plan; no approval is minted"), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn approvals_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -1061,12 +1195,16 @@ pub(crate) async fn approvals_route(
         let Some(run) = &inner.latest else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        let approvable = run.findings.iter().any(|finding| {
+        let Some(finding) = run.findings.iter().find(|finding| {
             finding.diagnosis.kind == request.diagnosis_kind
                 && matches!(finding.plan, RepairPlan::ApprovalRequiredReversible { .. })
-        });
-        if !approvable {
+        }) else {
             return StatusCode::NOT_FOUND.into_response();
+        };
+        // Refuse before anything is minted or audited: an approval for a
+        // repair this build cannot execute would only be spent on a failure.
+        if let Some(reason) = plan_unavailable_reason(&finding.plan, shared.repairs.as_ref()) {
+            return repair_unavailable(reason);
         }
         // Expired tokens are dead weight until the next run clears them;
         // drop them here so the map is bounded by live approvals.
@@ -1109,7 +1247,7 @@ pub(crate) async fn approvals_route(
     .into_response()
 }
 
-#[utoipa::path(post, path = "/api/v1/doctor/repair", request_body = DoctorRepairRequest, responses((status = 200, body = DoctorRepairResponse), (status = 400, description = "guided/observation plans are never executable, or the chosen device is not a claimant"), (status = 401), (status = 403, description = "missing, expired, used, or mismatched approval"), (status = 404, description = "the latest run has no plan for this diagnosis"), (status = 409, description = "a diagnostic run or another repair is in progress"), (status = 503)), security(("bearer_auth" = [])))]
+#[utoipa::path(post, path = "/api/v1/doctor/repair", request_body = DoctorRepairRequest, responses((status = 200, body = DoctorRepairResponse), (status = 400, description = "guided/observation plans are never executable, or the chosen device is not a claimant"), (status = 401), (status = 403, description = "missing, expired, used, or mismatched approval"), (status = 404, description = "the latest run has no plan for this diagnosis"), (status = 409, description = "a diagnostic run or another repair is in progress"), (status = 422, description = "this build cannot execute the plan; nothing is audited or spent"), (status = 503)), security(("bearer_auth" = [])))]
 pub(crate) async fn repair_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -1146,6 +1284,16 @@ pub(crate) async fn repair_route(
         };
         finding.plan.clone()
     };
+    // Refuse a repair this build cannot run before the approval is looked at,
+    // the intent is audited, or any token is spent. Advice-only plans keep
+    // their existing 400 below.
+    if matches!(
+        plan,
+        RepairPlan::SafeAutomatic { .. } | RepairPlan::ApprovalRequiredReversible { .. }
+    ) && let Some(reason) = plan_unavailable_reason(&plan, shared.repairs.as_ref())
+    {
+        return repair_unavailable(reason);
+    }
     let (executable, spend_approval) = match plan {
         RepairPlan::SafeAutomatic { action, .. } => {
             if request.chosen.is_some() {
@@ -1644,7 +1792,10 @@ nameserver fe80::1%eth0\nnameserver not-an-ip\noptions edns0\n";
             allow_external: false,
         };
         let refused = |result: Result<ProbeResponse, ProbeError>| {
-            matches!(result, Err(ProbeError::Transport(_)))
+            matches!(
+                result,
+                Err(ProbeError::Transport(_) | ProbeError::ConsentRequired)
+            )
         };
         assert!(refused(
             gated
@@ -1747,7 +1898,7 @@ nameserver fe80::1%eth0\nnameserver not-an-ip\noptions edns0\n";
             assert!(
                 matches!(
                     unconfirmed.probe(probe(request.clone())).await,
-                    Err(ProbeError::Transport(_))
+                    Err(ProbeError::ConsentRequired)
                 ),
                 "{request:?} must be refused without consent"
             );
@@ -1802,5 +1953,204 @@ nameserver fe80::1%eth0\nnameserver not-an-ip\noptions edns0\n";
             Err(ProbeError::Transport(_))
         ));
         assert_eq!(host.echoes.lock().unwrap().len(), before);
+    }
+
+    // -----------------------------------------------------------------------
+    // Production repair transport: capability and the worker restart.
+    // -----------------------------------------------------------------------
+
+    async fn repair_transport() -> (AppState, ServiceRepairTransport) {
+        let pool = lattice_store::connect_memory().await.unwrap();
+        let state = AppState::new(
+            "owner-token-0123456789abcdefghijkl",
+            lattice_store::M2StateRepository::new(pool),
+        )
+        .unwrap();
+        let transport = ServiceRepairTransport {
+            state: state.clone(),
+            clock: Arc::new(SystemClock),
+        };
+        (state, transport)
+    }
+
+    fn safe_plan(action: SafeAction) -> RepairPlan {
+        RepairPlan::SafeAutomatic {
+            action,
+            rationale: String::new(),
+        }
+    }
+
+    fn approval_plan(action: ApprovalAction) -> RepairPlan {
+        RepairPlan::ApprovalRequiredReversible {
+            action,
+            rationale: String::new(),
+        }
+    }
+
+    /// A stand-in for the discovery worker loop: attached for as long as the
+    /// task lives and answers every restart request with `rebuilt`.
+    fn spawn_answering_worker(
+        control: &crate::runtime::WorkerControl,
+        rebuilt: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        let control = control.clone();
+        // Read before attaching, exactly as the real worker loop does, so a
+        // request made once this worker is visible is never counted as old.
+        let mut handled = control.requested();
+        let attachment = control.attach();
+        tokio::spawn(async move {
+            let _attachment = attachment;
+            loop {
+                control.wait_request(handled).await;
+                handled = control.requested();
+                control.acknowledge(handled, rebuilt);
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn the_collector_restart_is_executable_only_while_a_worker_runs() {
+        let (state, transport) = repair_transport().await;
+        let restart = safe_plan(SafeAction::RestartCollectorWorker);
+        assert_eq!(
+            transport.unavailable_reason(&restart),
+            Some(UnavailableReason::WorkerNotRunning)
+        );
+        let worker = spawn_answering_worker(state.worker_control(), true);
+        assert_eq!(transport.unavailable_reason(&restart), None);
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn every_other_repair_is_declared_unexecutable_with_its_reason() {
+        let (_state, transport) = repair_transport().await;
+        let interface = lattice_doctor::types::InterfaceName::parse("eth0").unwrap();
+        let device: MacAddr = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        let cases = [
+            (
+                safe_plan(SafeAction::RefreshAppCaches),
+                UnavailableReason::NotWired,
+            ),
+            (
+                safe_plan(SafeAction::RepairTailscaleServe),
+                UnavailableReason::NotWired,
+            ),
+            (
+                safe_plan(SafeAction::RenewCollectorLease),
+                UnavailableReason::NeedsOsNetworkChange,
+            ),
+            (
+                safe_plan(SafeAction::RetryRouterSession),
+                UnavailableReason::NeedsRouterApi,
+            ),
+            (
+                approval_plan(ApprovalAction::ResetAdapter {
+                    interface: interface.clone(),
+                }),
+                UnavailableReason::NeedsOsNetworkChange,
+            ),
+            (
+                approval_plan(ApprovalAction::ChangeDnsServers {
+                    servers: vec!["9.9.9.9".parse().unwrap()],
+                }),
+                UnavailableReason::NeedsOsNetworkChange,
+            ),
+            (
+                approval_plan(ApprovalAction::RenewDhcpLease { interface }),
+                UnavailableReason::NeedsOsNetworkChange,
+            ),
+            (
+                approval_plan(ApprovalAction::BlockDevice { device }),
+                UnavailableReason::NeedsOsNetworkChange,
+            ),
+            (
+                approval_plan(ApprovalAction::UnblockDevice { device }),
+                UnavailableReason::NeedsOsNetworkChange,
+            ),
+            (
+                approval_plan(ApprovalAction::RebootRouter),
+                UnavailableReason::NeedsRouterApi,
+            ),
+            (
+                approval_plan(ApprovalAction::SetDhcpReservation {
+                    address: "10.0.0.5".parse().unwrap(),
+                    claimants: vec![device],
+                    chosen: Some(device),
+                }),
+                UnavailableReason::NeedsRouterApi,
+            ),
+        ];
+        for (plan, reason) in cases {
+            assert_eq!(
+                transport.unavailable_reason(&plan),
+                Some(reason),
+                "{plan:?}"
+            );
+        }
+        // And `apply` still refuses them if a caller bypasses the gate.
+        let bypass = ExecutableRepair::Safe {
+            action: SafeAction::RefreshAppCaches,
+        };
+        assert!(matches!(
+            transport.apply(&bypass).await,
+            Err(RepairTransportError::Apply(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn restart_apply_waits_for_the_worker_and_reports_a_failed_rebuild() {
+        let (state, transport) = repair_transport().await;
+        let restart = ExecutableRepair::Safe {
+            action: SafeAction::RestartCollectorWorker,
+        };
+        // No worker: a typed error, not a pretend success.
+        assert!(matches!(
+            transport.apply(&restart).await,
+            Err(RepairTransportError::Apply(_))
+        ));
+
+        let worker = spawn_answering_worker(state.worker_control(), true);
+        assert_eq!(transport.apply(&restart).await, Ok(()));
+        worker.abort();
+        let _ = worker.await;
+        // The aborted worker dropped its attachment.
+        assert!(!state.worker_control().is_attached());
+
+        let worker = spawn_answering_worker(state.worker_control(), false);
+        let error = transport.apply(&restart).await.unwrap_err();
+        assert!(error.to_string().contains("rebuild"), "{error}");
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn a_restart_that_does_not_improve_the_symptom_is_reported_unchanged() {
+        use lattice_doctor::executor::Verdict;
+        let (state, transport) = repair_transport().await;
+        let worker = spawn_answering_worker(state.worker_control(), true);
+        let symptom = Symptom::new(
+            CheckKind::CollectorHealth,
+            Metric::CaptureHealthy,
+            MetricDirection::HigherIsBetter,
+            0.5,
+        )
+        .unwrap();
+        let restart = ExecutableRepair::Safe {
+            action: SafeAction::RestartCollectorWorker,
+        };
+        let report = RepairExecutor::new()
+            .with_settle_policy(SettlePolicy::Immediate)
+            .execute(&RepairAdapter(&transport), &restart, &symptom)
+            .await;
+        worker.abort();
+        // The service was already ready, so the restart changed nothing the
+        // collector-health check can see, and the report says exactly that.
+        assert_eq!(
+            report.outcome,
+            lattice_doctor::executor::RepairOutcome::Completed {
+                verdict: Verdict::Unchanged
+            },
+            "{report:?}"
+        );
+        assert!(report.verification.is_some());
     }
 }

@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { isCheckUnavailable } from '../api/client';
-  import type { ApiClient, CheckResult, Confidence, DiagnosisKind, DoctorApproval, DoctorRun, GuidedAction, Measurement, RepairReport, RollbackOutcome } from '../api/client';
+  import { isCheckNeedsConsent, isCheckUnavailable } from '../api/client';
+  import type { ApiClient, CheckResult, Confidence, DiagnosisKind, DoctorApproval, DoctorRun, DoctorSettings, GuidedAction, Measurement, RepairPlan, RepairReport, RollbackOutcome } from '../api/client';
 
-  type DoctorClient = Pick<ApiClient, 'doctorRun' | 'doctorReport' | 'doctorApprove' | 'doctorRepair'>;
+  type DoctorClient = Pick<ApiClient, 'doctorRun' | 'doctorReport' | 'doctorApprove' | 'doctorRepair'> & Partial<Pick<ApiClient, 'doctorSettings'>>;
   // `deviceName` resolves a claimant MAC to the owner's name for that device,
   // when one is known. It is optional so the view works without an inventory.
-  let { client, deviceName = () => null }: { client: DoctorClient; deviceName?: (mac: string) => string | null } = $props();
+  // `onOpenSettings` takes the owner to the Doctor settings, where the
+  // permission to probe outside the home network is granted. Nothing here
+  // changes that setting.
+  let { client, deviceName = () => null, onOpenSettings }: { client: DoctorClient; deviceName?: (mac: string) => string | null; onOpenSettings?: () => void } = $props();
 
   let loading = $state(true);
   let run = $state<DoctorRun | null>(null);
@@ -25,6 +28,19 @@
   let choices = $state<Record<string, string>>({});
   const repairing = $derived(Object.values(busy).some(Boolean));
   let active = true;
+  let settings = $state<DoctorSettings | null>(null);
+  let settingsLoadedFor = '';
+  const needsPermission = $derived(run?.report.checks.some(isCheckNeedsConsent) ?? false);
+  // Name the real targets in the permission notice, once per run.
+  $effect(() => {
+    if (!run || !needsPermission || !client.doctorSettings || settingsLoadedFor === run.run_id) return;
+    settingsLoadedFor = run.run_id;
+    client.doctorSettings().then((loaded) => { if (active) settings = loaded; }).catch(() => { /* the notice reads fine without the names */ });
+  });
+  const probeTargets = $derived.by(() => {
+    if (!settings) return null;
+    return { resolvers: [...new Set([...settings.configured_resolvers, settings.independent_resolver])], internet: `${settings.internet_probe_address}:${settings.internet_probe_port}` };
+  });
 
   async function loadReport(): Promise<void> {
     loading = true;
@@ -127,12 +143,15 @@
     if (check.status.state === 'passed') return 'Passed';
     if (check.status.state === 'failed') return 'Failed';
     const because = check.status.because;
+    if (because.reason === 'consent_required') return 'Needs your permission';
+    if (because.reason === 'dependency_consent_required') return `Needs your permission — waits on: ${label(because.dependency)}`;
     if (because.reason === 'probe_unsupported' || because.reason === 'dependency_unavailable') return 'Not available in this build';
     if (because.reason === 'budget_exhausted') return 'Skipped — probe budget exhausted';
     const relation = because.reason === 'dependency_failed' ? 'dependency failed' : 'dependency skipped';
     return `Skipped — ${relation}: ${label(because.dependency)}`;
   }
   function statusIcon(check: CheckResult): string {
+    if (isCheckNeedsConsent(check)) return '?';
     if (isCheckUnavailable(check)) return '–';
     return check.status.state === 'passed' ? '✓' : check.status.state === 'failed' ? '!' : '◇';
   }
@@ -177,6 +196,33 @@
       'Run the diagnostic again to confirm the fault is resolved.'
     ]
   };
+
+  // What the owner does by hand when this build cannot make the change. Only
+  // shown for a plan the service reported as not executable.
+  function manualFix(plan: RepairPlan): string {
+    if (plan.class === 'safe_automatic') {
+      switch (plan.action.action) {
+        case 'restart_collector_worker': return 'Restart the NeonHearth service (or the app), then run the diagnostic again.';
+        case 'refresh_app_caches': return 'Restart NeonHearth so it rebuilds its caches.';
+        case 'renew_collector_lease': return 'Release and renew this computer’s network address from the operating system’s network settings, then run the diagnostic again.';
+        case 'retry_router_session': return 'Open the router’s admin page, sign in again, and confirm it responds.';
+        case 'repair_tailscale_serve': return 'Open Settings, turn remote access off and on again, and check that the status is healthy.';
+      }
+    }
+    if (plan.class === 'approval_required_reversible') {
+      const action = plan.action;
+      switch (action.action) {
+        case 'reset_adapter': return `Disable and re-enable the network adapter “${action.interface}” in the operating system’s network settings.`;
+        case 'change_dns_servers': return `In the adapter’s network settings (or on the router), set the DNS servers to ${action.servers.join(', ')}.`;
+        case 'renew_dhcp_lease': return `Release and renew the address for “${action.interface}” from the operating system’s network settings.`;
+        case 'set_interface_mtu': return `In the adapter’s advanced settings, set the MTU of “${action.interface}” to ${action.mtu}.`;
+        case 'set_dhcp_reservation': return `In the router’s DHCP settings, reserve ${action.address} for the one device that should keep it, then restart the other device’s network connection.`;
+        case 'reboot_router': return 'Power-cycle the router: unplug it for 30 seconds, plug it back in, and wait a few minutes.';
+        case 'block_device': case 'unblock_device': return 'Use the router’s access-control page to change this device’s access.';
+      }
+    }
+    return plan.rationale;
+  }
 
   type Headline = { tone: 'success' | 'neutral' | 'regressed' | 'unverified'; text: string };
   function repairHeadline(report: RepairReport): Headline {
@@ -230,13 +276,19 @@
       <h2 id="doctor-checks-heading">Diagnostic checks</h2>
       <p class="muted run-facts">Run started {new Date(run.report.started_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} · {run.report.probes_used} probes used</p>
       {#if networkUnavailable}<p class="doctor-notice" role="note">Doctor can currently check only that the collector is healthy. Network checks (adapter, address, gateway, DNS, internet) are not available in this build yet.</p>{/if}
+      {#if needsPermission}
+        <div class="permission-notice" role="note" aria-label="Permission needed">
+          <p><strong>Some checks need your permission.</strong> They contact servers outside your home network, so they have not run.{#if probeTargets} The Doctor would ask the DNS resolvers {probeTargets.resolvers.join(', ')} and connect to the internet test address {probeTargets.internet}.{/if} Nothing is sent but a standard test request: a name lookup, a ping or a plain connection attempt.</p>
+          {#if onOpenSettings}<button type="button" class="act" onclick={() => onOpenSettings?.()}>Review Doctor settings</button>{/if}
+        </div>
+      {/if}
       {#if run.report.budget_exhausted}<p class="budget-warning"><span aria-hidden="true">△</span> The probe budget ran out — these results are partial.</p>{/if}
       <ul class="check-list">
         {#each run.report.checks as check (check.kind)}
-          <li class="check-row state-{check.status.state}" class:unavailable={isCheckUnavailable(check)}>
+          <li class="check-row state-{check.status.state}" class:unavailable={isCheckUnavailable(check)} class:consent={isCheckNeedsConsent(check)}>
             <h3>{label(check.kind)}</h3>
             <p class="check-status"><span class="status-mark" aria-hidden="true">{statusIcon(check)}</span> {statusText(check)}</p>
-            {#if !isCheckUnavailable(check)}<p class="check-confidence">{confidencePercent(check.confidence)} confidence</p>{/if}
+            {#if !isCheckUnavailable(check) && !isCheckNeedsConsent(check)}<p class="check-confidence">{confidencePercent(check.confidence)} confidence</p>{/if}
             {#if check.evidence.length > 0}
               <ul class="measurements" aria-label="Measurements for {label(check.kind)}">
                 {#each check.evidence as measurement}<li>{formatMeasurement(measurement)}</li>{/each}
@@ -295,6 +347,12 @@
                     <p class="unverified-note">No before-and-after verification is available for this repair.</p>
                   {/if}
                 </div>
+              {:else if finding.executable === false && (plan.class === 'safe_automatic' || plan.class === 'approval_required_reversible')}
+                <div class="guidance-only" aria-label="Guidance for {name}">
+                  <p class="guidance-lead">NeonHearth can’t make this change for you in this build. To fix it yourself:</p>
+                  <p class="guidance-fix">{manualFix(plan)}</p>
+                  {#if finding.unavailable_detail}<p class="muted guidance-reason">{finding.unavailable_detail}</p>{/if}
+                </div>
               {:else if plan.class === 'safe_automatic'}
                 <div class="repair-actions">
                   <button type="button" class="act" aria-label="Repair {name}" disabled={inFlight} onclick={() => void executeRepair(key, finding.diagnosis.kind)}>{inFlight ? 'Repairing…' : 'Repair'}</button>
@@ -350,6 +408,9 @@
   .run-facts{font-size:12px}
   .doctor-notice{margin:12px 0 0;padding:9px;border:1px dashed var(--line-strong);border-radius:5px;color:var(--muted);font:11px var(--font-mono)}
   .check-row.unavailable{opacity:.85}
+  .check-row.consent{border-left-color:var(--blue);border-style:dashed}
+  .permission-notice{margin:12px 0 0;padding:12px;border:1px dashed var(--blue);border-radius:5px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}
+  .permission-notice p{margin:0;color:var(--ink);font-size:12px;flex:1 1 320px}
   .budget-warning{margin:12px 0 0;padding:9px;border:1px dashed var(--gold);color:var(--gold);font:11px var(--font-mono)}
   .check-list{margin:14px 0 0;padding:0;list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
   .check-row{padding:13px;border:1px solid var(--line-mid);border-left:4px solid var(--accent);border-radius:7px;background:var(--surface)}
@@ -387,6 +448,10 @@
   .claimant-choice legend{padding:0 6px;color:var(--ink);font:600 12px var(--font-display)}
   .claimant{display:flex;gap:8px;align-items:center;color:var(--ink);font:12px var(--font-mono);cursor:pointer}
   .claimant-note{margin:4px 0 0;font-size:12px}
+  .guidance-only{margin-top:14px;padding:10px 12px;border:1px dashed var(--line-strong);border-radius:5px}
+  .guidance-lead{margin:0;color:var(--muted-strong);font-size:12px}
+  .guidance-fix{margin:6px 0 0;color:var(--ink);font-size:13px}
+  .guidance-reason{margin:6px 0 0;font-size:11px}
   .guided-steps{margin:14px 0 0;padding-left:22px;display:grid;gap:6px;color:var(--ink);font-size:12px}
   .guided-steps li::marker{color:var(--accent);font-weight:700}
   .observation-note{margin:14px 0 0;padding:9px;border:1px dashed var(--muted);color:var(--muted-strong);font:11px var(--font-mono)}

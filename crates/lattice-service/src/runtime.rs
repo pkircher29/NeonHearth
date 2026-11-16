@@ -13,13 +13,148 @@ use lattice_domain::DeviceId;
 use lattice_sensor::neighbor::{NeighborSnapshotConfig, SystemNeighborSnapshotSource};
 use lattice_sensor::{InterfaceId, InterfaceInventory, InterfaceOverride, SystemInterfaceManager};
 use lattice_store::M2StateRepository;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::{fmt, future::Future, io};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 pub const MAX_NEIGHBOR_ROWS: usize = 4096;
 pub const FLOW_BATCH_LIMIT: usize = 4096;
 pub const LIVE_ROW_LIMIT: usize = 4096;
+
+/// Why a worker restart did not complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RestartError {
+    #[error("the discovery worker is not running")]
+    NotRunning,
+    #[error("the discovery worker did not finish restarting in time")]
+    TimedOut,
+    #[error("the discovery worker restarted but could not rebuild its capture")]
+    RebuildFailed,
+}
+
+/// The newest restart request the worker has answered.
+#[derive(Clone, Copy, Debug, Default)]
+struct RestartAck {
+    generation: u64,
+    rebuilt: bool,
+}
+
+struct WorkerControlInner {
+    /// True while a [`NeighborRuntime::run`] loop owns this control.
+    attached: AtomicBool,
+    /// Count of restart requests made so far.
+    requested: AtomicU64,
+    wake: Notify,
+    ack: watch::Sender<RestartAck>,
+}
+
+/// Lets the Doctor ask the running discovery worker to rebuild itself in place
+/// (without restarting the process) and learn whether the rebuild worked.
+/// The worker polls the request counter, so a request made while it is busy is
+/// never lost.
+#[derive(Clone)]
+pub struct WorkerControl {
+    inner: Arc<WorkerControlInner>,
+}
+
+impl Default for WorkerControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Marks the worker attached for as long as it lives.
+pub struct WorkerAttachment {
+    inner: Arc<WorkerControlInner>,
+}
+
+impl Drop for WorkerAttachment {
+    fn drop(&mut self) {
+        self.inner.attached.store(false, Ordering::SeqCst);
+    }
+}
+
+impl WorkerControl {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(WorkerControlInner {
+                attached: AtomicBool::new(false),
+                requested: AtomicU64::new(0),
+                wake: Notify::new(),
+                ack: watch::channel(RestartAck::default()).0,
+            }),
+        }
+    }
+
+    /// Whether a worker loop is currently running.
+    pub fn is_attached(&self) -> bool {
+        self.inner.attached.load(Ordering::SeqCst)
+    }
+
+    /// Called by the worker loop on entry; the returned guard detaches on drop.
+    pub fn attach(&self) -> WorkerAttachment {
+        self.inner.attached.store(true, Ordering::SeqCst);
+        WorkerAttachment {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// How many restarts have been requested so far.
+    pub fn requested(&self) -> u64 {
+        self.inner.requested.load(Ordering::SeqCst)
+    }
+
+    /// Worker side: resolves once a request newer than `handled` exists.
+    pub async fn wait_request(&self, handled: u64) {
+        loop {
+            if self.requested() > handled {
+                return;
+            }
+            self.inner.wake.notified().await;
+        }
+    }
+
+    /// Worker side: reports that the request numbered `generation` was
+    /// handled and whether the capture was rebuilt.
+    pub fn acknowledge(&self, generation: u64, rebuilt: bool) {
+        self.inner.ack.send_replace(RestartAck {
+            generation,
+            rebuilt,
+        });
+    }
+
+    /// Doctor side: asks the worker to rebuild and waits (bounded) for its
+    /// answer.
+    pub async fn restart(&self, timeout: std::time::Duration) -> Result<(), RestartError> {
+        if !self.is_attached() {
+            return Err(RestartError::NotRunning);
+        }
+        let mut ack = self.inner.ack.subscribe();
+        let target = self.inner.requested.fetch_add(1, Ordering::SeqCst) + 1;
+        self.inner.wake.notify_one();
+        let wait = async {
+            loop {
+                let current = *ack.borrow_and_update();
+                if current.generation >= target {
+                    return Some(current);
+                }
+                if ack.changed().await.is_err() {
+                    return None;
+                }
+            }
+        };
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(Some(answer)) if answer.rebuilt => Ok(()),
+            Ok(Some(_)) => Err(RestartError::RebuildFailed),
+            Ok(None) => Err(RestartError::NotRunning),
+            Err(_) => Err(RestartError::TimedOut),
+        }
+    }
+}
 
 /// Owns the neighbor worker for the life of the process. It builds the coordinator from the
 /// current inventory, retries with backoff while no interface is eligible yet (service started
@@ -225,10 +360,26 @@ async fn interface_set_changed(planned: &[InterfaceId]) {
 
 impl NeighborRuntime {
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
+        let control = self.state.worker_control().clone();
+        // Read before attaching: requests are refused until a worker is
+        // attached, so everything counted after this point is for this loop.
+        let mut handled = control.requested();
+        let _attached = control.attach();
+        let mut pending_ack: Option<u64> = None;
         let mut backoff = RETRY_INITIAL;
         loop {
             if *shutdown.borrow() {
                 return;
+            }
+            let requested = control.requested();
+            if requested > handled {
+                // An owner-approved restart: drop the coordinator so the block
+                // below rebuilds it from a fresh inventory.
+                handled = requested;
+                pending_ack = Some(requested);
+                if self.coordinator.take().is_some() {
+                    tracing::info!("worker restart requested; rebuilding the neighbor worker");
+                }
             }
             if self.coordinator.is_none() {
                 let inventory = tokio::task::spawn_blocking(|| SystemInterfaceManager.snapshot())
@@ -244,8 +395,14 @@ impl NeighborRuntime {
                         self.coordinator = Some(coordinator);
                         self.planned = planned;
                         backoff = RETRY_INITIAL;
+                        if let Some(generation) = pending_ack.take() {
+                            control.acknowledge(generation, true);
+                        }
                     }
                     None => {
+                        if let Some(generation) = pending_ack.take() {
+                            control.acknowledge(generation, false);
+                        }
                         self.state
                             .transition_service_status(ServiceRuntimeStatus::Degraded, Utc::now())
                             .await;
@@ -256,6 +413,7 @@ impl NeighborRuntime {
                                 }
                             }
                             () = tokio::time::sleep(backoff) => {}
+                            () = control.wait_request(handled) => {}
                         }
                         backoff = (backoff * 2).min(RETRY_MAX);
                         continue;
@@ -268,11 +426,12 @@ impl NeighborRuntime {
             let changed = tokio::select! {
                 () = run_loop(coordinator, &mut shutdown) => false,
                 () = interface_set_changed(&self.planned) => true,
+                () = control.wait_request(handled) => true,
             };
             if !changed {
                 return;
             }
-            tracing::info!("discovery interface set changed; rebuilding the neighbor worker");
+            tracing::info!("discovery worker is rebuilding (interface change or restart request)");
             self.coordinator = None;
         }
     }
@@ -574,5 +733,62 @@ mod tests {
         .unwrap_err();
         assert!(error.server_error().is_some());
         assert!(error.worker_error().unwrap().is_panic());
+    }
+
+    fn answering_worker(control: &WorkerControl, rebuilt: bool) -> JoinHandle<()> {
+        let control = control.clone();
+        let mut handled = control.requested();
+        let attachment = control.attach();
+        tokio::spawn(async move {
+            let _attachment = attachment;
+            loop {
+                control.wait_request(handled).await;
+                handled = control.requested();
+                control.acknowledge(handled, rebuilt);
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_restart_is_refused_without_a_worker_and_answered_by_one() {
+        let control = WorkerControl::new();
+        assert_eq!(
+            control.restart(std::time::Duration::from_secs(5)).await,
+            Err(RestartError::NotRunning)
+        );
+        assert_eq!(control.requested(), 0, "a refused restart is not counted");
+
+        let worker = answering_worker(&control, true);
+        assert!(control.is_attached());
+        for _ in 0..2 {
+            assert_eq!(
+                control.restart(std::time::Duration::from_secs(30)).await,
+                Ok(())
+            );
+        }
+        worker.abort();
+        let _ = worker.await;
+        assert!(!control.is_attached());
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_could_not_rebuild_is_reported_as_failed() {
+        let control = WorkerControl::new();
+        let worker = answering_worker(&control, false);
+        assert_eq!(
+            control.restart(std::time::Duration::from_secs(30)).await,
+            Err(RestartError::RebuildFailed)
+        );
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_never_answers_times_the_restart_out() {
+        let control = WorkerControl::new();
+        let _attachment = control.attach();
+        assert_eq!(
+            control.restart(std::time::Duration::from_millis(100)).await,
+            Err(RestartError::TimedOut)
+        );
     }
 }

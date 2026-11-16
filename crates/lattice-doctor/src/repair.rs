@@ -148,6 +148,47 @@ impl RepairPlan {
     }
 }
 
+/// Why a proposed plan cannot be executed by this build. Machine-readable
+/// (snake_case on the wire); [`UnavailableReason::detail`] is the owner-facing
+/// sentence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableReason {
+    /// The plan is advice (physical or observation-only); there is nothing
+    /// to execute.
+    GuidanceOnly,
+    /// Needs a privileged change to the operating system's network
+    /// configuration, which the service does not make.
+    NeedsOsNetworkChange,
+    /// Needs a router management API that does not exist in this build.
+    NeedsRouterApi,
+    /// The action exists in the contract but this build has no hook for it.
+    NotWired,
+    /// The action needs the discovery worker, which is not running.
+    WorkerNotRunning,
+}
+
+impl UnavailableReason {
+    /// One owner-facing sentence naming what is missing.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::GuidanceOnly => "this is guidance, not a change NeonHearth can make",
+            Self::NeedsOsNetworkChange => {
+                "changing the operating system's network settings needs administrator rights \
+                 that NeonHearth does not hold"
+            }
+            Self::NeedsRouterApi => {
+                "NeonHearth has no way to manage this router; the change must be made on the \
+                 router itself"
+            }
+            Self::NotWired => "this build of NeonHearth has no way to perform this repair",
+            Self::WorkerNotRunning => {
+                "the discovery worker is not running, so it cannot be restarted"
+            }
+        }
+    }
+}
+
 /// Facts about the environment the classifier needs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RepairContext {
