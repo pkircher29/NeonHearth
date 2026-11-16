@@ -97,8 +97,9 @@ not log files.
 
 ## Not yet available
 
-- The Network Doctor (guided diagnostics and repairs) — no automated
-  diagnosis or repair exists in this build; this page is the manual.
+- Automatic Network Doctor repairs — the Doctor measures and proposes plans
+  (see [Network Doctor](network-doctor.md)) but this build cannot change your
+  network settings for you; this page is the manual.
 - Automatic UI pairing (see above).
 - In-app surfacing of the degraded/no-interface state beyond the collector
   status and service status events.

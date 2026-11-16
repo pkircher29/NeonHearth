@@ -8,12 +8,13 @@
 //! [`DoctorApproval`]) and never reshapes the domain types.
 //!
 //! The engine and executor stay transport-injected. The production
-//! [`ServiceProbeTransport`] / [`ServiceRepairTransport`] answer only what the
-//! service can honestly observe or do locally without new privileges;
-//! everything else returns a typed unsupported/unavailable error so the
-//! engine's skip/confidence semantics label the gap instead of guessing. Tests
-//! (and a future privileged collector) inject richer transports through
-//! [`DoctorState::with_parts`].
+//! [`ServiceProbeTransport`] answers the collector probe from service state
+//! and every network probe from the operating system through
+//! [`probes::HostProbeTransport`]; a probe the platform cannot measure returns
+//! a typed unsupported error so the engine's skip/confidence semantics label
+//! the gap instead of guessing. The production [`ServiceRepairTransport`]
+//! still answers only what the service can honestly do locally. Tests inject
+//! other transports through [`DoctorState::with_parts`].
 
 use axum::{
     Extension, Json, Router,
@@ -53,6 +54,8 @@ use crate::{
     AppState,
     auth::{Authorized, Principal},
 };
+
+pub mod probes;
 
 /// How long a minted approval stays live (contract: 10 minutes, single-use).
 const APPROVAL_TTL_MINUTES: i64 = 10;
@@ -225,8 +228,12 @@ impl DoctorSettings {
     pub fn from_platform() -> Self {
         let route = platform_default_route();
         Self {
+            // A platform name the settings alphabet refuses (a Windows adapter
+            // such as "Ethernet 2") stays "primary": the probes resolve it to
+            // the interface that owns the default route.
             interface: route
                 .as_ref()
+                .filter(|route| valid_name(&route.0))
                 .map_or_else(|| "primary".to_owned(), |route| route.0.clone()),
             gateway_source: if route.is_some() {
                 TargetSource::Platform
@@ -387,7 +394,11 @@ fn platform_default_route() -> Option<(String, String)> {
             .ok()
             .and_then(|table| parse_proc_net_route(&table))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        probes::system_default_gateway()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         None
     }
@@ -401,7 +412,13 @@ fn platform_resolvers() -> Vec<String> {
             .map(|text| parse_resolv_conf(&text))
             .unwrap_or_default()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let mut resolvers = probes::system_resolvers();
+        resolvers.truncate(MAX_RESOLVERS);
+        resolvers
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         Vec::new()
     }
@@ -615,14 +632,18 @@ impl Clock for SharedClock {
 // Production transports: only honestly-observable local answers.
 // ---------------------------------------------------------------------------
 
-/// Probe transport backed exclusively by service-local state.
+/// Production probe transport.
 ///
 /// `CollectorStatus` is answered from the service runtime status; every
-/// network probe reports [`ProbeError::Unsupported`] so the engine labels
-/// downstream checks as unassessed instead of receiving fabricated data. A
-/// privileged transport can replace this behind [`DynProbeTransport`].
+/// network probe goes to the operating system through
+/// [`probes::HostProbeTransport`], which returns a measurement, a transport
+/// error, or [`ProbeError::Unsupported`] where the platform cannot measure it
+/// (the engine then labels the check unavailable instead of receiving
+/// fabricated data). Consent and target policy are applied in front of this
+/// transport by `GatedProbes`.
 pub struct ServiceProbeTransport {
     state: AppState,
+    host: probes::HostProbeTransport,
 }
 
 impl ProbeTransport for ServiceProbeTransport {
@@ -641,7 +662,7 @@ impl ProbeTransport for ServiceProbeTransport {
                     worker_running: true,
                 })
             }
-            _ => Err(ProbeError::Unsupported),
+            _ => self.host.probe(probe).await,
         }
     }
 }
@@ -741,6 +762,9 @@ struct DoctorInner {
     approvals: HashMap<String, ApprovalRecord>,
 }
 
+/// Reads the host's own hardware addresses.
+type LocalMacs = Arc<dyn Fn() -> Vec<MacAddr> + Send + Sync>;
+
 struct DoctorShared {
     budget: DiagnosticBudget,
     profile: ProbeProfile,
@@ -752,6 +776,10 @@ struct DoctorShared {
     repairs: Arc<dyn DynRepairTransport>,
     /// How long a repair is given to take effect before it is judged.
     settle: SettlePolicy,
+    /// Reads this host's own hardware addresses for the duplicate-address
+    /// check, so the host is never reported as its own rival. `None` when the
+    /// transport is injected (tests): the engine then allows one responder.
+    local_macs: Option<LocalMacs>,
     /// One diagnostic or repair at a time (contract: concurrent runs get
     /// 409; repairs share the flag so a repair never interleaves with a run
     /// or another repair's snapshot/apply/restore).
@@ -777,6 +805,7 @@ impl DoctorState {
         let budget = DiagnosticBudget::new(64, 2_000).expect("default budget is valid");
         let probes: Arc<dyn DynProbeTransport> = Arc::new(ServiceProbeTransport {
             state: state.clone(),
+            host: probes::HostProbeTransport::system(),
         });
         let repairs: Arc<dyn DynRepairTransport> = Arc::new(ServiceRepairTransport {
             state: state.clone(),
@@ -793,6 +822,7 @@ impl DoctorState {
             repairs,
         )
         .expect("default doctor configuration is valid")
+        .with_local_macs(Arc::new(probes::system_local_macs))
     }
 
     /// Assemble a doctor with injected config, clock, and transports — the
@@ -850,6 +880,7 @@ impl DoctorState {
                 probes,
                 repairs,
                 settle: SettlePolicy::PerAction,
+                local_macs: None,
                 running: AtomicBool::new(false),
                 inner: tokio::sync::Mutex::new(DoctorInner::default()),
             }),
@@ -864,6 +895,16 @@ impl DoctorState {
         Arc::get_mut(&mut self.shared)
             .expect("doctor state is not yet shared")
             .settle = settle;
+        self
+    }
+
+    /// Supplies the host's own hardware addresses to each diagnostic run.
+    /// Call before the state is shared.
+    #[must_use]
+    fn with_local_macs(mut self, read: LocalMacs) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("doctor state is not yet shared")
+            .local_macs = Some(read);
         self
     }
 
@@ -943,6 +984,10 @@ pub(crate) async fn run_route(
         SharedClock(Arc::clone(&shared.clock)),
     ) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let engine = match &shared.local_macs {
+        Some(read) => engine.with_local_macs(read()),
+        None => engine,
     };
     let gated = GatedProbes {
         inner: shared.probes.as_ref(),
@@ -1667,5 +1712,95 @@ nameserver fe80::1%eth0\nnameserver not-an-ip\noptions edns0\n";
                 .await
         ));
         assert_eq!(inner.0.lock().unwrap().len(), 3);
+    }
+
+    /// The consent rule lives in `GatedProbes` alone: with the real host
+    /// transport behind it and a fake OS under that, nothing outside the
+    /// private network is dialed, queried or pinged until the owner confirms.
+    #[tokio::test]
+    async fn external_targets_reach_the_host_only_with_the_owners_consent() {
+        let host = Arc::new(probes::testing::ScriptedHost::default());
+        let transport = probes::HostProbeTransport::new(host.clone());
+        let external = || {
+            [
+                ProbeRequest::ReachIp {
+                    address: "1.1.1.1".to_owned(),
+                    port: 443,
+                },
+                ProbeRequest::DnsQuery {
+                    resolver: "9.9.9.9".to_owned(),
+                    name: "example.com".to_owned(),
+                },
+                ProbeRequest::Ping {
+                    target: "1.1.1.1".to_owned(),
+                    payload_bytes: 1400,
+                    dont_fragment: true,
+                },
+            ]
+        };
+
+        let unconfirmed = GatedProbes {
+            inner: &transport,
+            allow_external: false,
+        };
+        for request in external() {
+            assert!(
+                matches!(
+                    unconfirmed.probe(probe(request.clone())).await,
+                    Err(ProbeError::Transport(_))
+                ),
+                "{request:?} must be refused without consent"
+            );
+        }
+        assert!(host.dials.lock().unwrap().is_empty());
+        assert!(host.exchanges.lock().unwrap().is_empty());
+        assert!(host.echoes.lock().unwrap().is_empty());
+
+        // Private targets need no consent.
+        assert!(matches!(
+            unconfirmed
+                .probe(probe(ProbeRequest::Ping {
+                    target: "192.168.1.1".to_owned(),
+                    payload_bytes: 56,
+                    dont_fragment: false,
+                }))
+                .await,
+            Ok(ProbeResponse::PingReply { .. })
+        ));
+        assert_eq!(host.echoes.lock().unwrap().len(), 1);
+
+        let confirmed = GatedProbes {
+            inner: &transport,
+            allow_external: true,
+        };
+        for request in external() {
+            assert!(
+                confirmed.probe(probe(request.clone())).await.is_ok(),
+                "{request:?} must reach the host once confirmed"
+            );
+        }
+        assert_eq!(
+            host.dials.lock().unwrap().clone(),
+            vec!["1.1.1.1:443".parse::<std::net::SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            host.exchanges.lock().unwrap().clone(),
+            vec!["9.9.9.9:53".parse::<std::net::SocketAddr>().unwrap()]
+        );
+        assert_eq!(host.echoes.lock().unwrap().len(), 2);
+
+        // The unconfigured placeholder is never dialed, consent or not.
+        let before = host.echoes.lock().unwrap().len();
+        assert!(matches!(
+            confirmed
+                .probe(probe(ProbeRequest::Ping {
+                    target: UNCONFIGURED_TARGET.to_owned(),
+                    payload_bytes: 56,
+                    dont_fragment: false,
+                }))
+                .await,
+            Err(ProbeError::Transport(_))
+        ));
+        assert_eq!(host.echoes.lock().unwrap().len(), before);
     }
 }

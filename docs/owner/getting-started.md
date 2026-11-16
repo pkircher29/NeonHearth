@@ -156,7 +156,7 @@ is working views:
 
 - **Home** — draw your home and see devices on a 3D plan; see
   [Home Twin](home-twin.md).
-- **Doctor** — runs diagnostics; see the Doctor section of the guide.
+- **Doctor** — runs diagnostics; see [Network Doctor](network-doctor.md).
 - **History** — the audit log of approvals, scans, enforcement and repairs,
   with a check that the log's hash chain is intact.
 - **Settings** — your sign-in session, appearance, phone pairing and

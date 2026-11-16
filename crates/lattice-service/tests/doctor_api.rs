@@ -1474,33 +1474,34 @@ async fn a_failed_settings_audit_leaves_the_settings_untouched_and_unsafe_interf
 }
 
 // ---------------------------------------------------------------------------
-// Production transport shape: only the collector probe is answerable.
+// Production transport: real host probes, honest about what it cannot measure.
 // ---------------------------------------------------------------------------
 
+/// The production transport talks to the machine the test runs on, so only
+/// facts that hold on every machine are asserted: the collector passes, the
+/// run finishes, nothing is reported `failed` merely because a probe was
+/// unsupported, and the checks no platform can measure never pass or fail.
 #[tokio::test]
-async fn the_production_probe_transport_reports_network_checks_as_unavailable_not_failed() {
+async fn the_production_probe_transport_measures_the_host_and_never_fails_a_check_as_unsupported() {
     let pool = connect_memory().await.unwrap();
     let state = AppState::new(TOKEN, M2StateRepository::new(pool)).unwrap();
     let doctor = DoctorState::for_service(&state);
     let router = app_with_doctor(state, doctor);
 
+    let started = std::time::Instant::now();
     let run = run_doctor(&router).await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(120),
+        "the run must finish within a generous bound: {:?}",
+        started.elapsed()
+    );
 
     assert_eq!(check(&run, "collector_health")["status"]["state"], "passed");
-    assert_eq!(
-        check(&run, "adapter_link")["status"],
-        serde_json::json!({ "state": "skipped", "because": { "reason": "probe_unsupported" } }),
-        "{run}"
-    );
-    assert_eq!(
-        check(&run, "address_dhcp")["status"],
-        serde_json::json!({
-            "state": "skipped",
-            "because": { "reason": "dependency_unavailable", "dependency": "adapter_link" }
-        }),
-        "{run}"
-    );
+    let report: DiagnosticReport = serde_json::from_value(run["report"].clone()).unwrap();
+    assert_eq!(report.checks.len(), 12);
     for kind in [
+        "adapter_link",
+        "address_dhcp",
         "duplicate_ip",
         "wifi_quality",
         "gateway",
@@ -1511,17 +1512,33 @@ async fn the_production_probe_transport_reports_network_checks_as_unavailable_no
         "route_vpn",
         "internet_reachability",
     ] {
-        let status = &check(&run, kind)["status"];
-        assert_eq!(status["state"], "skipped", "{kind}: {run}");
-        assert_eq!(
-            status["because"]["reason"], "dependency_unavailable",
+        let result = check(&run, kind);
+        let state = result["status"]["state"].as_str().unwrap_or_default();
+        assert!(
+            matches!(state, "passed" | "failed" | "skipped"),
             "{kind}: {run}"
         );
+        // A failed check is a real measurement or a real probe error; an
+        // unsupported probe is labelled unavailable, never failed.
+        if state == "failed" {
+            let error = result["detail"]["error"].as_str().unwrap_or_default();
+            assert!(
+                !error.contains("unsupported"),
+                "{kind} failed on an unsupported probe: {run}"
+            );
+        }
     }
-    // An unsupported probe is not a fault: no finding, least of all a
-    // "diagnostic probe failure".
-    assert_eq!(run["findings"], serde_json::json!([]), "{run}");
-    // The report still deserializes into the domain types.
-    let report: DiagnosticReport = serde_json::from_value(run["report"].clone()).unwrap();
-    assert_eq!(report.checks.len(), 12);
+    // Router health has no probe on any platform, so it is never assessed:
+    // skipped as unavailable, or skipped behind a failed gateway.
+    assert_eq!(
+        check(&run, "router_health")["status"]["state"],
+        "skipped",
+        "{run}"
+    );
+    // Findings may exist (a CI machine has whatever network it has), but none
+    // may be a probe failure that blames an unsupported probe.
+    for finding in run["findings"].as_array().unwrap() {
+        let text = finding["diagnosis"].to_string();
+        assert!(!text.contains("unsupported"), "{text}");
+    }
 }
