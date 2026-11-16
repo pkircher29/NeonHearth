@@ -744,7 +744,11 @@ async fn withheld_consent_skips_the_outside_checks_without_a_finding() {
     let report = engine_with(64).run(&transport).await;
 
     for kind in [CheckKind::Mtu, CheckKind::InternetReachability] {
-        assert_eq!(report.check(kind).unwrap().status, consent_skip(), "{kind:?}");
+        assert_eq!(
+            report.check(kind).unwrap().status,
+            consent_skip(),
+            "{kind:?}"
+        );
     }
     // One configured resolver is on the home network and answered; the public
     // ones were not asked. DNS passes on what could be checked.
@@ -857,7 +861,10 @@ async fn only_the_independent_resolver_askable_decides_dns() {
     )
     .unwrap();
     let report = engine.run(&FakeProbeTransport::new(consent_gated)).await;
-    assert_eq!(report.check(CheckKind::Dns).unwrap().status, CheckStatus::Passed);
+    assert_eq!(
+        report.check(CheckKind::Dns).unwrap().status,
+        CheckStatus::Passed
+    );
 
     // If that one resolver fails, there is a measured failure to report.
     let failing = FakeProbeTransport::new(|request| match request {
@@ -875,7 +882,10 @@ async fn only_the_independent_resolver_askable_decides_dns() {
     )
     .unwrap();
     let report = engine.run(&failing).await;
-    assert_eq!(report.check(CheckKind::Dns).unwrap().status, CheckStatus::Failed);
+    assert_eq!(
+        report.check(CheckKind::Dns).unwrap().status,
+        CheckStatus::Failed
+    );
 }
 
 #[test]

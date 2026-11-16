@@ -221,9 +221,15 @@ pub struct ResolverEvidence {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
 pub enum ResolverOutcome {
-    Answered { latency_ms: f64 },
-    Failed { reason: DnsFailureReason },
-    Unavailable { error: String },
+    Answered {
+        latency_ms: f64,
+    },
+    Failed {
+        reason: DnsFailureReason,
+    },
+    Unavailable {
+        error: String,
+    },
     /// Not queried: the owner has not allowed probes outside the home
     /// network. Not a failure of this resolver.
     ConsentRequired,

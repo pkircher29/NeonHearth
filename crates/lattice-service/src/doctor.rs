@@ -91,11 +91,7 @@ pub struct DoctorFinding {
 }
 
 impl DoctorFinding {
-    fn assess(
-        diagnosis: Diagnosis,
-        plan: RepairPlan,
-        transport: &dyn DynRepairTransport,
-    ) -> Self {
+    fn assess(diagnosis: Diagnosis, plan: RepairPlan, transport: &dyn DynRepairTransport) -> Self {
         let mut finding = Self {
             diagnosis,
             plan,
@@ -2085,7 +2081,11 @@ nameserver fe80::1%eth0\nnameserver not-an-ip\noptions edns0\n";
             ),
         ];
         for (plan, reason) in cases {
-            assert_eq!(transport.unavailable_reason(&plan), Some(reason), "{plan:?}");
+            assert_eq!(
+                transport.unavailable_reason(&plan),
+                Some(reason),
+                "{plan:?}"
+            );
         }
         // And `apply` still refuses them if a caller bypasses the gate.
         let bypass = ExecutableRepair::Safe {

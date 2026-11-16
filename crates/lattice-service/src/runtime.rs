@@ -121,9 +121,10 @@ impl WorkerControl {
     /// Worker side: reports that the request numbered `generation` was
     /// handled and whether the capture was rebuilt.
     pub fn acknowledge(&self, generation: u64, rebuilt: bool) {
-        self.inner
-            .ack
-            .send_replace(RestartAck { generation, rebuilt });
+        self.inner.ack.send_replace(RestartAck {
+            generation,
+            rebuilt,
+        });
     }
 
     /// Doctor side: asks the worker to rebuild and waits (bounded) for its
