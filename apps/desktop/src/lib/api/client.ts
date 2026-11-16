@@ -1,4 +1,4 @@
-import type { Bandwidth, BandwidthFrame, CameraDetail, ClockStatus, CameraHealth, CameraInventoryProjection, CameraList, CameraMediaStatus, CameraSessionResponse, DeviceSnapshot, EnforcementStatus, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
+import type { AddCameraInput, AddedCamera, Bandwidth, BandwidthFrame, CameraDetail, ClockStatus, CameraHealth, CameraInventoryProjection, CameraList, CameraMediaStatus, CameraSessionResponse, DeviceSnapshot, EnforcementStatus, Evidence, EventTicket, Health, Identity, PolicyChanged, PolicyEvaluation, PolicyProjection, Presence, ServerMessage, Snapshot } from './types';
 
 type ConnectionState = 'open' | 'closed' | 'error';
 
@@ -9,11 +9,35 @@ export type { AuthSource } from './http';
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number) {
+  /** The service's short error code (for example `sign_in_refused`) when the reply carried one. */
+  readonly code: string | null;
+  /** Machine-readable reason accompanying `video_unavailable`. */
+  readonly reason: string | null;
+  /** Plain-words detail accompanying `video_unavailable`. */
+  readonly detail: string | null;
+  constructor(status: number, code: string | null = null, reason: string | null = null, detail: string | null = null) {
     super(`Request failed with status ${status}`);
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
+    this.reason = reason;
+    this.detail = detail;
   }
+}
+
+/** Builds an ApiError from a failed reply, keeping only the bounded error code and the media reason/detail. */
+async function apiErrorFrom(response: Response): Promise<ApiError> {
+  let code: string | null = null; let reason: string | null = null; let detail: string | null = null;
+  try {
+    const body: unknown = await response.json();
+    if (typeof body === 'object' && body !== null) {
+      const record = body as Record<string, unknown>;
+      if (typeof record.error === 'string' && /^[a-z_]{1,64}$/.test(record.error)) code = record.error;
+      if (typeof record.reason === 'string' && /^[a-z_]{1,64}$/.test(record.reason)) reason = record.reason;
+      if (typeof record.detail === 'string') detail = record.detail.slice(0, 1024);
+    }
+  } catch { /* A reply without a readable body is just its status. */ }
+  return new ApiError(response.status, code, reason, detail);
 }
 
 export interface ApiClientOptions {
@@ -311,6 +335,10 @@ export interface ApiClient {
   startCameraSession(id: string, streamId: string): Promise<CameraSessionResponse>;
   closeCameraSession(sessionId: string): Promise<void>;
   authorizeCameraMediaXhr(xhr: XMLHttpRequest, url: string): void;
+  /** Owner only. Adds a camera at a private address on this network; the service checks the address, signs in over ONVIF and stores the password in its credential store. */
+  addCamera(input: AddCameraInput): Promise<AddedCamera>;
+  /** Owner only. Closes the camera's live views, withdraws its approval and deletes its stored password and streams. */
+  removeCamera(id: string): Promise<void>;
   /** Whether camera media runs on this machine and why not; null when the service predates the route or the reply is unreadable. */
   cameraMedia(): Promise<CameraMediaStatus | null>;
   policyAction(deviceId: string, action: OwnerActionInput): Promise<PolicyActionResult>;
@@ -849,6 +877,25 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
       };
     } catch { return null; }
   }
+  async function addCamera(input: AddCameraInput): Promise<AddedCamera> {
+    const encoder = new TextEncoder();
+    if (input.address.trim().length === 0 || input.address.length > 64 || input.username.length === 0 || encoder.encode(input.username).length > 128 || input.password.length === 0 || encoder.encode(input.password).length > 256
+      || (input.name !== undefined && [...input.name].length > 64) || (input.onvif_port !== undefined && (!Number.isInteger(input.onvif_port) || input.onvif_port < 1 || input.onvif_port > 65535))) throw new Error('Invalid camera request');
+    const body: Record<string, unknown> = { address: input.address.trim(), username: input.username, password: input.password };
+    if (input.name !== undefined && input.name.trim().length > 0) body.name = input.name.trim();
+    if (input.onvif_port !== undefined) body.onvif_port = input.onvif_port;
+    if (input.allow_basic === true) body.allow_basic = true;
+    const response = await send('/api/v1/cameras', authorized('POST', body));
+    if (!response.ok) throw await apiErrorFrom(response);
+    const v: unknown = await response.json();
+    if (!isRecord(v) || !exact(v, ['camera_id', 'name', 'streams']) || !isOpaqueId(v.camera_id) || (v.name !== null && typeof v.name !== 'string') || !Array.isArray(v.streams) || v.streams.length > 64 || !v.streams.every(isCameraStream)) throw new Error('Invalid camera response');
+    return v as unknown as AddedCamera;
+  }
+  async function removeCamera(id: string): Promise<void> {
+    if (!isOpaqueId(id)) throw new Error('Invalid camera id');
+    const response = await send(`/api/v1/cameras/${id}`, authorized('DELETE'));
+    if (!response.ok) throw await apiErrorFrom(response);
+  }
   async function closeCameraSession(sessionId: string): Promise<void> { if(!isSessionId(sessionId))throw new Error('Invalid camera session id'); const response=await send(`/api/v1/camera-sessions/${sessionId}`,authorized('DELETE')); if(!response.ok)throw new ApiError(response.status); }
   async function acknowledgeClock(): Promise<ClockStatus> {
     const value = await request('/api/v1/clock/acknowledge', authorized('POST'));
@@ -988,5 +1035,5 @@ export function createApiClient({ baseUrl, serviceToken, auth, fetchImpl, WebSoc
     return { expires_at: value.expires_at };
   }
 
-  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, cameraMedia, policyAction, acknowledgeClock, doctorRun, doctorReport, doctorApprove, doctorRepair, auditPage, auditVerify, doctorSettings, updateDoctorSettings, remoteStatus, remoteServe, remoteSessions, revokePhoneSession, integrationTokens, mintIntegrationToken, revokeIntegrationToken, pairPhone, stepUp };
+  return { health, snapshot, snapshotAll, issueEventTicket, openEvents, cameras, camera, cameraHealth, cameraInventory, cameraSnapshot, startCameraSession, closeCameraSession, authorizeCameraMediaXhr, addCamera, removeCamera, cameraMedia, policyAction, acknowledgeClock, doctorRun, doctorReport, doctorApprove, doctorRepair, auditPage, auditVerify, doctorSettings, updateDoctorSettings, remoteStatus, remoteServe, remoteSessions, revokePhoneSession, integrationTokens, mintIntegrationToken, revokeIntegrationToken, pairPhone, stepUp };
 }

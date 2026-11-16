@@ -1,5 +1,7 @@
 //! Authenticated camera media sessions and the credential-injecting RTSP loopback.
 
+pub mod onboarding;
+pub mod onvif_http;
 mod peer;
 pub mod production;
 
@@ -842,6 +844,34 @@ impl CameraSessionManager {
                 .await;
         }
         Ok(())
+    }
+
+    /// Closes every live session of one camera (its media process, loopback
+    /// proxy and temporary files) and returns how many there were. Used when a
+    /// camera is removed.
+    pub async fn close_camera_sessions(&self, camera: CameraId) -> usize {
+        let closing = {
+            let mut sessions = self.sessions.lock().await;
+            let ids: Vec<HlsSessionId> = sessions
+                .iter()
+                .filter(|(_, value)| value.camera == camera)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| sessions.remove(&id).map(|value| (id, value)))
+                .collect::<Vec<_>>()
+        };
+        let count = closing.len();
+        let handles: Vec<_> = closing
+            .into_iter()
+            .map(|(session, value)| {
+                self.spawn_cleanup(session, CleanupResources::from_session(value), 0)
+            })
+            .collect();
+        for handle in handles {
+            let _ = handle.await;
+        }
+        count
     }
 
     pub async fn shutdown(&self) -> Result<(), CameraSessionError> {

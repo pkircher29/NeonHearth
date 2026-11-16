@@ -2,22 +2,21 @@
 //!
 //! [`build`] assembles the real implementations (the OS vault, the production
 //! ffmpeg launcher with its cleared environment and argument whitelist, the
-//! interface-pinned RTSP connector, the guarded target registry, and the
-//! startup-swept output root) into one [`CameraSessionManager`]. Every
-//! prerequisite that can be absent on a given machine is checked first and
-//! reported as a specific reason instead of a generic failure; none of them can
-//! fail the rest of the service.
-//!
-//! What this does NOT provide: a way to add a camera. See
-//! [`CameraMediaStatus::setup_detail`].
+//! interface-pinned RTSP connector, the stored-approval target registry, and the
+//! startup-swept output root) into one [`CameraSessionManager`], together with
+//! the [`CameraOnboarding`] that adds and removes cameras. Every prerequisite
+//! that can be absent on a given machine is checked first and reported as a
+//! specific reason instead of a generic failure; none of them can fail the rest
+//! of the service.
 
 use super::{
-    CameraSessionConfig, CameraSessionManager, GuardedCameraTargetRegistry,
-    SystemAuthorizedRtspConnector,
+    CameraSessionConfig, CameraSessionManager, SystemAuthorizedRtspConnector,
+    onboarding::{
+        CameraOnboarding, CameraTargetBook, InterfaceSource, SystemInterfaces, SystemOnvifConnector,
+    },
 };
 use crate::vault::{Vault, VaultBackend, platform_vault};
 use lattice_camera::{FFMPEG_ENV, ProductionMediaProcessFactory, ffmpeg_executable};
-use lattice_sensor::{InterfaceInventory, TargetGuard};
 use lattice_store::CameraRepository;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -52,7 +51,9 @@ pub const OUTPUT_DIR_NAME: &str = "camera-media";
 /// The OS keyring can hang on a missing session bus; startup must not.
 const VAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
-const SETUP_UNAVAILABLE: &str = "No camera can be added yet. This build shows and streams a camera that is already registered, but it has no way to register one: there is no screen or route for entering a camera's address and password, approving it as a stream target, or reading its ONVIF profiles. Until that exists, live view and snapshots have nothing to show.";
+const SETUP_NEEDS_MEDIA: &str = "A camera cannot be added while video support is off on this machine. Fix the problem above first; adding a camera needs the same pieces as watching one.";
+const SETUP_NOT_WIRED: &str =
+    "This service process was started without the part that adds cameras.";
 
 /// What the owner needs to know about camera media on this machine. Served by
 /// `GET /api/v1/camera-media` and embedded (as `reason` and `detail`) in the
@@ -65,9 +66,10 @@ pub struct CameraMediaStatus {
     pub reason: &'static str,
     /// Plain-language explanation with what the owner can do about it.
     pub detail: String,
-    /// Whether this build can register a new camera.
+    /// Whether a camera can be added right now (true exactly when camera
+    /// media is running and the add-camera part was built with it).
     pub setup_available: bool,
-    /// Plain-language statement of the registration gap.
+    /// Plain-language reason a camera cannot be added; empty when it can.
     pub setup_detail: &'static str,
 }
 
@@ -83,7 +85,11 @@ impl CameraMediaStatus {
     /// A state whose session manager was supplied by the host (tests).
     #[must_use]
     pub fn injected() -> Self {
-        Self::ready("A camera session manager was supplied by the host process.")
+        Self {
+            setup_available: false,
+            setup_detail: SETUP_NOT_WIRED,
+            ..Self::ready("A camera session manager was supplied by the host process.")
+        }
     }
 
     #[must_use]
@@ -92,8 +98,8 @@ impl CameraMediaStatus {
             enabled: true,
             reason: REASON_READY,
             detail: detail.into(),
-            setup_available: false,
-            setup_detail: SETUP_UNAVAILABLE,
+            setup_available: true,
+            setup_detail: "",
         }
     }
 
@@ -104,16 +110,17 @@ impl CameraMediaStatus {
             reason,
             detail: detail.into(),
             setup_available: false,
-            setup_detail: SETUP_UNAVAILABLE,
+            setup_detail: SETUP_NEEDS_MEDIA,
         }
     }
 }
 
-/// The outcome of [`build`]: the manager when every prerequisite held, and in
-/// every case the status the routes report.
+/// The outcome of [`build`]: the manager and the add/remove part when every
+/// prerequisite held, and in every case the status the routes report.
 #[derive(Debug)]
 pub struct CameraMediaBuild {
     pub manager: Option<Arc<CameraSessionManager>>,
+    pub onboarding: Option<Arc<CameraOnboarding>>,
     pub status: CameraMediaStatus,
 }
 
@@ -121,6 +128,7 @@ impl CameraMediaBuild {
     fn disabled(status: CameraMediaStatus) -> Self {
         Self {
             manager: None,
+            onboarding: None,
             status,
         }
     }
@@ -187,21 +195,6 @@ pub fn check_prerequisites(environment: &CameraMediaEnvironment) -> Result<(), C
         }
     }
     Ok(())
-}
-
-/// The production target registry. No owner approval store for camera stream
-/// targets exists yet, so it is built over a guard that approves nothing:
-/// every registration and every lookup is refused, and a future approval
-/// mechanism has to supply approved prefixes explicitly. Loopback, unspecified
-/// and multicast targets are refused by the guard in every configuration.
-fn no_approved_targets() -> Option<GuardedCameraTargetRegistry> {
-    TargetGuard::new(
-        InterfaceInventory::new(Vec::new()),
-        std::iter::empty(),
-        std::iter::empty(),
-    )
-    .ok()
-    .map(GuardedCameraTargetRegistry::new)
 }
 
 async fn prepare_output_root(state_dir: &Path) -> Result<PathBuf, CameraMediaStatus> {
@@ -280,6 +273,27 @@ pub async fn assemble(
     vault_label: &str,
     state_dir: &Path,
 ) -> CameraMediaBuild {
+    assemble_with_interfaces(
+        environment,
+        pool,
+        vault,
+        vault_label,
+        state_dir,
+        Arc::new(SystemInterfaces),
+    )
+    .await
+}
+
+/// [`assemble`] over an explicit interface source (the seam tests use to give
+/// the target registry a fixed network).
+pub async fn assemble_with_interfaces(
+    environment: &CameraMediaEnvironment,
+    pool: SqlitePool,
+    vault: Arc<dyn Vault>,
+    vault_label: &str,
+    state_dir: &Path,
+    interfaces: Arc<dyn InterfaceSource>,
+) -> CameraMediaBuild {
     if let Err(status) = check_prerequisites(environment) {
         return CameraMediaBuild::disabled(status);
     }
@@ -287,29 +301,57 @@ pub async fn assemble(
         Ok(root) => root,
         Err(status) => return CameraMediaBuild::disabled(status),
     };
-    let Some(registry) = no_approved_targets() else {
-        return CameraMediaBuild::disabled(CameraMediaStatus::disabled(
-            REASON_REGISTRY_UNAVAILABLE,
-            "The camera target registry could not be constructed.",
-        ));
-    };
+    assemble_with(environment, pool, vault, vault_label, root, interfaces).await
+}
+
+async fn assemble_with(
+    environment: &CameraMediaEnvironment,
+    pool: SqlitePool,
+    vault: Arc<dyn Vault>,
+    vault_label: &str,
+    root: PathBuf,
+    interfaces: Arc<dyn InterfaceSource>,
+) -> CameraMediaBuild {
+    // The registry is rebuilt from the owner's stored approvals. If they cannot
+    // be read, no camera is approved (fail closed) and the cause is logged.
+    let repository = CameraRepository::new(pool.clone());
+    let book = Arc::new(CameraTargetBook::new(interfaces.clone()));
+    match book.load(&repository).await {
+        Ok(count) => tracing::info!(count, "camera host approvals loaded"),
+        Err(error) => tracing::error!(
+            %error,
+            "camera host approvals could not be read; no camera will stream until they can"
+        ),
+    }
     let manager = CameraSessionManager::new(
-        CameraRepository::new(pool),
-        vault,
-        Arc::new(registry),
+        repository,
+        vault.clone(),
+        book.clone(),
         Arc::new(ProductionMediaProcessFactory),
         Arc::new(SystemAuthorizedRtspConnector),
         root.clone(),
         CameraSessionConfig::default(),
     );
     match manager {
-        Ok(manager) => CameraMediaBuild {
-            manager: Some(Arc::new(manager)),
-            status: CameraMediaStatus::ready(format!(
-                "ffmpeg found at {}; camera credentials are kept in {vault_label}.",
-                environment.ffmpeg.display()
-            )),
-        },
+        Ok(manager) => {
+            let manager = Arc::new(manager);
+            let onboarding = Arc::new(CameraOnboarding::new(
+                pool,
+                vault,
+                book,
+                manager.clone(),
+                interfaces,
+                Arc::new(SystemOnvifConnector),
+            ));
+            CameraMediaBuild {
+                manager: Some(manager),
+                onboarding: Some(onboarding),
+                status: CameraMediaStatus::ready(format!(
+                    "ffmpeg found at {}; camera credentials are kept in {vault_label}.",
+                    environment.ffmpeg.display()
+                )),
+            }
+        }
         Err(_) => CameraMediaBuild::disabled(CameraMediaStatus::disabled(
             REASON_OUTPUT_DIR_UNAVAILABLE,
             format!(
@@ -423,32 +465,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_production_registry_approves_nothing_and_refuses_loopback() {
-        let registry = no_approved_targets().unwrap();
+    async fn the_production_registry_starts_empty_and_refuses_loopback_even_if_a_row_says_otherwise()
+     {
+        use lattice_sensor::{Address, Interface, InterfaceClass, InterfaceId, InterfaceInventory};
+        let inventory = InterfaceInventory::new(vec![
+            Interface {
+                id: InterfaceId::new(1),
+                name: "lo".into(),
+                description: None,
+                up: true,
+                class: InterfaceClass::Loopback,
+                addresses: vec![Address {
+                    ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    prefix: 8,
+                }],
+                owner_role: None,
+            },
+            Interface {
+                id: InterfaceId::new(2),
+                name: "eth0".into(),
+                description: None,
+                up: true,
+                class: InterfaceClass::PhysicalWired,
+                addresses: vec![Address {
+                    ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                    prefix: 24,
+                }],
+                owner_role: None,
+            },
+        ]);
+        let book = CameraTargetBook::new(Arc::new(
+            crate::cameras::onboarding::FixedInterfaces::new(inventory),
+        ));
         let camera = CameraId::from_uuid(Uuid::from_u128(1));
         let stream = StreamId::from_uuid(Uuid::from_u128(2));
-        assert!(registry.authorized_binding(camera, stream).await.is_err());
-        for target in [
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+        assert!(book.authorized_binding(camera, stream).await.is_err());
+        // A tampered row naming a host that must never be approved.
+        for (interface, address) in [
+            ("lo", Ipv4Addr::LOCALHOST),
+            ("lo", Ipv4Addr::new(127, 0, 0, 2)),
+            ("eth0", Ipv4Addr::UNSPECIFIED),
+            ("eth0", Ipv4Addr::new(224, 0, 0, 251)),
+            ("eth0", Ipv4Addr::BROADCAST),
+            ("eth0", Ipv4Addr::new(192, 168, 1, 255)),
+            ("eth0", Ipv4Addr::new(192, 168, 1, 10)),
+            ("eth0", Ipv4Addr::new(8, 8, 8, 8)),
         ] {
+            book.register(&lattice_store::CameraTarget {
+                camera_id: camera,
+                interface: interface.to_owned(),
+                address,
+                onvif_port: 80,
+                rtsp_port: 554,
+                allow_basic: false,
+                approved_at: chrono::Utc::now(),
+                name: None,
+            })
+            .await;
             assert!(
-                registry
-                    .register(
-                        camera,
-                        stream,
-                        lattice_sensor::InterfaceId::new(1),
-                        target,
-                        554
-                    )
-                    .await
-                    .is_err(),
-                "{target} must not be registrable without an approved prefix"
+                book.authorized_binding(camera, stream).await.is_err(),
+                "{address} on {interface} must never be approved"
             );
         }
-        assert!(registry.authorized_binding(camera, stream).await.is_err());
     }
 
     #[tokio::test]
@@ -511,7 +589,9 @@ mod tests {
         assert!(outcome.manager.is_some(), "{:?}", outcome.status);
         assert!(outcome.status.enabled);
         assert_eq!(outcome.status.reason, REASON_READY);
-        assert!(!outcome.status.setup_available);
+        assert!(outcome.onboarding.is_some());
+        assert!(outcome.status.setup_available);
+        assert_eq!(outcome.status.setup_detail, "");
         assert!(!stale.exists(), "stale session output must be swept");
         assert!(unrelated.exists(), "only session output is swept");
     }

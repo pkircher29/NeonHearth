@@ -4,7 +4,7 @@ use lattice_camera::{
     CameraHealth, CameraId, CameraProfile, Confidence, OnvifHealth, StreamId, StreamSourceRef,
 };
 use sqlx::SqlitePool;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, net::Ipv4Addr};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -422,6 +422,234 @@ impl CameraRepository {
             .map_err(map_sqlx)?;
         Ok(result.rows_affected() == 1)
     }
+
+    /// Records the owner's approval of exactly one host for an existing camera.
+    pub async fn put_camera_target(&self, target: &CameraTarget) -> Result<(), CameraStoreError> {
+        validate_target(target)?;
+        let mut transaction = crate::begin_write(&self.pool).await.map_err(map_sqlx)?;
+        insert_target(&mut transaction, target).await?;
+        transaction.commit().await.map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    pub async fn load_camera_target(
+        &self,
+        camera_id: CameraId,
+    ) -> Result<Option<CameraTarget>, CameraStoreError> {
+        let row: Option<TargetRow> = sqlx::query_as(
+            "SELECT camera_id, interface, address, onvif_port, rtsp_port, allow_basic, approved_at, name \
+             FROM camera_targets WHERE camera_id = ?",
+        )
+        .bind(camera_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.map(decode_target).transpose()
+    }
+
+    pub async fn list_camera_targets(&self) -> Result<Vec<CameraTarget>, CameraStoreError> {
+        let rows: Vec<TargetRow> = sqlx::query_as(
+            "SELECT camera_id, interface, address, onvif_port, rtsp_port, allow_basic, approved_at, name \
+             FROM camera_targets ORDER BY camera_id LIMIT ?",
+        )
+        .bind(i64::try_from(MAX_CAMERA_TARGETS + 1).map_err(|_| CameraStoreError::Storage)?)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if rows.len() > MAX_CAMERA_TARGETS {
+            return Err(CameraStoreError::Corrupt);
+        }
+        rows.into_iter().map(decode_target).collect()
+    }
+
+    /// Withdraws the approval only, leaving the camera and its stream
+    /// references in place (used while a removal is still cleaning up).
+    pub async fn delete_camera_target(
+        &self,
+        camera_id: CameraId,
+    ) -> Result<bool, CameraStoreError> {
+        let mut transaction = crate::begin_write(&self.pool).await.map_err(map_sqlx)?;
+        let result = sqlx::query("DELETE FROM camera_targets WHERE camera_id = ?")
+            .bind(camera_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_sqlx)?;
+        transaction.commit().await.map_err(map_sqlx)?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Writes everything a newly added camera consists of in one transaction:
+    /// the camera, its inventory, its stream references and the owner's
+    /// approval of its host. Either all of it is stored or none of it is.
+    pub async fn insert_onboarded_camera(
+        &self,
+        camera: &CameraRecord,
+        inventory: &CameraInventoryRecord,
+        profiles: &[CameraProfile],
+        target: &CameraTarget,
+    ) -> Result<(), CameraStoreError> {
+        validate_target(target)?;
+        if target.camera_id != camera.id
+            || profiles.len() > MAX_STREAM_REFS
+            || inventory.capabilities.len() > MAX_CAPABILITIES
+        {
+            return Err(CameraStoreError::Invalid);
+        }
+        let observed_at = encode_time(camera.observed_at).ok_or(CameraStoreError::Invalid)?;
+        let mut transaction = crate::begin_write(&self.pool).await.map_err(map_sqlx)?;
+        sqlx::query(
+            "INSERT INTO cameras(camera_id, classification, confidence, health, observed_at) \
+             VALUES(?, ?, ?, ?, ?)",
+        )
+        .bind(camera.id.to_string())
+        .bind(classification_string(camera.classification))
+        .bind(f64::from(camera.confidence.get()))
+        .bind(camera_health_string(camera.health))
+        .bind(observed_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_sqlx)?;
+        sqlx::query(
+            "INSERT INTO camera_inventory(camera_id, manufacturer, model, firmware, serial, health) \
+             VALUES(?, ?, ?, ?, ?, ?)",
+        )
+        .bind(camera.id.to_string())
+        .bind(inventory.manufacturer.as_ref().map(BoundedMetadata::as_str))
+        .bind(inventory.model.as_ref().map(BoundedMetadata::as_str))
+        .bind(inventory.firmware.as_ref().map(BoundedMetadata::as_str))
+        .bind(inventory.serial.as_ref().map(BoundedSerial::as_str))
+        .bind(onvif_health_string(inventory.health))
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_sqlx)?;
+        for capability in &inventory.capabilities {
+            sqlx::query("INSERT INTO camera_capabilities(camera_id, capability) VALUES(?, ?)")
+                .bind(camera.id.to_string())
+                .bind(capability.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(map_sqlx)?;
+        }
+        for profile in profiles {
+            sqlx::query(
+                "INSERT INTO camera_stream_refs(camera_id, stream_id, source_ref) VALUES(?, ?, ?)",
+            )
+            .bind(camera.id.to_string())
+            .bind(profile.stream_id().to_string())
+            .bind(profile.source_ref().as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_sqlx)?;
+        }
+        insert_target(&mut transaction, target).await?;
+        transaction.commit().await.map_err(map_sqlx)?;
+        Ok(())
+    }
+}
+
+/// The most cameras that can hold an approved host at once.
+pub const MAX_CAMERA_TARGETS: usize = 64;
+const MAX_TARGET_NAME_CHARS: usize = 64;
+const MAX_TARGET_INTERFACE_CHARS: usize = 256;
+
+type TargetRow = (
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    String,
+    Option<String>,
+);
+
+/// The owner's approval of exactly one host for one camera.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CameraTarget {
+    pub camera_id: CameraId,
+    /// Name of the local interface the address was approved on.
+    pub interface: String,
+    pub address: Ipv4Addr,
+    pub onvif_port: u16,
+    pub rtsp_port: u16,
+    /// Whether the owner allowed the less secure RTSP Basic sign-in.
+    pub allow_basic: bool,
+    pub approved_at: DateTime<Utc>,
+    /// The owner's optional label for the camera.
+    pub name: Option<String>,
+}
+
+fn validate_target(target: &CameraTarget) -> Result<(), CameraStoreError> {
+    let interface_len = target.interface.chars().count();
+    let name_ok = target.name.as_ref().is_none_or(|name| {
+        (1..=MAX_TARGET_NAME_CHARS).contains(&name.chars().count())
+            && !name.chars().any(char::is_control)
+    });
+    if !(1..=MAX_TARGET_INTERFACE_CHARS).contains(&interface_len)
+        || target.interface.chars().any(char::is_control)
+        || target.onvif_port == 0
+        || target.rtsp_port == 0
+        || !name_ok
+    {
+        return Err(CameraStoreError::Invalid);
+    }
+    Ok(())
+}
+
+async fn insert_target(
+    transaction: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    target: &CameraTarget,
+) -> Result<(), CameraStoreError> {
+    let approved_at = encode_time(target.approved_at).ok_or(CameraStoreError::Invalid)?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM camera_targets")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(map_sqlx)?;
+    if count >= i64::try_from(MAX_CAMERA_TARGETS).map_err(|_| CameraStoreError::Storage)? {
+        return Err(CameraStoreError::Capacity);
+    }
+    sqlx::query(
+        "INSERT INTO camera_targets(camera_id, interface, address, onvif_port, rtsp_port, allow_basic, approved_at, name) \
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(target.camera_id.to_string())
+    .bind(&target.interface)
+    .bind(target.address.to_string())
+    .bind(i64::from(target.onvif_port))
+    .bind(i64::from(target.rtsp_port))
+    .bind(i64::from(target.allow_basic))
+    .bind(approved_at)
+    .bind(target.name.as_deref())
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(())
+}
+
+fn decode_target(
+    (raw_id, interface, address, onvif_port, rtsp_port, allow_basic, approved_at, name): TargetRow,
+) -> Result<CameraTarget, CameraStoreError> {
+    let parsed: Ipv4Addr = address.parse().map_err(|_| CameraStoreError::Corrupt)?;
+    // Only the canonical dotted form is ever written; anything else was edited.
+    if parsed.to_string() != address {
+        return Err(CameraStoreError::Corrupt);
+    }
+    let target = CameraTarget {
+        camera_id: decode_camera_id(&raw_id)?,
+        interface,
+        address: parsed,
+        onvif_port: u16::try_from(onvif_port).map_err(|_| CameraStoreError::Corrupt)?,
+        rtsp_port: u16::try_from(rtsp_port).map_err(|_| CameraStoreError::Corrupt)?,
+        allow_basic: match allow_basic {
+            0 => false,
+            1 => true,
+            _ => return Err(CameraStoreError::Corrupt),
+        },
+        approved_at: decode_time(&approved_at)?,
+        name,
+    };
+    validate_target(&target).map_err(|_| CameraStoreError::Corrupt)?;
+    Ok(target)
 }
 
 fn map_sqlx(error: sqlx::Error) -> CameraStoreError {

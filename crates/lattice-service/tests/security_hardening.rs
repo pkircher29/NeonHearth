@@ -405,6 +405,9 @@ fn expected(method: &str, path: &str) -> Verdict {
         | ("PUT" | "DELETE", "/api/v1/home/draft") => HighImpact,
         // Acknowledging a suspect clock re-enables deadline enforcement: owner bearer only.
         ("POST", "/api/v1/clock/acknowledge") => Denied,
+        // Adding a camera hands over its password and approves a host for it;
+        // removing one revokes it. Neither is ever a phone action.
+        ("POST", "/api/v1/cameras") | ("DELETE", "/api/v1/cameras/{id}") => Denied,
         _ => Denied,
     }
 }
@@ -485,6 +488,8 @@ async fn every_scanned_route_has_an_explicit_phone_verdict() {
     for (method, path) in [
         ("GET", "/api/v1/health"),
         ("GET", "/api/v1/cameras/{id}"),
+        ("POST", "/api/v1/cameras"),
+        ("DELETE", "/api/v1/cameras/{id}"),
         ("PUT", "/api/v1/home/plan"),
         ("POST", "/api/v1/doctor/repair"),
         ("POST", "/api/v1/events/ticket"),

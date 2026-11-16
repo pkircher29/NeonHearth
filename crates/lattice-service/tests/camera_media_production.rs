@@ -269,7 +269,9 @@ async fn a_ready_machine_serves_the_routes_and_still_refuses_unapproved_targets(
     assert_eq!(status, StatusCode::OK);
     assert_eq!(media["enabled"], true);
     assert_eq!(media["reason"], REASON_READY);
-    assert_eq!(media["setup_available"], false);
+    // Media is running, so a camera can be added.
+    assert_eq!(media["setup_available"], true);
+    assert_eq!(media["setup_detail"], "");
 
     // The routes are live: an unknown camera is a 404, not "media disabled".
     let unknown = "018f47a0-9b5c-4a22-8a33-112233445599";
