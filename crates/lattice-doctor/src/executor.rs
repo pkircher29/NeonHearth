@@ -10,7 +10,10 @@
 //! [`RepairEvent`] sequence suitable for persistence.
 
 use crate::check::{CheckKind, Measurement, Metric};
-use crate::repair::{ApprovalAction, ExecutableRepair, RepairClass, SafeAction, StateKey};
+use crate::repair::{
+    ApprovalAction, ExecutableRepair, RepairClass, RepairPlan, SafeAction, StateKey,
+    UnavailableReason,
+};
 use crate::{Clock, DoctorError, SystemClock};
 use serde::{Deserialize, Serialize};
 #[cfg(any(test, feature = "test-support"))]
@@ -47,6 +50,14 @@ pub struct StateEntry {
 
 /// Side-effect boundary for repairs. The executor never touches the system.
 pub trait RepairTransport: Send + Sync {
+    /// Whether this transport can really execute the action a plan proposes.
+    /// `None` means it can; `Some(reason)` means a caller must refuse the plan
+    /// up front, before any approval is minted or spent. Defaults to "can" so
+    /// transports that implement every action need not say so.
+    fn unavailable_reason(&self, _plan: &RepairPlan) -> Option<UnavailableReason> {
+        None
+    }
+
     fn snapshot(
         &self,
         keys: &[StateKey],
@@ -777,6 +788,7 @@ mod fake {
         restore_result: Mutex<Result<(), RepairTransportError>>,
         measurements: Mutex<VecDeque<Result<Vec<Measurement>, RepairTransportError>>>,
         calls: Mutex<Vec<TransportCall>>,
+        unavailable: Option<UnavailableReason>,
     }
 
     impl Default for FakeRepairTransport {
@@ -793,7 +805,14 @@ mod fake {
                 restore_result: Mutex::new(Ok(())),
                 measurements: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
+                unavailable: None,
             }
+        }
+
+        /// Makes the transport declare every plan unexecutable for `reason`.
+        pub fn with_unavailable(mut self, reason: UnavailableReason) -> Self {
+            self.unavailable = Some(reason);
+            self
         }
 
         pub fn with_snapshot(self, entries: Vec<StateEntry>) -> Self {
@@ -843,6 +862,10 @@ mod fake {
     }
 
     impl RepairTransport for FakeRepairTransport {
+        fn unavailable_reason(&self, _plan: &RepairPlan) -> Option<UnavailableReason> {
+            self.unavailable
+        }
+
         async fn snapshot(
             &self,
             _keys: &[StateKey],
