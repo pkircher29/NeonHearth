@@ -417,7 +417,9 @@ mod tests {
             .unwrap();
         log.append(entry("after.backup")).await.unwrap();
         // The service is stopped before a restore: no open handles remain.
+        drop(log);
         pool.close().await;
+        drop(pool);
 
         let report = restore_database(&paths, &backup).await.unwrap();
         assert!(report.reconcile_required);
