@@ -17,3 +17,12 @@ export function formatThroughput(bytesPerSecond: number | null | undefined): str
   const kilobits = megabits * 1000;
   return kilobits >= 1 ? `${Math.round(kilobits)} kbps` : '0 kbps';
 }
+
+/** What a router in the `connected` state is, in plain words (shared by the Pulse and Traffic cards). */
+export function routerConnectedCopy(devices: number | null | undefined): { headline: string; detail: string } {
+  const count = typeof devices === 'number' && Number.isFinite(devices) ? `${devices} ${devices === 1 ? 'device' : 'devices'}` : 'its connected devices';
+  return {
+    headline: 'Router connected, no internet speed yet',
+    detail: `The router is connected and reports ${count}. This router only sends internet speed totals while its own admin page is open and signed in, so the totals will appear then.`
+  };
+}
