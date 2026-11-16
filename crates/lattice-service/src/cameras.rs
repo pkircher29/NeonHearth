@@ -2239,9 +2239,19 @@ async fn run_listener(
                             return;
                         }
                     }
-                    match serve_connection(stream, token, upstream, binding, connector, limits, expires).await {
+                    let mut trace = ProxyTrace::default();
+                    match serve_connection(stream, token, upstream, binding, connector, limits, expires, &mut trace).await {
                         Ok(()) => tracing::debug!("rtsp proxy connection closed"),
-                        Err(error) => tracing::debug!(error = ?error, "rtsp proxy connection ended"),
+                        // Which RTSP method and stage, the camera's status code
+                        // and the rule that refused; never a URL, header or body.
+                        Err(error) => tracing::warn!(
+                            error = ?error,
+                            stage = trace.stage,
+                            method = %trace.method,
+                            upstream_status = ?trace.status,
+                            rule = trace.rule,
+                            "rtsp proxy connection ended"
+                        ),
                     }
                 });
             }
@@ -2287,6 +2297,17 @@ async fn reject_connection(mut stream: TcpStream, status: u16, reason: &str, lim
     let _ = stream.shutdown().await;
 }
 
+/// Where a proxy connection was when it ended, kept only for the log. Holds a
+/// whitelisted method name, a status code and fixed phrases.
+#[derive(Default)]
+struct ProxyTrace {
+    stage: &'static str,
+    method: String,
+    status: Option<u16>,
+    rule: &'static str,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     client: TcpStream,
     token: LoopbackSourceToken,
@@ -2295,6 +2316,7 @@ async fn serve_connection(
     connector: Arc<dyn AuthorizedRtspConnector>,
     limits: RtspProxyLimits,
     expires: Instant,
+    trace: &mut ProxyTrace,
 ) -> Result<(), RtspProxyError> {
     let local_port = client
         .local_addr()
@@ -2305,6 +2327,7 @@ async fn serve_connection(
     let mut upstream_write: Option<tokio::io::WriteHalf<Box<dyn RtspConnection>>> = None;
     let mut auth = ConnectionAuth::default();
     let mut control_map = ControlMap::new();
+    trace.stage = "waiting for the first request";
     loop {
         enum Incoming {
             Client(Option<u8>),
@@ -2329,8 +2352,14 @@ async fn serve_connection(
                 write_all(&mut client_write, &frame, limits.io_timeout, expires).await?;
                 continue;
             }
-            Incoming::Upstream(Some(_)) => return Err(RtspProxyError::Protocol),
-            Incoming::Upstream(None) => return Err(RtspProxyError::Unavailable),
+            Incoming::Upstream(Some(_)) => {
+                trace.rule = "the camera sent something that is neither a reply nor video";
+                return Err(RtspProxyError::Protocol);
+            }
+            Incoming::Upstream(None) => {
+                trace.rule = "the camera closed the connection";
+                return Err(RtspProxyError::Unavailable);
+            }
         };
         let Some(first) = first else { return Ok(()) };
         if first == b'$' {
@@ -2340,13 +2369,16 @@ async fn serve_connection(
             continue;
         }
         let request = read_message(&mut client_read, first, limits, expires).await?;
+        trace.stage = "reading the media process's request";
         let validated = match ValidatedRequest::parse(request, &token, local_port) {
             Ok(request) => request,
             Err(RequestRejection::Forbidden) => {
+                trace.rule = "request refused: not under this session's address (403)";
                 write_status(&mut client_write, 403, "Forbidden", limits, expires).await?;
                 return Ok(());
             }
             Err(RequestRejection::Method) => {
+                trace.rule = "request refused: method not allowed (405)";
                 write_status(
                     &mut client_write,
                     405,
@@ -2358,10 +2390,15 @@ async fn serve_connection(
                 return Ok(());
             }
             Err(RequestRejection::Invalid) => {
+                trace.rule = "request refused: malformed or unsafe request (400)";
                 write_status(&mut client_write, 400, "Bad Request", limits, expires).await?;
                 return Ok(());
             }
         };
+        trace.method.clear();
+        trace.method.push_str(&validated.method);
+        trace.status = None;
+        trace.stage = "connecting to the camera";
         if upstream_io.is_none() {
             let io = timeout_at(
                 expires.min(Instant::now() + limits.io_timeout),
@@ -2384,10 +2421,14 @@ async fn serve_connection(
             authorization.as_ref().map(|value| value.as_str()),
         )?);
         let writer = upstream_write.as_mut().ok_or(RtspProxyError::Unavailable)?;
+        trace.stage = "sending the request to the camera";
         write_all(writer, &outbound, limits.io_timeout, expires).await?;
         let reader = upstream_io.as_mut().ok_or(RtspProxyError::Unavailable)?;
+        trace.stage = "waiting for the camera's reply";
         let mut response =
             read_upstream_response(reader, &mut client_write, limits, expires).await?;
+        trace.status = response.status_code();
+        trace.stage = "relaying the camera's reply";
         if response.status_code() == Some(401)
             && let Some(answer) =
                 auth.answer(&response, &upstream, &validated.method, &upstream_uri)?
@@ -2395,14 +2436,17 @@ async fn serve_connection(
             outbound = Zeroizing::new(validated.to_upstream(&upstream_uri, Some(&answer))?);
             write_all(writer, &outbound, limits.io_timeout, expires).await?;
             response = read_upstream_response(reader, &mut client_write, limits, expires).await?;
+            trace.status = response.status_code();
         }
         let local_endpoint = format!("rtsp://127.0.0.1:{local_port}/source/{token}");
+        trace.rule = "the camera's reply was refused by the reply rules (headers, transport, SDP or addresses)";
         let sanitized = response.sanitize(
             upstream.uri.expose_secret(),
             &local_endpoint,
             limits.max_body_bytes,
             &mut control_map,
         )?;
+        trace.rule = "";
         write_all(&mut client_write, &sanitized, limits.io_timeout, expires).await?;
 
         // Drain a coalesced first frame promptly. Subsequent frames are handled by
@@ -2964,6 +3008,18 @@ fn upstream_target(
         return Ok(mapped.clone());
     }
     let mut url = Url::parse(base).map_err(|_| RtspProxyError::Protocol)?;
+    if url.query().is_some() {
+        // A base such as `rtsp://cam/stream?channel=1&subtype=0/` (Dahua-family
+        // cameras advertise exactly this as Content-Base) is extended after
+        // its query, as the camera itself wrote it: `...subtype=0/trackID=0`.
+        // Rebuilding it through the path would move the suffix in front of the
+        // query and name a resource the camera does not have. The suffix came
+        // from a validated URL path, so it holds no query, fragment or space.
+        if suffix.bytes().any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'?' | b'#')) {
+            return Err(RtspProxyError::Protocol);
+        }
+        return Ok(format!("{}{suffix}", url.as_str().trim_end_matches('/')));
+    }
     let path = format!("{}{suffix}", url.path().trim_end_matches('/'));
     url.set_path(&path);
     Ok(url.to_string())

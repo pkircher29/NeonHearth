@@ -1429,3 +1429,218 @@ async fn basic_challenge_is_refused_unless_the_camera_explicitly_allows_basic() 
     assert!(!all.contains("Authorization"));
     assert!(!all.contains(PASSWORD) && !text.contains(PASSWORD));
 }
+
+/// Sends one request on an open connection and returns the reply head and body.
+async fn exchange(client: &mut TcpStream, request: &str) -> (String, String) {
+    client.write_all(request.as_bytes()).await.unwrap();
+    let head = String::from_utf8(read_rtsp_head(client).await).unwrap();
+    let length: usize = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .map_or(0, |value| value.trim().parse().unwrap());
+    let mut body = vec![0_u8; length];
+    client.read_exact(&mut body).await.unwrap();
+    (head, String::from_utf8(body).unwrap())
+}
+
+/// The shape of a real Dahua-family camera's handshake (FLIR PE133F): RTSP
+/// authentication switched off so DESCRIBE is answered without a challenge, a
+/// Content-Base that is the stream URL with its query followed by `/`, controls
+/// that are `trackID=N` relative to it, and a second, metadata-only media
+/// section beside the video.
+#[tokio::test]
+async fn a_dahua_style_camera_without_a_challenge_and_a_query_base_streams_through_the_proxy() {
+    const STREAM: &str = "rtsp://192.168.4.22:8554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif";
+    let options = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nServer: Rtsp Server/3.0\r\nPublic: OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, RECORD, PAUSE, TEARDOWN, SET_PARAMETER, GET_PARAMETER\r\n\r\n".to_vec();
+    let sdp = "v=0\r\no=RTSP Session 0 0 IN IP4 0.0.0.0\r\ns=Media Server\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\na=control:*\r\na=packetization-supported:DH\r\na=range:npt=now-\r\nm=video 0 RTP/AVP 96\r\na=control:trackID=0\r\na=framerate:10.000000\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=64001E\r\na=recvonly\r\nm=application 0 RTP/AVP 107\r\na=control:trackID=4\r\na=rtpmap:107 vnd.onvif.metadata/90000\r\na=recvonly\r\n";
+    let describe = format!(
+        "RTSP/1.0 200 OK\r\nCSeq: 2\r\nx-Accept-Dynamic-Rate: 1\r\nContent-Base: {STREAM}/\r\nCache-Control: must-revalidate\r\nContent-Length: {}\r\nContent-Type: application/sdp\r\n\r\n{sdp}",
+        sdp.len()
+    )
+    .into_bytes();
+    let setup = |cseq: u32, interleaved: &str| {
+        format!(
+            "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: 4242;timeout=60\r\nTransport: RTP/AVP/TCP;unicast;interleaved={interleaved}\r\nx-Dynamic-Rate: 1\r\nContent-Length: 0\r\n\r\n"
+        )
+        .into_bytes()
+    };
+    let play = format!(
+        "RTSP/1.0 200 OK\r\nCSeq: 5\r\nSession: 4242\r\nRange: npt=0.000-\r\nRTP-Info: url={STREAM}/trackID=0;seq=1;rtptime=2\r\nContent-Length: 0\r\n\r\n"
+    )
+    .into_bytes();
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![
+        options,
+        describe,
+        setup(3, "0-1"),
+        setup(4, "2-3"),
+        play,
+    ]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!(
+            "rtsp://viewer:{PASSWORD}@192.168.4.22:8554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"
+        )),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+        ProxyConsumer::Process(std::process::id()),
+    )
+    .await
+    .unwrap();
+    let uri = proxy.endpoint();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+
+    let (head, _) = exchange(
+        &mut client,
+        &format!("OPTIONS {uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("RTSP/1.0 200"), "{head}");
+    assert!(head.contains("Public: OPTIONS, DESCRIBE"), "{head}");
+
+    let (head, body) = exchange(
+        &mut client,
+        &format!("DESCRIBE {uri} RTSP/1.0\r\nCSeq: 2\r\nAccept: application/sdp\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("RTSP/1.0 200"), "{head}");
+    assert!(head.contains(&format!("Content-Base: {uri}/")), "{head}");
+    // Unknown vendor headers are dropped, not fatal.
+    for dropped in ["x-Accept-Dynamic-Rate", "Cache-Control", "Server"] {
+        assert!(!head.contains(dropped), "{dropped} leaked: {head}");
+    }
+    assert!(body.contains(&format!("a=control:{uri}/trackID=0")), "{body}");
+    assert!(body.contains(&format!("a=control:{uri}/trackID=4")), "{body}");
+    assert!(body.contains("m=application 0 RTP/AVP 107"), "{body}");
+    assert!(body.contains("c=IN IP4 127.0.0.1"), "{body}");
+    assert!(body.contains("a=control:*"), "{body}");
+    assert!(!body.contains("192.168.4.22"), "{body}");
+
+    for (cseq, track, interleaved) in [(3, 0, "0-1"), (4, 4, "2-3")] {
+        let (head, _) = exchange(
+            &mut client,
+            &format!(
+                "SETUP {uri}/trackID={track} RTSP/1.0\r\nCSeq: {cseq}\r\nTransport: RTP/AVP/TCP;unicast;interleaved={interleaved}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(head.starts_with("RTSP/1.0 200"), "{head}");
+        assert!(head.contains("Session: 4242"), "{head}");
+    }
+    let (head, _) = exchange(
+        &mut client,
+        &format!("PLAY {uri} RTSP/1.0\r\nCSeq: 5\r\nSession: 4242\r\nRange: npt=0.000-\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("RTSP/1.0 200"), "{head}");
+    assert!(head.contains(&format!("RTP-Info: url={uri}/trackID=0;seq=1")), "{head}");
+    assert!(!head.contains("192.168.4.22"), "{head}");
+
+    let requests: Vec<String> = connector
+        .requests()
+        .await
+        .into_iter()
+        .map(|bytes| String::from_utf8(bytes).unwrap())
+        .collect();
+    assert_eq!(requests.len(), 5);
+    // The camera never asked for credentials, so it is never sent any.
+    for request in &requests {
+        assert!(!request.to_ascii_lowercase().contains("authorization"), "{request}");
+        assert!(!request.contains(PASSWORD), "{request}");
+        assert!(!request.contains("viewer"), "{request}");
+    }
+    assert!(requests[0].starts_with(&format!("OPTIONS {STREAM} RTSP/1.0")));
+    assert!(requests[1].starts_with(&format!("DESCRIBE {STREAM} RTSP/1.0")));
+    // The suffix goes after the query, exactly as the camera's Content-Base
+    // said, not in front of it.
+    assert!(
+        requests[2].starts_with(&format!("SETUP {STREAM}/trackID=0 RTSP/1.0")),
+        "{}",
+        requests[2]
+    );
+    assert!(
+        requests[3].starts_with(&format!("SETUP {STREAM}/trackID=4 RTSP/1.0")),
+        "{}",
+        requests[3]
+    );
+    assert!(requests[4].starts_with(&format!("PLAY {STREAM} RTSP/1.0")));
+}
+
+#[tokio::test]
+async fn a_rejected_metadata_track_does_not_end_the_video_session() {
+    const STREAM: &str = "rtsp://192.168.4.22:8554/cam/realmonitor?channel=1&subtype=0";
+    let describe_sdp = "v=0\r\nm=video 0 RTP/AVP 96\r\na=control:trackID=0\r\nm=application 0 RTP/AVP 107\r\na=control:trackID=4\r\n";
+    let describe = format!(
+        "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Base: {STREAM}/\r\nContent-Length: {}\r\nContent-Type: application/sdp\r\n\r\n{describe_sdp}",
+        describe_sdp.len()
+    )
+    .into_bytes();
+    let refused = b"RTSP/1.0 461 Unsupported Transport\r\nCSeq: 2\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let setup = b"RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: 7\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![describe, refused, setup]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/cam/realmonitor?channel=1&subtype=0")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+        ProxyConsumer::Process(std::process::id()),
+    )
+    .await
+    .unwrap();
+    let uri = proxy.endpoint();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    exchange(&mut client, &format!("DESCRIBE {uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n")).await;
+    // The camera refuses the metadata track; that status is relayed, and the
+    // same connection still sets up the video track afterwards.
+    let (head, _) = exchange(
+        &mut client,
+        &format!("SETUP {uri}/trackID=4 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("RTSP/1.0 461"), "{head}");
+    let (head, _) = exchange(
+        &mut client,
+        &format!("SETUP {uri}/trackID=0 RTSP/1.0\r\nCSeq: 3\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("RTSP/1.0 200"), "{head}");
+}
+
+#[tokio::test]
+async fn a_base_without_a_query_still_extends_by_path() {
+    let describe_sdp = "v=0\r\nm=video 0 RTP/AVP 96\r\na=control:trackID=1\r\n";
+    let describe = format!(
+        "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Base: rtsp://192.168.4.22:8554/live/\r\nContent-Length: {}\r\nContent-Type: application/sdp\r\n\r\n{describe_sdp}",
+        describe_sdp.len()
+    )
+    .into_bytes();
+    let setup = b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: 7\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let connector = Arc::new(FakeAuthorizedRtspConnector::new(vec![describe, setup]));
+    let proxy = LoopbackRtspProxy::start(
+        HlsSessionId::new(),
+        LoopbackSourceToken::new(),
+        SecretString::from(format!("rtsp://viewer:{PASSWORD}@192.168.4.22:8554/live")),
+        approved([192, 168, 4, 22]),
+        connector.clone(),
+        limits(),
+        ProxyConsumer::Process(std::process::id()),
+    )
+    .await
+    .unwrap();
+    let uri = proxy.endpoint();
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    exchange(&mut client, &format!("DESCRIBE {uri} RTSP/1.0\r\nCSeq: 1\r\n\r\n")).await;
+    exchange(
+        &mut client,
+        &format!("SETUP {uri}/trackID=1 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"),
+    )
+    .await;
+    let requests = connector.requests().await;
+    assert!(
+        String::from_utf8_lossy(&requests[1])
+            .starts_with("SETUP rtsp://192.168.4.22:8554/live/trackID=1 RTSP/1.0")
+    );
+}
