@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { isCheckUnavailable } from '../api/client';
-  import type { ApiClient, CheckResult, Confidence, DiagnosisKind, DoctorApproval, DoctorRun, GuidedAction, Measurement, RepairPlan, RepairReport, RollbackOutcome } from '../api/client';
+  import { isCheckNeedsConsent, isCheckUnavailable } from '../api/client';
+  import type { ApiClient, CheckResult, Confidence, DiagnosisKind, DoctorApproval, DoctorRun, DoctorSettings, GuidedAction, Measurement, RepairPlan, RepairReport, RollbackOutcome } from '../api/client';
 
-  type DoctorClient = Pick<ApiClient, 'doctorRun' | 'doctorReport' | 'doctorApprove' | 'doctorRepair'>;
+  type DoctorClient = Pick<ApiClient, 'doctorRun' | 'doctorReport' | 'doctorApprove' | 'doctorRepair'> & Partial<Pick<ApiClient, 'doctorSettings'>>;
   // `deviceName` resolves a claimant MAC to the owner's name for that device,
   // when one is known. It is optional so the view works without an inventory.
-  let { client, deviceName = () => null }: { client: DoctorClient; deviceName?: (mac: string) => string | null } = $props();
+  // `onOpenSettings` takes the owner to the Doctor settings, where the
+  // permission to probe outside the home network is granted. Nothing here
+  // changes that setting.
+  let { client, deviceName = () => null, onOpenSettings }: { client: DoctorClient; deviceName?: (mac: string) => string | null; onOpenSettings?: () => void } = $props();
 
   let loading = $state(true);
   let run = $state<DoctorRun | null>(null);
@@ -25,6 +28,19 @@
   let choices = $state<Record<string, string>>({});
   const repairing = $derived(Object.values(busy).some(Boolean));
   let active = true;
+  let settings = $state<DoctorSettings | null>(null);
+  let settingsLoadedFor = '';
+  const needsPermission = $derived(run?.report.checks.some(isCheckNeedsConsent) ?? false);
+  // Name the real targets in the permission notice, once per run.
+  $effect(() => {
+    if (!run || !needsPermission || !client.doctorSettings || settingsLoadedFor === run.run_id) return;
+    settingsLoadedFor = run.run_id;
+    client.doctorSettings().then((loaded) => { if (active) settings = loaded; }).catch(() => { /* the notice reads fine without the names */ });
+  });
+  const probeTargets = $derived.by(() => {
+    if (!settings) return null;
+    return { resolvers: [...new Set([...settings.configured_resolvers, settings.independent_resolver])], internet: `${settings.internet_probe_address}:${settings.internet_probe_port}` };
+  });
 
   async function loadReport(): Promise<void> {
     loading = true;
@@ -127,12 +143,15 @@
     if (check.status.state === 'passed') return 'Passed';
     if (check.status.state === 'failed') return 'Failed';
     const because = check.status.because;
+    if (because.reason === 'consent_required') return 'Needs your permission';
+    if (because.reason === 'dependency_consent_required') return `Needs your permission — waits on: ${label(because.dependency)}`;
     if (because.reason === 'probe_unsupported' || because.reason === 'dependency_unavailable') return 'Not available in this build';
     if (because.reason === 'budget_exhausted') return 'Skipped — probe budget exhausted';
     const relation = because.reason === 'dependency_failed' ? 'dependency failed' : 'dependency skipped';
     return `Skipped — ${relation}: ${label(because.dependency)}`;
   }
   function statusIcon(check: CheckResult): string {
+    if (isCheckNeedsConsent(check)) return '?';
     if (isCheckUnavailable(check)) return '–';
     return check.status.state === 'passed' ? '✓' : check.status.state === 'failed' ? '!' : '◇';
   }
@@ -257,13 +276,19 @@
       <h2 id="doctor-checks-heading">Diagnostic checks</h2>
       <p class="muted run-facts">Run started {new Date(run.report.started_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} · {run.report.probes_used} probes used</p>
       {#if networkUnavailable}<p class="doctor-notice" role="note">Doctor can currently check only that the collector is healthy. Network checks (adapter, address, gateway, DNS, internet) are not available in this build yet.</p>{/if}
+      {#if needsPermission}
+        <div class="permission-notice" role="note" aria-label="Permission needed">
+          <p><strong>Some checks need your permission.</strong> They contact servers outside your home network, so they have not run.{#if probeTargets} The Doctor would ask the DNS resolvers {probeTargets.resolvers.join(', ')} and connect to the internet test address {probeTargets.internet}.{/if} Nothing is sent but a standard test request: a name lookup, a ping or a plain connection attempt.</p>
+          {#if onOpenSettings}<button type="button" class="act" onclick={() => onOpenSettings?.()}>Review Doctor settings</button>{/if}
+        </div>
+      {/if}
       {#if run.report.budget_exhausted}<p class="budget-warning"><span aria-hidden="true">△</span> The probe budget ran out — these results are partial.</p>{/if}
       <ul class="check-list">
         {#each run.report.checks as check (check.kind)}
-          <li class="check-row state-{check.status.state}" class:unavailable={isCheckUnavailable(check)}>
+          <li class="check-row state-{check.status.state}" class:unavailable={isCheckUnavailable(check)} class:consent={isCheckNeedsConsent(check)}>
             <h3>{label(check.kind)}</h3>
             <p class="check-status"><span class="status-mark" aria-hidden="true">{statusIcon(check)}</span> {statusText(check)}</p>
-            {#if !isCheckUnavailable(check)}<p class="check-confidence">{confidencePercent(check.confidence)} confidence</p>{/if}
+            {#if !isCheckUnavailable(check) && !isCheckNeedsConsent(check)}<p class="check-confidence">{confidencePercent(check.confidence)} confidence</p>{/if}
             {#if check.evidence.length > 0}
               <ul class="measurements" aria-label="Measurements for {label(check.kind)}">
                 {#each check.evidence as measurement}<li>{formatMeasurement(measurement)}</li>{/each}
@@ -383,6 +408,9 @@
   .run-facts{font-size:12px}
   .doctor-notice{margin:12px 0 0;padding:9px;border:1px dashed var(--line-strong);border-radius:5px;color:var(--muted);font:11px var(--font-mono)}
   .check-row.unavailable{opacity:.85}
+  .check-row.consent{border-left-color:var(--blue);border-style:dashed}
+  .permission-notice{margin:12px 0 0;padding:12px;border:1px dashed var(--blue);border-radius:5px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}
+  .permission-notice p{margin:0;color:var(--ink);font-size:12px;flex:1 1 320px}
   .budget-warning{margin:12px 0 0;padding:9px;border:1px dashed var(--gold);color:var(--gold);font:11px var(--font-mono)}
   .check-list{margin:14px 0 0;padding:0;list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
   .check-row{padding:13px;border:1px solid var(--line-mid);border-left:4px solid var(--accent);border-radius:7px;background:var(--surface)}

@@ -135,6 +135,10 @@ pub enum ProbeError {
     Unsupported,
     #[error("probe transport failed: {0}")]
     Transport(String),
+    /// The probe would leave the owner's network and the owner has not
+    /// allowed that. Not a fault in the network and not a transport failure.
+    #[error("the owner has not allowed this probe to leave the home network")]
+    ConsentRequired,
 }
 
 /// A request paired with the per-probe timeout the engine grants it.

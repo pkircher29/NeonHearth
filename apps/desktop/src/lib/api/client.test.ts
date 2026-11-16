@@ -697,6 +697,27 @@ describe('createApiClient', () => {
     }
   });
 
+  it('accepts the consent-required skip reasons and resolver outcome and rejects malformed ones', async () => {
+    const consent = { kind: 'mtu', status: { state: 'skipped', because: { reason: 'consent_required' } }, evidence: [], confidence: { basis_points: 10000 }, detail: null };
+    const waiting = { kind: 'route_vpn', status: { state: 'skipped', because: { reason: 'dependency_consent_required', dependency: 'dns' } }, evidence: [], confidence: { basis_points: 10000 }, detail: null };
+    const dns = { kind: 'dns', status: { state: 'passed' }, evidence: [], confidence: { basis_points: 9500 }, detail: { detail: 'dns', resolvers: [
+      { resolver: '192.168.1.1', independent: false, outcome: { outcome: 'answered', latency_ms: 4 } },
+      { resolver: '8.8.8.8', independent: false, outcome: { outcome: 'consent_required' } }
+    ] } };
+    const envelope = { ...runEnvelope, report: { ...runEnvelope.report, checks: [consent, waiting, dns] }, findings: [] };
+    const ok = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(envelope), { status: 200 })) });
+    await expect(ok.doctorRun()).resolves.toEqual({ status: 'completed', run: envelope });
+    for (const bad of [
+      { ...consent, status: { state: 'skipped', because: { reason: 'consent_required', dependency: 'dns' } } },
+      { ...waiting, status: { state: 'skipped', because: { reason: 'dependency_consent_required' } } },
+      { ...dns, detail: { detail: 'dns', resolvers: [{ resolver: '8.8.8.8', independent: false, outcome: { outcome: 'consent_required', error: 'x' } }] } }
+    ]) {
+      const malformed = { ...envelope, report: { ...envelope.report, checks: [bad] } };
+      const client = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(JSON.stringify(malformed), { status: 200 })) });
+      await expect(client.doctorRun()).rejects.toThrow('Invalid doctor run response');
+    }
+  });
+
   it('returns a typed empty report on 204 and the validated envelope on 200', async () => {
     const empty = createApiClient({ baseUrl: 'https://collector.example', serviceToken: 'secret', fetchImpl: vi.fn(async () => new Response(null, { status: 204 })) });
     await expect(empty.doctorReport()).resolves.toBeNull();

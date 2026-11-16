@@ -37,7 +37,12 @@ Probes to your own network (the gateway, your own resolvers, anything on a priva
 - the **MTU** echoes to the internet probe address (default `1.1.1.1`);
 - the **internet reachability** connection to that address and port (default `1.1.1.1` port 443).
 
-Without confirmation these checks do not run their probe. They report that the target is not confirmed by the owner, so you can see why they say nothing about your internet connection. If your computer is configured to use a public DNS server, the DNS check counts that resolver as unanswered until you confirm external probes.
+Without confirmation these checks do not run their probe. They are shown as **Needs your permission**, not as failures, and they never produce a finding: a check that has not been allowed to run says nothing about your network. The Doctor shows one notice naming the servers involved (your DNS resolvers and the internet test address from the settings) and a button that opens the Doctor settings, where you can grant the permission. Nothing is sent except a standard test request (a name lookup, a ping, or a plain connection attempt), and the Doctor never turns the setting on for you.
+
+How this plays out for each check:
+
+- **MTU** and **internet reachability** need permission, so both read *Needs your permission* until you confirm.
+- **DNS** only asks the resolvers it is allowed to ask. A resolver on your home network (for example your router) is asked as normal; a public resolver such as `1.1.1.1` or `8.8.8.8` is shown as *not checked*. If every resolver that could be checked answered, DNS passes on those. If none could be checked, DNS needs your permission, and the **Route / VPN** check that follows it waits for the same reason. A resolver that was asked and failed is still a real DNS failure.
 
 A target that is not set (for example no default gateway could be found) is never probed at all; the check reports that the target is not configured.
 

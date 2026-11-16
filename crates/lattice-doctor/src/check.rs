@@ -168,11 +168,29 @@ pub enum SkipReason {
     DependencyUnavailable {
         dependency: CheckKind,
     },
+    /// The probe leaves the owner's network and the owner has not allowed
+    /// that yet. Neither a fault nor a failed probe: it never yields a
+    /// diagnosis.
+    ConsentRequired,
+    /// A parent check needs the owner's permission (see
+    /// [`SkipReason::ConsentRequired`]), so this one could not run either.
+    DependencyConsentRequired {
+        dependency: CheckKind,
+    },
 }
 
 impl SkipReason {
     /// True when the check could not run because probing is unsupported, as
     /// opposed to a failed dependency or an exhausted budget.
+    /// True when the check waits on the owner's permission to probe outside
+    /// the home network, directly or through a parent.
+    pub fn needs_consent(self) -> bool {
+        matches!(
+            self,
+            SkipReason::ConsentRequired | SkipReason::DependencyConsentRequired { .. }
+        )
+    }
+
     pub fn is_unavailable(self) -> bool {
         matches!(
             self,
@@ -206,6 +224,9 @@ pub enum ResolverOutcome {
     Answered { latency_ms: f64 },
     Failed { reason: DnsFailureReason },
     Unavailable { error: String },
+    /// Not queried: the owner has not allowed probes outside the home
+    /// network. Not a failure of this resolver.
+    ConsentRequired,
 }
 
 /// Structured, check-specific findings that diagnoses are built from.

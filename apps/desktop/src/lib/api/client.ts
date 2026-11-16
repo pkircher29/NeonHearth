@@ -68,12 +68,21 @@ export type SkipReason =
   | { reason: 'budget_exhausted' }
   // The service cannot perform this check's probe in this build; not a fault.
   | { reason: 'probe_unsupported' }
-  | { reason: 'dependency_unavailable'; dependency: CheckKind };
+  | { reason: 'dependency_unavailable'; dependency: CheckKind }
+  // The probe leaves the home network and the owner has not allowed that yet;
+  // neither a fault nor a failed probe.
+  | { reason: 'consent_required' }
+  | { reason: 'dependency_consent_required'; dependency: CheckKind };
 export type CheckStatus = { state: 'passed' } | { state: 'failed' } | { state: 'skipped'; because: SkipReason };
 /** True when a check was never assessed because its probe is unsupported (directly or via a parent). */
 export function isCheckUnavailable(check: { status: CheckStatus }): boolean {
   return check.status.state === 'skipped'
     && (check.status.because.reason === 'probe_unsupported' || check.status.because.reason === 'dependency_unavailable');
+}
+/** True when a check is waiting for the owner's permission to probe outside the home network (directly or via a parent). */
+export function isCheckNeedsConsent(check: { status: CheckStatus }): boolean {
+  return check.status.state === 'skipped'
+    && (check.status.because.reason === 'consent_required' || check.status.because.reason === 'dependency_consent_required');
 }
 export type LeaseState = 'static' | 'valid' | 'expired' | 'missing';
 export type DnsFailureReason = 'timeout' | 'refused' | 'serv_fail' | 'no_answer';
@@ -81,7 +90,8 @@ export interface RouteEntry { interface: string; gateway: string; is_vpn: boolea
 export type ResolverOutcome =
   | { outcome: 'answered'; latency_ms: number }
   | { outcome: 'failed'; reason: DnsFailureReason }
-  | { outcome: 'unavailable'; error: string };
+  | { outcome: 'unavailable'; error: string }
+  | { outcome: 'consent_required' };
 export interface ResolverEvidence { resolver: string; independent: boolean; outcome: ResolverOutcome }
 export type CheckDetail =
   | { detail: 'probe_failure'; error: string }
@@ -524,8 +534,8 @@ function isDoctorMeasurement(value: unknown): value is Measurement {
 }
 function isSkipReason(value: unknown): value is SkipReason {
   if (!isRecord(value)) return false;
-  if (value.reason === 'budget_exhausted' || value.reason === 'probe_unsupported') return exact(value, ['reason']);
-  return (value.reason === 'dependency_failed' || value.reason === 'dependency_skipped' || value.reason === 'dependency_unavailable')
+  if (value.reason === 'budget_exhausted' || value.reason === 'probe_unsupported' || value.reason === 'consent_required') return exact(value, ['reason']);
+  return (value.reason === 'dependency_failed' || value.reason === 'dependency_skipped' || value.reason === 'dependency_unavailable' || value.reason === 'dependency_consent_required')
     && exact(value, ['reason', 'dependency']) && checkKinds.has(String(value.dependency));
 }
 function isCheckStatus(value: unknown): value is CheckStatus {
@@ -542,6 +552,7 @@ function isResolverOutcome(value: unknown): value is ResolverOutcome {
   if (!isRecord(value)) return false;
   if (value.outcome === 'answered') return exact(value, ['outcome', 'latency_ms']) && isFiniteNumber(value.latency_ms);
   if (value.outcome === 'failed') return exact(value, ['outcome', 'reason']) && dnsFailureReasons.has(String(value.reason));
+  if (value.outcome === 'consent_required') return exact(value, ['outcome']);
   return value.outcome === 'unavailable' && exact(value, ['outcome', 'error']) && isBoundedText(value.error);
 }
 function isResolverEvidence(value: unknown): value is ResolverEvidence {

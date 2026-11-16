@@ -1155,14 +1155,15 @@ async fn settings_are_owner_editable_validated_audited_and_gate_external_probes(
     );
     let run = run_doctor(&fixture.router).await;
     assert_eq!(check(&run, "dns")["status"]["state"], "passed");
+    // Withheld consent is "needs your permission", not a failed probe, and
+    // it yields no finding.
     let internet = check(&run, "internet_reachability");
-    assert_eq!(internet["status"]["state"], "failed");
-    assert_eq!(internet["detail"]["detail"], "probe_failure");
+    assert_eq!(internet["status"]["state"], "skipped");
+    assert_eq!(internet["status"]["because"]["reason"], "consent_required");
     assert!(
-        internet["detail"]["error"]
-            .as_str()
-            .unwrap()
-            .contains("not confirmed")
+        run["findings"].as_array().unwrap().is_empty(),
+        "{}",
+        run["findings"]
     );
 
     // Clearing the gateway leaves the check unconfigured rather than guessed.

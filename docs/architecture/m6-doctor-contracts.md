@@ -20,6 +20,10 @@ the domain types.
   `needs_router_api`, `not_wired`, `worker_not_running`, and
   `unavailable_detail` is one owner-facing sentence. The latter two are
   omitted when `executable` is true.
+  A check whose probe the owner has not allowed to leave the home network is
+  `skipped` with `because: { reason: "consent_required" }` (dependents:
+  `dependency_consent_required` with `dependency`), a DNS resolver that was not
+  asked has outcome `consent_required`, and none of these yields a finding.
   Concurrent runs are refused with 409 (one diagnostic at a time).
 - `GET /api/v1/doctor/report` — the latest completed run (same envelope), or
   204 when none has run.

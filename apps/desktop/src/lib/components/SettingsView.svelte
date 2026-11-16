@@ -264,7 +264,7 @@
       {:else if !tokensError}<p class="unavailable-copy">No integration tokens yet.</p>{/if}
     </section>
 
-    <section class="settings-card" aria-labelledby="doctor-heading">
+    <section class="settings-card" id="doctor-settings" tabindex="-1" aria-labelledby="doctor-heading">
       <h2 id="doctor-heading">Network Doctor targets</h2>
       <p class="muted">The Doctor pings your gateway and resolvers, then a known-good resolver and one internet address. Anything outside your private network is only probed after you confirm it here.</p>
       {#if doctorError}<p class="pair-error" role="alert">{doctorError} <button type="button" class="link" onclick={loadDoctor}>Retry</button></p>

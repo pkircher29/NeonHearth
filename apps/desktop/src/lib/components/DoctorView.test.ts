@@ -349,3 +349,42 @@ describe('DoctorView capability', () => {
     expect(screen.queryByText(/NeonHearth can’t make this change/)).toBeNull();
   });
 });
+
+describe('DoctorView permission notice', () => {
+  const consentCheck: CheckResult = { kind: 'mtu', status: { state: 'skipped', because: { reason: 'consent_required' } }, evidence: [], confidence: { basis_points: 10000 }, detail: null };
+  const waitingCheck: CheckResult = { kind: 'route_vpn', status: { state: 'skipped', because: { reason: 'dependency_consent_required', dependency: 'dns' } }, evidence: [], confidence: { basis_points: 10000 }, detail: null };
+  const settings = { interface: 'eth0', gateway: '192.168.1.1', gateway_source: 'platform', configured_resolvers: ['1.1.1.1', '8.8.8.8'], independent_resolver: '9.9.9.9', internet_probe_address: '1.1.1.1', internet_probe_port: 443, dns_probe_name: 'example.com', external_probes_confirmed: false };
+
+  it('reads as neutral "Needs your permission" and explains it once, naming the configured targets', async () => {
+    const onOpenSettings = vi.fn();
+    const client = { ...fakeClient({ doctorReport: vi.fn(async () => envelope([], [passedCheck, consentCheck, waitingCheck])) }), doctorSettings: vi.fn(async () => settings) };
+    render(DoctorView, { client, onOpenSettings });
+
+    await waitFor(() => screen.getByText('Needs your permission'));
+    expect(screen.getByText(/Needs your permission — waits on: dns/)).toBeTruthy();
+    expect(screen.queryByText('Failed')).toBeNull();
+    // One notice, however many checks wait.
+    const notice = await screen.findByRole('note', { name: 'Permission needed' });
+    expect(screen.getAllByRole('note', { name: 'Permission needed' })).toHaveLength(1);
+    await waitFor(() => expect(notice.textContent).toContain('1.1.1.1, 8.8.8.8, 9.9.9.9'));
+    expect(notice.textContent).toContain('internet test address 1.1.1.1:443');
+    expect(notice.textContent).toContain('Nothing is sent but a standard test request');
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Review Doctor settings' }));
+    expect(onOpenSettings).toHaveBeenCalledOnce();
+    // The UI never grants the permission itself.
+    expect(client.doctorSettings).toHaveBeenCalledOnce();
+  });
+
+  it('still explains the notice when the settings cannot be loaded, and shows nothing when no check waits', async () => {
+    const failing = { ...fakeClient({ doctorReport: vi.fn(async () => envelope([], [consentCheck])) }), doctorSettings: vi.fn(async () => { throw new Error('nope'); }) };
+    const first = render(DoctorView, { client: failing, onOpenSettings: () => {} });
+    const notice = await first.findByRole('note', { name: 'Permission needed' });
+    expect(notice.textContent).toContain('contact servers outside your home network');
+    first.unmount();
+
+    render(DoctorView, { client: fakeClient({ doctorReport: vi.fn(async () => envelope([], [passedCheck])) }) });
+    await waitFor(() => screen.getByRole('heading', { name: 'Diagnostic checks' }));
+    expect(screen.queryByRole('note', { name: 'Permission needed' })).toBeNull();
+  });
+});

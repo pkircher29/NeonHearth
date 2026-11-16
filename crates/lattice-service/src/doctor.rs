@@ -590,9 +590,9 @@ impl ProbeTransport for GatedProbes<'_> {
                 ));
             }
             if !self.allow_external && !is_private_target(target) {
-                return Err(ProbeError::Transport(
-                    "external probe targets are not confirmed by the owner".to_owned(),
-                ));
+                // Withheld consent is not a transport failure: the engine
+                // reports the check as needing the owner's permission.
+                return Err(ProbeError::ConsentRequired);
             }
         }
         self.inner.dyn_probe(probe).await
@@ -1796,7 +1796,10 @@ nameserver fe80::1%eth0\nnameserver not-an-ip\noptions edns0\n";
             allow_external: false,
         };
         let refused = |result: Result<ProbeResponse, ProbeError>| {
-            matches!(result, Err(ProbeError::Transport(_)))
+            matches!(
+                result,
+                Err(ProbeError::Transport(_) | ProbeError::ConsentRequired)
+            )
         };
         assert!(refused(
             gated
@@ -1899,7 +1902,7 @@ nameserver fe80::1%eth0\nnameserver not-an-ip\noptions edns0\n";
             assert!(
                 matches!(
                     unconfirmed.probe(probe(request.clone())).await,
-                    Err(ProbeError::Transport(_))
+                    Err(ProbeError::ConsentRequired)
                 ),
                 "{request:?} must be refused without consent"
             );
