@@ -31,8 +31,8 @@ use secrecy::ExposeSecret;
 use std::{
     net::{IpAddr, Ipv4Addr},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering},
     },
     time::Duration,
 };
@@ -54,14 +54,77 @@ const WSU: &str =
 const PASSWORD_DIGEST: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest";
 const BASE64_BINARY: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary";
 
-/// Set by the transport when the camera advertised a service on another host,
-/// so the caller can tell that refusal from an ordinary protocol error.
-pub type ForeignServiceFlag = Arc<AtomicBool>;
+/// What the transport observed while talking to the camera, shared with the
+/// caller so a refusal can be explained without keeping any reply body: that
+/// the camera advertised a service on another host, which ONVIF step was the
+/// last one attempted, and the HTTP status of that step's reply.
+#[derive(Debug, Default)]
+pub struct TransportNotes {
+    foreign_service: AtomicBool,
+    last_status: AtomicU16,
+    last_step: AtomicU8,
+}
+
+/// The shared handle the connector hands to the transport.
+pub type ForeignServiceFlag = Arc<TransportNotes>;
+
+impl TransportNotes {
+    /// The camera advertised a service on a host other than the approved one.
+    #[must_use]
+    pub fn foreign_service(&self) -> bool {
+        self.foreign_service.load(Ordering::SeqCst)
+    }
+
+    /// The HTTP status of the last step's reply, when one arrived.
+    #[must_use]
+    pub fn http_status(&self) -> Option<u16> {
+        match self.last_status.load(Ordering::SeqCst) {
+            0 => None,
+            status => Some(status),
+        }
+    }
+
+    /// The last ONVIF step that was attempted, in words (for logs).
+    #[must_use]
+    pub fn step(&self) -> &'static str {
+        match self.last_step.load(Ordering::SeqCst) {
+            1 => "device information",
+            2 => "capabilities",
+            3 => "profiles",
+            4 => "stream address",
+            5 => "date and time",
+            _ => "not started",
+        }
+    }
+
+    /// Whether the last step attempted was the very first one.
+    #[must_use]
+    pub fn at_first_step(&self) -> bool {
+        self.last_step.load(Ordering::SeqCst) == 1
+    }
+
+    fn begin(&self, action: &OnvifAction) {
+        self.last_step.store(
+            match action {
+                OnvifAction::GetDeviceInformation => 1,
+                OnvifAction::GetCapabilities => 2,
+                OnvifAction::GetProfiles => 3,
+                OnvifAction::GetStreamUri { .. } => 4,
+                OnvifAction::GetSystemDateAndTime => 5,
+            },
+            Ordering::SeqCst,
+        );
+        self.last_status.store(0, Ordering::SeqCst);
+    }
+}
 
 pub struct HttpOnvifTransport {
     approved: Ipv4Addr,
     client: reqwest::Client,
     foreign_service: ForeignServiceFlag,
+    /// Path of the media service the camera advertised on the approved host,
+    /// used for the media steps once `GetCapabilities` has named it.
+    media_path: Mutex<Option<String>>,
     #[cfg(any(test, feature = "test-support"))]
     endpoint_override: Option<SocketAddr>,
 }
@@ -81,6 +144,7 @@ impl HttpOnvifTransport {
                 .build()
                 .map_err(|_| OnvifError::Transport)?,
             foreign_service,
+            media_path: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             endpoint_override: None,
         })
@@ -103,23 +167,34 @@ impl HttpOnvifTransport {
                 .build()
                 .map_err(|_| OnvifError::Transport)?,
             foreign_service,
+            media_path: Mutex::new(None),
             endpoint_override: Some(endpoint),
         })
     }
 
-    fn url(&self, target: &TargetAddress) -> String {
+    fn url(&self, target: &TargetAddress, path: &str) -> String {
         #[cfg(any(test, feature = "test-support"))]
         {
             if let Some(endpoint) = self.endpoint_override {
-                return format!("http://{endpoint}{}", target.path());
+                return format!("http://{endpoint}{path}");
             }
         }
-        format!(
-            "http://{}:{}{}",
-            self.approved,
-            target.port(),
-            target.path()
-        )
+        format!("http://{}:{}{path}", self.approved, target.port())
+    }
+
+    /// The path a step is sent to: the media service the camera advertised for
+    /// the media steps (when it named one on the approved host), otherwise the
+    /// device service path the owner's approval started from.
+    fn path_for(&self, action: &OnvifAction, target: &TargetAddress) -> String {
+        if matches!(
+            action,
+            OnvifAction::GetProfiles | OnvifAction::GetStreamUri { .. }
+        ) && let Ok(media) = self.media_path.lock()
+            && let Some(path) = media.as_ref()
+        {
+            return path.clone();
+        }
+        target.path().to_owned()
     }
 }
 
@@ -156,10 +231,12 @@ impl OnvifTransport for HttpOnvifTransport {
         if target.address() != IpAddr::V4(self.approved) || target.tls() {
             return Err(OnvifError::InvalidTarget);
         }
+        self.foreign_service.begin(request.action());
         let body = signed_request(request.request_bytes(), credential)?;
+        let path = self.path_for(request.action(), target);
         let mut reply = self
             .client
-            .post(self.url(target))
+            .post(self.url(target, &path))
             .header(
                 reqwest::header::CONTENT_TYPE,
                 "application/soap+xml; charset=utf-8",
@@ -170,6 +247,9 @@ impl OnvifTransport for HttpOnvifTransport {
             .await
             .map_err(|error| map_send_error(&error))?;
         let status = reply.status();
+        self.foreign_service
+            .last_status
+            .store(status.as_u16(), Ordering::SeqCst);
         if status.is_redirection() {
             // Redirects are never followed; the camera gets no say in where
             // the next request, or the credential digest, goes.
@@ -210,9 +290,20 @@ impl OnvifTransport for HttpOnvifTransport {
                 copy.extend_from_slice(&chunk);
             }
         }
-        if inspect && !service_addresses_are_on(&copy, self.approved) {
-            self.foreign_service.store(true, Ordering::SeqCst);
-            return Err(OnvifError::InvalidResponse);
+        if inspect {
+            if !service_addresses_are_on(&copy, self.approved) {
+                self.foreign_service
+                    .foreign_service
+                    .store(true, Ordering::SeqCst);
+                return Err(OnvifError::InvalidResponse);
+            }
+            // Follow the media service the camera named, but only when it is
+            // on the approved host and port (checked here, never trusted).
+            if let Some(path) = media_service_path(&copy, self.approved, target.port())
+                && let Ok(mut media) = self.media_path.lock()
+            {
+                *media = Some(path);
+            }
         }
         Ok(())
     }
@@ -252,6 +343,57 @@ fn service_addresses(xml: &[u8]) -> Vec<String> {
         found.push(text[start..end].trim().to_owned());
     }
     found
+}
+
+/// The path of the media service the camera advertised (the `XAddr` inside its
+/// `Media` capability group), only when it is a plain `http` address on exactly
+/// the approved host and the port already in use, with a short, ordinary path.
+/// Anything else yields `None`, so the media steps use the device path.
+fn media_service_path(xml: &[u8], approved: Ipv4Addr, port: u16) -> Option<String> {
+    let text = String::from_utf8_lossy(xml);
+    for (index, _) in text.match_indices("Media>") {
+        let open = text[..index].rfind('<')?;
+        let name = &text[open + 1..index + "Media".len()];
+        if name.starts_with('/') || name.rsplit(':').next() != Some("Media") {
+            continue;
+        }
+        let rest = &text[index + "Media>".len()..];
+        let group = rest.find("Media>").map_or(rest, |end| &rest[..end]);
+        let address = service_addresses(group.as_bytes()).into_iter().next()?;
+        // Judge the address as the camera wrote it: `Url` would quietly
+        // resolve dot segments and decode nothing, hiding both.
+        if address.contains('%') || address.contains("/.") {
+            return None;
+        }
+        let url = Url::parse(&address).ok()?;
+        let host_ok = match url.host()? {
+            Host::Ipv4(host) => host == approved,
+            Host::Domain(host) => host.parse::<Ipv4Addr>().is_ok_and(|host| host == approved),
+            Host::Ipv6(_) => false,
+        };
+        let path = url.path();
+        let ordinary = path.starts_with('/')
+            && path.len() <= 128
+            && !path.starts_with("//")
+            && path.bytes().all(|byte| {
+                byte.is_ascii_graphic()
+                    && !matches!(byte, b'\\' | b'\'' | b'"' | b'<' | b'>' | b'&' | b'%')
+            })
+            && !path.split('/').any(|part| matches!(part, "." | ".."));
+        if url.scheme() == "http"
+            && host_ok
+            && url.port_or_known_default() == Some(port)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && ordinary
+        {
+            return Some(path.to_owned());
+        }
+        return None;
+    }
+    None
 }
 
 /// Whether every service address the camera advertised is on `approved`.
@@ -412,6 +554,31 @@ pub mod fake_device {
         OversizedWithoutLength,
         /// Answers 401 whatever the credentials are.
         Unauthorized,
+        /// Answers 404 to everything, like a camera with ONVIF switched off.
+        NotFound,
+        /// Answers 200 with an HTML page, like a web server that is not ONVIF.
+        NotOnvif,
+        /// Replays recorded real-camera replies (checking the digest as
+        /// `Normal` does), byte for byte, with no WS-Addressing header.
+        Recorded(Arc<Recorded>),
+    }
+
+    /// Recorded replies of a real camera, one per ONVIF step.
+    #[derive(Debug)]
+    pub struct Recorded {
+        pub datetime: String,
+        pub device_info: String,
+        pub capabilities: String,
+        pub profiles: String,
+        /// Served for the first profile; for the second, `subtype=0` becomes
+        /// `subtype=1` so the two streams differ as a real camera's do.
+        pub stream_uri: String,
+        /// Device, capabilities and date-and-time requests are answered only
+        /// at these paths (404 otherwise).
+        pub device_paths: Vec<String>,
+        /// Profiles and stream-address requests are answered only at these
+        /// paths (404 otherwise).
+        pub media_paths: Vec<String>,
     }
 
     #[derive(Clone, Debug)]
@@ -441,6 +608,7 @@ pub mod fake_device {
     pub struct FakeOnvifDevice {
         addr: SocketAddr,
         requests: Arc<AtomicUsize>,
+        paths: Arc<std::sync::Mutex<Vec<String>>>,
         task: JoinHandle<()>,
     }
 
@@ -459,6 +627,8 @@ pub mod fake_device {
             let addr = listener.local_addr().expect("fake device address");
             let requests = Arc::new(AtomicUsize::new(0));
             let counter = requests.clone();
+            let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = paths.clone();
             let config = Arc::new(config);
             let task = tokio::spawn(async move {
                 loop {
@@ -467,16 +637,27 @@ pub mod fake_device {
                     };
                     let config = config.clone();
                     let counter = counter.clone();
+                    let seen = seen.clone();
                     tokio::spawn(async move {
-                        let _ = serve(stream, &config, &counter).await;
+                        let _ = serve(stream, &config, &counter, &seen).await;
                     });
                 }
             });
             Self {
                 addr,
                 requests,
+                paths,
                 task,
             }
+        }
+
+        /// The request path of every request received, in order.
+        #[must_use]
+        pub fn request_paths(&self) -> Vec<String> {
+            self.paths
+                .lock()
+                .expect("fake device paths poisoned")
+                .clone()
         }
 
         #[must_use]
@@ -546,10 +727,68 @@ pub mod fake_device {
         mut stream: tokio::net::TcpStream,
         config: &Config,
         requests: &AtomicUsize,
+        paths: &std::sync::Mutex<Vec<String>>,
     ) -> Option<()> {
         let request = read_request(&mut stream).await?;
         requests.fetch_add(1, Ordering::SeqCst);
+        let path = request
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_owned();
+        paths
+            .lock()
+            .expect("fake device paths poisoned")
+            .push(path.clone());
         let reply: Vec<u8> = match &config.behavior {
+            Behavior::NotFound => {
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            }
+            Behavior::NotOnvif => {
+                let body = "<html><body>hello</body></html>";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
+            Behavior::Recorded(recorded) => {
+                let media_step = request.contains("<trt:GetProfiles/>")
+                    || request.contains("<trt:GetStreamUri>");
+                let allowed = if media_step {
+                    &recorded.media_paths
+                } else {
+                    &recorded.device_paths
+                };
+                if !allowed.contains(&path) {
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                } else if !authorized(&request, config) && !request.contains("GetSystemDateAndTime") {
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                } else {
+                    let body = if request.contains("<tds:GetDeviceInformation/>") {
+                        recorded.device_info.clone()
+                    } else if request.contains("<tds:GetCapabilities>") {
+                        recorded.capabilities.clone()
+                    } else if request.contains("<trt:GetProfiles/>") {
+                        recorded.profiles.clone()
+                    } else if request.contains("<trt:GetStreamUri>") {
+                        if request.contains(">MediaProfile001<") {
+                            recorded.stream_uri.replace("subtype=0", "subtype=1")
+                        } else {
+                            recorded.stream_uri.clone()
+                        }
+                    } else {
+                        recorded.datetime.clone()
+                    };
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .into_bytes()
+                }
+            }
             Behavior::Redirect(location) => format!(
                 "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
@@ -715,6 +954,40 @@ mod tests {
     }
 
     #[test]
+    fn the_media_service_is_followed_only_when_it_is_on_the_approved_host_and_port() {
+        let caps = |xaddr: &str| {
+            format!(
+                "<tt:Device><tt:XAddr>http://192.168.1.50/onvif/device_service</tt:XAddr></tt:Device><tt:Media><tt:XAddr>{xaddr}</tt:XAddr><tt:StreamingCapabilities/></tt:Media>"
+            )
+        };
+        let path = |xaddr: &str| media_service_path(caps(xaddr).as_bytes(), APPROVED, 80);
+        assert_eq!(
+            path("http://192.168.1.50/onvif/media_service").as_deref(),
+            Some("/onvif/media_service")
+        );
+        assert_eq!(
+            path("http://192.168.1.50:80/onvif/media").as_deref(),
+            Some("/onvif/media")
+        );
+        for refused in [
+            "http://192.168.1.51/onvif/media_service",
+            "http://192.168.1.50:8080/onvif/media_service",
+            "https://192.168.1.50/onvif/media_service",
+            "http://camera.example/onvif/media_service",
+            "http://user:pw@192.168.1.50/onvif/media_service",
+            "http://192.168.1.50/onvif/media_service?x=1",
+            "http://192.168.1.50/onvif/../admin",
+            "http://192.168.1.50/%2e%2e/admin",
+            "not a url",
+        ] {
+            assert_eq!(path(refused), None, "{refused}");
+        }
+        // No Media group, or a self-closing one, means the device path is used.
+        assert_eq!(media_service_path(b"<tt:Media/>", APPROVED, 80), None);
+        assert_eq!(media_service_path(b"<tt:Device/>", APPROVED, 80), None);
+    }
+
+    #[test]
     fn the_security_header_never_contains_the_password() {
         let credential =
             OnvifCredential::new("admin", SecretString::from(PASSWORD.to_owned())).unwrap();
@@ -783,7 +1056,7 @@ mod tests {
         assert_eq!(profiles.len(), 1);
         // Device info, capabilities, profiles, one stream URI, date and time.
         assert_eq!(device.requests(), 5);
-        assert!(!flag.load(Ordering::SeqCst));
+        assert!(!flag.foreign_service());
     }
 
     #[tokio::test]
@@ -854,7 +1127,7 @@ mod tests {
             run(&device, &flag, PASSWORD).await.unwrap_err(),
             OnvifError::InvalidResponse
         );
-        assert!(flag.load(Ordering::SeqCst));
+        assert!(flag.foreign_service());
         // Device information and capabilities only: nothing after the refusal.
         assert_eq!(device.requests(), 2);
     }

@@ -18,7 +18,7 @@ pub use media::{
     FFMPEG_ENV, HlsSession, HlsSessionId, LoopbackSourceToken, MediaError, MediaJob, MediaProcess,
     MediaProcessExit, MediaProcessFactory, MediaProcessObservation, MediaProcessSpec,
     ProductionMediaProcessFactory, SnapshotRequest, ffmpeg_executable, hls_args,
-    platform_default_ffmpeg, resolve_ffmpeg_executable, snapshot_args,
+    platform_default_ffmpeg, resolve_ffmpeg_executable, sanitize_diagnostic, snapshot_args,
 };
 pub use onvif::{
     BoundedMetadata, BoundedSerial, CameraHealth as OnvifHealth, CameraInventory, CameraProfile,

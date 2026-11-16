@@ -68,6 +68,7 @@ export function addCameraError(error: unknown): string {
     case 'sign_in_refused': return 'The camera refused that user name or password.';
     case 'streams_elsewhere': return 'The camera points its video somewhere else, so it was not added.';
     case 'unexpected_answer': return 'That device did not answer like a camera.';
+    case 'onvif_not_enabled': return "ONVIF does not appear to be enabled on that device. Turn ONVIF on in the camera's settings, then try again.";
     case 'no_streams': return 'The camera has no video stream to show.';
     case 'already_added': return 'A camera is already added at that address.';
     case 'rate_limited':

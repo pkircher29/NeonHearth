@@ -3,3 +3,5 @@ crates/lattice-store/migrations/*.sql -text
 crates/lattice-service/data/mac-assignments.tsv text eol=lf
 # Keep verified third-party sources stable across Windows/Linux checkouts.
 vendor/** text eol=lf
+# Recorded real-camera replies are served byte for byte by the fake device.
+crates/lattice-service/tests/fixtures/** -text

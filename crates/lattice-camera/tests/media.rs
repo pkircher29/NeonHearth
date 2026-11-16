@@ -131,7 +131,7 @@ fn hls_arguments_are_an_exact_shell_free_vector_with_localhost_only_input() {
             "tcp",
             "-protocol_whitelist",
             "rtsp,tcp,rtp,udp",
-            "-rw_timeout",
+            "-timeout",
             "15000000",
             "-i",
             "rtsp://127.0.0.1:43123/source/0190c6d1-1234-7abc-8def-0123456789ab",
@@ -148,8 +148,8 @@ fn hls_arguments_are_an_exact_shell_free_vector_with_localhost_only_input() {
             "2",
             "-hls_list_size",
             "4",
-            "-hls_segment_size",
-            "8388608",
+            "-hls_base_url",
+            "segments/",
             "-hls_flags",
             "delete_segments+append_list+omit_endlist+independent_segments",
             "-hls_segment_filename",
@@ -188,7 +188,7 @@ fn snapshot_arguments_are_fixed_to_one_jpeg_in_the_owned_directory() {
             "tcp",
             "-protocol_whitelist",
             "rtsp,tcp,rtp,udp",
-            "-rw_timeout",
+            "-timeout",
             "15000000",
             "-i",
             "rtsp://127.0.0.1:43123/source/0190c6d1-1234-7abc-8def-0123456789ab",
@@ -380,4 +380,31 @@ async fn production_factory_accepts_the_exact_fixed_vector() {
         MediaProcessSpec::hls(43123, &token, Path::new("/tmp/neonhearth-media-contract")).unwrap();
     let mut process = ProductionMediaProcessFactory.spawn(spec).await.unwrap();
     process.close().await.unwrap();
+}
+
+/// Option names verified against a real ffmpeg 8.1 (Windows) and a real
+/// Dahua-family RTSP camera: `-timeout` is the RTSP demuxer's socket timeout,
+/// while `-rw_timeout` is not an RTSP option ("Option rw_timeout not found"),
+/// and `-hls_segment_size` switches HLS to single-file byte-range mode, which
+/// breaks the separate `segment-%06d.ts` files the service serves.
+#[test]
+fn argument_lists_use_only_option_names_a_real_ffmpeg_accepts() {
+    let token =
+        LoopbackSourceToken::from_canonical("0190c6d1-1234-7abc-8def-0123456789ab").unwrap();
+    let dir = media_dir("verified-options");
+    for args in [
+        hls_args(43123, &token, &dir).unwrap(),
+        snapshot_args(43123, &token, &dir).unwrap(),
+    ] {
+        let args: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|arg| arg == "-timeout"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "-rw_timeout"), "{args:?}");
+        assert!(
+            !args.iter().any(|arg| arg == "-hls_segment_size"),
+            "{args:?}"
+        );
+    }
 }

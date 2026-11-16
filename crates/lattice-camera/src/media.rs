@@ -3,7 +3,8 @@
 //! Callers can select only HLS or one-frame snapshot jobs. Both use an exact
 //! argument vector, a loopback-only source, and a caller-owned absolute output
 //! directory. Production spawning never invokes a shell and never returns
-//! process diagnostics.
+//! raw process diagnostics. A failed process's stderr is kept (bounded) and
+//! only a short, sanitised excerpt of it is ever exposed, for the log.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -13,6 +14,7 @@ use std::{
     fmt,
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::{Arc, Mutex},
 };
 use thiserror::Error;
 use tokio::{
@@ -29,9 +31,6 @@ const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const INPUT_PROTOCOLS: &str = "rtsp,tcp,rtp,udp";
 /// Socket read timeout in microseconds (15 s): a stalled source ends the process.
 const READ_TIMEOUT_MICROS: &str = "15000000";
-/// One HLS segment may not exceed 8 MiB, so a source that never sends a
-/// keyframe cannot grow a single segment without bound.
-const MAX_SEGMENT_BYTES: &str = "8388608";
 /// Hard media-time ceiling for an HLS job: the 10 minute lease plus margin.
 const MAX_HLS_SECONDS: &str = "660";
 const MAX_SNAPSHOT_BYTES: &str = "4194304";
@@ -376,7 +375,7 @@ pub fn hls_args(
         "tcp",
         "-protocol_whitelist",
         INPUT_PROTOCOLS,
-        "-rw_timeout",
+        "-timeout",
         READ_TIMEOUT_MICROS,
         "-i",
         &source,
@@ -393,8 +392,9 @@ pub fn hls_args(
         "2",
         "-hls_list_size",
         "4",
-        "-hls_segment_size",
-        MAX_SEGMENT_BYTES,
+        // Segments are served under `segments/`; the playlist must name them so.
+        "-hls_base_url",
+        "segments/",
         "-hls_flags",
         "delete_segments+append_list+omit_endlist+independent_segments",
         "-hls_segment_filename",
@@ -423,7 +423,7 @@ pub fn snapshot_args(
         "tcp",
         "-protocol_whitelist",
         INPUT_PROTOCOLS,
-        "-rw_timeout",
+        "-timeout",
         READ_TIMEOUT_MICROS,
         "-i",
         &source,
@@ -484,6 +484,12 @@ pub trait MediaProcess: Send {
         None
     }
 
+    /// A short, sanitised excerpt of what the process wrote to stderr, for the
+    /// log when it failed. Never contains a URL, a lease token or credentials.
+    fn diagnostic(&self) -> Option<String> {
+        None
+    }
+
     async fn close(&mut self) -> Result<(), MediaError> {
         match tokio::time::timeout(MEDIA_PROCESS_CLOSE_TIMEOUT, async {
             let kill = self.kill().await;
@@ -526,22 +532,29 @@ impl MediaProcessFactory for ProductionMediaProcessFactory {
             .spawn()
             .map_err(|_| MediaError::ProcessUnavailable)?;
         let stderr = child.stderr.take().ok_or(MediaError::ProcessUnavailable)?;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = captured.clone();
         let diagnostic = tokio::spawn(async move {
             let mut stderr = stderr;
             let mut buffer = [0_u8; 4096];
-            let mut count = 0_usize;
             loop {
                 match stderr.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(read) => count = count.saturating_add(read),
-                    Err(_) => break,
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        // Keep the first bytes only; the rest is drained so the
+                        // child never blocks on a full pipe.
+                        if let Ok(mut kept) = sink.lock() {
+                            let room = MAX_DIAGNOSTIC_BYTES.saturating_sub(kept.len());
+                            kept.extend_from_slice(&buffer[..read.min(room)]);
+                        }
+                    }
                 }
             }
-            sanitized_diagnostic(count)
         });
         Ok(Box::new(ProductionMediaProcess {
             child,
             diagnostic: Some(diagnostic),
+            captured,
             waited: false,
         }))
     }
@@ -600,7 +613,8 @@ fn validate_production_spec(spec: &MediaProcessSpec) -> Result<(), MediaError> {
 
 struct ProductionMediaProcess {
     child: Child,
-    diagnostic: Option<JoinHandle<Vec<u8>>>,
+    diagnostic: Option<JoinHandle<()>>,
+    captured: Arc<Mutex<Vec<u8>>>,
     waited: bool,
 }
 
@@ -631,6 +645,12 @@ impl MediaProcess for ProductionMediaProcess {
 
     fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    fn diagnostic(&self) -> Option<String> {
+        let kept = self.captured.lock().ok()?;
+        let excerpt = sanitize_diagnostic(&kept);
+        (!excerpt.is_empty()).then_some(excerpt)
     }
 
     fn try_wait(&mut self) -> Result<Option<MediaProcessExit>, MediaError> {
@@ -734,7 +754,11 @@ mod fake {
             let output = spec.args().last().map(PathBuf::from);
             state.specs.push(spec);
             if let Some(diagnostic) = state.fail_next.take() {
-                state.last_diagnostic = Some(sanitized_diagnostic(diagnostic.len()));
+                // The fake keeps only a redacted size note, never the text.
+                let bounded = diagnostic.len().min(MAX_DIAGNOSTIC_BYTES);
+                state.last_diagnostic = Some(
+                    format!("media process diagnostic redacted ({bounded} bytes)").into_bytes(),
+                );
                 return Err(MediaError::ProcessFailed);
             }
             let index = state.observations.len();
@@ -815,9 +839,115 @@ mod fake {
 #[cfg(any(test, feature = "test-support"))]
 pub use fake::FakeMediaProcessFactory;
 
-fn sanitized_diagnostic(bytes: usize) -> Vec<u8> {
-    let bounded = bytes.min(MAX_DIAGNOSTIC_BYTES);
-    format!("media process diagnostic redacted ({bounded} bytes)").into_bytes()
+const DIAGNOSTIC_LINES: usize = 3;
+const DIAGNOSTIC_LINE_CHARS: usize = 200;
+
+/// The first few lines of a process's stderr, bounded, with everything that
+/// could carry a secret masked: any URL (the source is the loopback proxy
+/// address with a lease token in its path), anything with an `@`, anything
+/// under `/source/`, a lease-token-shaped word, a `token` and the word after it,
+/// and credential assignments. Control characters are dropped.
+#[must_use]
+pub fn sanitize_diagnostic(raw: &[u8]) -> String {
+    let raw = &raw[..raw.len().min(MAX_DIAGNOSTIC_BYTES)];
+    let text = String::from_utf8_lossy(raw);
+    let mut lines = Vec::new();
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(DIAGNOSTIC_LINES)
+    {
+        let mut words: Vec<String> = Vec::new();
+        let mut mask_next = false;
+        for word in line.split_whitespace() {
+            let word: String = word.chars().filter(|c| !c.is_control()).collect();
+            let lower = word.to_ascii_lowercase();
+            let secret_shaped = lower.contains("://")
+                || word.contains('@')
+                || lower.contains("/source/")
+                || looks_like_lease_token(&word)
+                || ["token", "password", "passwd", "secret", "authorization"]
+                    .iter()
+                    .any(|name| lower.contains(name));
+            if mask_next || secret_shaped {
+                words.push("[masked]".to_owned());
+            } else {
+                words.push(word);
+            }
+            mask_next = lower.contains("token") || lower.contains("authorization");
+        }
+        let line: String = words
+            .join(" ")
+            .chars()
+            .take(DIAGNOSTIC_LINE_CHARS)
+            .collect();
+        lines.push(line);
+    }
+    lines.join(" | ")
+}
+
+/// A canonical UUID, with or without surrounding punctuation.
+fn looks_like_lease_token(word: &str) -> bool {
+    let trimmed = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    trimmed.len() == 36
+        && trimmed.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn an_ffmpeg_error_is_kept_but_urls_tokens_and_credentials_are_masked() {
+        let token = "018f47a0-9b5c-7a22-8a33-112233445599";
+        let raw = format!(
+            "[rtsp @ 000001] Option rw_timeout not found.\r\nrtsp://127.0.0.1:5555/source/{token}: Invalid data found\nopening {token} failed\nlease token abcdef then more\nuser:pw@host fourth line\n"
+        );
+        let excerpt = sanitize_diagnostic(raw.as_bytes());
+        assert!(
+            excerpt.contains("Option rw_timeout not found."),
+            "{excerpt}"
+        );
+        for leaked in [
+            token,
+            "127.0.0.1",
+            "rtsp://",
+            "source",
+            "abcdef",
+            "user:pw",
+            "pw@",
+        ] {
+            assert!(!excerpt.contains(leaked), "{leaked} leaked: {excerpt}");
+        }
+        // Only the first three lines survive.
+        assert!(!excerpt.contains("fourth"), "{excerpt}");
+        assert_eq!(excerpt.matches(" | ").count(), 2);
+    }
+
+    #[test]
+    fn the_excerpt_is_bounded_and_free_of_control_characters() {
+        let long = format!("{}\u{7}\u{1b}[31m end", "x".repeat(5000));
+        let excerpt = sanitize_diagnostic(long.as_bytes());
+        assert!(excerpt.chars().count() <= DIAGNOSTIC_LINE_CHARS);
+        assert!(!excerpt.chars().any(char::is_control));
+        assert_eq!(sanitize_diagnostic(b""), "");
+        assert_eq!(sanitize_diagnostic(b"\n  \r\n"), "");
+        let huge = vec![b'a'; MAX_DIAGNOSTIC_BYTES * 4];
+        assert!(sanitize_diagnostic(&huge).chars().count() <= DIAGNOSTIC_LINE_CHARS);
+    }
+
+    #[test]
+    fn invalid_utf8_is_tolerated() {
+        let excerpt = sanitize_diagnostic(b"bad \xff\xfe bytes");
+        assert!(excerpt.starts_with("bad"));
+    }
 }
 
 #[cfg(test)]

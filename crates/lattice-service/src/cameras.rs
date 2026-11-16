@@ -62,6 +62,19 @@ fn note_session_failure(session: &HlsSessionId, stage: &'static str, error: &dyn
     tracing::warn!(session = %session, stage, error = ?error, "camera session stage failed");
 }
 
+/// Logs that the media process ended badly, with the short sanitised excerpt of
+/// what it wrote to stderr (masked URLs, tokens and credentials; see
+/// `lattice_camera::sanitize_diagnostic`) so the reason is not lost.
+fn note_media_exit(session: &HlsSessionId, stage: &'static str, excerpt: Option<String>) {
+    tracing::warn!(
+        session = %session,
+        stage,
+        error = ?MediaError::ProcessFailed,
+        ffmpeg = excerpt.as_deref().unwrap_or(""),
+        "camera session stage failed"
+    );
+}
+
 const CLEANUP_COMPONENT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_RETRY_BASE: Duration = Duration::from_millis(25);
 const CLEANUP_RETRY_MAX: Duration = Duration::from_secs(1);
@@ -972,7 +985,14 @@ impl CameraSessionManager {
                 }
             }
             Ok(Ok(_)) => {
-                note_session_failure(&owner, "snapshot_exit", &MediaError::ProcessFailed);
+                note_media_exit(
+                    &owner,
+                    "snapshot_exit",
+                    resources
+                        .process
+                        .as_ref()
+                        .and_then(|process| process.diagnostic()),
+                );
                 Err(CameraSessionError::Unavailable)
             }
             Ok(Err(error)) => {
@@ -1123,8 +1143,14 @@ impl CameraSessionManager {
             (value.output_dir.clone(), crashed)
         };
         if crashed {
-            note_session_failure(session, "media_process_exited", &MediaError::ProcessFailed);
             let crashed = { self.sessions.lock().await.remove(session) };
+            note_media_exit(
+                session,
+                "media_process_exited",
+                crashed
+                    .as_ref()
+                    .and_then(|value| value.process.diagnostic()),
+            );
             if let Some(value) = crashed {
                 let _ = self
                     .cleanup_or_retain(session.clone(), CleanupResources::from_session(value), 0)
@@ -1468,6 +1494,60 @@ fn run_file_open_hook(directory: &Path) {
     };
     if let Some(action) = action {
         action();
+    }
+}
+
+#[cfg(test)]
+mod proxy_end_tests {
+    use super::*;
+
+    fn trace(method: &str, status: Option<u16>, playing: bool) -> ProxyTrace {
+        ProxyTrace {
+            stage: "test",
+            method: method.to_owned(),
+            status,
+            rule: "",
+            playing,
+        }
+    }
+
+    #[test]
+    fn a_hang_up_after_play_or_teardown_is_normal_and_everything_else_is_not() {
+        let hung_up = RtspProxyError::Unavailable;
+        // After PLAY succeeded (ffmpeg stopped, or the camera closed): normal.
+        assert!(is_normal_end(&hung_up, &trace("PLAY", Some(200), true)));
+        assert!(is_normal_end(
+            &hung_up,
+            &trace("GET_PARAMETER", Some(200), true)
+        ));
+        // The camera hangs up after TEARDOWN without answering: normal.
+        assert!(is_normal_end(&hung_up, &trace("TEARDOWN", None, false)));
+        // Before PLAY succeeded, a hang-up is a failure at that step.
+        for method in ["OPTIONS", "DESCRIBE", "SETUP", "PLAY"] {
+            assert!(
+                !is_normal_end(&hung_up, &trace(method, None, false)),
+                "{method}"
+            );
+        }
+        assert!(!is_normal_end(&hung_up, &trace("PLAY", Some(454), false)));
+        // Only a hang-up is excused: timeouts while media should flow, protocol
+        // errors and limits stay warnings even after PLAY.
+        for error in [
+            RtspProxyError::Timeout,
+            RtspProxyError::Protocol,
+            RtspProxyError::Limit,
+            RtspProxyError::Consumer,
+            RtspProxyError::TargetMismatch,
+        ] {
+            assert!(
+                !is_normal_end(&error, &trace("PLAY", Some(200), true)),
+                "{error:?}"
+            );
+            assert!(
+                !is_normal_end(&error, &trace("TEARDOWN", None, false)),
+                "{error:?}"
+            );
+        }
     }
 }
 
@@ -2239,9 +2319,24 @@ async fn run_listener(
                             return;
                         }
                     }
-                    match serve_connection(stream, token, upstream, binding, connector, limits, expires).await {
+                    let mut trace = ProxyTrace::default();
+                    match serve_connection(stream, token, upstream, binding, connector, limits, expires, &mut trace).await {
                         Ok(()) => tracing::debug!("rtsp proxy connection closed"),
-                        Err(error) => tracing::debug!(error = ?error, "rtsp proxy connection ended"),
+                        // A stream that ends after PLAY succeeded, or a camera
+                        // that hangs up after TEARDOWN, is a normal end.
+                        Err(error) if is_normal_end(&error, &trace) => {
+                            tracing::debug!(error = ?error, method = %trace.method, "rtsp proxy connection closed");
+                        }
+                        // Which RTSP method and stage, the camera's status code
+                        // and the rule that refused; never a URL, header or body.
+                        Err(error) => tracing::warn!(
+                            error = ?error,
+                            stage = trace.stage,
+                            method = %trace.method,
+                            upstream_status = ?trace.status,
+                            rule = trace.rule,
+                            "rtsp proxy connection ended"
+                        ),
                     }
                 });
             }
@@ -2287,6 +2382,27 @@ async fn reject_connection(mut stream: TcpStream, status: u16, reason: &str, lim
     let _ = stream.shutdown().await;
 }
 
+/// Where a proxy connection was when it ended, kept only for the log. Holds a
+/// whitelisted method name, a status code and fixed phrases.
+#[derive(Default)]
+struct ProxyTrace {
+    stage: &'static str,
+    method: String,
+    status: Option<u16>,
+    rule: &'static str,
+    /// A PLAY was answered with a success status: media is (or was) flowing.
+    playing: bool,
+}
+
+/// Whether a connection that ended with `error` simply came to its natural end:
+/// either side hung up (`Unavailable`) after PLAY succeeded, or the session was
+/// being torn down. Everything else (a hang-up mid-handshake, a rule refusal,
+/// a timeout, a protocol error) is a real failure and stays a warning.
+fn is_normal_end(error: &RtspProxyError, trace: &ProxyTrace) -> bool {
+    matches!(error, RtspProxyError::Unavailable) && (trace.playing || trace.method == "TEARDOWN")
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     client: TcpStream,
     token: LoopbackSourceToken,
@@ -2295,6 +2411,7 @@ async fn serve_connection(
     connector: Arc<dyn AuthorizedRtspConnector>,
     limits: RtspProxyLimits,
     expires: Instant,
+    trace: &mut ProxyTrace,
 ) -> Result<(), RtspProxyError> {
     let local_port = client
         .local_addr()
@@ -2305,6 +2422,7 @@ async fn serve_connection(
     let mut upstream_write: Option<tokio::io::WriteHalf<Box<dyn RtspConnection>>> = None;
     let mut auth = ConnectionAuth::default();
     let mut control_map = ControlMap::new();
+    trace.stage = "waiting for the first request";
     loop {
         enum Incoming {
             Client(Option<u8>),
@@ -2329,8 +2447,14 @@ async fn serve_connection(
                 write_all(&mut client_write, &frame, limits.io_timeout, expires).await?;
                 continue;
             }
-            Incoming::Upstream(Some(_)) => return Err(RtspProxyError::Protocol),
-            Incoming::Upstream(None) => return Err(RtspProxyError::Unavailable),
+            Incoming::Upstream(Some(_)) => {
+                trace.rule = "the camera sent something that is neither a reply nor video";
+                return Err(RtspProxyError::Protocol);
+            }
+            Incoming::Upstream(None) => {
+                trace.rule = "the camera closed the connection";
+                return Err(RtspProxyError::Unavailable);
+            }
         };
         let Some(first) = first else { return Ok(()) };
         if first == b'$' {
@@ -2340,13 +2464,16 @@ async fn serve_connection(
             continue;
         }
         let request = read_message(&mut client_read, first, limits, expires).await?;
+        trace.stage = "reading the media process's request";
         let validated = match ValidatedRequest::parse(request, &token, local_port) {
             Ok(request) => request,
             Err(RequestRejection::Forbidden) => {
+                trace.rule = "request refused: not under this session's address (403)";
                 write_status(&mut client_write, 403, "Forbidden", limits, expires).await?;
                 return Ok(());
             }
             Err(RequestRejection::Method) => {
+                trace.rule = "request refused: method not allowed (405)";
                 write_status(
                     &mut client_write,
                     405,
@@ -2358,10 +2485,15 @@ async fn serve_connection(
                 return Ok(());
             }
             Err(RequestRejection::Invalid) => {
+                trace.rule = "request refused: malformed or unsafe request (400)";
                 write_status(&mut client_write, 400, "Bad Request", limits, expires).await?;
                 return Ok(());
             }
         };
+        trace.method.clear();
+        trace.method.push_str(&validated.method);
+        trace.status = None;
+        trace.stage = "connecting to the camera";
         if upstream_io.is_none() {
             let io = timeout_at(
                 expires.min(Instant::now() + limits.io_timeout),
@@ -2384,10 +2516,18 @@ async fn serve_connection(
             authorization.as_ref().map(|value| value.as_str()),
         )?);
         let writer = upstream_write.as_mut().ok_or(RtspProxyError::Unavailable)?;
+        trace.stage = "sending the request to the camera";
         write_all(writer, &outbound, limits.io_timeout, expires).await?;
         let reader = upstream_io.as_mut().ok_or(RtspProxyError::Unavailable)?;
+        trace.stage = "waiting for the camera's reply";
         let mut response =
             read_upstream_response(reader, &mut client_write, limits, expires).await?;
+        trace.status = response.status_code();
+        trace.stage = "relaying the camera's reply";
+        if validated.method == "PLAY" && trace.status.is_some_and(|code| (200..300).contains(&code))
+        {
+            trace.playing = true;
+        }
         if response.status_code() == Some(401)
             && let Some(answer) =
                 auth.answer(&response, &upstream, &validated.method, &upstream_uri)?
@@ -2395,14 +2535,17 @@ async fn serve_connection(
             outbound = Zeroizing::new(validated.to_upstream(&upstream_uri, Some(&answer))?);
             write_all(writer, &outbound, limits.io_timeout, expires).await?;
             response = read_upstream_response(reader, &mut client_write, limits, expires).await?;
+            trace.status = response.status_code();
         }
         let local_endpoint = format!("rtsp://127.0.0.1:{local_port}/source/{token}");
+        trace.rule = "the camera's reply was refused by the reply rules (headers, transport, SDP or addresses)";
         let sanitized = response.sanitize(
             upstream.uri.expose_secret(),
             &local_endpoint,
             limits.max_body_bytes,
             &mut control_map,
         )?;
+        trace.rule = "";
         write_all(&mut client_write, &sanitized, limits.io_timeout, expires).await?;
 
         // Drain a coalesced first frame promptly. Subsequent frames are handled by
@@ -2964,6 +3107,21 @@ fn upstream_target(
         return Ok(mapped.clone());
     }
     let mut url = Url::parse(base).map_err(|_| RtspProxyError::Protocol)?;
+    if url.query().is_some() {
+        // A base such as `rtsp://cam/stream?channel=1&subtype=0/` (Dahua-family
+        // cameras advertise exactly this as Content-Base) is extended after
+        // its query, as the camera itself wrote it: `...subtype=0/trackID=0`.
+        // Rebuilding it through the path would move the suffix in front of the
+        // query and name a resource the camera does not have. The suffix came
+        // from a validated URL path, so it holds no query, fragment or space.
+        if suffix
+            .bytes()
+            .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'?' | b'#'))
+        {
+            return Err(RtspProxyError::Protocol);
+        }
+        return Ok(format!("{}{suffix}", url.as_str().trim_end_matches('/')));
+    }
     let path = format!("{}{suffix}", url.path().trim_end_matches('/'));
     url.set_path(&path);
     Ok(url.to_string())

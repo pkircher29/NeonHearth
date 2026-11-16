@@ -35,6 +35,8 @@ enum Mutation {
     WrongCorrelation,
     DuplicateResponse,
     MissingHeader,
+    EmptyHeader,
+    HalfHeader,
     NestedManufacturer,
     DetachedManufacturer,
     MixedManufacturer,
@@ -245,7 +247,14 @@ impl OnvifTransport for FixtureTransport {
         } else {
             ""
         };
-        let header_xml = if header {
+        let header_xml = if matches!(self.mutation, Mutation::EmptyHeader) {
+            // Dahua-family firmware: an empty header and no WS-Addressing.
+            "<s:Header/>".to_owned()
+        } else if matches!(self.mutation, Mutation::HalfHeader)
+            && matches!(request.action(), OnvifAction::GetDeviceInformation)
+        {
+            format!("<s:Header><wsa:Action>{response_action}</wsa:Action></s:Header>")
+        } else if header {
             format!(
                 "<s:Header><wsa:Action>{response_action}</wsa:Action>{extra_header}<wsa:RelatesTo>{relates_to}</wsa:RelatesTo></s:Header>"
             )
@@ -646,6 +655,7 @@ async fn soap_structure_actions_correlation_namespaces_and_leaf_ownership_are_st
         Mutation::WrongCorrelation,
         Mutation::DuplicateResponse,
         Mutation::MissingHeader,
+        Mutation::HalfHeader,
         Mutation::NestedManufacturer,
         Mutation::DetachedManufacturer,
         Mutation::MixedManufacturer,
@@ -903,7 +913,11 @@ async fn escaped_entities_and_real_device_extras_are_accepted() {
         value.manufacturer.as_ref().map(BoundedMetadata::as_str),
         Some("A&B <C> \"D\" 'E' AB")
     );
-    for mutation in [Mutation::Interoperable, Mutation::PasswordName] {
+    for mutation in [
+        Mutation::Interoperable,
+        Mutation::PasswordName,
+        Mutation::EmptyHeader,
+    ] {
         let value = inventory(
             &FixtureTransport::mutated(mutation),
             &Sink::default(),

@@ -552,6 +552,9 @@ pub enum AddFailure {
     SignInRefused,
     /// Something answered, but not like an ONVIF camera.
     UnexpectedAnswer,
+    /// The device answered the first ONVIF request with "no such page", as a
+    /// camera does when ONVIF is switched off in its settings.
+    OnvifNotEnabled,
     /// The camera advertised a service or a video stream on another host.
     StreamsElsewhere,
     /// The camera has no video stream to show.
@@ -655,11 +658,10 @@ impl CameraOnboarding {
         input: AddCameraInput,
     ) -> Result<AddedCamera, AddFailure> {
         let name = validate_input(&input)?;
-        let inventory = self
-            .interfaces
-            .snapshot()
-            .await
-            .map_err(|_| AddFailure::Unavailable)?;
+        let inventory = self.interfaces.snapshot().await.map_err(|_| {
+            tracing::warn!("camera add failed: the network interface list could not be read");
+            AddFailure::Unavailable
+        })?;
         let host =
             approve_address(&input.address, &inventory).map_err(AddFailure::NotOnYourNetwork)?;
         if self.book.address_in_use(host.address).await {
@@ -714,12 +716,28 @@ impl CameraOnboarding {
             Ok(found) => found,
             Err(error) => {
                 let failure = classify(error, &foreign, &sink);
+                // Which step failed and why, never a body, address-bearing
+                // value, user name or password.
+                tracing::warn!(
+                    step = foreign.step(),
+                    http_status = ?foreign.http_status(),
+                    onvif_error = ?error,
+                    stream_host_mismatch = sink.mismatch(),
+                    foreign_service = foreign.foreign_service(),
+                    reason = failure_code(failure),
+                    "camera add refused"
+                );
                 self.refused(principal, camera_id, &host, failure).await;
                 return Err(failure);
             }
         };
         let (staged, rtsp_port) = sink.take();
         if staged.is_empty() {
+            tracing::warn!(
+                step = "profiles",
+                reason = failure_code(AddFailure::NoStreams),
+                "camera add refused"
+            );
             self.refused(principal, camera_id, &host, AddFailure::NoStreams)
                 .await;
             return Err(AddFailure::NoStreams);
@@ -785,7 +803,9 @@ impl CameraOnboarding {
                 .await
             {
                 Ok(reference) => written.push((stream, reference)),
-                Err(_) => {
+                Err(error) => {
+                    // The vault error types carry no secret material.
+                    tracing::warn!(%error, "camera add failed: the credential store refused the stream source");
                     self.discard(camera_id, &written).await;
                     return Err(AddFailure::Unavailable);
                 }
@@ -833,6 +853,7 @@ impl CameraOnboarding {
             .insert_onboarded_camera(&record, &inventory, &profiles, &target)
             .await
         {
+            tracing::warn!(%error, "camera add failed: the camera record could not be stored");
             self.discard(camera_id, &written).await;
             return Err(match error {
                 lattice_store::CameraStoreError::Conflict => AddFailure::AlreadyAdded,
@@ -948,8 +969,14 @@ fn classify(error: OnvifError, foreign: &ForeignServiceFlag, sink: &StagingSink)
         OnvifError::Authentication => AddFailure::SignInRefused,
         OnvifError::Transport | OnvifError::Timeout | OnvifError::Tls => AddFailure::Unreachable,
         OnvifError::Sink if sink.mismatch() => AddFailure::StreamsElsewhere,
-        OnvifError::InvalidResponse if foreign.load(Ordering::SeqCst) => {
-            AddFailure::StreamsElsewhere
+        OnvifError::InvalidResponse if foreign.foreign_service() => AddFailure::StreamsElsewhere,
+        // The device answered the very first ONVIF request as "no such page":
+        // a camera with ONVIF switched off does exactly this.
+        OnvifError::InvalidResponse
+            if foreign.at_first_step()
+                && matches!(foreign.http_status(), Some(404 | 405 | 501)) =>
+        {
+            AddFailure::OnvifNotEnabled
         }
         OnvifError::Sink => AddFailure::UnexpectedAnswer,
         OnvifError::InvalidResponse
@@ -1036,6 +1063,7 @@ fn failure_code(failure: AddFailure) -> &'static str {
         AddFailure::UnexpectedAnswer => "unexpected_answer",
         AddFailure::StreamsElsewhere => "streams_elsewhere",
         AddFailure::NoStreams => "no_streams",
+        AddFailure::OnvifNotEnabled => "onvif_not_enabled",
         AddFailure::Unavailable => "unavailable",
     }
 }
@@ -1052,7 +1080,8 @@ fn failure_status(failure: AddFailure) -> StatusCode {
         | AddFailure::SignInRefused
         | AddFailure::UnexpectedAnswer
         | AddFailure::StreamsElsewhere
-        | AddFailure::NoStreams => StatusCode::UNPROCESSABLE_ENTITY,
+        | AddFailure::NoStreams
+        | AddFailure::OnvifNotEnabled => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 
@@ -1076,6 +1105,9 @@ fn failure_message(failure: AddFailure) -> &'static str {
             "The camera points its video somewhere else, so it was not added."
         }
         AddFailure::NoStreams => "The camera has no video stream to show.",
+        AddFailure::OnvifNotEnabled => {
+            "ONVIF does not appear to be enabled on that device. Turn ONVIF on in the camera's settings, then try again."
+        }
         AddFailure::Unavailable => "The camera could not be saved. Try again shortly.",
     }
 }

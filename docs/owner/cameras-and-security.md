@@ -20,9 +20,11 @@ against explicitly approved private targets on your own network.
 
 Camera credentials live in the platform secret store — Windows Credential
 Manager on Windows, the Secret Service keyring on Linux — and nowhere else.
-(The Linux service runs as a system user with no desktop session, so there it
-normally uses an encrypted file in its own state directory instead; Windows
-never falls back to a file.) The database holds only opaque references. (See "Where the password is kept" below for what happens to a password you type into the add-camera form.) Credentials are never displayed,
+(The store is tested with a throwaway write, read and delete first. A service
+account usually has no keyring session, on Linux or on Windows, where the
+Credential Manager refuses a service logon; in that case the service uses an
+encrypted file in its own state directory instead, readable only by the
+service and administrators.) The database holds only opaque references. (See "Where the password is kept" below for what happens to a password you type into the add-camera form.) Credentials are never displayed,
 never logged, never included in errors or exports, and never sent to the
 desktop app. When a stream needs authentication, a local loopback proxy
 inside the privileged service injects the credential; the raw camera URL and
@@ -110,7 +112,9 @@ Then, in this order:
    packet is sent. The log records the address and the adapter, never the user
    name or the password.
 3. NeonHearth asks the camera for its details and its video streams over
-   ONVIF, at exactly that address and port (80 unless you change it), through
+   ONVIF (a few cameras answer with an empty SOAP header and no
+   WS-Addressing; that is accepted, while a header that is present but wrong is
+   not), at exactly that address and port (80 unless you change it), through
    the adapter the address was approved on. It follows no redirects and ignores
    proxy settings, signs in with a one-time digest so the password itself is
    not sent, and refuses answers larger than a fixed limit.
@@ -124,7 +128,9 @@ Then, in this order:
 
 Each failure has its own plain message: the address is not on your network, the
 camera could not be reached, it refused the user name or password, it points its
-video somewhere else, it did not answer like a camera, it has no video stream,
+video somewhere else, ONVIF does not appear to be enabled on it (the camera
+answered "no such page" to the first ONVIF request, which is what a camera does
+when ONVIF is switched off in its settings), it did not answer like a camera, it has no video stream,
 a camera is already added at that address, or video support is not available on
 this machine (with the reason).
 
@@ -158,6 +164,27 @@ database records are deleted, and the removal is written to the audit log. If
 the credential store cannot delete something, the camera stays switched off and
 the app says the removal is not finished; removing it again retries.
 
+### What has been proven on real hardware
+
+One camera family has been tried end to end: a FLIR PE133F (Dahua-family
+firmware) on a home network, with NeonHearth on Windows and ffmpeg 8.1. Adding
+it over ONVIF, reading its details, taking snapshots and watching live view
+through ffmpeg all work. Two things that camera does are handled because of
+it: it answers ONVIF with an empty SOAP header, and it gives its stream address
+with a query string (`...?channel=1&subtype=1...`) that is kept exactly.
+
+Cameras whose RTSP stream needs no login are supported. If the camera never
+asks for credentials, none are ever sent to it (this is safer than sending them
+unasked); the stored address still carries them for the cameras that do ask,
+and only answers a challenge the camera itself makes. HTTP Basic login stays
+off unless you allowed it for that camera.
+
+Only that one camera family has been tried. Other makes differ in how they
+speak ONVIF and RTSP, so expect some to need fixes; if adding or viewing fails,
+the service log now says which step failed and why, and for a failed ffmpeg run
+it includes a short excerpt of ffmpeg's own message with every address, token
+and credential masked.
+
 ### What adding a camera does not do
 
 - It does not detect cameras for you. Cameras the network monitor recognizes are
@@ -167,13 +194,16 @@ the app says the removal is not finished; removing it again retries.
 - The camera's names, models and other details come from the camera and are
   shown as the camera reports them; the optional name you type is stored but is
   not yet shown in the list.
-- It speaks plain-HTTP ONVIF only (no encrypted ONVIF), sends every ONVIF
-  request to the single address and path `/onvif/device_service`, and follows
-  none of the other service addresses a camera advertises. A camera that serves
-  its media service only from a different path cannot be added yet.
-- The camera's user name may contain only letters, digits, dot, underscore and
-  hyphen (so an email-style user name cannot be used yet). The password may
-  contain anything, up to 256 bytes.
+- It speaks plain-HTTP ONVIF only (no encrypted ONVIF). It starts at
+  `/onvif/device_service` on the address and port you gave. If the camera then
+  names its media service on that same address and port (for example
+  `/onvif/media_service`), the profile and stream steps are sent there; a
+  service address on any other host, port or scheme is never contacted, and a
+  camera advertising one is refused.
+- The camera's user name may be 1 to 128 characters and may contain only
+  letters, digits, dot, underscore and hyphen, so a plain `admin` works but an
+  email-style user name (with `@`) or one with a space cannot be used yet. The
+  password may contain anything, up to 256 bytes.
 
 ## Advisory findings
 
@@ -223,9 +253,11 @@ presents information for you to act on yourself.
 - Real-camera acceptance is still pending: the viewing pipeline (vault,
   streaming, snapshots, cleanup) and adding and removing a camera are verified
   end-to-end against fixtures and a stand-in device on this computer, and are
-  built into the running service, but no physical camera has been through the
-  documented acceptance procedure yet. Cameras differ in how they answer
-  ONVIF, so expect some to need fixes.
+  built into the running service. Adding, snapshots and live view have been
+  proven on one real camera (see "What has been proven on real hardware"); the
+  documented acceptance procedure has not been run across other makes, and
+  cameras differ in how they answer ONVIF and RTSP, so expect some to need
+  fixes.
 - Automatic camera detection that creates a viewable camera: you add each
   camera yourself (see "Adding and removing a camera"), and nothing the network
   monitor recognizes becomes a camera on its own.

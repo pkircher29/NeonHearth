@@ -133,6 +133,7 @@ describe('CamerasView add a camera', () => {
     ['unreachable', 502, null, null, /could not reach the camera/i],
     ['sign_in_refused', 422, null, null, /refused that user name or password/i],
     ['streams_elsewhere', 422, null, null, /points its video somewhere else/i],
+    ['onvif_not_enabled', 422, null, null, /ONVIF does not appear to be enabled/i],
     ['video_unavailable', 503, 'ffmpeg_not_found', 'Install ffmpeg at the expected path.', /Video support is not available: Install ffmpeg at the expected path\./],
     ['rate_limited', 429, null, null, /too many tries/i],
     ['already_added', 409, null, null, /already added at that address/i]
@@ -174,5 +175,22 @@ describe('CamerasView add a camera', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Remove camera' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Yes, remove it' }));
     expect((await screen.findByRole('alert')).textContent).toMatch(/some of its stored data could not be removed yet/i);
+  });
+});
+
+describe('CamerasView live view for an owner-added camera', () => {
+  const firstStream = '018f47a0-9b5c-4a22-8a33-1122334455aa';
+  const secondStream = '018f47a0-9b5c-4a22-8a33-1122334455bb';
+  const sessionId = '018f47a0-9b5c-7a22-8a33-112233445500';
+  const added = { ...detail, streams: [{ stream_id: firstStream }, { stream_id: secondStream }] };
+
+  it('asks for a session with the stream id the camera detail lists, and snapshots by camera', async () => {
+    const startCameraSession = vi.fn(async () => ({ session_id: sessionId }));
+    const cameraSnapshot = vi.fn(async () => new Blob(['safe'], { type: 'image/jpeg' }));
+    render(CamerasView, { client: clientStub({ camera: vi.fn(async () => added) as unknown as ApiClient['camera'], startCameraSession: startCameraSession as unknown as ApiClient['startCameraSession'], cameraSnapshot }), owner: true });
+    await fireEvent.click(await screen.findByRole('button', { name: /start live view/i }));
+    await vi.waitFor(() => expect(startCameraSession).toHaveBeenCalledWith(id, firstStream));
+    await fireEvent.click(screen.getByRole('button', { name: /capture snapshot/i }));
+    await vi.waitFor(() => expect(cameraSnapshot).toHaveBeenCalledWith(id, undefined));
   });
 });

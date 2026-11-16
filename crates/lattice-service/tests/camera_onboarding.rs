@@ -27,7 +27,7 @@ use lattice_service::{
         },
         onvif_http::{
             ForeignServiceFlag, HttpOnvifTransport,
-            fake_device::{Behavior, Config, FakeOnvifDevice},
+            fake_device::{Behavior, Config, FakeOnvifDevice, Recorded},
         },
     },
 };
@@ -53,7 +53,11 @@ const RTSP: &str = "rtsp://192.168.1.50:8554/main";
 
 fn interface(name: &str, up: bool, ip: &str, prefix: u8) -> Interface {
     Interface {
-        id: InterfaceId::new(if name == "eth0" { 2 } else { 3 }),
+        id: InterfaceId::new(match name {
+            "eth0" => 2,
+            "eth1" => 3,
+            _ => 4,
+        }),
         name: name.to_owned(),
         description: None,
         up,
@@ -70,6 +74,7 @@ fn network(eth0_up: bool) -> InterfaceInventory {
     InterfaceInventory::new(vec![
         interface("eth0", eth0_up, "192.168.1.10", 24),
         interface("eth1", true, "10.5.0.2", 24),
+        interface("eth2", true, "192.168.50.5", 24),
     ])
 }
 
@@ -1027,4 +1032,206 @@ async fn without_camera_media_adding_says_video_support_is_not_available() {
     assert_eq!(body["error"], "video_unavailable");
     assert_eq!(body["reason"], "not_configured");
     assert!(!String::from_utf8_lossy(&bytes).contains(PASSWORD));
+}
+
+// --- a recorded real camera (Dahua-family firmware, FLIR PE133F) -------------
+
+const DAHUA_HOST: &str = "192.168.50.20";
+
+fn dahua(mutate: impl Fn(String) -> String, media_only_at_media_path: bool) -> Config {
+    let recorded = Recorded {
+        datetime: include_str!("fixtures/onvif-dahua/datetime.xml").to_owned(),
+        device_info: include_str!("fixtures/onvif-dahua/deviceinfo.xml").to_owned(),
+        capabilities: mutate(include_str!("fixtures/onvif-dahua/capabilities.xml").to_owned()),
+        profiles: include_str!("fixtures/onvif-dahua/profiles.xml").to_owned(),
+        stream_uri: mutate(include_str!("fixtures/onvif-dahua/streamuri.xml").to_owned()),
+        device_paths: vec!["/onvif/device_service".to_owned()],
+        media_paths: if media_only_at_media_path {
+            vec!["/onvif/media_service".to_owned()]
+        } else {
+            vec![
+                "/onvif/device_service".to_owned(),
+                "/onvif/media_service".to_owned(),
+            ]
+        },
+    };
+    let mut config = Config::new(USER, PASSWORD, "unused");
+    config.behavior = Behavior::Recorded(Arc::new(recorded));
+    config
+}
+
+#[tokio::test]
+async fn a_recorded_real_camera_is_added_with_both_streams_and_its_query_intact() {
+    let device = FakeOnvifDevice::start(dahua(|text| text, true)).await;
+    let rig = Rig::loopback(device.addr()).await;
+    let (status, body) = rig.add(DAHUA_HOST, PASSWORD).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_no_secret("response", &body.to_string());
+    assert_eq!(body["streams"].as_array().unwrap().len(), 2);
+
+    // Device information, capabilities, profiles, two stream addresses, date
+    // and time. The media steps went to the media service the camera named.
+    assert_eq!(
+        device.request_paths(),
+        [
+            "/onvif/device_service",
+            "/onvif/device_service",
+            "/onvif/media_service",
+            "/onvif/media_service",
+            "/onvif/media_service",
+            "/onvif/device_service",
+        ]
+    );
+
+    let camera = CameraId::from_uuid(body["camera_id"].as_str().unwrap().parse().unwrap());
+    let repository = CameraRepository::new(rig.pool.clone());
+    let inventory = repository.load_inventory(camera).await.unwrap().unwrap();
+    assert_eq!(inventory.manufacturer.unwrap().as_str(), "FLIR Systems");
+    assert_eq!(inventory.model.unwrap().as_str(), "PE133F");
+    assert_eq!(
+        inventory.firmware.unwrap().as_str(),
+        "2.400.FLIR 00.6.R, build: 2017-01-23"
+    );
+    let target = repository
+        .load_camera_target(camera)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(target.address.to_string(), DAHUA_HOST);
+    assert_eq!(target.interface, "eth2");
+    assert_eq!(target.rtsp_port, 554);
+
+    let profiles = repository.load_stream_refs(camera).await.unwrap();
+    assert_eq!(profiles.len(), 2);
+    let mut subtypes = Vec::new();
+    for profile in &profiles {
+        let secret = rig
+            .vault
+            .get_stream_source(camera, profile.stream_id(), profile.source_ref())
+            .await
+            .unwrap();
+        let stored = url::Url::parse(secret.expose_secret()).unwrap();
+        assert_eq!(stored.scheme(), "rtsp");
+        assert_eq!(stored.host_str(), Some(DAHUA_HOST));
+        assert_eq!(stored.port(), Some(554));
+        assert_eq!(stored.path(), "/cam/realmonitor");
+        assert_eq!(stored.username(), USER);
+        assert_eq!(
+            percent_encoding::percent_decode_str(stored.password().unwrap())
+                .decode_utf8()
+                .unwrap(),
+            PASSWORD
+        );
+        // The `&amp;` entities were decoded once, and nothing else changed.
+        let query = stored.query().unwrap().to_owned();
+        assert!(!query.contains("amp;"), "{query}");
+        let subtype = query
+            .strip_prefix("channel=1&subtype=")
+            .and_then(|rest| rest.strip_suffix("&unicast=true&proto=Onvif"))
+            .unwrap_or_else(|| panic!("query changed: {query}"))
+            .to_owned();
+        subtypes.push(subtype);
+    }
+    subtypes.sort();
+    assert_eq!(subtypes, ["0", "1"]);
+
+    // The media proxy's own parser takes the stored source: a live view starts.
+    rig.media
+        .set_hls_output(b"#EXTM3U\n".to_vec(), Vec::new())
+        .await;
+    for profile in &profiles {
+        let session = rig
+            .manager
+            .start_session(camera, profile.stream_id())
+            .await
+            .expect("the stored source is accepted by the media proxy");
+        rig.manager.close_session(session.id()).await.unwrap();
+    }
+    assert_no_secret("audit", &rig.audit_dump().await.1);
+}
+
+#[tokio::test]
+async fn a_recorded_camera_that_serves_media_at_the_device_path_is_added_too() {
+    // This camera answers media calls at both paths; the advertised one is used.
+    let device = FakeOnvifDevice::start(dahua(|text| text, false)).await;
+    let rig = Rig::loopback(device.addr()).await;
+    let (status, body) = rig.add(DAHUA_HOST, PASSWORD).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(device.request_paths()[2], "/onvif/media_service");
+}
+
+#[tokio::test]
+async fn a_recorded_camera_pointing_its_video_or_services_elsewhere_is_refused() {
+    let moved = |text: String| text.replace(DAHUA_HOST, "192.168.50.99");
+    let streams_elsewhere = FakeOnvifDevice::start(dahua(
+        |text| {
+            if text.contains("GetStreamUriResponse") {
+                moved(text)
+            } else {
+                text
+            }
+        },
+        false,
+    ))
+    .await;
+    let rig = Rig::loopback(streams_elsewhere.addr()).await;
+    let (status, body) = rig.add(DAHUA_HOST, PASSWORD).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("streams_elsewhere"))
+    );
+    rig.nothing_stored().await;
+    assert!(rig.vault.labels().await.is_empty());
+
+    let services_elsewhere = FakeOnvifDevice::start(dahua(
+        |text| {
+            if text.contains("GetCapabilitiesResponse") {
+                moved(text)
+            } else {
+                text
+            }
+        },
+        false,
+    ))
+    .await;
+    let rig = Rig::loopback(services_elsewhere.addr()).await;
+    let (status, body) = rig.add(DAHUA_HOST, PASSWORD).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("streams_elsewhere"))
+    );
+    rig.nothing_stored().await;
+}
+
+#[tokio::test]
+async fn a_device_with_onvif_switched_off_is_told_apart_from_one_that_is_not_a_camera() {
+    let mut off = Config::new(USER, PASSWORD, RTSP);
+    off.behavior = Behavior::NotFound;
+    let device = FakeOnvifDevice::start(off).await;
+    let rig = Rig::loopback(device.addr()).await;
+    let (status, body) = rig.add(ADDRESS, PASSWORD).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("onvif_not_enabled"))
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("ONVIF does not appear to be enabled")
+    );
+    assert_eq!(device.requests(), 1);
+    rig.nothing_stored().await;
+    assert_no_secret("response", &body.to_string());
+
+    let mut web = Config::new(USER, PASSWORD, RTSP);
+    web.behavior = Behavior::NotOnvif;
+    let device = FakeOnvifDevice::start(web).await;
+    let rig = Rig::loopback(device.addr()).await;
+    let (status, body) = rig.add(ADDRESS, PASSWORD).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("unexpected_answer"))
+    );
+    rig.nothing_stored().await;
 }
