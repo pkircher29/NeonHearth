@@ -61,7 +61,8 @@ impl HostProbeTransport {
     ) -> Result<ProbeResponse, ProbeError> {
         let address = parse_ip(resolver, "the resolver")?;
         let id = random_u16().map_err(map_os_error)?;
-        let query = dns::build_query(id, name).map_err(|error| ProbeError::Transport(error.to_string()))?;
+        let query =
+            dns::build_query(id, name).map_err(|error| ProbeError::Transport(error.to_string()))?;
         let started = Instant::now();
         let outcome = self
             .os
@@ -172,9 +173,8 @@ impl HostProbeTransport {
 
 impl ProbeTransport for HostProbeTransport {
     async fn probe(&self, probe: Probe) -> Result<ProbeResponse, ProbeError> {
-        let budget = Duration::from_millis(u64::from(
-            probe.timeout_ms.clamp(1, MAX_PROBE_TIMEOUT_MS),
-        ));
+        let budget =
+            Duration::from_millis(u64::from(probe.timeout_ms.clamp(1, MAX_PROBE_TIMEOUT_MS)));
         match tokio::time::timeout(
             budget + HARD_TIMEOUT_SLACK,
             self.dispatch(probe.request, budget),
@@ -204,8 +204,8 @@ fn map_os_error(error: OsError) -> ProbeError {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testing::{DnsScript, NeverHost, ScriptedHost};
     use super::super::model::{EchoOutcome, Ipv4Lease};
+    use super::super::testing::{DnsScript, NeverHost, ScriptedHost};
     use super::*;
     use lattice_doctor::probe::{LeaseState, RouteEntry};
     use std::io::ErrorKind;
@@ -216,7 +216,10 @@ mod tests {
         (HostProbeTransport::new(host.clone()), host)
     }
 
-    async fn ask(transport: &HostProbeTransport, request: ProbeRequest) -> Result<ProbeResponse, ProbeError> {
+    async fn ask(
+        transport: &HostProbeTransport,
+        request: ProbeRequest,
+    ) -> Result<ProbeResponse, ProbeError> {
         transport
             .probe(Probe {
                 request,
@@ -229,11 +232,26 @@ mod tests {
     async fn link_and_address_probes_answer_from_the_primary_interface() {
         let (transport, _) = transport(ScriptedHost::default());
         assert_eq!(
-            ask(&transport, ProbeRequest::LinkStatus { interface: "primary".to_owned() }).await,
-            Ok(ProbeResponse::LinkStatus { up: true, speed_mbps: Some(1000) })
+            ask(
+                &transport,
+                ProbeRequest::LinkStatus {
+                    interface: "primary".to_owned()
+                }
+            )
+            .await,
+            Ok(ProbeResponse::LinkStatus {
+                up: true,
+                speed_mbps: Some(1000)
+            })
         );
         assert_eq!(
-            ask(&transport, ProbeRequest::IpConfig { interface: "eth0".to_owned() }).await,
+            ask(
+                &transport,
+                ProbeRequest::IpConfig {
+                    interface: "eth0".to_owned()
+                }
+            )
+            .await,
             Ok(ProbeResponse::IpConfig {
                 address: Some("192.168.1.10".to_owned()),
                 lease: LeaseState::Valid
@@ -241,7 +259,9 @@ mod tests {
         );
         let Err(ProbeError::Transport(message)) = ask(
             &transport,
-            ProbeRequest::LinkStatus { interface: "missing0".to_owned() },
+            ProbeRequest::LinkStatus {
+                interface: "missing0".to_owned(),
+            },
         )
         .await
         else {
@@ -262,7 +282,13 @@ mod tests {
         };
         let (transport, _) = transport(host);
         assert_eq!(
-            ask(&transport, ProbeRequest::IpConfig { interface: "eth0".to_owned() }).await,
+            ask(
+                &transport,
+                ProbeRequest::IpConfig {
+                    interface: "eth0".to_owned()
+                }
+            )
+            .await,
             Ok(ProbeResponse::IpConfig {
                 address: Some("169.254.7.7".to_owned()),
                 lease: LeaseState::Missing
@@ -278,20 +304,26 @@ mod tests {
         };
         let (transport, _) = transport(host);
         assert_eq!(
-            ask(&transport, ProbeRequest::ArpProbe {
-                interface: "eth0".to_owned(),
-                address: "192.168.1.10".to_owned()
-            })
+            ask(
+                &transport,
+                ProbeRequest::ArpProbe {
+                    interface: "eth0".to_owned(),
+                    address: "192.168.1.10".to_owned()
+                }
+            )
             .await,
             Ok(ProbeResponse::ArpProbe {
                 responding_macs: vec!["02:00:00:00:00:99".to_owned()]
             })
         );
         assert!(matches!(
-            ask(&transport, ProbeRequest::ArpProbe {
-                interface: "eth0".to_owned(),
-                address: "192.168.1.77".to_owned()
-            })
+            ask(
+                &transport,
+                ProbeRequest::ArpProbe {
+                    interface: "eth0".to_owned(),
+                    address: "192.168.1.77".to_owned()
+                }
+            )
             .await,
             Err(ProbeError::Transport(_))
         ));
@@ -313,12 +345,32 @@ mod tests {
         host.wifi = Ok(-58);
         let (transport, _) = transport(host);
         assert_eq!(
-            ask(&transport, ProbeRequest::WifiMetrics { interface: "eth0".to_owned() }).await,
-            Ok(ProbeResponse::WifiMetrics { wireless: false, rssi_dbm: None, retry_percent: None })
+            ask(
+                &transport,
+                ProbeRequest::WifiMetrics {
+                    interface: "eth0".to_owned()
+                }
+            )
+            .await,
+            Ok(ProbeResponse::WifiMetrics {
+                wireless: false,
+                rssi_dbm: None,
+                retry_percent: None
+            })
         );
         assert_eq!(
-            ask(&transport, ProbeRequest::WifiMetrics { interface: "wlan0".to_owned() }).await,
-            Ok(ProbeResponse::WifiMetrics { wireless: true, rssi_dbm: Some(-58), retry_percent: None })
+            ask(
+                &transport,
+                ProbeRequest::WifiMetrics {
+                    interface: "wlan0".to_owned()
+                }
+            )
+            .await,
+            Ok(ProbeResponse::WifiMetrics {
+                wireless: true,
+                rssi_dbm: Some(-58),
+                retry_percent: None
+            })
         );
 
         let mut host = ScriptedHost::default();
@@ -326,7 +378,13 @@ mod tests {
         host.wifi = Err(OsError::Unsupported("no signal report"));
         let (transport, _) = self::transport(host);
         assert_eq!(
-            ask(&transport, ProbeRequest::WifiMetrics { interface: "eth0".to_owned() }).await,
+            ask(
+                &transport,
+                ProbeRequest::WifiMetrics {
+                    interface: "eth0".to_owned()
+                }
+            )
+            .await,
             Err(ProbeError::Unsupported)
         );
     }
@@ -339,11 +397,14 @@ mod tests {
         };
         let (transport, host) = transport(host);
         assert_eq!(
-            ask(&transport, ProbeRequest::Ping {
-                target: "192.168.1.1".to_owned(),
-                payload_bytes: 1472,
-                dont_fragment: true
-            })
+            ask(
+                &transport,
+                ProbeRequest::Ping {
+                    target: "192.168.1.1".to_owned(),
+                    payload_bytes: 1472,
+                    dont_fragment: true
+                }
+            )
             .await,
             Ok(ProbeResponse::PingReply { rtt_ms: 0.8 })
         );
@@ -356,26 +417,36 @@ mod tests {
 
         for (target, payload) in [("router.lan", 56u16), ("192.168.1.1", 65_001)] {
             assert!(matches!(
-                ask(&transport, ProbeRequest::Ping {
-                    target: target.to_owned(),
-                    payload_bytes: payload,
-                    dont_fragment: false
-                })
+                ask(
+                    &transport,
+                    ProbeRequest::Ping {
+                        target: target.to_owned(),
+                        payload_bytes: payload,
+                        dont_fragment: false
+                    }
+                )
                 .await,
                 Err(ProbeError::Transport(_))
             ));
         }
         // IPv6 echo is not implemented on any platform.
         assert_eq!(
-            ask(&transport, ProbeRequest::Ping {
-                target: "fd00::1".to_owned(),
-                payload_bytes: 56,
-                dont_fragment: false
-            })
+            ask(
+                &transport,
+                ProbeRequest::Ping {
+                    target: "fd00::1".to_owned(),
+                    payload_bytes: 56,
+                    dont_fragment: false
+                }
+            )
             .await,
             Err(ProbeError::Unsupported)
         );
-        assert_eq!(host.echoes.lock().unwrap().len(), 1, "rejected pings must not reach the OS");
+        assert_eq!(
+            host.echoes.lock().unwrap().len(),
+            1,
+            "rejected pings must not reach the OS"
+        );
     }
 
     #[tokio::test]
@@ -383,7 +454,9 @@ mod tests {
         for (outcome, expected) in [
             (EchoOutcome::Timeout, Ok(ProbeResponse::PingTimeout)),
             (
-                EchoOutcome::FragmentationNeeded { next_hop_mtu: Some(1400) },
+                EchoOutcome::FragmentationNeeded {
+                    next_hop_mtu: Some(1400),
+                },
                 Ok(ProbeResponse::FragmentationNeeded { next_hop_mtu: 1400 }),
             ),
         ] {
@@ -392,11 +465,14 @@ mod tests {
                 ..ScriptedHost::default()
             });
             assert_eq!(
-                ask(&transport, ProbeRequest::Ping {
-                    target: "1.1.1.1".to_owned(),
-                    payload_bytes: 1472,
-                    dont_fragment: true
-                })
+                ask(
+                    &transport,
+                    ProbeRequest::Ping {
+                        target: "1.1.1.1".to_owned(),
+                        payload_bytes: 1472,
+                        dont_fragment: true
+                    }
+                )
                 .await,
                 expected
             );
@@ -406,24 +482,26 @@ mod tests {
     #[tokio::test]
     async fn dns_answers_failures_and_silence_are_measurements() {
         for (script, expected) in [
-            (
-                DnsScript::Answer,
-                Some(vec!["93.184.216.34".to_owned()]),
-            ),
+            (DnsScript::Answer, Some(vec!["93.184.216.34".to_owned()])),
             (DnsScript::NoReply, None),
         ] {
             let (transport, _) = transport(ScriptedHost {
                 dns: script,
                 ..ScriptedHost::default()
             });
-            let response = ask(&transport, ProbeRequest::DnsQuery {
-                resolver: "192.168.1.1".to_owned(),
-                name: "example.com".to_owned(),
-            })
+            let response = ask(
+                &transport,
+                ProbeRequest::DnsQuery {
+                    resolver: "192.168.1.1".to_owned(),
+                    name: "example.com".to_owned(),
+                },
+            )
             .await
             .unwrap();
             match (response, expected) {
-                (ProbeResponse::DnsAnswer { addresses, .. }, Some(want)) => assert_eq!(addresses, want),
+                (ProbeResponse::DnsAnswer { addresses, .. }, Some(want)) => {
+                    assert_eq!(addresses, want)
+                }
                 (ProbeResponse::DnsFailure { reason }, None) => {
                     assert_eq!(reason, DnsFailureReason::Timeout);
                 }
@@ -441,10 +519,13 @@ mod tests {
                 ..ScriptedHost::default()
             });
             assert_eq!(
-                ask(&transport, ProbeRequest::DnsQuery {
-                    resolver: "192.168.1.1".to_owned(),
-                    name: "example.com".to_owned()
-                })
+                ask(
+                    &transport,
+                    ProbeRequest::DnsQuery {
+                        resolver: "192.168.1.1".to_owned(),
+                        name: "example.com".to_owned()
+                    }
+                )
                 .await,
                 Ok(ProbeResponse::DnsFailure { reason })
             );
@@ -455,27 +536,36 @@ mod tests {
             ..ScriptedHost::default()
         });
         assert!(matches!(
-            ask(&transport, ProbeRequest::DnsQuery {
-                resolver: "192.168.1.1".to_owned(),
-                name: "example.com".to_owned()
-            })
+            ask(
+                &transport,
+                ProbeRequest::DnsQuery {
+                    resolver: "192.168.1.1".to_owned(),
+                    name: "example.com".to_owned()
+                }
+            )
             .await,
             Err(ProbeError::Transport(_))
         ));
         // Resolvers are IP literals; names and bad probe names are errors.
         assert!(matches!(
-            ask(&transport, ProbeRequest::DnsQuery {
-                resolver: "dns.example".to_owned(),
-                name: "example.com".to_owned()
-            })
+            ask(
+                &transport,
+                ProbeRequest::DnsQuery {
+                    resolver: "dns.example".to_owned(),
+                    name: "example.com".to_owned()
+                }
+            )
             .await,
             Err(ProbeError::Transport(_))
         ));
         assert!(matches!(
-            ask(&transport, ProbeRequest::DnsQuery {
-                resolver: "192.168.1.1".to_owned(),
-                name: "bad name".to_owned()
-            })
+            ask(
+                &transport,
+                ProbeRequest::DnsQuery {
+                    resolver: "192.168.1.1".to_owned(),
+                    name: "bad name".to_owned()
+                }
+            )
             .await,
             Err(ProbeError::Transport(_))
         ));
@@ -527,7 +617,10 @@ mod tests {
     #[tokio::test]
     async fn tcp_reachability_is_a_measurement_and_dials_the_literal_endpoint() {
         let (transport, host) = transport(ScriptedHost::default());
-        let reach = ProbeRequest::ReachIp { address: "1.1.1.1".to_owned(), port: 443 };
+        let reach = ProbeRequest::ReachIp {
+            address: "1.1.1.1".to_owned(),
+            port: 443,
+        };
         assert!(matches!(
             ask(&transport, reach.clone()).await,
             Ok(ProbeResponse::Reachable { .. })
@@ -541,12 +634,18 @@ mod tests {
             tcp_error: Some(ErrorKind::ConnectionRefused),
             ..ScriptedHost::default()
         });
-        assert_eq!(ask(&refused, reach.clone()).await, Ok(ProbeResponse::Unreachable));
+        assert_eq!(
+            ask(&refused, reach.clone()).await,
+            Ok(ProbeResponse::Unreachable)
+        );
         let (broken, _) = self::transport(ScriptedHost {
             tcp_error: Some(ErrorKind::PermissionDenied),
             ..ScriptedHost::default()
         });
-        assert!(matches!(ask(&broken, reach).await, Err(ProbeError::Transport(_))));
+        assert!(matches!(
+            ask(&broken, reach).await,
+            Err(ProbeError::Transport(_))
+        ));
     }
 
     #[tokio::test]
@@ -561,7 +660,9 @@ mod tests {
     async fn every_probe_that_waits_on_the_os_is_cut_off_at_its_timeout() {
         let transport = HostProbeTransport::new(Arc::new(NeverHost::default()));
         let requests = [
-            ProbeRequest::IpConfig { interface: "eth0".to_owned() },
+            ProbeRequest::IpConfig {
+                interface: "eth0".to_owned(),
+            },
             ProbeRequest::ArpProbe {
                 interface: "eth0".to_owned(),
                 address: "192.168.1.10".to_owned(),
@@ -575,7 +676,10 @@ mod tests {
                 resolver: "192.168.1.1".to_owned(),
                 name: "example.com".to_owned(),
             },
-            ProbeRequest::ReachIp { address: "1.1.1.1".to_owned(), port: 443 },
+            ProbeRequest::ReachIp {
+                address: "1.1.1.1".to_owned(),
+                port: 443,
+            },
         ];
         for request in requests {
             let started = tokio::time::Instant::now();
@@ -600,7 +704,10 @@ mod tests {
         let started = tokio::time::Instant::now();
         let result = transport
             .probe(Probe {
-                request: ProbeRequest::ReachIp { address: "1.1.1.1".to_owned(), port: 443 },
+                request: ProbeRequest::ReachIp {
+                    address: "1.1.1.1".to_owned(),
+                    port: 443,
+                },
                 timeout_ms: u32::MAX,
             })
             .await;

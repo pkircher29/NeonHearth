@@ -19,16 +19,16 @@ configuration") or if it cannot create its state directory
 
 ## The UI reaches the service but cannot pair
 
-Symptoms: the collector card says reachable, but Pulse shows "Protected
-pairing is waiting" / "Unavailable until paired" and Devices says "Pair
-NeonHearth to begin building a private device list."
+Symptoms: the collector card says reachable, but the app shows its sign-in
+screen, or views stay empty or report that the service refused the request.
 
 Protected requests are answered `401 Unauthorized` when the bearer token is
 absent or wrong. The service requires exactly one `Authorization: Bearer …`
 header whose value matches its configured token (at least 32 characters).
-Note that in this build the desktop app does not yet supply the token
-automatically, so this state is expected until pairing is wired — the API
-works when called with the correct token.
+The desktop app asks you to paste the owner service token on its sign-in
+screen (see [Getting started](getting-started.md#where-the-token-lives-and-rotating-it)
+for where to find it). A phone signs in with a pairing code instead; see
+[Private phone access](getting-started.md#private-phone-access).
 
 After the owner rotates the token the old one is rejected at once. The
 service keeps the new token in its `owner-token` file (see
@@ -61,8 +61,10 @@ between other devices is invisible to it. *Estimated* means inference or
 mixed-quality sources; whenever sources of different quality overlap, the
 label is conservatively downgraded. "Complete" appears only when a verified
 gateway/bridge/mirror source observes the traffic; no such source is
-configured in this build, so local-only and estimated are the honest
-normal.
+configured in this build, so any figure you do see is local-only or
+estimated. A device with no bandwidth figure at all is expected: this build
+has no source of per-device traffic counters, so per-device bandwidth is
+unavailable for every device.
 
 ## Camera live view will not open
 

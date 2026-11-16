@@ -87,11 +87,10 @@ device is still a risk.
 
 ## Not yet available
 
-- The Home destination in the app's navigation still shows "This room is
-  still being wired": the editor and 3D view are built and tested as
-  components, but they are not yet mounted in the main app, and the
-  service-side `/api/v1/home` storage routes are still being connected. The
-  behavior above describes the built components and their locked contract.
+- Per-device heat. The heat colors above need per-device bandwidth, and this
+  build has no traffic source that supplies it (see
+  [Network monitoring](network-monitor.md)), so device pins show the neutral
+  gray "no reading" color.
 - Blueprint/image import (manual drawing is the first release).
 - Packet-path animations, Wi-Fi field estimates, and event animations in
   the 3D view.

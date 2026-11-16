@@ -68,6 +68,16 @@ silently accepted after operating-system truncation.
 
 ## Scheduler defaults and ceilings
 
+> **Status: everything in this section (up to "Limitations") describes code the running
+> service does not use.** `Scheduler`, `SchedulerRunner`, the token buckets and
+> `CuratedPlan` have no production caller; they are built and tested for a future
+> scheduled-discovery feature. Owner-started network scans call `ActiveEngine` directly
+> and are paced by the service's own `ScanPacer`
+> (`crates/lattice-service/src/network_scan.rs`): one probe attempt may start every
+> 25 ms, and a scan stops at its deadline or when cancelled. The budgets, ceilings,
+> queue and backoff below do not apply to those scans. `ActiveEngine` and `TargetGuard`
+> (described above) apply to every scan.
+
 | Budget | Default | Valid ceiling |
 | --- | ---: | ---: |
 | Global in-flight | 32 | 256 |

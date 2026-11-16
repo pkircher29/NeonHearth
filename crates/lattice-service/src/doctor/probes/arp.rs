@@ -88,8 +88,14 @@ mod tests {
 
     #[test]
     fn another_hosts_reply_or_announcement_for_the_address_is_a_claim() {
-        assert_eq!(parse_claim(&claim(2, OTHER, ADDRESS), ADDRESS, OWN), Some(OTHER));
-        assert_eq!(parse_claim(&claim(1, OTHER, ADDRESS), ADDRESS, OWN), Some(OTHER));
+        assert_eq!(
+            parse_claim(&claim(2, OTHER, ADDRESS), ADDRESS, OWN),
+            Some(OTHER)
+        );
+        assert_eq!(
+            parse_claim(&claim(1, OTHER, ADDRESS), ADDRESS, OWN),
+            Some(OTHER)
+        );
     }
 
     #[test]
@@ -98,11 +104,18 @@ mod tests {
         assert_eq!(parse_claim(&claim(2, OWN, ADDRESS), ADDRESS, OWN), None);
         // Someone claiming a different address.
         assert_eq!(
-            parse_claim(&claim(2, OTHER, Ipv4Addr::new(192, 168, 1, 11)), ADDRESS, OWN),
+            parse_claim(
+                &claim(2, OTHER, Ipv4Addr::new(192, 168, 1, 11)),
+                ADDRESS,
+                OWN
+            ),
             None
         );
         // Our own probe: sender protocol address is zero.
-        assert_eq!(parse_claim(&build_probe(OTHER, ADDRESS), ADDRESS, OWN), None);
+        assert_eq!(
+            parse_claim(&build_probe(OTHER, ADDRESS), ADDRESS, OWN),
+            None
+        );
         // Unusable sender hardware addresses.
         for sender in [[0; 6], [0xff; 6], [0x03, 0, 0, 0, 0, 1]] {
             assert_eq!(parse_claim(&claim(2, sender, ADDRESS), ADDRESS, OWN), None);
@@ -113,6 +126,9 @@ mod tests {
         not_arp[13] = 0x00;
         assert_eq!(parse_claim(&not_arp, ADDRESS, OWN), None);
         assert_eq!(parse_claim(&claim(3, OTHER, ADDRESS), ADDRESS, OWN), None);
-        assert_eq!(parse_claim(&claim(2, OTHER, ADDRESS)[..30], ADDRESS, OWN), None);
+        assert_eq!(
+            parse_claim(&claim(2, OTHER, ADDRESS)[..30], ADDRESS, OWN),
+            None
+        );
     }
 }

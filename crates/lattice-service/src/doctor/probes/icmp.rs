@@ -113,7 +113,11 @@ mod tests {
     #[test]
     fn only_well_formed_echo_replies_yield_a_sequence() {
         let mut reply = build_echo_request(1, 0x1234, 8);
-        assert_eq!(echo_reply_sequence(&reply), None, "a request is not a reply");
+        assert_eq!(
+            echo_reply_sequence(&reply),
+            None,
+            "a request is not a reply"
+        );
         reply[0] = 0;
         assert_eq!(echo_reply_sequence(&reply), Some(0x1234));
         reply[1] = 3;

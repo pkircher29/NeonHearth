@@ -2,9 +2,7 @@
 //!
 //! Nothing here touches the OS, so every rule has a fixture test.
 
-use super::model::{
-    DefaultRoute, EchoOutcome, LinkInfo, LinkKind, Mac, Ipv4Lease, OsError,
-};
+use super::model::{DefaultRoute, EchoOutcome, Ipv4Lease, LinkInfo, LinkKind, Mac, OsError};
 use lattice_doctor::probe::{LeaseState, ProbeError, ProbeResponse, RouteEntry};
 use std::io::ErrorKind;
 use std::net::Ipv4Addr;
@@ -368,10 +366,7 @@ mod tests {
 
     #[test]
     fn route_table_marks_tunnel_owned_routes_as_vpn_and_sorts_by_metric() {
-        let links = [
-            link("eth0", LinkKind::Wired),
-            link("wg0", LinkKind::Tunnel),
-        ];
+        let links = [link("eth0", LinkKind::Wired), link("wg0", LinkKind::Tunnel)];
         let routes = [
             route("wg0", [0, 0, 0, 0], 50),
             route("eth0", [192, 168, 1, 1], 100),
@@ -451,7 +446,10 @@ mod tests {
             );
         }
         assert!(matches!(
-            reach_response(Err(std::io::Error::from(ErrorKind::PermissionDenied)), elapsed),
+            reach_response(
+                Err(std::io::Error::from(ErrorKind::PermissionDenied)),
+                elapsed
+            ),
             Err(ProbeError::Transport(_))
         ));
     }

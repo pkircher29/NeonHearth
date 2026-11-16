@@ -37,10 +37,10 @@ mod other;
 #[cfg(windows)]
 mod windows;
 
-#[cfg(not(any(target_os = "linux", windows)))]
-use other as platform;
 #[cfg(target_os = "linux")]
 use linux as platform;
+#[cfg(not(any(target_os = "linux", windows)))]
+use other as platform;
 #[cfg(windows)]
 use windows as platform;
 

@@ -152,8 +152,11 @@ pub trait HostOs: Send + Sync {
     ) -> Result<UdpOutcome, OsError>;
 
     /// Open (and immediately drop) a TCP connection. Never reads or writes.
-    async fn tcp_connect(&self, address: SocketAddr, timeout: Duration)
-    -> Result<(), std::io::Error>;
+    async fn tcp_connect(
+        &self,
+        address: SocketAddr,
+        timeout: Duration,
+    ) -> Result<(), std::io::Error>;
 }
 
 /// Fills `buffer` from the OS random source.

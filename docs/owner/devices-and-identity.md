@@ -86,13 +86,19 @@ of coverages across devices is shown as *mixed*.
 
 ## Not yet available
 
-- On-screen controls to confirm or correct a device's identity (the Devices
-  view shows "Needs your confirmation" but the confirm action is not wired
-  into the app yet).
+- Confirming or correcting anything about a device other than its name. In
+  the Devices and Guard views you can confirm a suggested name ("Confirm
+  name"), edit it, or name an unnamed device; confirming a name does not
+  approve the device's network access. There is no control to correct the
+  device's type, vendor or model.
 - A merge-proposal review screen (proposals exist inside the identity
   engine; there is no owner-facing surface for them yet).
 - Real-hardware departure/rejoin acceptance is still pending: the join and
   departure machinery is fixture-verified, and physical-device evidence is
   deliberately not claimed until observed.
 - Verified gateway/mirror/router bandwidth sources are not configured in
-  this build, so live figures are local-only or estimated in practice.
+  this build. Per-device bandwidth is not produced at all: no traffic source
+  supplies per-device counters, so devices show no bandwidth figure. The
+  coverage labels above describe what the figures would mean if a source
+  existed. Household totals come only from the Acer Predator Connect W6 feed
+  (see [Network monitoring](network-monitor.md)).

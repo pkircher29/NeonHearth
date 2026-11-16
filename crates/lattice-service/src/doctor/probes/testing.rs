@@ -92,9 +92,8 @@ fn script_reply(script: DnsScript, query: &[u8]) -> UdpOutcome {
         DnsScript::WrongTransaction => message[1] = message[1].wrapping_add(1),
         DnsScript::Answer => {
             message[6..8].copy_from_slice(&1u16.to_be_bytes());
-            message.extend_from_slice(&[
-                0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34,
-            ]);
+            message
+                .extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
         }
     }
     UdpOutcome::Reply(message)

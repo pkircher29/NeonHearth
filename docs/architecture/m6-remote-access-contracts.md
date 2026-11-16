@@ -17,7 +17,8 @@ Locked 2026-08-24 for the Tailscale (T1–T4) and integrations (I1–I2) lanes.
 - **Phone sessions (T3)**: pairing mints a device-bound session (opaque id +
   secret hash, device label, created/expires timestamps; default expiry 30
   days, sliding). High-impact actions (policy actions, doctor repairs,
-  audit-module approval, plan-affecting writes) require step-up: a 6-digit
+  audit-module approval (contract only: the service has no audit-module
+  host, so no such route exists), plan-affecting writes) require step-up: a 6-digit
   PIN set at pairing (Argon2id-hashed) re-entered per high-impact action
   with a short grace window (5 min). Failed step-up attempts are rate
   limited and audited.
@@ -70,7 +71,8 @@ Every minting/revocation and step-up failure is appended to the audit log
   unknown" instead of a second execution.
 - **Sessions are bounded.** Sliding expiry never passes an absolute 180-day
   age; revoked or expired sessions are never touched back to life, and the
-  store exposes `purge_dead_phone_sessions` for the maintenance task.
+  store exposes `purge_dead_phone_sessions`, which the service's maintenance
+  pass calls (dead sessions are deleted 30 days after they ended).
 - **Sockets follow their principal.** An event ticket records the principal it
   was issued to (64 outstanding overall; a phone session holds at most 8, and phones together never take the last 8 slots, which stay reserved for the owner). A phone
   socket closes immediately when its session is revoked (broadcast) and

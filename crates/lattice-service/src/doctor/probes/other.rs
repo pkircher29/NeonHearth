@@ -1,9 +1,7 @@
 //! Platforms the Doctor has no OS glue for (neither Windows nor Linux): every
 //! OS-dependent probe is unsupported, never invented.
 
-use super::model::{
-    DefaultRoute, EchoOutcome, EchoRequest, Ipv4Lease, LinkInfo, Mac, OsError,
-};
+use super::model::{DefaultRoute, EchoOutcome, EchoRequest, Ipv4Lease, LinkInfo, Mac, OsError};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 

@@ -152,9 +152,7 @@ fn skip_name(message: &[u8], start: usize) -> Result<usize, DnsCodecError> {
         }
         if length & 0xc0 == 0xc0 {
             // A compression pointer ends the name in place.
-            message
-                .get(position + 1)
-                .ok_or(DnsCodecError::Malformed)?;
+            message.get(position + 1).ok_or(DnsCodecError::Malformed)?;
             return Ok(position + 2);
         }
         if length & 0xc0 != 0 {
@@ -194,9 +192,7 @@ mod tests {
     }
 
     /// `example.com A 93.184.216.34`, name compressed to the question.
-    const A_RECORD: [u8; 16] = [
-        0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34,
-    ];
+    const A_RECORD: [u8; 16] = [0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34];
 
     #[test]
     fn the_query_is_a_recursive_a_question() {
@@ -245,7 +241,9 @@ mod tests {
         records.extend_from_slice(&[0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 0x0c]);
         records.extend_from_slice(&A_RECORD);
         records.extend_from_slice(&[0xc0, 0x0c, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
-        records.extend_from_slice(&[0x26, 0x06, 0x28, 0, 0x02, 0x20, 0, 1, 0x02, 0x48, 0x18, 0x93, 0x25, 0xc8, 0x19, 0x46]);
+        records.extend_from_slice(&[
+            0x26, 0x06, 0x28, 0, 0x02, 0x20, 0, 1, 0x02, 0x48, 0x18, 0x93, 0x25, 0xc8, 0x19, 0x46,
+        ]);
         let parsed = parse_reply(&reply(0, 3, &records), ID).unwrap();
         assert_eq!(
             parsed,

@@ -1,9 +1,10 @@
 //! Background retention and compaction.
 //!
-//! The store exposes one bounded maintenance entry point, but nothing called it, so the
-//! database only ever grew. [`spawn`] runs a [`MaintenanceRunner`] on a jittered timer, never
-//! overlaps itself, logs a per-step summary, backs off on error and re-runs promptly while a
-//! pass reports that it hit its row bound.
+//! The store exposes one bounded maintenance entry point. `main.rs` starts [`spawn`] with
+//! `MaintenancePolicy::default()`, so the running service calls it: first pass after about two
+//! minutes, then every 15 minutes (both jittered). [`spawn`] runs a [`MaintenanceRunner`] on
+//! that timer, never overlaps itself, logs a per-step summary, backs off on error and re-runs
+//! promptly while a pass reports that it hit its row bound.
 //!
 //! The runner is a small local trait so the schedule can be tested without a database.
 //! [`StoreMaintenance`] delegates to `DbMaintenance::run_maintenance(policy, now, batch_limit)`,

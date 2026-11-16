@@ -46,8 +46,8 @@ pub fn enrich_links(links: &mut [LinkInfo]) {
                 link.up = up;
             }
         }
-        link.speed_mbps = read_attribute(&link.name, "speed")
-            .and_then(|text| procfs::parse_speed_mbps(&text));
+        link.speed_mbps =
+            read_attribute(&link.name, "speed").and_then(|text| procfs::parse_speed_mbps(&text));
         link.mtu = read_attribute(&link.name, "mtu").and_then(|text| procfs::parse_mtu(&text));
         link.mac = read_attribute(&link.name, "address").and_then(|text| procfs::parse_mac(&text));
         if matches!(link.kind, LinkKind::Wired | LinkKind::Other) && is_wireless(&link.name) {
@@ -63,9 +63,8 @@ pub fn default_routes(_links: &[LinkInfo]) -> Result<Vec<DefaultRoute>, OsError>
 }
 
 pub fn wifi_rssi_dbm(link: &LinkInfo) -> Result<i16, OsError> {
-    let text = std::fs::read_to_string("/proc/net/wireless").map_err(|_| {
-        OsError::Unsupported("this kernel does not expose /proc/net/wireless")
-    })?;
+    let text = std::fs::read_to_string("/proc/net/wireless")
+        .map_err(|_| OsError::Unsupported("this kernel does not expose /proc/net/wireless"))?;
     procfs::parse_wireless_level(&text, &link.name).ok_or(OsError::Unsupported(
         "the wireless driver does not report signal strength in dBm",
     ))
@@ -79,8 +78,9 @@ pub async fn ipv4_leases(link_index: u32) -> Result<Vec<Ipv4Lease>, OsError> {
     use futures_util::TryStreamExt;
     use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressHeaderFlags};
 
-    let (connection, handle, _) = rtnetlink::new_connection()
-        .map_err(|error| OsError::failed(format!("the netlink socket could not be opened: {error}")))?;
+    let (connection, handle, _) = rtnetlink::new_connection().map_err(|error| {
+        OsError::failed(format!("the netlink socket could not be opened: {error}"))
+    })?;
     tokio::spawn(connection);
     let mut stream = handle
         .address()
@@ -181,14 +181,18 @@ fn open_echo_socket() -> Result<Socket, OsError> {
 fn echo_blocking(request: &EchoRequest) -> Result<EchoOutcome, OsError> {
     let socket = open_echo_socket()?;
     set_mtu_discover(&socket, request.dont_fragment).map_err(|error| {
-        OsError::failed(format!("the don't-fragment option could not be set: {error}"))
+        OsError::failed(format!(
+            "the don't-fragment option could not be set: {error}"
+        ))
     })?;
     socket
         .connect(&SockAddr::from(SocketAddr::new(
             IpAddr::V4(request.target),
             0,
         )))
-        .map_err(|error| OsError::failed(format!("the echo target could not be addressed: {error}")))?;
+        .map_err(|error| {
+            OsError::failed(format!("the echo target could not be addressed: {error}"))
+        })?;
     let identifier = random_u16()?;
     let sequence = random_u16()?;
     let packet = icmp::build_echo_request(identifier, sequence, usize::from(request.payload_bytes));
@@ -203,7 +207,9 @@ fn echo_blocking(request: &EchoRequest) -> Result<EchoOutcome, OsError> {
             });
         }
         Err(error) => {
-            return Err(OsError::failed(format!("the echo could not be sent: {error}")));
+            return Err(OsError::failed(format!(
+                "the echo could not be sent: {error}"
+            )));
         }
     }
     let mut buffer = vec![0u8; usize::from(request.payload_bytes) + 128];
@@ -216,9 +222,9 @@ fn echo_blocking(request: &EchoRequest) -> Result<EchoOutcome, OsError> {
         else {
             return Ok(EchoOutcome::Timeout);
         };
-        socket
-            .set_read_timeout(Some(remaining))
-            .map_err(|error| OsError::failed(format!("the echo timeout could not be set: {error}")))?;
+        socket.set_read_timeout(Some(remaining)).map_err(|error| {
+            OsError::failed(format!("the echo timeout could not be set: {error}"))
+        })?;
         match reader.read(&mut buffer) {
             Ok(length) => {
                 if icmp::echo_reply_sequence(&buffer[..length]) == Some(sequence) {
@@ -259,7 +265,9 @@ fn recv_failure(socket: &Socket, error: &io::Error) -> Result<EchoOutcome, OsErr
         {
             Ok(EchoOutcome::Timeout)
         }
-        _ => Err(OsError::failed(format!("the echo reply could not be read: {error}"))),
+        _ => Err(OsError::failed(format!(
+            "the echo reply could not be read: {error}"
+        ))),
     }
 }
 
@@ -300,11 +308,13 @@ fn arp_probe_blocking(
     };
     if raw < 0 {
         let error = io::Error::last_os_error();
-        return Err(OsError::failed(if error.kind() == io::ErrorKind::PermissionDenied {
-            "an ARP probe needs the CAP_NET_RAW capability".to_owned()
-        } else {
-            format!("the packet socket could not be opened: {error}")
-        }));
+        return Err(OsError::failed(
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                "an ARP probe needs the CAP_NET_RAW capability".to_owned()
+            } else {
+                format!("the packet socket could not be opened: {error}")
+            },
+        ));
     }
     // SAFETY: `raw` is a freshly created, valid descriptor that nothing else owns.
     let socket = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -312,8 +322,8 @@ fn arp_probe_blocking(
     let mut link_address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     link_address.sll_family = libc::AF_PACKET as libc::c_ushort;
     link_address.sll_protocol = protocol;
-    link_address.sll_ifindex = i32::try_from(index)
-        .map_err(|_| OsError::failed("the interface index is out of range"))?;
+    link_address.sll_ifindex =
+        i32::try_from(index).map_err(|_| OsError::failed("the interface index is out of range"))?;
     link_address.sll_halen = 6;
     link_address.sll_addr[..6].copy_from_slice(&[0xff; 6]);
     // SAFETY: the descriptor is owned by `socket`; the pointer and length
@@ -408,7 +418,9 @@ fn collect_claims(
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(OsError::failed(format!("waiting for ARP replies failed: {error}")));
+            return Err(OsError::failed(format!(
+                "waiting for ARP replies failed: {error}"
+            )));
         }
         if ready == 0 {
             return Ok(());
@@ -431,7 +443,9 @@ fn collect_claims(
             ) {
                 continue;
             }
-            return Err(OsError::failed(format!("reading an ARP reply failed: {error}")));
+            return Err(OsError::failed(format!(
+                "reading an ARP reply failed: {error}"
+            )));
         }
         let length = usize::try_from(received).unwrap_or(0).min(buffer.len());
         if let Some(claimant) = arp::parse_claim(&buffer[..length], address, own_mac)

@@ -59,7 +59,9 @@ pub fn parse_wireless_level(text: &str, interface: &str) -> Option<i16> {
         // Columns: status, link quality, level, noise, ...
         let level = rest.split_whitespace().nth(2)?;
         let level: i32 = level.trim_end_matches('.').parse().ok()?;
-        return i16::try_from(level).ok().filter(|dbm| (-200..0).contains(dbm));
+        return i16::try_from(level)
+            .ok()
+            .filter(|dbm| (-200..0).contains(dbm));
     }
     None
 }
@@ -160,7 +162,10 @@ wlp3s0: 0000   45.  199.  161        0      0      0      0      0        0\n";
             parse_wireless_level("h1\nh2\nwlan0: 0000 70. -40", "wlan0"),
             Some(-40)
         );
-        assert_eq!(parse_wireless_level("h1\nh2\nwlan0: 0000 70.", "wlan0"), None);
+        assert_eq!(
+            parse_wireless_level("h1\nh2\nwlan0: 0000 70.", "wlan0"),
+            None
+        );
     }
 
     #[test]

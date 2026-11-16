@@ -35,9 +35,9 @@ fn link_kind(class: InterfaceClass) -> LinkKind {
 
 /// The interface inventory (names, state, addresses) before per-OS facts.
 fn inventory_links() -> Result<Vec<LinkInfo>, OsError> {
-    let inventory = SystemInterfaceManager
-        .snapshot()
-        .map_err(|error| OsError::failed(format!("the interface inventory is unavailable: {error}")))?;
+    let inventory = SystemInterfaceManager.snapshot().map_err(|error| {
+        OsError::failed(format!("the interface inventory is unavailable: {error}"))
+    })?;
     Ok(inventory
         .interfaces()
         .map(|interface| {
@@ -181,10 +181,9 @@ impl HostOs for SystemHost {
             .connect(server)
             .await
             .map_err(|error| OsError::failed(format!("could not reach the resolver: {error}")))?;
-        socket
-            .send(query)
-            .await
-            .map_err(|error| OsError::failed(format!("the DNS query could not be sent: {error}")))?;
+        socket.send(query).await.map_err(|error| {
+            OsError::failed(format!("the DNS query could not be sent: {error}"))
+        })?;
         let mut buffer = vec![0u8; MAX_DATAGRAM];
         match tokio::time::timeout(timeout, socket.recv(&mut buffer)).await {
             Err(_elapsed) => Ok(UdpOutcome::NoReply),

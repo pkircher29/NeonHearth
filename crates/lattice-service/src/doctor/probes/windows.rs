@@ -314,9 +314,8 @@ pub fn dns_servers() -> Vec<String> {
     }
     let mut buffer = vec![0u64; (length as usize).div_ceil(8)];
     // SAFETY: the buffer is 8-byte aligned and at least `length` bytes long.
-    let status = unsafe {
-        GetNetworkParams(buffer.as_mut_ptr().cast::<FIXED_INFO_W2KSP1>(), &mut length)
-    };
+    let status =
+        unsafe { GetNetworkParams(buffer.as_mut_ptr().cast::<FIXED_INFO_W2KSP1>(), &mut length) };
     if status != ERROR_SUCCESS {
         return Vec::new();
     }
