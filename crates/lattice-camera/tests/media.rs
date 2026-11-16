@@ -148,6 +148,8 @@ fn hls_arguments_are_an_exact_shell_free_vector_with_localhost_only_input() {
             "2",
             "-hls_list_size",
             "4",
+            "-hls_base_url",
+            "segments/",
             "-hls_flags",
             "delete_segments+append_list+omit_endlist+independent_segments",
             "-hls_segment_filename",
@@ -400,6 +402,9 @@ fn argument_lists_use_only_option_names_a_real_ffmpeg_accepts() {
             .collect();
         assert!(args.iter().any(|arg| arg == "-timeout"), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "-rw_timeout"), "{args:?}");
-        assert!(!args.iter().any(|arg| arg == "-hls_segment_size"), "{args:?}");
+        assert!(
+            !args.iter().any(|arg| arg == "-hls_segment_size"),
+            "{args:?}"
+        );
     }
 }

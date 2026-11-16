@@ -988,7 +988,10 @@ impl CameraSessionManager {
                 note_media_exit(
                     &owner,
                     "snapshot_exit",
-                    resources.process.as_ref().and_then(|process| process.diagnostic()),
+                    resources
+                        .process
+                        .as_ref()
+                        .and_then(|process| process.diagnostic()),
                 );
                 Err(CameraSessionError::Unavailable)
             }
@@ -1144,7 +1147,9 @@ impl CameraSessionManager {
             note_media_exit(
                 session,
                 "media_process_exited",
-                crashed.as_ref().and_then(|value| value.process.diagnostic()),
+                crashed
+                    .as_ref()
+                    .and_then(|value| value.process.diagnostic()),
             );
             if let Some(value) = crashed {
                 let _ = self
@@ -1511,12 +1516,18 @@ mod proxy_end_tests {
         let hung_up = RtspProxyError::Unavailable;
         // After PLAY succeeded (ffmpeg stopped, or the camera closed): normal.
         assert!(is_normal_end(&hung_up, &trace("PLAY", Some(200), true)));
-        assert!(is_normal_end(&hung_up, &trace("GET_PARAMETER", Some(200), true)));
+        assert!(is_normal_end(
+            &hung_up,
+            &trace("GET_PARAMETER", Some(200), true)
+        ));
         // The camera hangs up after TEARDOWN without answering: normal.
         assert!(is_normal_end(&hung_up, &trace("TEARDOWN", None, false)));
         // Before PLAY succeeded, a hang-up is a failure at that step.
         for method in ["OPTIONS", "DESCRIBE", "SETUP", "PLAY"] {
-            assert!(!is_normal_end(&hung_up, &trace(method, None, false)), "{method}");
+            assert!(
+                !is_normal_end(&hung_up, &trace(method, None, false)),
+                "{method}"
+            );
         }
         assert!(!is_normal_end(&hung_up, &trace("PLAY", Some(454), false)));
         // Only a hang-up is excused: timeouts while media should flow, protocol
@@ -1528,8 +1539,14 @@ mod proxy_end_tests {
             RtspProxyError::Consumer,
             RtspProxyError::TargetMismatch,
         ] {
-            assert!(!is_normal_end(&error, &trace("PLAY", Some(200), true)), "{error:?}");
-            assert!(!is_normal_end(&error, &trace("TEARDOWN", None, false)), "{error:?}");
+            assert!(
+                !is_normal_end(&error, &trace("PLAY", Some(200), true)),
+                "{error:?}"
+            );
+            assert!(
+                !is_normal_end(&error, &trace("TEARDOWN", None, false)),
+                "{error:?}"
+            );
         }
     }
 }
@@ -2382,8 +2399,7 @@ struct ProxyTrace {
 /// being torn down. Everything else (a hang-up mid-handshake, a rule refusal,
 /// a timeout, a protocol error) is a real failure and stays a warning.
 fn is_normal_end(error: &RtspProxyError, trace: &ProxyTrace) -> bool {
-    matches!(error, RtspProxyError::Unavailable)
-        && (trace.playing || trace.method == "TEARDOWN")
+    matches!(error, RtspProxyError::Unavailable) && (trace.playing || trace.method == "TEARDOWN")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2508,7 +2524,8 @@ async fn serve_connection(
             read_upstream_response(reader, &mut client_write, limits, expires).await?;
         trace.status = response.status_code();
         trace.stage = "relaying the camera's reply";
-        if validated.method == "PLAY" && trace.status.is_some_and(|code| (200..300).contains(&code)) {
+        if validated.method == "PLAY" && trace.status.is_some_and(|code| (200..300).contains(&code))
+        {
             trace.playing = true;
         }
         if response.status_code() == Some(401)

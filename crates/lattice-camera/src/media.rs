@@ -392,6 +392,9 @@ pub fn hls_args(
         "2",
         "-hls_list_size",
         "4",
+        // Segments are served under `segments/`; the playlist must name them so.
+        "-hls_base_url",
+        "segments/",
         "-hls_flags",
         "delete_segments+append_list+omit_endlist+independent_segments",
         "-hls_segment_filename",
@@ -904,8 +907,19 @@ mod diagnostic_tests {
             "[rtsp @ 000001] Option rw_timeout not found.\r\nrtsp://127.0.0.1:5555/source/{token}: Invalid data found\nopening {token} failed\nlease token abcdef then more\nuser:pw@host fourth line\n"
         );
         let excerpt = sanitize_diagnostic(raw.as_bytes());
-        assert!(excerpt.contains("Option rw_timeout not found."), "{excerpt}");
-        for leaked in [token, "127.0.0.1", "rtsp://", "source", "abcdef", "user:pw", "pw@"] {
+        assert!(
+            excerpt.contains("Option rw_timeout not found."),
+            "{excerpt}"
+        );
+        for leaked in [
+            token,
+            "127.0.0.1",
+            "rtsp://",
+            "source",
+            "abcdef",
+            "user:pw",
+            "pw@",
+        ] {
             assert!(!excerpt.contains(leaked), "{leaked} leaked: {excerpt}");
         }
         // Only the first three lines survive.
