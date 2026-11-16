@@ -548,11 +548,12 @@ fn same_target(a: &Path, b: &Path) -> bool {
 /// system has released every handle (and a virus scanner may briefly hold
 /// the file too), so the first rename after a close can fail with a sharing
 /// violation. Other errors, and every error on other platforms, are returned
-/// immediately; the wait is bounded at about five seconds.
+/// immediately; the wait is bounded at about thirty seconds (a busy machine
+/// can take several seconds to let go of a just-closed database).
 async fn retry_while_in_use<T>(
     mut operation: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    const ATTEMPTS: u32 = 50;
+    const ATTEMPTS: u32 = 300;
     let mut attempt = 0;
     loop {
         match operation() {
